@@ -25,6 +25,7 @@ pub mod fairplay_frame;
 pub mod fairplay_ipa;
 pub mod fairplay_key;
 pub mod fairplay_macho;
+pub mod fairplay_oracle_export;
 pub mod fairplay_oracle_model;
 pub mod fairplay_page;
 pub mod fairplay_portable;

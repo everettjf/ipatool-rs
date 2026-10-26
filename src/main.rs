@@ -18,6 +18,7 @@ use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2
 use ipatool_rs::fairplay_enrollment_v3::{V3Material, build_fpsenr3};
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
 use ipatool_rs::fairplay_key::CurrentSinfModel;
+use ipatool_rs::fairplay_oracle_export::export_26a428_model;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
 use ipatool_rs::fairplay_recovery;
@@ -268,6 +269,17 @@ enum FairplayEnrollCommand {
         mac_address_file: Option<PathBuf>,
         #[arg(long)]
         iokit15_output: Option<PathBuf>,
+    },
+    /// Export a private 26A428 oracle model from a checkpoint and memory trace.
+    ExportOracleModel {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long)]
+        fairplayd: PathBuf,
+        #[arg(long)]
+        memory_trace: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Transform a private 192/224-byte source with the embedded 26A428 state model.
     EvaluateState {
@@ -1200,6 +1212,46 @@ fn run() -> Result<()> {
                     }
                 }
             }
+            FairplayEnrollCommand::ExportOracleModel {
+                checkpoint,
+                fairplayd,
+                memory_trace,
+                output,
+            } => {
+                const MAX_FAIRPLAYD_BYTES: u64 = 256 * 1024 * 1024;
+                let file = File::open(&fairplayd)
+                    .with_context(|| format!("open fairplayd {}", fairplayd.display()))?;
+                let metadata = file.metadata()?;
+                if !metadata.file_type().is_file() || metadata.len() > MAX_FAIRPLAYD_BYTES {
+                    bail!("fairplayd has invalid file type or size");
+                }
+                let mut binary = Vec::new();
+                file.take(MAX_FAIRPLAYD_BYTES + 1)
+                    .read_to_end(&mut binary)
+                    .context("read fairplayd image")?;
+                if binary.len() as u64 > MAX_FAIRPLAYD_BYTES {
+                    bail!("fairplayd exceeds size limit");
+                }
+                let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
+                let model = export_26a428_model(&snapshot, &binary, &memory_trace)?;
+                write_private_binary(&output, &model.compressed)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "fairplay.oracle-export.v1",
+                            "model": output,
+                            "pages": model.pages,
+                            "binary_sha256": format!("{:x}", Sha256::digest(&binary)),
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Exported private FairPlay oracle model with {} pages to {}",
+                        model.pages,
+                        output.display()
+                    ),
+                }
+            }
             FairplayEnrollCommand::EvaluateState { input, output } => {
                 let source = read_private_bytes(&input, 224)?;
                 let transformed = fairplay_portable::evaluate_state(&source)?;
@@ -2080,6 +2132,41 @@ mod tests {
             [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
         );
         assert!(parse_private_mac(b"aa:bb:cc:dd:ee:xx").is_err());
+    }
+
+    #[test]
+    fn fairplay_oracle_export_accepts_private_capture_paths() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "export-oracle-model",
+            "--checkpoint",
+            "/private/oracle.pkl.gz",
+            "--fairplayd",
+            "/private/fairplayd",
+            "--memory-trace",
+            "/private/oracle-trace.json",
+            "--output",
+            "/private/oracle-model.gz",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::FairplayEnroll {
+                command:
+                    FairplayEnrollCommand::ExportOracleModel {
+                        checkpoint,
+                        fairplayd,
+                        memory_trace,
+                        output,
+                    },
+            } => {
+                assert_eq!(checkpoint, PathBuf::from("/private/oracle.pkl.gz"));
+                assert_eq!(fairplayd, PathBuf::from("/private/fairplayd"));
+                assert_eq!(memory_trace, PathBuf::from("/private/oracle-trace.json"));
+                assert_eq!(output, PathBuf::from("/private/oracle-model.gz"));
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 
     #[test]
