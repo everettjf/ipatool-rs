@@ -1137,7 +1137,20 @@ mod tests {
         assert_eq!(member_header.uuid, candidate.uuid);
         let mapping = member_header.mapping_for_address(image).unwrap();
         let image_offset = mapping.file_offset + image - mapping.address;
-        let segments = crate::dyld_cache::read_image_segments(&mut member, image_offset).unwrap();
+        let layout = crate::dyld_cache::read_image_layout(&mut member, image_offset).unwrap();
+        eprintln!(
+            "AppleMediaServices load commands: {:x?}",
+            layout.command_types
+        );
+        for kind in [0x8000_0033, 2, 0xb, 0x26, 0x29, 0x3a] {
+            if let Some(bytes) = layout.first_command(kind) {
+                eprintln!(
+                    "AppleMediaServices command {kind:#x}: {:02x?}",
+                    &bytes[..bytes.len().min(32)]
+                );
+            }
+        }
+        let segments = layout.segments;
         eprintln!(
             "AppleMediaServices segments: {:?}",
             segments

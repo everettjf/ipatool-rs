@@ -2,16 +2,22 @@
 
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
-use crate::{sap_aea::AeaReader, sap_archive::PinnedRestore};
+use crate::{
+    dyld_export::export_image, sap_aea::AeaReader, sap_archive::PinnedRestore,
+    sap_system_os::SystemOsCache,
+};
 
 const CACHE_DIRECTORY: &str = "apple-assets-macos-27-26A434-arm64-v1";
 const FILE_SYSTEM_IMAGE_SIZE: u64 = 14_189_330_432;
+const APPLE_MEDIA_SERVICES_IMAGE: &str =
+    "/System/Library/PrivateFrameworks/AppleMediaServices.framework/Versions/A/AppleMediaServices";
 const FRAMEWORK_PATHS: [&str; 3] = [
     "/System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Resources/commerce",
     "/System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP",
@@ -64,6 +70,10 @@ pub struct SapFrameworkAssets {
 impl SapFrameworkAssets {
     pub fn download_pinned() -> Result<Self> {
         let restore = PinnedRestore::open().context("open pinned macOS restore archive")?;
+        Self::download_from_restore(&restore)
+    }
+
+    fn download_from_restore(restore: &PinnedRestore) -> Result<Self> {
         let image = AeaReader::open(&restore.remote, restore.file_system)
             .context("open encrypted macOS filesystem")?;
         if image.size() != FILE_SYSTEM_IMAGE_SIZE {
@@ -103,6 +113,33 @@ impl SapFrameworkAssets {
 }
 
 impl SapAssetBundle {
+    /// Load a validated cache or download and atomically replace the pinned assets.
+    pub fn load_or_download() -> Result<Self> {
+        let directory = cache_directory()?;
+        if let Ok(bundle) = Self::load_from(&directory) {
+            return Ok(bundle);
+        }
+        let bundle = Self::download_pinned()?;
+        bundle.save_to(&directory)?;
+        Ok(bundle)
+    }
+
+    pub fn download_pinned() -> Result<Self> {
+        let restore = PinnedRestore::open().context("open pinned macOS restore archive")?;
+        let frameworks = SapFrameworkAssets::download_from_restore(&restore)?;
+        let mut system_os = SystemOsCache::open(&restore)?;
+        let apple_media_services = export_image(&mut system_os, APPLE_MEDIA_SERVICES_IMAGE)
+            .context("extract AppleMediaServices from SystemOS shared cache")?;
+        let bundle = Self {
+            apple_media_services,
+            commerce: frameworks.commerce,
+            core_fp: frameworks.core_fp,
+            core_fp_icxs: frameworks.core_fp_icxs,
+        };
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
     pub fn validate(&self) -> Result<()> {
         for (spec, bytes) in SPECS.iter().zip(self.files()) {
             validate_file(*spec, bytes)?;
@@ -139,6 +176,29 @@ impl SapAssetBundle {
             core_fp: files.next().unwrap(),
             core_fp_icxs: files.next().unwrap(),
         })
+    }
+
+    pub fn save_to(&self, directory: &Path) -> Result<()> {
+        self.validate()?;
+        fs::create_dir_all(directory)
+            .with_context(|| format!("create SAP asset cache {}", directory.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        for (spec, bytes) in SPECS.iter().zip(self.files()) {
+            let mut temporary = tempfile::NamedTempFile::new_in(directory)
+                .with_context(|| format!("create temporary cache file for {}", spec.name))?;
+            temporary.write_all(bytes)?;
+            temporary.flush()?;
+            temporary.as_file().sync_all()?;
+            let destination = directory.join(spec.name);
+            temporary
+                .persist(&destination)
+                .with_context(|| format!("install cached SAP asset {}", spec.name))?;
+        }
+        Ok(())
     }
 }
 
@@ -214,5 +274,17 @@ mod tests {
         assert_eq!(assets.commerce.len(), SPECS[1].size);
         assert_eq!(assets.core_fp.len(), SPECS[2].size);
         assert_eq!(assets.core_fp_icxs.len(), SPECS[3].size);
+    }
+
+    #[test]
+    #[ignore = "downloads, validates, and caches all four pinned Apple SAP assets"]
+    fn downloads_complete_pinned_bundle() {
+        let bundle = SapAssetBundle::download_pinned().unwrap();
+        bundle.validate().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        bundle.save_to(directory.path()).unwrap();
+        let restored = SapAssetBundle::load_from(directory.path()).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.apple_media_services, bundle.apple_media_services);
     }
 }

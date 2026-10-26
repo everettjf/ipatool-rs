@@ -6,6 +6,7 @@ pub mod cookies;
 pub mod credentials;
 pub mod decmpfs;
 pub mod dyld_cache;
+pub mod dyld_export;
 pub mod fairplay;
 pub mod host;
 pub mod lzbitmap;

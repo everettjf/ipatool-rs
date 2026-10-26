@@ -42,11 +42,43 @@ pub struct MachSegment {
     pub file_size: u64,
 }
 
+pub struct ImageLayout {
+    pub header: [u8; 32],
+    pub commands: Vec<u8>,
+    pub segments: Vec<MachSegment>,
+    pub command_types: Vec<u32>,
+    pub load_commands: Vec<LoadCommand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadCommand {
+    pub kind: u32,
+    pub offset: usize,
+    pub size: usize,
+}
+
+impl ImageLayout {
+    pub fn command_bytes(&self, command: LoadCommand) -> &[u8] {
+        &self.commands[command.offset..command.offset + command.size]
+    }
+
+    pub fn first_command(&self, kind: u32) -> Option<&[u8]> {
+        self.load_commands
+            .iter()
+            .find(|command| command.kind == kind)
+            .map(|command| self.command_bytes(*command))
+    }
+}
+
 /// Read the segment commands of an image located in a cache member.
 pub fn read_image_segments<R: Read + Seek>(
     reader: &mut R,
     offset: u64,
 ) -> Result<Vec<MachSegment>> {
+    Ok(read_image_layout(reader, offset)?.segments)
+}
+
+pub fn read_image_layout<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<ImageLayout> {
     let size = reader.seek(SeekFrom::End(0))?;
     if offset.checked_add(32).is_none_or(|end| end > size) {
         bail!("dyld image header is outside its cache member");
@@ -69,9 +101,12 @@ pub fn read_image_segments<R: Read + Seek>(
     let mut commands = vec![0u8; command_size];
     reader.read_exact(&mut commands)?;
     let mut segments = Vec::new();
+    let mut command_types = Vec::with_capacity(command_count);
+    let mut load_commands = Vec::with_capacity(command_count);
     let mut cursor = 0usize;
     for _ in 0..command_count {
         let command = u32_at(&commands, cursor)?;
+        command_types.push(command);
         let length = u32_at(&commands, cursor + 4)? as usize;
         if length < 8
             || cursor
@@ -80,6 +115,11 @@ pub fn read_image_segments<R: Read + Seek>(
         {
             bail!("dyld image has invalid load command size");
         }
+        load_commands.push(LoadCommand {
+            kind: command,
+            offset: cursor,
+            size: length,
+        });
         if command == 0x19 {
             let segment = range(&commands, cursor, 72)?;
             let end = segment[8..24]
@@ -99,7 +139,13 @@ pub fn read_image_segments<R: Read + Seek>(
     if segments.is_empty() {
         bail!("dyld image has no segments");
     }
-    Ok(segments)
+    Ok(ImageLayout {
+        header,
+        commands,
+        segments,
+        command_types,
+        load_commands,
+    })
 }
 
 impl MemberHeader {
