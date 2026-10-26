@@ -12,6 +12,7 @@ pub mod dyld_cache;
 pub mod dyld_export;
 pub mod fairplay;
 pub mod fairplay_codesign;
+pub mod fairplay_decrypt;
 pub mod fairplay_key;
 pub mod fairplay_macho;
 pub mod fairplay_page;
