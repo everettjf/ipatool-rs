@@ -228,7 +228,7 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Evaluate one private 16-byte slot with the embedded 26A428 frame model.
+    /// Evaluate one transformed 16-byte slot with the embedded 26A428 frame model.
     EvaluateFrame {
         #[arg(long)]
         input: PathBuf,
@@ -236,6 +236,25 @@ enum FairplayEnrollCommand {
         output: PathBuf,
         #[arg(long)]
         slot: Option<usize>,
+    },
+    /// Recover an FPSENR2 enrollment model by testing state slots against a private SINF.
+    RecoverState {
+        #[arg(long, help = "Private 192/224-byte state field at object +0x304")]
+        state_source: PathBuf,
+        #[arg(long, help = "Private 432-byte input before the first transform")]
+        source_block: PathBuf,
+        #[arg(long, help = "Private 432-byte output after the first transform")]
+        encoded_block: PathBuf,
+        #[arg(long)]
+        sinf: PathBuf,
+        #[arg(long)]
+        selector: String,
+        #[arg(long)]
+        fairplayd_sha256: String,
+        #[arg(long)]
+        slot: Option<usize>,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Recover a private AES model from a frame and embedded or supplied SIDB oracle.
     RecoverOracle {
@@ -250,9 +269,9 @@ enum FairplayEnrollCommand {
     BuildModel {
         #[arg(long)]
         recovered_model: PathBuf,
-        #[arg(long)]
+        #[arg(long, help = "Private 432-byte input before the first transform")]
         source_block: PathBuf,
-        #[arg(long)]
+        #[arg(long, help = "Private 432-byte output after the first transform")]
         encoded_block: PathBuf,
         #[arg(long)]
         selector: String,
@@ -969,6 +988,51 @@ fn run() -> Result<()> {
                     }
                 }
             }
+            FairplayEnrollCommand::RecoverState {
+                state_source,
+                source_block,
+                encoded_block,
+                sinf,
+                selector,
+                fairplayd_sha256,
+                slot,
+                output,
+            } => {
+                let selector = parse_enrollment_selector(&selector)?;
+                let fairplayd_sha256 = parse_sha256(&fairplayd_sha256)?;
+                let state_source = read_private_bytes(&state_source, 224)?;
+                let source = read_private_block::<FIRST_TRANSFORM_BYTES>(&source_block)?;
+                let encoded = read_private_block::<FIRST_TRANSFORM_BYTES>(&encoded_block)?;
+                let sinf = read_private_bytes(&sinf, 1024 * 1024)?;
+                let enrollment = fairplay_portable::recover_enrollment_from_state(
+                    &state_source,
+                    &source,
+                    &encoded,
+                    selector,
+                    fairplayd_sha256,
+                    &sinf,
+                    slot,
+                )?;
+                write_private_binary(&output, &enrollment.model)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "fairplay.enrollment-model.v2",
+                            "output": output,
+                            "selector": selector.identifier(),
+                            "slot": enrollment.slot,
+                            "bytes": enrollment.model.len(),
+                            "recovery_milliseconds": enrollment.recovery_milliseconds,
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Recovered private FairPlay enrollment model from slot {} in {}",
+                        enrollment.slot,
+                        output.display()
+                    ),
+                }
+            }
             FairplayEnrollCommand::RecoverOracle {
                 model,
                 enrollment_frame,
@@ -1280,6 +1344,38 @@ mod tests {
             recover.command,
             Command::FairplayEnroll {
                 command: FairplayEnrollCommand::RecoverOracle { model: None, .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn recover_state_accepts_capture_material_and_optional_slot() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "recover-state",
+            "--state-source",
+            "/private/state.bin",
+            "--source-block",
+            "/private/source.bin",
+            "--encoded-block",
+            "/private/encoded.bin",
+            "--sinf",
+            "/private/app.sinf",
+            "--selector",
+            "12345678:00000009",
+            "--fairplayd-sha256",
+            "1e58d37e9602dd0ca5e24b14762063b6c310248b4d3a94272771d815e4ea1784",
+            "--slot",
+            "8",
+            "--output",
+            "/private/enrollment.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::RecoverState { slot: Some(8), .. }
             }
         ));
     }

@@ -13,6 +13,19 @@ use crate::{
 pub const FIRST_TRANSFORM_BYTES: usize = 27 * 16;
 pub const FPSENR2_BYTES: usize = 8 + 4 + 4 + 32 + 4 + 4 + 16 + 16 + 16 * 256;
 
+pub fn first_transform_whitening(
+    source: &[u8; FIRST_TRANSFORM_BYTES],
+    encoded: &[u8; FIRST_TRANSFORM_BYTES],
+) -> Result<[u8; 16]> {
+    let whitening: [u8; 16] = core::array::from_fn(|index| source[index] ^ encoded[index]);
+    for index in 0..FIRST_TRANSFORM_BYTES {
+        if source[index] ^ encoded[index] != whitening[index % 16] {
+            bail!("first protected transform is not a sixteen-byte XOR period");
+        }
+    }
+    Ok(whitening)
+}
+
 /// A SINF and its independently known 16-byte logical key.
 pub struct EnrollmentFixture<'a> {
     pub sinf: &'a [u8],
@@ -30,12 +43,7 @@ pub fn build_fpsenr2(
     recovered.input_encoding.check_permutation()?;
     recovered.output_encoding.check_permutation()?;
     let input_decode = recovered.input_encoding.inverse()?;
-    let whitening: [u8; 16] = core::array::from_fn(|index| source[index] ^ encoded[index]);
-    for index in 0..FIRST_TRANSFORM_BYTES {
-        if source[index] ^ encoded[index] != whitening[index % 16] {
-            bail!("first protected transform is not a sixteen-byte XOR period");
-        }
-    }
+    let whitening = first_transform_whitening(source, encoded)?;
     let mut bytes = Zeroizing::new(vec![0u8; FPSENR2_BYTES]);
     bytes[..8].copy_from_slice(b"FPSENR2\0");
     bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
