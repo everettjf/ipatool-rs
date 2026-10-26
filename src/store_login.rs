@@ -5,6 +5,7 @@ use std::{error::Error, fmt, thread, time::Duration};
 use anyhow::{Context, Result, bail};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
+use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
@@ -306,6 +307,10 @@ fn retryable_status(status: u16) -> bool {
 }
 
 fn retry_delay(response: &Response, retry: usize) -> Result<Duration> {
+    retry_delay_at(response, retry, OffsetDateTime::now_utc())
+}
+
+fn retry_delay_at(response: &Response, retry: usize, now: OffsetDateTime) -> Result<Duration> {
     let fallback = Duration::from_secs((10u64 << retry).min(30));
     let Some(value) = response.header("retry-after") else {
         return Ok(fallback);
@@ -315,6 +320,13 @@ fn retry_delay(response: &Response, retry: usize) -> Result<Duration> {
             bail!("Apple requested a wait longer than 30 seconds; try again later");
         }
         return Ok(Duration::from_secs(seconds.max(1)));
+    }
+    if let Ok(date) = OffsetDateTime::parse(value.trim(), &Rfc2822) {
+        let requested = Duration::try_from(date - now).unwrap_or(Duration::ZERO);
+        if requested > Duration::from_secs(30) {
+            bail!("Apple requested a wait longer than 30 seconds; try again later");
+        }
+        return Ok(requested.max(Duration::from_secs(1)));
     }
     Ok(fallback)
 }
@@ -535,6 +547,25 @@ mod tests {
         .unwrap();
         assert!(error.to_string().contains("credentials expired"));
         assert_eq!(backend.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn honors_bounded_retry_after_date() {
+        let mut response = fixture_response(429, "too many requests");
+        response
+            .headers
+            .insert("retry-after".into(), "Wed, 21 Oct 2015 07:28:00 GMT".into());
+        let now = OffsetDateTime::parse(
+            "2015-10-21T07:27:57Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert_eq!(
+            retry_delay_at(&response, 0, now).unwrap(),
+            Duration::from_secs(3)
+        );
+        response.headers.insert("retry-after".into(), "31".into());
+        assert!(retry_delay_at(&response, 0, now).is_err());
     }
 
     #[test]

@@ -392,6 +392,16 @@ mod tests {
     }
 
     #[test]
+    fn authentication_429_with_plist_keeps_server_error() {
+        let res = response(
+            429,
+            r#"<plist version="1.0"><dict><key>failureType</key><string>2034</string></dict></plist>"#,
+        );
+        let value: HashMap<String, String> = res.plist(true).unwrap();
+        assert_eq!(value["failureType"], "2034");
+    }
+
+    #[test]
     fn redirect_allowlist_excludes_303_and_requires_location_for_authentication() {
         assert!(is_authentication_redirect(301));
         assert!(is_authentication_redirect(302));

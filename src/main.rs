@@ -1,11 +1,17 @@
-use std::path::PathBuf;
+use std::{
+    io::{self, IsTerminal, Write},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
+use ipatool_rs::store_backend::StoreBackend;
+use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput};
 use ipatool_rs::{App, CatalogClient, Platform, SearchOutput};
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Format {
@@ -24,6 +30,8 @@ struct Cli {
     format: Format,
     #[arg(long, global = true)]
     verbose: bool,
+    #[arg(long, global = true)]
+    non_interactive: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -84,6 +92,15 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
+    /// Sign in to the App Store and save the account in the system keychain.
+    Login {
+        #[arg(short, long)]
+        email: Option<String>,
+        #[arg(short, long)]
+        password: Option<String>,
+        #[arg(long)]
+        auth_code: Option<String>,
+    },
     /// Show the stored account's name and email address.
     Info,
     /// Remove the stored account and KBSync cache.
@@ -107,6 +124,69 @@ fn run() -> Result<()> {
         Command::Auth { command } => {
             let account_store = AccountStore::new(open_system_keychain()?);
             match command {
+                AuthCommand::Login {
+                    email,
+                    password,
+                    auth_code,
+                } => {
+                    let interactive = !cli.non_interactive && io::stdin().is_terminal();
+                    let email = match email {
+                        Some(value) if !value.is_empty() => value,
+                        _ if interactive => {
+                            prompt("enter Apple ID (email address or phone number): ", false)?
+                        }
+                        _ => bail!(
+                            "an Apple ID is required when not running in interactive mode; use --email"
+                        ),
+                    };
+                    let password = Zeroizing::new(match password {
+                        Some(value) if !value.is_empty() => value,
+                        _ if interactive => prompt("enter password: ", true)?,
+                        _ => bail!(
+                            "password is required when not running in interactive mode; use --password"
+                        ),
+                    });
+                    let mut auth_code = Zeroizing::new(auth_code.unwrap_or_default());
+                    let backend = StoreBackend::open()?;
+                    let mut code_prompts = 0;
+                    let account = loop {
+                        let result = store_login::login(
+                            &backend,
+                            &account_store,
+                            LoginInput {
+                                email: email.clone(),
+                                password: password.to_string(),
+                                auth_code: auth_code.to_string(),
+                            },
+                        );
+                        match result {
+                            Ok(account) => break account,
+                            Err(error) if error.downcast_ref::<AuthCodeRequired>().is_some() => {
+                                if !interactive || code_prompts == 1 {
+                                    return Err(
+                                        error.context("supply a fresh code with --auth-code")
+                                    );
+                                }
+                                *auth_code = prompt("enter 2FA code: ", false)?;
+                                code_prompts += 1;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    };
+                    let summary = ipatool_rs::credentials::AccountSummary {
+                        name: account.name.clone(),
+                        email: account.email.clone(),
+                        success: true,
+                    };
+                    match cli.format {
+                        Format::Json => println!("{}", serde_json::to_string(&summary)?),
+                        Format::Text => {
+                            println!("name: {}", summary.name);
+                            println!("email: {}", summary.email);
+                            println!("success: true");
+                        }
+                    }
+                }
                 AuthCommand::Info => {
                     let summary = account_store.info()?;
                     match cli.format {
@@ -191,6 +271,59 @@ fn run() -> Result<()> {
         // Accepted for CLI compatibility. HTTP diagnostics will be added with the transport port.
     }
     Ok(())
+}
+
+fn prompt(label: &str, secret: bool) -> Result<String> {
+    eprint!("{label}");
+    io::stderr().flush().context("write prompt")?;
+    #[cfg(unix)]
+    let echo = if secret {
+        Some(EchoGuard::hide()?)
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    if secret {
+        bail!("hidden password prompt is unavailable on this platform; use --password");
+    }
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).context("read prompt")?;
+    #[cfg(unix)]
+    drop(echo);
+    if secret {
+        eprintln!();
+    }
+    Ok(input.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+#[cfg(unix)]
+struct EchoGuard(libc::termios);
+
+#[cfg(unix)]
+impl EchoGuard {
+    fn hide() -> Result<Self> {
+        // SAFETY: termios is initialized by tcgetattr before it is read.
+        let mut original: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: stdin is an open terminal in the interactive login path.
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
+            return Err(io::Error::last_os_error()).context("read terminal settings");
+        }
+        let mut hidden = original;
+        hidden.c_lflag &= !libc::ECHO;
+        // SAFETY: hidden is a valid termios value from tcgetattr.
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &hidden) } != 0 {
+            return Err(io::Error::last_os_error()).context("hide password input");
+        }
+        Ok(Self(original))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        // SAFETY: this restores the terminal settings captured by tcgetattr.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0) };
+    }
 }
 
 fn parse_platform(value: Option<&str>) -> Result<Option<Platform>> {
