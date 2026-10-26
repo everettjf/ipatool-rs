@@ -566,6 +566,22 @@ impl StoreRuntime {
         self.invoke(encoder, "initWithBag:", &[bag])
     }
 
+    pub fn resolve_promise(&mut self, promise: u64) -> Result<u64> {
+        let failure = self.allocate(8)?;
+        let result = self.invoke(promise, "resultWithError:", &[failure])?;
+        let error = self.read_u64(failure)?;
+        if error != 0 {
+            let domain = self.invoke(error, "domain", &[])?;
+            let code = self.invoke(error, "code", &[])? as i64;
+            let domain = self.object_string(domain)?;
+            bail!("Store framework error {domain}/{code}");
+        }
+        if result == 0 {
+            bail!("Store framework returned no result");
+        }
+        Ok(result)
+    }
+
     pub fn encode_request(
         &mut self,
         account: u64,
@@ -596,11 +612,12 @@ impl StoreRuntime {
         };
         let url = self.new_object("NSURL", StoreValue::String(endpoint.into()))?;
         let parameters = self.import_json(parameters)?;
-        self.invoke(
+        let promise = self.invoke(
             encoder,
             "requestWithMethod:URL:parameters:",
             &[method_id, url, parameters],
-        )
+        )?;
+        self.resolve_promise(promise)
     }
 
     /// Execute a pinned guest entry. Bridge calls not yet ported fail explicitly.
@@ -4780,19 +4797,17 @@ mod tests {
             runtime.state.borrow().objects[&encoder].class,
             "AMSURLRequestEncoder"
         );
-        let promise = runtime
+        let request = runtime
             .encode_request(0, 0, "POST", "https://example.com/test", &nested)
             .unwrap();
-        assert!(runtime.state.borrow().objects.contains_key(&promise));
-        assert!(!runtime.state.borrow().pending.is_empty());
-        let error = runtime.allocate(8).unwrap();
-        let request = runtime
-            .invoke(promise, "resultWithError:", &[error])
-            .unwrap();
-        assert_eq!(runtime.read_u64(error).unwrap(), 0);
         assert_eq!(
             runtime.state.borrow().objects[&request].class,
             "AMSURLRequest"
+        );
+        let url = runtime.invoke(request, "URL", &[]).unwrap();
+        assert_eq!(
+            runtime.object_string(url).unwrap(),
+            "https://example.com/test"
         );
         let joined_call = runtime
             .profile
