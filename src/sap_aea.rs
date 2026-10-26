@@ -1,14 +1,33 @@
 //! Bounded parsing of AEA cryptex headers and FCS metadata.
 
 use std::collections::HashMap;
+use std::io::Read;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use hpke::{
+    Deserializable, Kem, OpModeR, aead::AesGcm256, kdf::HkdfSha256, kem::DhP256HkdfSha256,
+    setup_receiver,
+};
+use p256::{SecretKey, pkcs8::DecodePrivateKey};
+use serde::Deserialize;
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::{sap_archive::ArchiveEntry, sap_remote::RemoteFile};
 
 const HEADER_SIZE: usize = 12;
 const MAX_AUTH_DATA: usize = 1 << 20;
+const MAX_FCS_KEY_SIZE: u64 = 64 << 10;
+
+#[derive(Deserialize)]
+struct FcsResponse {
+    #[serde(rename = "enc-request")]
+    enc_request: String,
+    #[serde(rename = "wrapped-key")]
+    wrapped_key: String,
+}
 
 pub struct AeaHeader {
     pub profile_and_scrypt_strength: u32,
@@ -38,6 +57,66 @@ impl AeaHeader {
             .get("com.apple.wkms.fcs-response")
             .map(Vec::as_slice)
             .context("AEA metadata does not contain an FCS response")
+    }
+
+    /// Fetch the Apple-published restore-image key and unwrap this image's AEA key.
+    pub fn resolve_symmetric_key(&self) -> Result<Zeroizing<Vec<u8>>> {
+        let url = self.fcs_key_url()?;
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("create Apple FCS client")?;
+        let mut response = client
+            .get(url)
+            .send()
+            .context("download Apple FCS key")?
+            .error_for_status()
+            .context("Apple FCS key server returned an error")?;
+        let mut pem = Vec::new();
+        response
+            .by_ref()
+            .take(MAX_FCS_KEY_SIZE + 1)
+            .read_to_end(&mut pem)
+            .context("read Apple FCS key")?;
+        if pem.len() as u64 > MAX_FCS_KEY_SIZE {
+            bail!("Apple FCS key response is too large");
+        }
+        self.unwrap_fcs_key(&pem)
+    }
+
+    /// Decrypt an HPKE-wrapped AEA key using a PKCS#8 P-256 FCS private key.
+    pub fn unwrap_fcs_key(&self, pem: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        if pem.len() as u64 > MAX_FCS_KEY_SIZE {
+            bail!("Apple FCS key response is too large");
+        }
+        let pem = std::str::from_utf8(pem).context("Apple FCS key is not PEM encoded")?;
+        let secret = SecretKey::from_pkcs8_pem(pem)
+            .context("Apple FCS key is not a PKCS#8 P-256 private key")?;
+        let wrapped: FcsResponse =
+            serde_json::from_slice(self.fcs_response()?).context("parse AEA FCS response")?;
+        let encapsulation = STANDARD
+            .decode(&wrapped.enc_request)
+            .context("decode AEA FCS encapsulation")?;
+        let ciphertext = STANDARD
+            .decode(&wrapped.wrapped_key)
+            .context("decode AEA wrapped key")?;
+        type FcsKem = DhP256HkdfSha256;
+        let private_key = <FcsKem as Kem>::PrivateKey::from_bytes(secret.to_bytes().as_ref())
+            .map_err(|_| anyhow::anyhow!("load AEA FCS private key"))?;
+        let encapsulated_key = <FcsKem as Kem>::EncappedKey::from_bytes(&encapsulation)
+            .map_err(|_| anyhow::anyhow!("invalid AEA FCS encapsulation"))?;
+        let mut receiver = setup_receiver::<AesGcm256, HkdfSha256, FcsKem>(
+            &OpModeR::Base,
+            &private_key,
+            &encapsulated_key,
+            b"",
+        )
+        .map_err(|_| anyhow::anyhow!("initialize AEA FCS recipient"))?;
+        let key = receiver
+            .open(&ciphertext, b"")
+            .map_err(|_| anyhow::anyhow!("unwrap AEA symmetric key"))?;
+        Ok(Zeroizing::new(key))
     }
 }
 
@@ -114,6 +193,8 @@ pub fn parse_metadata(data: &[u8]) -> Result<HashMap<String, Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hpke::{OpModeS, Serializable, setup_sender};
+    use p256::pkcs8::{EncodePrivateKey, LineEnding};
 
     #[test]
     fn parses_bounded_aea_metadata_and_fcs_url() {
@@ -159,5 +240,47 @@ mod tests {
             )]),
         };
         assert!(header.fcs_key_url().is_err());
+    }
+
+    #[test]
+    fn unwraps_fcs_hpke_key_and_rejects_tampering() {
+        type FcsKem = DhP256HkdfSha256;
+        let secret = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let pem = secret.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let public =
+            <FcsKem as Kem>::PublicKey::from_bytes(secret.public_key().to_sec1_bytes().as_ref())
+                .unwrap();
+        let (encapsulation, mut sender) =
+            setup_sender::<AesGcm256, HkdfSha256, FcsKem>(&OpModeS::Base, &public, b"").unwrap();
+        let wrapped = sender.seal(&[0x42; 32], b"").unwrap();
+        let mut header = AeaHeader {
+            profile_and_scrypt_strength: 1,
+            metadata: HashMap::from([(
+                "com.apple.wkms.fcs-response".into(),
+                serde_json::json!({
+                    "enc-request": STANDARD.encode(encapsulation.to_bytes()),
+                    "wrapped-key": STANDARD.encode(&wrapped),
+                })
+                .to_string()
+                .into_bytes(),
+            )]),
+        };
+        assert_eq!(
+            &*header.unwrap_fcs_key(pem.as_bytes()).unwrap(),
+            &[0x42; 32]
+        );
+
+        let mut tampered = wrapped;
+        tampered[0] ^= 1;
+        header.metadata.insert(
+            "com.apple.wkms.fcs-response".into(),
+            serde_json::json!({
+                "enc-request": STANDARD.encode(encapsulation.to_bytes()),
+                "wrapped-key": STANDARD.encode(tampered),
+            })
+            .to_string()
+            .into_bytes(),
+        );
+        assert!(header.unwrap_fcs_key(pem.as_bytes()).is_err());
     }
 }
