@@ -1,3 +1,4 @@
+pub mod arm64_compat;
 pub mod auth;
 pub mod capture;
 pub mod catalog;
