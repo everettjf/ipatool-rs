@@ -53,6 +53,7 @@ struct StoreState {
     pending: Vec<(u64, u64)>,
     allocations: HashMap<u64, u64>,
     main_queue: Option<u64>,
+    associations: HashMap<(u64, u64), u64>,
 }
 
 struct CallbackResume {
@@ -72,6 +73,20 @@ enum CallbackAction {
     StoreAt {
         destination: u64,
         value: u64,
+    },
+    StoreProperty {
+        receiver: u64,
+        key: String,
+        value: u64,
+    },
+    ReturnUnavailableProxy {
+        error_block: u64,
+    },
+    EnumerateEntries {
+        block: u64,
+        entries: Vec<(String, u64)>,
+        index: usize,
+        stop: u64,
     },
     ArrayCopy {
         destination: u64,
@@ -239,6 +254,7 @@ impl StoreRuntime {
             pending: Vec::new(),
             allocations: HashMap::new(),
             main_queue: None,
+            associations: HashMap::new(),
         }));
         let hook_error = Rc::new(RefCell::new(None));
         let error_slot = Rc::clone(&hook_error);
@@ -248,7 +264,9 @@ impl StoreRuntime {
         engine.add_code_hook(0, u64::MAX, move |context, address, _| {
             let resume = hook_state.borrow_mut().callbacks.remove(&address);
             if let Some(resume) = resume {
-                if let Err(error) = resume_callback(context, &mut hook_state.borrow_mut(), resume) {
+                if let Err(error) =
+                    resume_callback(context, &hook_profile, &mut hook_state.borrow_mut(), resume)
+                {
                     *error_slot.borrow_mut() =
                         Some(format!("Store callback at {address:#x}: {error:#}"));
                     context
@@ -772,6 +790,7 @@ fn dispatch_call(
         "CRIsAutoSubmitEnabled"
         | "CFURLResponseCopyPeerAddress"
         | "os_signpost_enabled"
+        | "os_signpost_id_make_with_pointer"
         | "os_log_type_enabled"
         | "os_variant_has_internal_content"
         | "swift_isUniquelyReferenced_nonNull_native"
@@ -781,6 +800,98 @@ fn dispatch_call(
         "getuid" | "geteuid" => context.reg_write(REG_X0, 501)?,
         "getgid" | "getegid" => context.reg_write(REG_X0, 20)?,
         "getpid" => context.reg_write(REG_X0, 123)?,
+        "NSSearchPathForDirectoriesInDomains" => {
+            if context.reg_read(REG_X0)? != 5 || context.reg_read(REG_X0 + 1)? != 8 {
+                bail!("unsupported virtual filesystem directory");
+            }
+            let path = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String("/System/Library".into()),
+            )?;
+            let array = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSArray",
+                StoreValue::Addresses(vec![path]),
+            )?;
+            context.reg_write(REG_X0, array)?;
+        }
+        "MGCopyAnswerWithError" | "MGCopyAnswer" => {
+            let key = object_string_value(state, context.reg_read(REG_X0)?)?;
+            let value = match key {
+                "BuildVersion" => "26A434",
+                "ProductVersion" => "27.0.1",
+                "DeviceClass" => "Mac",
+                "ProductType" => "Mac14,2",
+                _ => bail!("unsupported device property {key}"),
+            };
+            if symbol == "MGCopyAnswerWithError" {
+                let error = context.reg_read(REG_X0 + 2)?;
+                if error != 0 {
+                    context.mem_write(error, &[0; 4])?;
+                }
+            }
+            let address = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(value.into()),
+            )?;
+            context.reg_write(REG_X0, address)?;
+        }
+        "time" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let output = context.reg_read(REG_X0)?;
+            if output != 0 {
+                write_guest_u64(context, output, now)?;
+            }
+            context.reg_write(REG_X0, now)?;
+        }
+        "localtime" | "localtime_r" | "gmtime_r" => {
+            let timestamp = read_guest_u64(context, context.reg_read(REG_X0)?)? as i64;
+            let date = time::OffsetDateTime::from_unix_timestamp(timestamp)
+                .context("invalid guest time value")?;
+            let output = if symbol == "localtime" {
+                state.allocate(56)?
+            } else {
+                context.reg_read(REG_X0 + 1)?
+            };
+            let fields = [
+                date.second() as i32,
+                date.minute() as i32,
+                date.hour() as i32,
+                date.day() as i32,
+                date.month() as i32 - 1,
+                date.year() - 1900,
+                date.weekday().number_days_from_sunday() as i32,
+                date.ordinal() as i32 - 1,
+                0,
+            ];
+            let mut bytes = [0u8; 56];
+            for (index, field) in fields.iter().enumerate() {
+                bytes[index * 4..index * 4 + 4].copy_from_slice(&field.to_le_bytes());
+            }
+            context.mem_write(output, &bytes)?;
+            context.reg_write(REG_X0, output)?;
+        }
+        "os_transaction_create" => {
+            let name = guest_cstring(context, profile, state, context.reg_read(REG_X0)?)?;
+            let transaction = new_guest_object(
+                context,
+                profile,
+                state,
+                "HostOSTransaction",
+                StoreValue::String(name),
+            )?;
+            context.reg_write(REG_X0, transaction)?;
+        }
         "chkstk_darwin" | "free" => {}
         "malloc_size" => {
             let address = context.reg_read(REG_X0)?;
@@ -1092,6 +1203,21 @@ fn dispatch_call(
                 _ => false,
             };
             context.reg_write(REG_X0, u64::from(value))?;
+        }
+        "objc_getAssociatedObject" => {
+            let object = context.reg_read(REG_X0)?;
+            let key = context.reg_read(REG_X0 + 1)?;
+            context.reg_write(
+                REG_X0,
+                state.associations.get(&(object, key)).copied().unwrap_or(0),
+            )?;
+        }
+        "objc_setAssociatedObject" => {
+            let object = context.reg_read(REG_X0)?;
+            let key = context.reg_read(REG_X0 + 1)?;
+            let value = context.reg_read(REG_X0 + 2)?;
+            state.associations.insert((object, key), value);
+            context.reg_write(REG_X0, 0)?;
         }
         "objc_opt_respondsToSelector" => {
             let receiver = context.reg_read(REG_X0)?;
@@ -1586,6 +1712,52 @@ fn dispatch_call(
             };
             context.reg_write(REG_X0, queue)?;
         }
+        "$sSo18OS_dispatch_sourceC8DispatchE16makeSignalSource6signal5queueSo0a1_b1_c1_H0_ps5Int32V_So0a1_b1_I0CSgtFZ" =>
+        {
+            let signal = context.reg_read(REG_X0)?;
+            let queue = context.reg_read(REG_X0 + 1)?;
+            let source = new_guest_object(
+                context,
+                profile,
+                state,
+                "HostDispatchSource",
+                StoreValue::Number(signal as i64),
+            )?;
+            let properties = &mut state
+                .objects
+                .get_mut(&source)
+                .expect("new dispatch source")
+                .properties;
+            properties.insert("queue".into(), queue);
+            properties.insert("suspendCount".into(), 1);
+            context.reg_write(REG_X0, source)?;
+        }
+        "$sSo18OS_dispatch_sourceP8DispatchE15setEventHandler3qos5flags7handleryAC0D3QoSV_AC0D13WorkItemFlagsVyyXBSgtF" =>
+        {
+            let source = context.reg_read(REG_X0 + 20)?;
+            let handler = context.reg_read(REG_X0 + 2)?;
+            let object = state
+                .objects
+                .get_mut(&source)
+                .context("unknown Swift dispatch source")?;
+            if object.class != "HostDispatchSource" {
+                bail!("setEventHandler receiver is not a dispatch source");
+            }
+            object.properties.insert("eventHandler".into(), handler);
+            context.reg_write(REG_X0, 0)?;
+        }
+        "$sSo18OS_dispatch_sourceP8DispatchE8activateyyF" => {
+            let source = context.reg_read(REG_X0 + 20)?;
+            let object = state
+                .objects
+                .get_mut(&source)
+                .context("unknown Swift dispatch source")?;
+            if object.class != "HostDispatchSource" {
+                bail!("activate receiver is not a dispatch source");
+            }
+            object.properties.insert("suspendCount".into(), 0);
+            context.reg_write(REG_X0, 0)?;
+        }
         "$sSo13os_log_type_ta0A0E5errorABvgZ" => context.reg_write(REG_X0, 16)?,
         "$sSo13os_log_type_ta0A0E5faultABvgZ" => context.reg_write(REG_X0, 17)?,
         "$sSo13os_log_type_ta0A0E4infoABvgZ" => context.reg_write(REG_X0, 1)?,
@@ -1602,6 +1774,21 @@ fn dispatch_call(
                 write_guest_u64(context, destination, 0)?;
             }
         }
+        "$s2os12OSSignposterV9logHandleACSo03OS_a1_C0C_tcfC" => {
+            let output = context.reg_read(REG_X0 + 8)?;
+            let metadata = *profile
+                .index
+                .swift_accessors
+                .get("$s2os12OSSignposterVMa")
+                .context("missing OS signposter metadata")?;
+            let witnesses = read_guest_u64(context, metadata - 8)?;
+            let size = read_guest_u64(context, witnesses + 64)?;
+            if size != 8 {
+                bail!("unsupported OS signposter layout: {size} bytes");
+            }
+            write_guest_u64(context, output, context.reg_read(REG_X0)?)?;
+        }
+        "$s2os12OSSignposterV9isEnabledSbvg" => context.reg_write(REG_X0, 0)?,
         "$sSo17OS_dispatch_queueC8DispatchE5label3qos10attributes20autoreleaseFrequency6targetABSS_AC0D3QoSVAbCE10AttributesVAbCE011AutoreleaseI0OABSgtcfC"
         | "$sSo24OS_dispatch_queue_serialC8DispatchE5label3qos10attributes20autoreleaseFrequency6targetABSS_AC0E3QoSVAbCE10AttributesVSo0a1_b1_C0CACE011AutoreleaseJ0OANSgtcfC" =>
         {
@@ -1726,6 +1913,32 @@ fn dispatch_call(
             return_swift_string(context, state, &(left + &right))?;
             write_guest_u64(context, destination, context.reg_read(REG_X0)?)?;
             write_guest_u64(context, destination + 8, context.reg_read(REG_X0 + 1)?)?;
+        }
+        "$sSS11utf8CStrings15ContiguousArrayVys4Int8VGvg" => {
+            let value = swift_string(
+                context,
+                state,
+                context.reg_read(REG_X0)?,
+                context.reg_read(REG_X0 + 1)?,
+            )?;
+            if value.len() > 1_048_576 {
+                bail!("Swift UTF-8 C string exceeds runtime limit");
+            }
+            let empty = *profile
+                .index
+                .symbols
+                .get("_swiftEmptyArrayStorage")
+                .context("missing Swift empty array storage")?;
+            let metadata = read_guest_u64(context, empty)?;
+            let count = value.len() as u64 + 1;
+            let storage = state.allocate(32 + count)?;
+            write_guest_u64(context, storage, metadata)?;
+            write_guest_u64(context, storage + 8, 3)?;
+            write_guest_u64(context, storage + 16, count)?;
+            write_guest_u64(context, storage + 24, count * 2)?;
+            context.mem_write(storage + 32, value.as_bytes())?;
+            context.mem_write(storage + 32 + value.len() as u64, &[0])?;
+            context.reg_write(REG_X0, storage)?;
         }
         "$sSKsSS7ElementRtzrlE6joined9separatorS2S_tF" => {
             let separator = swift_string(
@@ -1887,6 +2100,7 @@ fn begin_callback(
 
 fn resume_callback(
     context: &HookContext,
+    profile: &ProfileData,
     state: &mut StoreState,
     resume: CallbackResume,
 ) -> Result<()> {
@@ -1899,6 +2113,63 @@ fn resume_callback(
         }
         CallbackAction::StoreAt { destination, value } => {
             write_guest_u64(context, destination, value)?;
+        }
+        CallbackAction::StoreProperty {
+            receiver,
+            key,
+            value,
+        } => {
+            state
+                .objects
+                .get_mut(&receiver)
+                .context("missing block owner")?
+                .properties
+                .insert(key, value);
+            context.reg_write(REG_X0, 0)?;
+        }
+        CallbackAction::ReturnUnavailableProxy { error_block } => {
+            let proxy = state.allocate(256)?;
+            state.objects.insert(
+                proxy,
+                StoreObject {
+                    class: "HostUnavailableProxy".into(),
+                    value: StoreValue::Empty,
+                    properties: HashMap::from([("errorBlock".into(), error_block)]),
+                },
+            );
+            context.reg_write(REG_X0, proxy)?;
+        }
+        CallbackAction::EnumerateEntries {
+            block,
+            entries,
+            index,
+            stop,
+        } => {
+            if index < entries.len() && read_guest_u64(context, stop)? == 0 {
+                let (name, value) = &entries[index];
+                let key = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String(name.clone()),
+                )?;
+                context.reg_write(REG_LR, resume.link)?;
+                begin_callback(
+                    context,
+                    state,
+                    read_guest_u64(context, block + 16)?,
+                    &[block, key, *value, stop],
+                    CallbackAction::EnumerateEntries {
+                        block,
+                        entries,
+                        index: index + 1,
+                        stop,
+                    },
+                )?;
+                return Ok(());
+            }
+            context.reg_write(REG_X0, 0)?;
         }
         CallbackAction::ArrayCopy {
             destination,
@@ -2385,6 +2656,56 @@ fn dispatch_message(
             .class
             .clone()
     };
+    if class_name == "HostUnavailableProxy" {
+        let error_block = state.objects[&receiver]
+            .properties
+            .get("errorBlock")
+            .copied()
+            .unwrap_or(0);
+        if error_block == 0 {
+            bail!("unavailable XPC proxy has no error callback");
+        }
+        let domain = new_guest_object(
+            context,
+            profile,
+            state,
+            "NSString",
+            StoreValue::String("NSCocoaErrorDomain".into()),
+        )?;
+        let code = new_guest_object(
+            context,
+            profile,
+            state,
+            "NSNumber",
+            StoreValue::Number(4099),
+        )?;
+        let user_info = new_guest_object(
+            context,
+            profile,
+            state,
+            "NSDictionary",
+            StoreValue::Entries(HashMap::new()),
+        )?;
+        let error = new_guest_object(
+            context,
+            profile,
+            state,
+            "NSError",
+            StoreValue::Entries(HashMap::from([
+                ("domain".into(), domain),
+                ("code".into(), code),
+                ("userInfo".into(), user_info),
+            ])),
+        )?;
+        begin_callback(
+            context,
+            state,
+            read_guest_u64(context, error_block + 16)?,
+            &[error_block, error],
+            CallbackAction::ReturnZero,
+        )?;
+        return Ok(());
+    }
     if !skip_lookup
         && let Some(entry) = method_address(profile, &class_name, selector, class_method)
     {
@@ -2431,6 +2752,370 @@ fn dispatch_message(
             )?;
             return Ok(());
         }
+    }
+    if !class_method && class_name == "RBSProcessHandle" && selector == "isManaged" {
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if !class_method && class_name == "NSCharacterSet" && selector == "invertedSet" {
+        let StoreValue::String(characters) = &state.objects[&receiver].value else {
+            bail!("invalid Store character set")
+        };
+        let characters = characters.clone();
+        let inverted = state.objects[&receiver]
+            .properties
+            .get("inverted")
+            .copied()
+            .unwrap_or(0)
+            == 0;
+        let set = new_guest_object(
+            context,
+            profile,
+            state,
+            "NSCharacterSet",
+            StoreValue::String(characters),
+        )?;
+        state
+            .objects
+            .get_mut(&set)
+            .expect("new character set")
+            .properties
+            .insert("inverted".into(), u64::from(inverted));
+        context.reg_write(REG_X0, set)?;
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "NSURL"
+        && matches!(
+            selector,
+            "host" | "scheme" | "query" | "fragment" | "isFileURL"
+        )
+    {
+        let url = url::Url::parse(object_string_value(state, receiver)?)?;
+        if selector == "isFileURL" {
+            context.reg_write(REG_X0, u64::from(url.scheme() == "file"))?;
+        } else {
+            let text = match selector {
+                "host" => url.host_str().unwrap_or(""),
+                "scheme" => url.scheme(),
+                "query" => url.query().unwrap_or(""),
+                _ => url.fragment().unwrap_or(""),
+            };
+            let value = if selector == "fragment" && text.is_empty() {
+                0
+            } else {
+                new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String(text.into()),
+                )?
+            };
+            context.reg_write(REG_X0, value)?;
+        }
+        return Ok(());
+    }
+    if !class_method
+        && matches!(
+            selector,
+            "rangeOfCharacterFromSet:" | "rangeOfCharacterFromSet:options:"
+        )
+    {
+        let value = object_string_value(state, receiver)?;
+        let set = state
+            .objects
+            .get(&context.reg_read(REG_X0 + 2)?)
+            .context("unknown Store character set")?;
+        let StoreValue::String(characters) = &set.value else {
+            bail!("invalid Store character set")
+        };
+        let inverted = set.properties.get("inverted").copied().unwrap_or(0) != 0;
+        let options = if selector.ends_with("options:") {
+            context.reg_read(REG_X0 + 3)?
+        } else {
+            0
+        };
+        let mut start = i64::MAX as u64;
+        let mut length = 0;
+        let mut offset = 0;
+        for character in value.chars() {
+            let width = character.len_utf16() as u64;
+            let matches = if characters == "0123456789" {
+                character.is_numeric()
+            } else {
+                characters.contains(character)
+            };
+            if matches != inverted {
+                start = offset;
+                length = width;
+                if options & 4 == 0 {
+                    break;
+                }
+            }
+            offset += width;
+        }
+        context.reg_write(REG_X0, start)?;
+        context.reg_write(REG_X0 + 1, length)?;
+        return Ok(());
+    }
+    if !class_method && class_name == "NSProcessInfo" && selector == "operatingSystemVersion" {
+        let output = context.reg_read(REG_X0 + 8)?;
+        for (index, value) in [27u64, 0, 1].into_iter().enumerate() {
+            write_guest_u64(context, output + index as u64 * 8, value)?;
+        }
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "NSURLComponents"
+        && selector == "initWithURL:resolvingAgainstBaseURL:"
+    {
+        let url = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
+        url::Url::parse(&url).context("invalid Store URL components source")?;
+        state
+            .objects
+            .get_mut(&receiver)
+            .expect("known URL components")
+            .value = StoreValue::String(url);
+        context.reg_write(REG_X0, receiver)?;
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "NSURLComponents"
+        && matches!(selector, "queryItems" | "percentEncodedQueryItems")
+    {
+        let raw = object_string_value(state, receiver)?.to_owned();
+        let url = url::Url::parse(&raw)?;
+        let mut items = Vec::new();
+        if let Some(query) = url.query().filter(|query| !query.is_empty()) {
+            for part in query.split('&') {
+                let (name, value) = part
+                    .split_once('=')
+                    .map_or((part, None), |(name, value)| (name, Some(value)));
+                let decode = |input: &str| -> String {
+                    if selector == "percentEncodedQueryItems" {
+                        return input.to_owned();
+                    }
+                    let protected = input.replace('+', "%2B");
+                    url::form_urlencoded::parse(format!("{protected}=").as_bytes())
+                        .next()
+                        .map(|(value, _)| value.into_owned())
+                        .unwrap_or_default()
+                };
+                let name = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String(decode(name)),
+                )?;
+                let value = value
+                    .map(|value| {
+                        new_guest_object(
+                            context,
+                            profile,
+                            state,
+                            "NSString",
+                            StoreValue::String(decode(value)),
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or(0);
+                let item =
+                    new_guest_object(context, profile, state, "NSURLQueryItem", StoreValue::Empty)?;
+                let properties = &mut state
+                    .objects
+                    .get_mut(&item)
+                    .expect("new query item")
+                    .properties;
+                properties.insert("name".into(), name);
+                properties.insert("value".into(), value);
+                items.push(item);
+            }
+        }
+        let array = new_guest_object(
+            context,
+            profile,
+            state,
+            "NSArray",
+            StoreValue::Addresses(items),
+        )?;
+        context.reg_write(REG_X0, array)?;
+        return Ok(());
+    }
+    if !class_method && class_name == "NSBundle" && selector == "objectForInfoDictionaryKey:" {
+        let key = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
+        let info = state.objects[&receiver]
+            .properties
+            .get("infoDictionary")
+            .copied()
+            .unwrap_or(0);
+        let value = if let Some(StoreObject {
+            value: StoreValue::Entries(entries),
+            ..
+        }) = state.objects.get(&info)
+        {
+            entries.get(&key).copied().unwrap_or(0)
+        } else {
+            let text = match key.as_str() {
+                "CFBundleIdentifier" => Some("me.majd.ipatool"),
+                "CFBundleVersion" => Some("1.0"),
+                "CFBundleExecutable" | "CFBundleName" => Some("ipatool"),
+                _ => None,
+            };
+            if let Some(text) = text {
+                new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String(text.into()),
+                )?
+            } else {
+                0
+            }
+        };
+        context.reg_write(REG_X0, value)?;
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "NSXPCConnection"
+        && selector == "initWithMachServiceName:options:"
+    {
+        let service = context.reg_read(REG_X0 + 2)?;
+        state
+            .objects
+            .get_mut(&receiver)
+            .expect("known connection")
+            .properties
+            .insert("serviceName".into(), service);
+        context.reg_write(REG_X0, receiver)?;
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "NSXPCConnection"
+        && matches!(selector, "_setQueue:" | "setRemoteObjectInterface:")
+    {
+        let key = if selector == "_setQueue:" {
+            "queue"
+        } else {
+            "interface"
+        };
+        let value = context.reg_read(REG_X0 + 2)?;
+        state
+            .objects
+            .get_mut(&receiver)
+            .expect("known connection")
+            .properties
+            .insert(key.into(), value);
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "NSXPCConnection"
+        && matches!(
+            selector,
+            "setInterruptionHandler:" | "setInvalidationHandler:"
+        )
+    {
+        let block = context.reg_read(REG_X0 + 2)?;
+        let copied = if block == 0 || (read_guest_u64(context, block + 8)? as u32) & (1 << 28) != 0
+        {
+            block
+        } else {
+            let flags = read_guest_u64(context, block + 8)? as u32;
+            let descriptor = read_guest_u64(context, block + 24)?;
+            let size = read_guest_u64(context, descriptor + 8)?;
+            if !(32..=1_048_576).contains(&size) {
+                bail!("invalid XPC handler block size {size}");
+            }
+            let copied = state.allocate(size)?;
+            context.mem_write(copied, &context.mem_read(block, size as usize)?)?;
+            if flags & (1 << 25) != 0 {
+                begin_callback(
+                    context,
+                    state,
+                    read_guest_u64(context, descriptor + 16)?,
+                    &[copied, block],
+                    CallbackAction::StoreProperty {
+                        receiver,
+                        key: selector.into(),
+                        value: copied,
+                    },
+                )?;
+                return Ok(());
+            }
+            copied
+        };
+        state
+            .objects
+            .get_mut(&receiver)
+            .expect("known connection")
+            .properties
+            .insert(selector.into(), copied);
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "NSXPCConnection"
+        && selector == "remoteObjectProxyWithErrorHandler:"
+    {
+        let block = context.reg_read(REG_X0 + 2)?;
+        let copied = if block == 0 || (read_guest_u64(context, block + 8)? as u32) & (1 << 28) != 0
+        {
+            block
+        } else {
+            let flags = read_guest_u64(context, block + 8)? as u32;
+            let descriptor = read_guest_u64(context, block + 24)?;
+            let size = read_guest_u64(context, descriptor + 8)?;
+            if !(32..=1_048_576).contains(&size) {
+                bail!("invalid XPC error block size {size}");
+            }
+            let copied = state.allocate(size)?;
+            context.mem_write(copied, &context.mem_read(block, size as usize)?)?;
+            if flags & (1 << 25) != 0 {
+                begin_callback(
+                    context,
+                    state,
+                    read_guest_u64(context, descriptor + 16)?,
+                    &[copied, block],
+                    CallbackAction::ReturnUnavailableProxy {
+                        error_block: copied,
+                    },
+                )?;
+                return Ok(());
+            }
+            copied
+        };
+        let proxy = new_guest_object(
+            context,
+            profile,
+            state,
+            "HostUnavailableProxy",
+            StoreValue::Empty,
+        )?;
+        state
+            .objects
+            .get_mut(&proxy)
+            .expect("new unavailable proxy")
+            .properties
+            .insert("errorBlock".into(), copied);
+        context.reg_write(REG_X0, proxy)?;
+        return Ok(());
+    }
+    if !class_method
+        && matches!(class_name.as_str(), "NSXPCConnection" | "NSXPCInterface")
+        && matches!(
+            selector,
+            "resume"
+                | "invalidate"
+                | "setClass:forSelector:argumentIndex:ofReply:"
+                | "setClasses:forSelector:argumentIndex:ofReply:"
+                | "setInterface:forSelector:argumentIndex:ofReply:"
+        )
+    {
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
     }
     if !class_method && class_is_kind_of(profile, &class_name, "NSError") {
         let StoreValue::Entries(fields) = &state.objects[&receiver].value else {
@@ -2507,6 +3192,58 @@ fn dispatch_message(
         }
     }
     if !class_method && class_is_kind_of(profile, &class_name, "NSURLRequest") {
+        if selector == "valueForHTTPHeaderField:" {
+            let key = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
+            let headers = state.objects[&receiver]
+                .properties
+                .get("allHTTPHeaderFields")
+                .copied()
+                .unwrap_or(0);
+            let value = state
+                .objects
+                .get(&headers)
+                .and_then(|object| match &object.value {
+                    StoreValue::Entries(entries) => entries
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(&key))
+                        .map(|(_, &value)| value),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            context.reg_write(REG_X0, value)?;
+            return Ok(());
+        }
+        if matches!(
+            selector,
+            "setValue:forHTTPHeaderField:" | "addValue:forHTTPHeaderField:"
+        ) {
+            let value = context.reg_read(REG_X0 + 2)?;
+            let key = object_string_value(state, context.reg_read(REG_X0 + 3)?)?.to_owned();
+            let headers = state.objects[&receiver]
+                .properties
+                .get("allHTTPHeaderFields")
+                .copied()
+                .unwrap_or(0);
+            let dictionary = state
+                .objects
+                .get_mut(&headers)
+                .context("request has no header dictionary")?;
+            let StoreValue::Entries(entries) = &mut dictionary.value else {
+                bail!("invalid request header dictionary")
+            };
+            let existing = entries
+                .keys()
+                .find(|name| name.eq_ignore_ascii_case(&key))
+                .cloned();
+            if let Some(existing) = existing {
+                entries.remove(&existing);
+            }
+            if value != 0 {
+                entries.insert(key, value);
+            }
+            context.reg_write(REG_X0, 0)?;
+            return Ok(());
+        }
         if selector == "_CFURLRequest" {
             context.reg_write(REG_X0, receiver)?;
             return Ok(());
@@ -2595,6 +3332,154 @@ fn dispatch_message(
         }
     }
     match (class_method, selector) {
+        (true, "null") if class_name == "NSNull" => {
+            let null = new_guest_object(context, profile, state, "NSNull", StoreValue::Empty)?;
+            context.reg_write(REG_X0, null)?;
+        }
+        (true, "decimalDigitCharacterSet") if class_name == "NSCharacterSet" => {
+            let set = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSCharacterSet",
+                StoreValue::String("0123456789".into()),
+            )?;
+            context.reg_write(REG_X0, set)?;
+        }
+        (true, "bundleWithPath:") if class_name == "NSBundle" => {
+            let path = context.reg_read(REG_X0 + 2)?;
+            if object_string_value(state, path)? != "/System/Library/Frameworks/WebKit.framework" {
+                context.reg_write(REG_X0, 0)?;
+            } else {
+                let version = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String("22625.1.29.11.28".into()),
+                )?;
+                let info = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSDictionary",
+                    StoreValue::Entries(HashMap::from([("CFBundleVersion".into(), version)])),
+                )?;
+                let bundle =
+                    new_guest_object(context, profile, state, "NSBundle", StoreValue::Empty)?;
+                let properties = &mut state
+                    .objects
+                    .get_mut(&bundle)
+                    .expect("new bundle")
+                    .properties;
+                properties.insert("bundlePath".into(), path);
+                properties.insert("infoDictionary".into(), info);
+                context.reg_write(REG_X0, bundle)?;
+            }
+        }
+        (true, "standardUserDefaults") if class_name == "NSUserDefaults" => {
+            let defaults = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSUserDefaults",
+                StoreValue::Entries(HashMap::new()),
+            )?;
+            context.reg_write(REG_X0, defaults)?;
+        }
+        (true, "propertyList:isValidForFormat:") if class_name == "NSPropertyListSerialization" => {
+            let object = context.reg_read(REG_X0 + 2)?;
+            let valid = export_object(state, object, &mut HashSet::new(), 0)
+                .and_then(|value| {
+                    let mut output = Vec::new();
+                    plist::to_writer_xml(&mut output, &value).map_err(anyhow::Error::from)
+                })
+                .is_ok();
+            context.reg_write(REG_X0, u64::from(valid))?;
+        }
+        (true, "dataWithPropertyList:format:options:error:")
+            if class_name == "NSPropertyListSerialization" =>
+        {
+            let object = context.reg_read(REG_X0 + 2)?;
+            let format = context.reg_read(REG_X0 + 3)?;
+            let value = export_object(state, object, &mut HashSet::new(), 0)?;
+            let mut bytes = Vec::new();
+            if format == 200 {
+                plist::to_writer_binary(&mut bytes, &value)?;
+            } else {
+                plist::to_writer_xml(&mut bytes, &value)?;
+            }
+            let data =
+                new_guest_object(context, profile, state, "NSData", StoreValue::Bytes(bytes))?;
+            context.reg_write(REG_X0, data)?;
+        }
+        (true, "setWithObjects:" | "arrayWithObjects:")
+            if matches!(
+                class_name.as_str(),
+                "NSSet" | "NSMutableSet" | "NSArray" | "NSMutableArray"
+            ) =>
+        {
+            let first = context.reg_read(REG_X0 + 2)?;
+            let mut values = Vec::new();
+            if first != 0 {
+                values.push(first);
+                let stack = context.reg_read(REG_SP)?;
+                for index in 0..1024 {
+                    let value = read_guest_u64(context, stack + index * 8)?;
+                    if value == 0 {
+                        break;
+                    }
+                    values.push(value);
+                }
+            }
+            let collection = new_guest_object(
+                context,
+                profile,
+                state,
+                &class_name,
+                StoreValue::Addresses(values),
+            )?;
+            context.reg_write(REG_X0, collection)?;
+        }
+        (true, "setWithArray:") if matches!(class_name.as_str(), "NSSet" | "NSMutableSet") => {
+            let array = context.reg_read(REG_X0 + 2)?;
+            let values = if array == 0 {
+                Vec::new()
+            } else {
+                let StoreValue::Addresses(values) = &state
+                    .objects
+                    .get(&array)
+                    .context("unknown set source array")?
+                    .value
+                else {
+                    bail!("set source is not an array");
+                };
+                values.clone()
+            };
+            let set = new_guest_object(
+                context,
+                profile,
+                state,
+                &class_name,
+                StoreValue::Addresses(values),
+            )?;
+            context.reg_write(REG_X0, set)?;
+        }
+        (true, "interfaceWithProtocol:") if class_name == "NSXPCInterface" => {
+            let interface =
+                new_guest_object(context, profile, state, "NSXPCInterface", StoreValue::Empty)?;
+            context.reg_write(REG_X0, interface)?;
+        }
+        (true, "currentProcess") if class_name == "RBSProcessHandle" => {
+            let process = new_guest_object(
+                context,
+                profile,
+                state,
+                "RBSProcessHandle",
+                StoreValue::Empty,
+            )?;
+            context.reg_write(REG_X0, process)?;
+        }
         (true, "errorWithDomain:code:userInfo:") if class_name == "NSError" => {
             let code = new_guest_object(
                 context,
@@ -2782,6 +3667,16 @@ fn dispatch_message(
             )?;
             context.reg_write(REG_X0, address)?;
         }
+        (true, "dictionary" | "dictionaryWithCapacity:") => {
+            let address = new_guest_object(
+                context,
+                profile,
+                state,
+                &class_name,
+                StoreValue::Entries(HashMap::new()),
+            )?;
+            context.reg_write(REG_X0, address)?;
+        }
         (true, "setWithObject:" | "arrayWithObject:") => {
             let value = context.reg_read(REG_X0 + 2)?;
             let address = new_guest_object(
@@ -2912,6 +3807,23 @@ fn dispatch_message(
             }
             context.reg_write(REG_X0, 0)?;
         }
+        (false, "addEntriesFromDictionary:") => {
+            let source = context.reg_read(REG_X0 + 2)?;
+            let StoreValue::Entries(entries) = &state.objects[&source].value else {
+                bail!("dictionary merge source on {class_name}");
+            };
+            let entries = entries.clone();
+            let StoreValue::Entries(destination) = &mut state
+                .objects
+                .get_mut(&receiver)
+                .expect("known receiver")
+                .value
+            else {
+                bail!("dictionary merge destination on {class_name}");
+            };
+            destination.extend(entries);
+            context.reg_write(REG_X0, 0)?;
+        }
         (false, "allKeys" | "allValues") => {
             let StoreValue::Entries(entries) = &state.objects[&receiver].value else {
                 bail!("dictionary keys on {class_name}");
@@ -2941,6 +3853,42 @@ fn dispatch_message(
                 StoreValue::Addresses(values),
             )?;
             context.reg_write(REG_X0, array)?;
+        }
+        (false, "enumerateKeysAndObjectsUsingBlock:") => {
+            let StoreValue::Entries(entries) = &state.objects[&receiver].value else {
+                bail!("dictionary enumeration on {class_name}")
+            };
+            let mut pairs: Vec<(String, u64)> = entries
+                .iter()
+                .map(|(key, &value)| (key.clone(), value))
+                .collect();
+            pairs.sort_by(|left, right| left.0.cmp(&right.0));
+            if pairs.is_empty() {
+                context.reg_write(REG_X0, 0)?;
+            } else {
+                let block = context.reg_read(REG_X0 + 2)?;
+                let stop = state.allocate(8)?;
+                let (name, value) = &pairs[0];
+                let key = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String(name.clone()),
+                )?;
+                begin_callback(
+                    context,
+                    state,
+                    read_guest_u64(context, block + 16)?,
+                    &[block, key, *value, stop],
+                    CallbackAction::EnumerateEntries {
+                        block,
+                        entries: pairs,
+                        index: 1,
+                        stop,
+                    },
+                )?;
+            }
         }
         (false, "countByEnumeratingWithState:objects:count:") => {
             let enumeration = context.reg_read(REG_X0 + 2)?;
@@ -3365,6 +4313,103 @@ fn dispatch_message(
                 context.reg_write(REG_X0, receiver)?;
             }
         }
+        (false, "UTF8String" | "cStringUsingEncoding:") => {
+            let value = object_string_value(state, receiver)?;
+            let bytes = value.as_bytes().to_vec();
+            let address = state.allocate(bytes.len() as u64 + 1)?;
+            context.mem_write(address, &bytes)?;
+            context.mem_write(address + bytes.len() as u64, &[0])?;
+            context.reg_write(REG_X0, address)?;
+        }
+        (false, "stringValue") => {
+            let value = match &state.objects[&receiver].value {
+                StoreValue::Number(value) => value.to_string(),
+                StoreValue::Float(value) => value.to_string(),
+                StoreValue::Boolean(value) => value.to_string(),
+                StoreValue::String(value) => value.clone(),
+                _ => bail!("stringValue on {class_name}"),
+            };
+            let string = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(value),
+            )?;
+            context.reg_write(REG_X0, string)?;
+        }
+        (false, "componentsJoinedByString:") => {
+            let separator = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
+            let StoreValue::Addresses(items) = &state.objects[&receiver].value else {
+                bail!("componentsJoinedByString: on {class_name}")
+            };
+            let parts = items
+                .iter()
+                .map(|&item| object_string_value(state, item).map(str::to_owned))
+                .collect::<Result<Vec<_>>>()?;
+            let result = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(parts.join(&separator)),
+            )?;
+            context.reg_write(REG_X0, result)?;
+        }
+        (false, "stringByAppendingPathComponent:") => {
+            let base = object_string_value(state, receiver)?.to_owned();
+            let component = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
+            let value = format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                component.trim_start_matches('/')
+            );
+            let result = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(value),
+            )?;
+            context.reg_write(REG_X0, result)?;
+        }
+        (false, "substringFromIndex:" | "substringToIndex:" | "substringWithRange:") => {
+            let value: Vec<u16> = object_string_value(state, receiver)?
+                .encode_utf16()
+                .collect();
+            let argument = context.reg_read(REG_X0 + 2)? as usize;
+            let (start, end) = match selector {
+                "substringFromIndex:" => (argument, value.len()),
+                "substringToIndex:" => (0, argument),
+                _ => (
+                    argument,
+                    argument
+                        .checked_add(context.reg_read(REG_X0 + 3)? as usize)
+                        .context("substring range overflow")?,
+                ),
+            };
+            if start > end || end > value.len() {
+                bail!("substring range exceeds string");
+            }
+            let result = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(String::from_utf16_lossy(&value[start..end])),
+            )?;
+            context.reg_write(REG_X0, result)?;
+        }
+        (false, "hasSuffix:" | "containsString:") => {
+            let value = object_string_value(state, receiver)?;
+            let needle = object_string_value(state, context.reg_read(REG_X0 + 2)?)?;
+            let found = if selector == "hasSuffix:" {
+                value.ends_with(needle)
+            } else {
+                value.contains(needle)
+            };
+            context.reg_write(REG_X0, u64::from(found))?;
+        }
         (false, "copy" | "mutableCopy" | "mutableCopyWithZone:") => {
             let object = &state.objects[&receiver];
             let mutable = selector != "copy";
@@ -3740,6 +4785,15 @@ mod tests {
             .unwrap();
         assert!(runtime.state.borrow().objects.contains_key(&promise));
         assert!(!runtime.state.borrow().pending.is_empty());
+        let error = runtime.allocate(8).unwrap();
+        let request = runtime
+            .invoke(promise, "resultWithError:", &[error])
+            .unwrap();
+        assert_eq!(runtime.read_u64(error).unwrap(), 0);
+        assert_eq!(
+            runtime.state.borrow().objects[&request].class,
+            "AMSURLRequest"
+        );
         let joined_call = runtime
             .profile
             .index
