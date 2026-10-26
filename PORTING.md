@@ -28,7 +28,7 @@ This checklist records behavior in that source tree; the Go README and source ar
 2. Port `internal/store` and its generated profile data, then `internal/sap` signing and runtime support. URL bag parsing, endpoint validation, machine GUID creation, 2FA normalization, and phone account routing are implemented. Login, authenticated search country selection, purchase, and owned-app listing still depend on the Store/SAP runtime.
 3. Port iOS/tvOS/watchOS/visionOS download flows, resume and range logic, ZIP framing, SINF replication, and all package tests.
 4. Port macOS preflight, version metadata, package download, encrypted payload processing, and publish behavior.
-5. Port `internal/fairplay` model, enrollment capture/recovery, diagnostics, and decryption. Validate against known offline fixtures before enabling account or device flows.
+5. Continue `internal/fairplay` enrollment capture/recovery, host diagnostics, and decryption. SINF atom parsing, IPA SINF inspection, and enrollment model envelope/permutation checks are implemented. Validate against known offline fixtures before enabling account or device flows.
 6. Port MCP handlers and CLI output/error behavior. Compare command help, JSON fields, and exit codes against the Go binary.
 
 ## Parity gate
