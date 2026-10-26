@@ -108,7 +108,7 @@ impl CatalogClient {
         Ok(Self { http })
     }
 
-    fn get(&self, url: Url) -> Result<Response> {
+    pub(crate) fn get(&self, url: Url) -> Result<Response> {
         let mut request = Request::get(url);
         request.timeout = Some(std::time::Duration::from_secs(30));
         let response = self.http.send(request)?;
@@ -210,7 +210,7 @@ fn search_output(response: CatalogResponse, platform: Option<Platform>) -> Searc
     SearchOutput { count, apps }
 }
 
-fn validate_country(country: &str) -> Result<()> {
+pub(crate) fn validate_country(country: &str) -> Result<()> {
     if country.len() != 2 || !country.bytes().all(|c| c.is_ascii_alphabetic()) {
         bail!("country must be a two-letter country code");
     }

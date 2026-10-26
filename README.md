@@ -8,9 +8,12 @@ This repository is a Rust port of the sibling `ipatool-fairplay` Go project. The
 cargo run -- search "notes" --country US --limit 5
 cargo run -- --format json search "notes" --platform ipad
 cargo run -- lookup --app-id 497799835
+cargo run -- latest-version-id --app-id 874139669 --platform iphone
 ```
 
 `search` supports iPhone, iPad, Apple TV, Apple Watch, visionOS and macOS platform aliases. It derives platforms from catalog metadata, filters Watch results, and uses the visionOS storefront when appropriate. `lookup` accepts an app ID or bundle identifier. These read-only commands use the public catalog; `--country` defaults to `US` until account storefront support is ported.
+
+`latest-version-id` resolves the current external version ID for iPhone, iPad, Apple TV, Apple Watch, or visionOS through the public platform catalog. It does not list historical versions. macOS version lookup still requires the authenticated Store and package metadata flow.
 
 ## Port status
 
@@ -18,6 +21,7 @@ cargo run -- lookup --app-id 497799835
 | --- | --- |
 | Public search, including visionOS discovery | Implemented, with offline unit tests |
 | Public app lookup by ID or bundle identifier | Implemented, with offline unit tests |
+| Latest public external version ID for non-macOS platforms | Implemented, with offline unit tests; iPhone live lookup checked |
 | Shared HTTP request/response decoding and state directory migration | Implemented as library modules; account integration pending |
 | Authentication URL bag, endpoint validation, 2FA and phone routing helpers | Implemented as library modules; SAP signing and login execution pending |
 | FairPlay SINF, IPA SINF and enrollment model inspection | Implemented as library modules; doctor CLI and decryption pending |

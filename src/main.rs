@@ -46,6 +46,17 @@ enum Command {
         #[arg(long, default_value = "US")]
         country: String,
     },
+    /// Resolve the latest external version ID from the public platform catalog.
+    LatestVersionId {
+        #[arg(long)]
+        app_id: i64,
+        #[arg(long)]
+        bundle_identifier: Option<String>,
+        #[arg(long, default_value = "iphone")]
+        platform: String,
+        #[arg(long, default_value = "US")]
+        country: String,
+    },
 }
 
 fn main() {
@@ -81,6 +92,24 @@ fn run() -> Result<()> {
             let platform = parse_platform(platform.as_deref())?;
             let app = client.lookup(app_id, bundle_identifier.as_deref(), &country, platform)?;
             print_app(&app, cli.format)?;
+        }
+        Command::LatestVersionId {
+            app_id,
+            bundle_identifier,
+            platform,
+            country,
+        } => {
+            let platform = Platform::parse(&platform)?.context("platform is required")?;
+            let app = App {
+                id: app_id,
+                bundle_id: bundle_identifier.unwrap_or_default(),
+                ..App::default()
+            };
+            let id = client.latest_external_version_id(&app, &country, platform)?;
+            match cli.format {
+                Format::Text => println!("{id}"),
+                Format::Json => println!("{}", serde_json::json!({ "externalVersionID": id })),
+            }
         }
     }
     if cli.verbose {

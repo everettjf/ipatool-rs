@@ -18,6 +18,15 @@ pub fn search_url(term: &str, country: &str) -> Result<Url> {
     Ok(url)
 }
 
+pub fn product_url(app_id: i64, country: &str) -> Result<Url> {
+    let mut url = Url::parse(&format!(
+        "https://apps.apple.com/{}/app/id{app_id}",
+        country.to_ascii_lowercase()
+    ))?;
+    url.query_pairs_mut().append_pair("platform", "vision");
+    Ok(url)
+}
+
 fn serialized_server_data(body: &str) -> Result<&str> {
     let marker = [format!("id=\"{SCRIPT_ID}\""), format!("id='{SCRIPT_ID}'")]
         .into_iter()

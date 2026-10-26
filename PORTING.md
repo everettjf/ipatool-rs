@@ -13,6 +13,7 @@ This checklist records behavior in that source tree; the Go README and source ar
 | `purchase` | Pending | Authenticated purchase flow, action signing |
 | `download` | Pending | License, version selection, download, resume, IPA/PKG packaging, SINF, optional FairPlay actions |
 | `list-versions` | Pending | Platform-specific version lookup |
+| `latest-version-id` | Added as a Rust diagnostic command | Public platform version lookup; historical version listing still pending |
 | `get-version-metadata` | Pending | Platform-specific metadata requests |
 | `fairplay-doctor` | Pending | Mach-O, capture, SINF and model validators |
 | `fairplay-enroll collect`, `fairplay-enroll recover` | Pending | Native capture, FairPlay binary profiles, recovery runtime |
@@ -26,7 +27,7 @@ This checklist records behavior in that source tree; the Go README and source ar
 
 1. Finish `pkg/http` (cookie persistence and Store executor), then port `pkg/keychain` and account data. Shared HTTP response decoding and state directory migration are implemented. Verify format compatibility with a throwaway Go session before using any existing credentials.
 2. Port `internal/store` and its generated profile data, then `internal/sap` signing and runtime support. URL bag parsing, endpoint validation, machine GUID creation, 2FA normalization, and phone account routing are implemented. Login, authenticated search country selection, purchase, and owned-app listing still depend on the Store/SAP runtime.
-3. Port iOS/tvOS/watchOS/visionOS download flows, resume and range logic, ZIP framing, SINF replication, and all package tests.
+3. Port iOS/tvOS/watchOS/visionOS download flows, resume and range logic, ZIP framing, SINF replication, and all package tests. The latest public external version ID lookup for these platforms is implemented.
 4. Port macOS preflight, version metadata, package download, encrypted payload processing, and publish behavior.
 5. Continue `internal/fairplay` enrollment capture/recovery, host diagnostics, and decryption. SINF atom parsing, IPA SINF inspection, and enrollment model envelope/permutation checks are implemented. Validate against known offline fixtures before enabling account or device flows.
 6. Port MCP handlers and CLI output/error behavior. Compare command help, JSON fields, and exit codes against the Go binary.
