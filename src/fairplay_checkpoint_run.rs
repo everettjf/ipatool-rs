@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
+    arm64_compat::emulate_hook_instruction,
     fairplay_checkpoint::{FairplayCheckpoint, clear_value},
     fairplay_recovery_output::write_private_binary,
     machimage::Image,
@@ -49,6 +50,8 @@ const PTHREAD_ONCE_STUB: [u32; 6] = [
     0xd65f_03c0, // ret x30
 ];
 const SYNTHETIC_ALLOCATION_BASE: u64 = 0x7101_0000_0000;
+const LAZY_DATA_START: u64 = 0x7000_0000_0000;
+const LAZY_DATA_END: u64 = 0x8000_0000_0000;
 const STATIC_ALLOCATION_START: u64 = 0x7000_1000_0000;
 const STATIC_ALLOCATION_END: u64 = 0x7000_2000_0000;
 const STATIC_ALLOCATION_STRIDE: u64 = 0x10_0000;
@@ -467,6 +470,7 @@ pub struct LoadedFairplayd {
     pub image_base: u64,
     pub fixups: usize,
     pub data_pages: Vec<u64>,
+    pub compatibility_sites: Vec<(u64, u32)>,
 }
 
 /// Load the exact arm64e image with chained rebases and deterministic external
@@ -475,6 +479,7 @@ pub fn load_fairplayd(engine: &mut Engine, binary: &[u8]) -> Result<LoadedFairpl
     let mut image = Image::open("fairplayd", binary).context("parse fairplayd arm64e Mach-O")?;
     let image_base = image.base();
     let fixups = image.fixup_count();
+    let compatibility_sites = image.compatibility_sites()?;
     let mut data_pages = Vec::new();
     for segment in image.segments() {
         if !segment.name.starts_with("__DATA") && !segment.name.starts_with("__AUTH") {
@@ -524,6 +529,7 @@ pub fn load_fairplayd(engine: &mut Engine, binary: &[u8]) -> Result<LoadedFairpl
         image_base,
         fixups,
         data_pages,
+        compatibility_sites,
     })
 }
 
@@ -533,6 +539,7 @@ pub struct CheckpointRunner {
     pub checkpoint_pages: usize,
     pub start_pc: u64,
     pub modeled_imports: usize,
+    pub compatibility_instruction_sites: usize,
     external_failure: Rc<RefCell<Option<String>>>,
     allocation_state: Rc<RefCell<AllocationState>>,
     once_tokens: Rc<RefCell<BTreeSet<u64>>>,
@@ -1236,6 +1243,54 @@ impl CheckpointRunner {
         }
         let external_failure = Rc::new(RefCell::new(None));
         let allocation_state = Rc::new(RefCell::new(AllocationState::from_checkpoint(checkpoint)?));
+        {
+            let failure = Rc::clone(&external_failure);
+            let hook_allocations = Rc::clone(&allocation_state);
+            engine.add_memory_fault_hook(move |context, address, _size| {
+                if !(LAZY_DATA_START..LAZY_DATA_END).contains(&address)
+                    || context.reg_read(REG_PC).ok() == Some(address)
+                {
+                    return false;
+                }
+                let page = address & !(PAGE_BYTES - 1);
+                let mapped = (|| -> Result<()> {
+                    let mut state = hook_allocations.borrow_mut();
+                    if state.mapped_pages.len() >= MAX_SNAPSHOT_PAGES {
+                        bail!("FairPlay lazy data page limit exceeded");
+                    }
+                    context.mem_map(page, PAGE_BYTES as usize)?;
+                    state.mapped_pages.insert(page);
+                    state.new_pages.insert(page);
+                    Ok(())
+                })();
+                if let Err(error) = mapped {
+                    *failure.borrow_mut() = Some(format!("FairPlay lazy data page: {error:#}"));
+                    return false;
+                }
+                true
+            })?;
+        }
+        let compatibility_instruction_sites = image.compatibility_sites.len();
+        for &(address, opcode) in &image.compatibility_sites {
+            let failure = Rc::clone(&external_failure);
+            engine.add_code_hook(address, address, move |context, pc, _| {
+                let execution = (|| -> Result<()> {
+                    let bytes = context.mem_read(pc, 4)?;
+                    let actual = u32::from_le_bytes(bytes.as_slice().try_into()?);
+                    if actual != opcode && actual != 0xd503_201f {
+                        bail!("FairPlay compatibility opcode changed at {pc:#x}");
+                    }
+                    if !emulate_hook_instruction(context, pc, opcode)? {
+                        bail!("FairPlay compatibility opcode is unsupported at {pc:#x}");
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = execution {
+                    *failure.borrow_mut() = Some(format!("FairPlay ARM64 instruction: {error:#}"));
+                    let _ = context.stop();
+                }
+            })?;
+        }
         let once_tokens = Rc::new(RefCell::new(
             checkpoint.once_tokens()?.into_iter().collect(),
         ));
@@ -1292,6 +1347,7 @@ impl CheckpointRunner {
             checkpoint_pages,
             start_pc,
             modeled_imports,
+            compatibility_instruction_sites,
             external_failure,
             allocation_state,
             once_tokens,
@@ -1758,6 +1814,56 @@ mod tests {
                 .unwrap(),
             b"Rust"
         );
+    }
+
+    #[test]
+    fn lazy_guest_data_pages_survive_checkpoint_reload_without_mapping_fetches() {
+        const DATA: u64 = 0x7000_3000_0000;
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let binary_path = directory.path().join("fairplayd.arm64e");
+        let output_path = directory.path().join("resumed.pkl.gz");
+        std::fs::write(&binary_path, SYNTHETIC_BINARY).unwrap();
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        runner.engine.mem_map(0x3000, PAGE_BYTES as usize).unwrap();
+        runner
+            .engine
+            .mem_write(0x3000, &0xf940_0020u32.to_le_bytes())
+            .unwrap();
+        runner.engine.reg_write(200, DATA).unwrap();
+        runner
+            .engine
+            .start_bounded(0x3000, 0x3004, Duration::from_secs(2), 4)
+            .unwrap();
+        assert_eq!(runner.engine.reg_read(199).unwrap(), 0);
+        assert!(runner.allocation_state.borrow().new_pages.contains(&DATA));
+        runner.engine.mem_write(DATA, b"live").unwrap();
+        runner
+            .engine
+            .reg_write(REG_PC, source.pc().unwrap())
+            .unwrap();
+        runner
+            .write_checkpoint(&source, &binary_path, &output_path)
+            .unwrap();
+        let resumed = FairplayCheckpoint::load_private(&output_path).unwrap();
+        assert_eq!(resumed.read_block::<4>(DATA).unwrap().as_slice(), b"live");
+        let replay = CheckpointRunner::new(&resumed, SYNTHETIC_BINARY).unwrap();
+        assert_eq!(replay.engine.mem_read(DATA, 4).unwrap(), b"live");
+
+        let mut fetch = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        assert!(
+            fetch
+                .engine
+                .start_bounded(DATA, DATA + 4, Duration::from_secs(2), 4)
+                .is_err()
+        );
+        assert!(!fetch.allocation_state.borrow().new_pages.contains(&DATA));
     }
 
     #[test]
@@ -2395,6 +2501,7 @@ mod tests {
         let mut engine = Engine::new().unwrap();
         let loaded = load_fairplayd(&mut engine, &binary).unwrap();
         assert!(loaded.fixups > 100);
+        assert!(!loaded.compatibility_sites.is_empty());
         assert!(!loaded.externals.is_empty());
         assert!(!loaded.regions.is_empty());
         let bytes = engine.mem_read(loaded.image_base, 4).unwrap();

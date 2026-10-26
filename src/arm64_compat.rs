@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 
-use crate::unicorn_runtime::{Engine, REG_PC, REG_X0};
+use crate::unicorn_runtime::{Engine, HookContext, REG_PC, REG_X0};
 
 const REG_X29: i32 = 1;
 const REG_LR: i32 = 2;
@@ -33,6 +33,96 @@ fn classify(instruction: u32) -> Option<Instruction> {
         SWPAL32 => Some(Instruction::Swpal(4)),
         SWPAL64 => Some(Instruction::Swpal(8)),
         _ => None,
+    }
+}
+
+pub fn needs_compat_hook(instruction: u32) -> bool {
+    classify(instruction).is_some()
+}
+
+/// Execute a compatibility opcode from a Unicorn code hook and skip its native
+/// instruction. The hook preserves the original bytes in checkpoint memory.
+pub fn emulate_hook_instruction(
+    context: &HookContext,
+    address: u64,
+    instruction: u32,
+) -> Result<bool> {
+    let Some(kind) = classify(instruction) else {
+        return Ok(false);
+    };
+    match kind {
+        Instruction::Eor3 => {
+            let destination = (instruction & 31) as i32;
+            let first = ((instruction >> 5) & 31) as i32;
+            let third = ((instruction >> 10) & 31) as i32;
+            let second = ((instruction >> 16) & 31) as i32;
+            let a = context.reg_read_128(REG_V0 + first)?;
+            let b = context.reg_read_128(REG_V0 + second)?;
+            let c = context.reg_read_128(REG_V0 + third)?;
+            let mut result = [0u8; 16];
+            for index in 0..16 {
+                result[index] = a[index] ^ b[index] ^ c[index];
+            }
+            context.reg_write_128(REG_V0 + destination, result)?;
+        }
+        Instruction::Casal(width) | Instruction::Swpal(width) => {
+            let source = (instruction >> 16) & 31;
+            let base = (instruction >> 5) & 31;
+            let destination = instruction & 31;
+            let address = if base == 31 {
+                context.reg_read(REG_SP)?
+            } else {
+                context.reg_read(general_register(base)?)?
+            };
+            let memory = context.mem_read(address, width)?;
+            let mut padded = [0u8; 8];
+            padded[..width].copy_from_slice(&memory);
+            let old_value = u64::from_le_bytes(padded);
+            let mut source_value = read_hook_value_register(context, source)?;
+            if width == 4 {
+                source_value = u64::from(source_value as u32);
+            }
+            match kind {
+                Instruction::Casal(_) => {
+                    let mut new_value = read_hook_value_register(context, destination)?;
+                    if width == 4 {
+                        new_value = u64::from(new_value as u32);
+                    }
+                    if old_value == source_value {
+                        context.mem_write(address, &new_value.to_le_bytes()[..width])?;
+                    }
+                    write_hook_value_register(context, source, old_value)?;
+                }
+                Instruction::Swpal(_) => {
+                    context.mem_write(address, &source_value.to_le_bytes()[..width])?;
+                    write_hook_value_register(context, destination, old_value)?;
+                }
+                Instruction::Eor3 => unreachable!(),
+            }
+        }
+    }
+    context.reg_write(
+        REG_PC,
+        address
+            .checked_add(4)
+            .context("arm64 instruction address overflows")?,
+    )?;
+    Ok(true)
+}
+
+fn read_hook_value_register(context: &HookContext, index: u32) -> Result<u64> {
+    if index == 31 {
+        Ok(0)
+    } else {
+        context.reg_read(general_register(index)?)
+    }
+}
+
+fn write_hook_value_register(context: &HookContext, index: u32, value: u64) -> Result<()> {
+    if index == 31 {
+        Ok(())
+    } else {
+        context.reg_write(general_register(index)?, value)
     }
 }
 
@@ -159,6 +249,7 @@ fn write_memory_value(engine: &mut Engine, address: u64, value: u64, width: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn recognizes_only_supported_opcodes_and_register_layout() {
@@ -171,6 +262,43 @@ mod tests {
         assert_eq!(general_register(29).unwrap(), REG_X29);
         assert_eq!(general_register(30).unwrap(), REG_LR);
         assert!(general_register(31).is_err());
+    }
+
+    #[test]
+    fn compatibility_hooks_execute_guest_opcodes_with_one_bounded_run() {
+        let mut engine = Engine::new().unwrap();
+        engine.mem_map(0x1000, 4096).unwrap();
+        engine.mem_map(0x2000, 4096).unwrap();
+        let opcodes = [
+            EOR3 | (1 << 5) | (2 << 16) | (3 << 10) | 4,
+            CASAL64 | (1 << 16) | (2 << 5) | 3,
+            SWPAL32 | (4 << 16) | (2 << 5) | 5,
+        ];
+        for (index, opcode) in opcodes.into_iter().enumerate() {
+            let address = 0x1000 + (index as u64) * 4;
+            engine.mem_write(address, &opcode.to_le_bytes()).unwrap();
+            engine
+                .add_code_hook(address, address, move |context, pc, _| {
+                    emulate_hook_instruction(context, pc, opcode).unwrap();
+                })
+                .unwrap();
+        }
+        engine.reg_write_128(REG_V0 + 1, [0xf0; 16]).unwrap();
+        engine.reg_write_128(REG_V0 + 2, [0x33; 16]).unwrap();
+        engine.reg_write_128(REG_V0 + 3, [0x0f; 16]).unwrap();
+        engine.mem_write(0x2000, &7u64.to_le_bytes()).unwrap();
+        engine.reg_write(REG_X0 + 1, 7).unwrap();
+        engine.reg_write(REG_X0 + 2, 0x2000).unwrap();
+        engine.reg_write(REG_X0 + 3, 9).unwrap();
+        engine.reg_write(REG_X0 + 4, 13).unwrap();
+        engine
+            .start_bounded(0x1000, 0x100c, Duration::from_secs(2), 3)
+            .unwrap();
+        assert_eq!(engine.reg_read(REG_PC).unwrap(), 0x100c);
+        assert_eq!(engine.reg_read_128(REG_V0 + 4).unwrap(), [0xcc; 16]);
+        assert_eq!(engine.reg_read(REG_X0 + 1).unwrap(), 7);
+        assert_eq!(engine.reg_read(REG_X0 + 5).unwrap(), 9);
+        assert_eq!(engine.mem_read(0x2000, 4).unwrap(), 13u32.to_le_bytes());
     }
 
     #[test]

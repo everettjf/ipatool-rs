@@ -32,6 +32,7 @@ pub struct Image {
     base: u64,
     segments: Vec<Segment>,
     code_ranges: Vec<(u64, u64)>,
+    code_sections: Vec<(u64, u64, u64)>,
     fixups: Vec<Fixup>,
     loaded_base: Option<u64>,
 }
@@ -71,6 +72,7 @@ impl Image {
         }
         let mut segments = Vec::new();
         let mut code_ranges = Vec::new();
+        let mut code_sections = Vec::new();
         let mut chained_command = None;
         let mut command_offset = 32usize;
         for _ in 0..command_count {
@@ -112,6 +114,7 @@ impl Image {
                             .checked_add(section_size)
                             .context("instruction address overflows")?;
                         code_ranges.push((section_address, end));
+                        code_sections.push((section_address, offset, section_size));
                     }
                 }
                 segments.push(Segment {
@@ -149,6 +152,7 @@ impl Image {
             base,
             segments,
             code_ranges,
+            code_sections,
             fixups,
             loaded_base: None,
         })
@@ -156,6 +160,29 @@ impl Image {
 
     pub fn base(&self) -> u64 {
         self.base
+    }
+
+    /// Locate opcodes that need the shared ARM64 compatibility interpreter.
+    pub fn compatibility_sites(&self) -> Result<Vec<(u64, u32)>> {
+        let mut sites = Vec::new();
+        for &(address, offset, size) in &self.code_sections {
+            let start = usize::try_from(offset)?;
+            let end = usize::try_from(offset.checked_add(size).context("code section overflow")?)?;
+            let section = self
+                .data
+                .get(start..end)
+                .context("code section exceeds image")?;
+            for (index, bytes) in section.as_chunks::<4>().0.iter().enumerate() {
+                let opcode = u32::from_le_bytes(*bytes);
+                if crate::arm64_compat::needs_compat_hook(opcode) {
+                    let location = address
+                        .checked_add((index as u64) * 4)
+                        .context("compatibility instruction address overflow")?;
+                    sites.push((location, opcode));
+                }
+            }
+        }
+        Ok(sites)
     }
 
     /// Resolve a Mach-O symbol and translate it to the image's load address.
@@ -621,6 +648,23 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
+    #[test]
+    fn finds_compatibility_opcodes_only_in_instruction_sections() {
+        let binary = include_bytes!("../tests/fixtures/fairplay-checkpoint-run-synthetic.macho");
+        let mut image = Image::open("synthetic", binary).unwrap();
+        let segment = image
+            .segments
+            .iter()
+            .find(|segment| segment.name == "__TEXT" && segment.file_size >= 4)
+            .unwrap();
+        let (address, offset) = (segment.address, segment.file_offset);
+        image.code_sections.push((address, offset, 4));
+        let start = offset as usize;
+        image.data[start..start + 4].copy_from_slice(&0xce00_0000u32.to_le_bytes());
+        let sites = image.compatibility_sites().unwrap();
+        assert!(sites.contains(&(address, 0xce00_0000)));
+    }
+
     #[derive(Default)]
     struct RecordedMemory {
         maps: Vec<(u64, u64)>,
@@ -725,6 +769,7 @@ mod tests {
                 },
             ],
             code_ranges: Vec::new(),
+            code_sections: Vec::new(),
             fixups: Vec::new(),
             loaded_base: None,
         };
@@ -753,6 +798,7 @@ mod tests {
                 file_size: 24,
             }],
             code_ranges: Vec::new(),
+            code_sections: Vec::new(),
             fixups: vec![
                 Fixup {
                     file_offset: 0,

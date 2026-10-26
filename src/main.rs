@@ -1130,6 +1130,7 @@ fn run() -> Result<()> {
                             "fairplayd_fixups": runner.image.fixups,
                             "external_imports": runner.image.externals.len(),
                             "modeled_imports": runner.modeled_imports,
+                            "compatibility_instruction_sites": runner.compatibility_instruction_sites,
                             "output_checkpoint": output_checkpoint,
                             "output_pages": written_pages,
                         })
