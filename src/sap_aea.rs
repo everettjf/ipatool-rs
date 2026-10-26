@@ -39,6 +39,22 @@ pub struct AeaRoot {
     pub main_key: Zeroizing<Vec<u8>>,
 }
 
+#[derive(Clone)]
+pub struct AeaSegment {
+    pub input_offset: u64,
+    pub output_offset: u64,
+    pub compressed_size: u32,
+    pub decompressed_size: u32,
+    pub checksum: [u8; 32],
+    pub mac: [u8; 32],
+    pub cluster: u32,
+    pub index: u32,
+}
+
+pub struct AeaIndex {
+    pub segments: Vec<Option<AeaSegment>>,
+}
+
 #[derive(Deserialize)]
 struct FcsResponse {
     #[serde(rename = "enc-request")]
@@ -199,6 +215,163 @@ pub fn read_remote_root(
     )
 }
 
+pub fn index_remote_clusters(
+    remote: &RemoteFile,
+    entry: ArchiveEntry,
+    root: &AeaRoot,
+) -> Result<AeaIndex> {
+    let entry_end = entry
+        .offset
+        .checked_add(entry.size)
+        .filter(|end| *end <= remote.size())
+        .context("AEA archive entry exceeds remote image")?;
+    if root.cluster_offset < entry.offset || root.cluster_offset > entry_end {
+        bail!("AEA cluster offset exceeds archive entry");
+    }
+    if root.segment_size == 0 || root.segments_per_cluster == 0 {
+        bail!("AEA has an invalid segment layout");
+    }
+    let segment_count = root.file_size.div_ceil(u64::from(root.segment_size));
+    let segment_count = usize::try_from(segment_count).context("AEA segment count overflow")?;
+    if segment_count > 10_000_000 {
+        bail!("AEA segment count is too large");
+    }
+    let mut segments = vec![None; segment_count];
+    let cluster_segments = usize::try_from(root.segments_per_cluster)?;
+    let encrypted_headers_size = cluster_segments
+        .checked_mul(40)
+        .context("AEA cluster header size overflow")?;
+    let header_size = cluster_segments
+        .checked_mul(72)
+        .and_then(|size| size.checked_add(32))
+        .context("AEA cluster header size overflow")?;
+    if header_size > 16 << 20 || header_size as u64 > entry.size {
+        bail!("AEA cluster header is too large");
+    }
+    let mut cluster_mac = root.cluster_mac;
+    let mut offset = root.cluster_offset;
+    let mut output_size = 0u64;
+    let mut cluster_index = 0u32;
+    while output_size < root.file_size {
+        if offset > entry_end || header_size as u64 > entry_end - offset {
+            bail!("AEA cluster header extends beyond encrypted image");
+        }
+        let mut header_data = vec![0u8; header_size];
+        read_exact_at(remote, &mut header_data, offset)?;
+        let cluster_key = derive_cluster_key(&root.main_key, cluster_index)?;
+        let header_key = derive_header_key(&cluster_key, b"AEA_CHEK")?;
+        let (encrypted_headers, rest) = header_data.split_at(encrypted_headers_size);
+        let (next_cluster_mac, segment_mac_data) = rest.split_at(32);
+        verify_aea_mac(
+            &header_key[..32],
+            encrypted_headers,
+            &[next_cluster_mac, segment_mac_data],
+            &cluster_mac,
+        )
+        .with_context(|| format!("AEA cluster {cluster_index} failed authentication"))?;
+        let mut plain = encrypted_headers.to_vec();
+        Aes256Ctr::new_from_slices(&header_key[32..64], &header_key[64..80])?
+            .apply_keystream(&mut plain);
+        let mut data_offset = offset + header_size as u64;
+        for segment_index in 0..cluster_segments {
+            let start = segment_index * 40;
+            let decompressed_size = u32::from_le_bytes(plain[start..start + 4].try_into()?);
+            let compressed_size = u32::from_le_bytes(plain[start + 4..start + 8].try_into()?);
+            if decompressed_size == 0 {
+                if compressed_size != 0 {
+                    bail!(
+                        "AEA cluster {cluster_index} segment {segment_index} has compressed data without output"
+                    );
+                }
+                continue;
+            }
+            if decompressed_size > root.segment_size || compressed_size == 0 {
+                bail!("AEA cluster {cluster_index} segment {segment_index} has invalid sizes");
+            }
+            if data_offset > entry_end || u64::from(compressed_size) > entry_end - data_offset {
+                bail!(
+                    "AEA cluster {cluster_index} segment {segment_index} exceeds encrypted image"
+                );
+            }
+            let global_index = u64::from(cluster_index)
+                .checked_mul(u64::from(root.segments_per_cluster))
+                .and_then(|value| value.checked_add(segment_index as u64))
+                .context("AEA segment index overflow")?;
+            let slot = usize::try_from(global_index)?;
+            if slot >= segments.len() {
+                bail!(
+                    "AEA cluster {cluster_index} segment {segment_index} is outside declared output"
+                );
+            }
+            let output_offset = global_index
+                .checked_mul(u64::from(root.segment_size))
+                .context("AEA output offset overflow")?;
+            if output_offset + u64::from(decompressed_size) > root.file_size {
+                bail!(
+                    "AEA cluster {cluster_index} segment {segment_index} exceeds declared output"
+                );
+            }
+            let mac_start = segment_index * 32;
+            segments[slot] = Some(AeaSegment {
+                input_offset: data_offset,
+                output_offset,
+                compressed_size,
+                decompressed_size,
+                checksum: plain[start + 8..start + 40].try_into()?,
+                mac: segment_mac_data[mac_start..mac_start + 32].try_into()?,
+                cluster: cluster_index,
+                index: segment_index as u32,
+            });
+            data_offset += u64::from(compressed_size);
+            output_size = output_size
+                .checked_add(u64::from(decompressed_size))
+                .context("AEA output size overflow")?;
+            if output_size > root.file_size {
+                bail!("AEA segment data exceeds declared output size");
+            }
+        }
+        offset = data_offset;
+        cluster_mac.copy_from_slice(next_cluster_mac);
+        cluster_index = cluster_index
+            .checked_add(1)
+            .context("AEA cluster count overflow")?;
+    }
+    Ok(AeaIndex { segments })
+}
+
+fn derive_cluster_key(main_key: &[u8], cluster_index: u32) -> Result<Zeroizing<Vec<u8>>> {
+    let mut info = b"AEA_CK".to_vec();
+    info.extend_from_slice(&cluster_index.to_le_bytes());
+    let mut key = Zeroizing::new(vec![0u8; main_key.len()]);
+    Hkdf::<Sha256>::new(None, main_key)
+        .expand(&info, &mut key)
+        .map_err(|_| anyhow::anyhow!("derive AEA cluster key"))?;
+    Ok(key)
+}
+
+fn derive_header_key(key: &[u8], info: &[u8]) -> Result<Zeroizing<[u8; 80]>> {
+    let mut derived = Zeroizing::new([0u8; 80]);
+    Hkdf::<Sha256>::new(None, key)
+        .expand(info, &mut *derived)
+        .map_err(|_| anyhow::anyhow!("derive AEA header key"))?;
+    Ok(derived)
+}
+
+fn verify_aea_mac(key: &[u8], data: &[u8], salt_parts: &[&[u8]], expected: &[u8]) -> Result<()> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)?;
+    let mut salt_size = 0u64;
+    for salt in salt_parts {
+        mac.update(salt);
+        salt_size = salt_size
+            .checked_add(salt.len() as u64)
+            .context("AEA MAC salt is too large")?;
+    }
+    mac.update(data);
+    mac.update(&salt_size.to_le_bytes());
+    mac.verify_slice(expected)
+        .map_err(|_| anyhow::anyhow!("AEA MAC mismatch"))
+}
+
 fn decrypt_root_header(
     header: &AeaHeader,
     encrypted_size: u64,
@@ -311,6 +484,8 @@ mod tests {
     use super::*;
     use hpke::{OpModeS, Serializable, setup_sender};
     use p256::pkcs8::{EncodePrivateKey, LineEnding};
+    use reqwest::blocking::Client;
+    use std::{io::Write, net::TcpListener, thread};
 
     #[test]
     fn parses_bounded_aea_metadata_and_fcs_url() {
@@ -449,5 +624,75 @@ mod tests {
 
         encrypted[32] ^= 1;
         assert!(decrypt_root_header(&header, 4096, &salt, &encrypted, &symmetric_key).is_err());
+    }
+
+    #[test]
+    fn indexes_authenticated_cluster_from_remote_image() {
+        let root = AeaRoot {
+            file_size: 4,
+            segment_size: 4,
+            segments_per_cluster: 1,
+            cluster_offset: 0,
+            cluster_mac: [0; 32],
+            main_key: Zeroizing::new(vec![7; 32]),
+        };
+        let cluster_key = derive_cluster_key(&root.main_key, 0).unwrap();
+        let header_key = derive_header_key(&cluster_key, b"AEA_CHEK").unwrap();
+        let mut image = [0u8; 108];
+        image[..4].copy_from_slice(&4u32.to_le_bytes());
+        image[4..8].copy_from_slice(&4u32.to_le_bytes());
+        image[8..40].copy_from_slice(&[0xaa; 32]);
+        image[104..].copy_from_slice(b"data");
+        Aes256Ctr::new_from_slices(&header_key[32..64], &header_key[64..80])
+            .unwrap()
+            .apply_keystream(&mut image[..40]);
+        image[72..104].fill(0x55);
+        let mut mac = Hmac::<Sha256>::new_from_slice(&header_key[..32]).unwrap();
+        mac.update(&image[40..104]);
+        mac.update(&image[..40]);
+        mac.update(&64u64.to_le_bytes());
+        let mut root = root;
+        root.cluster_mac
+            .copy_from_slice(&mac.finalize().into_bytes());
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for (start, end) in [(0usize, 0usize), (0, 103)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let count = stream.read(&mut buffer).unwrap();
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.contains(&format!("range: bytes={start}-{end}\r\n")));
+                let body = &image[start..=end];
+                write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/108\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        let remote = RemoteFile::open(
+            Client::new(),
+            Url::parse(&format!("http://{address}/image")).unwrap(),
+        )
+        .unwrap();
+        let index = index_remote_clusters(
+            &remote,
+            ArchiveEntry {
+                offset: 0,
+                size: 108,
+            },
+            &root,
+        )
+        .unwrap();
+        let segment = index.segments[0].as_ref().unwrap();
+        assert_eq!(segment.input_offset, 104);
+        assert_eq!(segment.output_offset, 0);
+        assert_eq!(segment.compressed_size, 4);
+        assert_eq!(segment.decompressed_size, 4);
+        assert_eq!(segment.mac, [0x55; 32]);
+        server.join().unwrap();
     }
 }
