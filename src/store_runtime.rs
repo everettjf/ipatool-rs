@@ -49,6 +49,7 @@ struct StoreState {
     callbacks: HashMap<u64, CallbackResume>,
     hardware_id: Option<[u8; 6]>,
     preferences: HashMap<String, u64>,
+    current_queue: u64,
 }
 
 struct CallbackResume {
@@ -58,6 +59,8 @@ struct CallbackResume {
 
 enum CallbackAction {
     ReturnZero,
+    ReturnValue { value: u64 },
+    RestoreQueue { previous: u64 },
     CopyProperty { destination: u64 },
 }
 
@@ -72,6 +75,7 @@ pub enum StoreValue {
     Empty,
     String(String),
     Number(i64),
+    Float(f64),
     Boolean(bool),
     Bytes(Vec<u8>),
     Addresses(Vec<u64>),
@@ -200,6 +204,7 @@ impl StoreRuntime {
             callbacks: HashMap::new(),
             hardware_id: None,
             preferences: HashMap::new(),
+            current_queue: 0,
         }));
         let hook_error = Rc::new(RefCell::new(None));
         let error_slot = Rc::clone(&hook_error);
@@ -207,8 +212,9 @@ impl StoreRuntime {
         let hook_code_ranges = code_ranges.clone();
         let hook_state = Rc::clone(&state);
         engine.add_code_hook(0, u64::MAX, move |context, address, _| {
-            if let Some(resume) = hook_state.borrow_mut().callbacks.remove(&address) {
-                if let Err(error) = resume_callback(context, resume) {
+            let resume = hook_state.borrow_mut().callbacks.remove(&address);
+            if let Some(resume) = resume {
+                if let Err(error) = resume_callback(context, &mut hook_state.borrow_mut(), resume) {
                     *error_slot.borrow_mut() =
                         Some(format!("Store callback at {address:#x}: {error:#}"));
                     context
@@ -385,6 +391,53 @@ impl StoreRuntime {
         export_object(&self.state.borrow(), address, &mut HashSet::new(), 0)
     }
 
+    pub fn import_json(&mut self, value: &Value) -> Result<u64> {
+        self.import_json_inner(value, 0)
+    }
+
+    fn import_json_inner(&mut self, value: &Value, depth: usize) -> Result<u64> {
+        if depth > 32 {
+            bail!("Store Foundation import exceeds nesting limit");
+        }
+        match value {
+            Value::Null => Ok(0),
+            Value::String(value) => self.new_object("NSString", StoreValue::String(value.clone())),
+            Value::Bool(value) => self.new_object("NSNumber", StoreValue::Boolean(*value)),
+            Value::Number(value) => {
+                let value = if let Some(integer) = value.as_i64() {
+                    StoreValue::Number(integer)
+                } else if let Some(integer) =
+                    value.as_u64().filter(|value| *value <= i64::MAX as u64)
+                {
+                    StoreValue::Number(integer as i64)
+                } else {
+                    StoreValue::Float(value.as_f64().context("invalid Store JSON number")?)
+                };
+                self.new_object("NSNumber", value)
+            }
+            Value::Array(values) => {
+                if values.len() > 65_536 {
+                    bail!("Store Foundation array exceeds size limit");
+                }
+                let mut imported = Vec::with_capacity(values.len());
+                for value in values {
+                    imported.push(self.import_json_inner(value, depth + 1)?);
+                }
+                self.new_object("NSArray", StoreValue::Addresses(imported))
+            }
+            Value::Object(values) => {
+                if values.len() > 65_536 {
+                    bail!("Store Foundation dictionary exceeds size limit");
+                }
+                let mut imported = HashMap::with_capacity(values.len());
+                for (key, value) in values {
+                    imported.insert(key.clone(), self.import_json_inner(value, depth + 1)?);
+                }
+                self.new_object("NSDictionary", StoreValue::Entries(imported))
+            }
+        }
+    }
+
     pub fn invoke(&mut self, receiver: u64, selector: &str, arguments: &[u64]) -> Result<u64> {
         let entry = self
             .profile
@@ -454,6 +507,11 @@ impl StoreRuntime {
             bail!("Store authentication hardware identity mismatch");
         }
         Ok(parameters)
+    }
+
+    pub fn new_request_encoder(&mut self, bag: u64) -> Result<u64> {
+        let encoder = self.new_object("AMSURLRequestEncoder", StoreValue::Empty)?;
+        self.invoke(encoder, "initWithBag:", &[bag])
     }
 
     /// Execute a pinned guest entry. Bridge calls not yet ported fail explicitly.
@@ -597,7 +655,7 @@ fn responds_to(profile: &ProfileData, state: &StoreState, receiver: u64, selecto
                 | "unsignedLongLongValue"
                 | "boolValue"
         ),
-        StoreValue::Number(_) | StoreValue::Boolean(_) => matches!(
+        StoreValue::Number(_) | StoreValue::Boolean(_) | StoreValue::Float(_) => matches!(
             selector,
             "integerValue"
                 | "intValue"
@@ -651,6 +709,36 @@ fn dispatch_call(
         "getuid" | "geteuid" => context.reg_write(REG_X0, 501)?,
         "getgid" | "getegid" => context.reg_write(REG_X0, 20)?,
         "getpid" => context.reg_write(REG_X0, 123)?,
+        "chkstk_darwin" | "free" => {}
+        "swift_allocObject" => {
+            let metadata = context.reg_read(REG_X0)?;
+            let size = context.reg_read(REG_X0 + 1)?;
+            if !(16..=1_048_576).contains(&size) {
+                bail!("invalid Swift object size {size}");
+            }
+            let object = state.allocate(size)?;
+            write_guest_u64(context, object, metadata)?;
+            write_guest_u64(context, object + 8, 3)?;
+            context.reg_write(REG_X0, object)?;
+        }
+        "swift_getObjectType" => {
+            let object = context.reg_read(REG_X0)?;
+            context.reg_write(REG_X0, read_guest_u64(context, object)?)?;
+        }
+        "swift_defaultActor_initialize" => {
+            let actor = context.reg_read(REG_X0)?;
+            if actor == 0 {
+                bail!("cannot initialize null Swift actor");
+            }
+            state.objects.insert(
+                actor,
+                StoreObject {
+                    class: "HostSwiftActor".into(),
+                    value: StoreValue::Empty,
+                    properties: HashMap::new(),
+                },
+            );
+        }
         "objc_opt_self"
         | "swift_getObjCClassMetadata"
         | "swift_retain_n"
@@ -680,6 +768,32 @@ fn dispatch_call(
         | "objc_retainAutorelease"
         | "objc_release"
         | "objc_autoreleasePoolPop" => {}
+        "Block_copy" | "objc_retainBlock" => {
+            let block = context.reg_read(REG_X0)?;
+            if block == 0 || (read_guest_u64(context, block + 8)? as u32) & (1 << 28) != 0 {
+                return Ok(());
+            }
+            let flags = read_guest_u64(context, block + 8)? as u32;
+            let descriptor = read_guest_u64(context, block + 24)?;
+            let size = read_guest_u64(context, descriptor + 8)?;
+            if !(32..=1_048_576).contains(&size) {
+                bail!("invalid guest block size {size}");
+            }
+            let copied = state.allocate(size)?;
+            let data = context.mem_read(block, size as usize)?;
+            context.mem_write(copied, &data)?;
+            if flags & (1 << 25) != 0 {
+                begin_callback(
+                    context,
+                    state,
+                    read_guest_u64(context, descriptor + 16)?,
+                    &[copied, block],
+                    CallbackAction::ReturnValue { value: copied },
+                )?;
+            } else {
+                context.reg_write(REG_X0, copied)?;
+            }
+        }
         "Block_release" | "Block_object_dispose" => {}
         "objc_autoreleasePoolPush" => context.reg_write(REG_X0, 0)?,
         "objc_getProperty" => {
@@ -787,6 +901,26 @@ fn dispatch_call(
                 REG_X0,
                 u64::from(responds_to(profile, state, receiver, &selector)),
             )?;
+        }
+        "NSClassFromString" => {
+            let name = object_string_value(state, context.reg_read(REG_X0)?)?;
+            let address = profile
+                .runtime
+                .classes_by_name
+                .get(name)
+                .map(|&index| profile.index.classes[index].address)
+                .unwrap_or(0);
+            context.reg_write(REG_X0, address)?;
+        }
+        "objc_getClass" => {
+            let name = guest_cstring(context, profile, state, context.reg_read(REG_X0)?)?;
+            let address = profile
+                .runtime
+                .classes_by_name
+                .get(&name)
+                .map(|&index| profile.index.classes[index].address)
+                .unwrap_or(0);
+            context.reg_write(REG_X0, address)?;
         }
         "CFBundleGetMainBundle" => {
             let bundle = new_main_bundle(context, profile, state)?;
@@ -1005,6 +1139,23 @@ fn dispatch_call(
             state.preferences.insert(format!("{app}/{key}"), value);
             context.reg_write(REG_X0, 0)?;
         }
+        "SecTaskCreateFromSelf" => {
+            let task = new_guest_object(
+                context,
+                profile,
+                state,
+                "HostSecurityTask",
+                StoreValue::Empty,
+            )?;
+            context.reg_write(REG_X0, task)?;
+        }
+        "SecTaskCopyValueForEntitlement" => {
+            let error = context.reg_read(REG_X0 + 2)?;
+            if error != 0 {
+                write_guest_u64(context, error, 0)?;
+            }
+            context.reg_write(REG_X0, 0)?;
+        }
         "dispatch_once" => {
             let predicate = context.reg_read(REG_X0)?;
             let block = context.reg_read(REG_X0 + 1)?;
@@ -1021,6 +1172,55 @@ fn dispatch_call(
                     CallbackAction::ReturnZero,
                 )?;
             }
+        }
+        "dispatch_queue_attr_make_with_autorelease_frequency"
+        | "dispatch_queue_attr_make_with_qos_class"
+        | "dispatch_retain"
+        | "dispatch_release" => {}
+        "dispatch_sync" | "dispatch_sync_f" => {
+            let previous = std::mem::replace(&mut state.current_queue, context.reg_read(REG_X0)?);
+            let (function, arguments) = if symbol == "dispatch_sync" {
+                let block = context.reg_read(REG_X0 + 1)?;
+                (read_guest_u64(context, block + 16)?, vec![block])
+            } else {
+                (
+                    context.reg_read(REG_X0 + 2)?,
+                    vec![context.reg_read(REG_X0 + 1)?],
+                )
+            };
+            begin_callback(
+                context,
+                state,
+                function,
+                &arguments,
+                CallbackAction::RestoreQueue { previous },
+            )?;
+        }
+        "dispatch_set_target_queue" => {
+            let queue = context.reg_read(REG_X0)?;
+            let target = context.reg_read(REG_X0 + 1)?;
+            state
+                .objects
+                .get_mut(&queue)
+                .context("unknown dispatch queue")?
+                .properties
+                .insert("targetQueue".into(), target);
+        }
+        "dispatch_queue_create"
+        | "dispatch_get_global_queue"
+        | "dispatch_get_main_queue"
+        | "dispatch_queue_create_with_target" => {
+            let queue = new_guest_object(context, profile, state, "HostQueue", StoreValue::Empty)?;
+            if symbol == "dispatch_queue_create_with_target" {
+                let target = context.reg_read(REG_X0 + 2)?;
+                state
+                    .objects
+                    .get_mut(&queue)
+                    .expect("new queue")
+                    .properties
+                    .insert("targetQueue".into(), target);
+            }
+            context.reg_write(REG_X0, queue)?;
         }
         "swift_once" | "dispatch_once_f" => {
             let predicate = context.reg_read(REG_X0)?;
@@ -1092,6 +1292,51 @@ fn dispatch_call(
                 .get("_swiftEmptyDictionarySingleton")
                 .context("missing Swift empty dictionary singleton")?;
             context.reg_write(REG_X0, *empty)?;
+        }
+        "$s8Dispatch0A3QoSV11unspecifiedACvgZ" => {
+            let output = context.reg_read(REG_X0 + 8)?;
+            write_guest_u64(context, output, 5)?;
+            write_guest_u64(context, output + 8, 0)?;
+        }
+        "$sSo17OS_dispatch_queueC8DispatchE5label3qos10attributes20autoreleaseFrequency6targetABSS_AC0D3QoSVAbCE10AttributesVAbCE011AutoreleaseI0OABSgtcfC"
+        | "$sSo24OS_dispatch_queue_serialC8DispatchE5label3qos10attributes20autoreleaseFrequency6targetABSS_AC0E3QoSVAbCE10AttributesVSo0a1_b1_C0CACE011AutoreleaseJ0OANSgtcfC" =>
+        {
+            let label = swift_string(
+                context,
+                state,
+                context.reg_read(REG_X0)?,
+                context.reg_read(REG_X0 + 1)?,
+            )?;
+            let target = context.reg_read(REG_X0 + 5)?;
+            let queue = new_guest_object(
+                context,
+                profile,
+                state,
+                "HostQueue",
+                StoreValue::String(label),
+            )?;
+            state
+                .objects
+                .get_mut(&queue)
+                .expect("new queue")
+                .properties
+                .insert("targetQueue".into(), target);
+            context.reg_write(REG_X0, queue)?;
+        }
+        "$ss10SetAlgebraPyxqd__ncSTRd__7ElementQyd__ACRtzlufCTj" => {
+            let metadata = context.reg_read(REG_X0 + 3)?;
+            let accepted = [
+                "$sSo24OS_dispatch_queue_serialC8DispatchE10AttributesVMa",
+                "$sSo17OS_dispatch_queueC8DispatchE10AttributesVMa",
+                "$s8Dispatch0A13WorkItemFlagsVMa",
+            ]
+            .iter()
+            .any(|name| profile.index.swift_accessors.get(*name) == Some(&metadata));
+            let source = context.reg_read(REG_X0)?;
+            if !accepted || read_guest_u64(context, read_guest_u64(context, source)? + 16)? != 0 {
+                bail!("unsupported Swift SetAlgebra initializer");
+            }
+            write_guest_u64(context, context.reg_read(REG_X0 + 8)?, 0)?;
         }
         "$sSo9OS_os_logC0B0E9subsystem8categoryABSS_SStcfC" => {
             let address =
@@ -1198,11 +1443,39 @@ fn dispatch_call(
             context.reg_write(REG_X0, receiver)?;
             return dispatch_message(context, profile, state, &selector, selector_address, true);
         }
-        _ => bail!(
-            "unsupported Store bridge call: {} {}",
-            call.symbol,
-            call.selector
-        ),
+        _ => {
+            if (symbol.starts_with("$sSo17OS_dispatch_queueC8DispatchE")
+                || symbol.starts_with("$s10Foundation3URLV13DirectoryHintO"))
+                && symbol.ends_with("Owui")
+            {
+                let metadata = context.reg_read(REG_X0 + 2)?;
+                let witnesses = read_guest_u64(context, metadata - 8)?;
+                if read_guest_u64(context, witnesses + 64)? != 1 {
+                    bail!("unexpected Swift enum size");
+                }
+                let value = context.reg_read(REG_X0 + 1)? as u8;
+                context.mem_write(context.reg_read(REG_X0)?, &[value])?;
+            } else if symbol.contains("SwiftRetainableBox")
+                && symbol.contains("initializeBufferWithCopyOfBuffer")
+            {
+                let destination = context.reg_read(REG_X0)?;
+                let source = context.reg_read(REG_X0 + 1)?;
+                write_guest_u64(context, destination, read_guest_u64(context, source)?)?;
+                context.reg_write(REG_X0, destination)?;
+            } else if symbol.contains("SwiftRetainableBox") && symbol.contains("7destroy") {
+            } else if let Some(&value) = profile.index.swift_globals.get(symbol) {
+                context.reg_write(REG_X0, value)?;
+            } else if let Some(&value) = profile.index.swift_accessors.get(symbol) {
+                context.reg_write(REG_X0, value)?;
+                context.reg_write(REG_X0 + 1, 0)?;
+            } else {
+                bail!(
+                    "unsupported Store bridge call: {} {}",
+                    call.symbol,
+                    call.selector
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1240,9 +1513,18 @@ fn begin_callback(
     Ok(())
 }
 
-fn resume_callback(context: &HookContext, resume: CallbackResume) -> Result<()> {
+fn resume_callback(
+    context: &HookContext,
+    state: &mut StoreState,
+    resume: CallbackResume,
+) -> Result<()> {
     match resume.action {
         CallbackAction::ReturnZero => context.reg_write(REG_X0, 0)?,
+        CallbackAction::ReturnValue { value } => context.reg_write(REG_X0, value)?,
+        CallbackAction::RestoreQueue { previous } => {
+            state.current_queue = previous;
+            context.reg_write(REG_X0, 0)?;
+        }
         CallbackAction::CopyProperty { destination } => {
             let value = context.reg_read(REG_X0)?;
             write_guest_u64(context, destination, value)?;
@@ -1601,6 +1883,7 @@ fn guest_format(
                     match &object.value {
                         StoreValue::String(value) => value.clone(),
                         StoreValue::Number(value) => value.to_string(),
+                        StoreValue::Float(value) => value.to_string(),
                         StoreValue::Boolean(value) => value.to_string(),
                         _ => bail!("unsupported formatted Store object"),
                     }
@@ -1664,20 +1947,35 @@ fn dispatch_message(
         context.reg_write(REG_PC, entry)?;
         return Ok(());
     }
+    if !class_method && class_name == "NSIndexSet" {
+        match selector {
+            "initWithIndexesInRange:" => {
+                let object = state.objects.get_mut(&receiver).expect("known index set");
+                object
+                    .properties
+                    .insert("rangeStart".into(), context.reg_read(REG_X0 + 2)?);
+                object
+                    .properties
+                    .insert("rangeLength".into(), context.reg_read(REG_X0 + 3)?);
+                context.reg_write(REG_X0, receiver)?;
+                return Ok(());
+            }
+            "containsIndex:" => {
+                let object = &state.objects[&receiver];
+                let start = object.properties.get("rangeStart").copied().unwrap_or(0);
+                let length = object.properties.get("rangeLength").copied().unwrap_or(0);
+                let index = context.reg_read(REG_X0 + 2)?;
+                context.reg_write(REG_X0, u64::from(index >= start && index - start < length))?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     if !class_method
         && (class_is_kind_of(profile, &class_name, "ACAccount")
             || matches!(class_name.as_str(), "ACAccountType" | "ACAccountCredential"))
     {
-        if let Some(name) = selector
-            .strip_prefix("set")
-            .and_then(|rest| rest.strip_suffix(':'))
-            && !name.is_empty()
-            && !name.contains(':')
-        {
-            let mut key = name.to_owned();
-            if key.len() < 2 || !key.as_bytes()[1].is_ascii_uppercase() {
-                key.replace_range(..1, &key[..1].to_ascii_lowercase());
-            }
+        if let Some(key) = setter_property_key(selector) {
             let value = context.reg_read(REG_X0 + 2)?;
             state
                 .objects
@@ -1711,7 +2009,48 @@ fn dispatch_message(
             return Ok(());
         }
     }
+    if !class_method
+        && matches!(
+            class_name.as_str(),
+            "NSURLSessionConfiguration" | "NSOperationQueue" | "NSCache"
+        )
+    {
+        if let Some(key) = setter_property_key(selector) {
+            let value = context.reg_read(REG_X0 + 2)?;
+            state
+                .objects
+                .get_mut(&receiver)
+                .expect("known configurable object")
+                .properties
+                .insert(key, value);
+            context.reg_write(REG_X0, 0)?;
+            return Ok(());
+        }
+        if let Some(&value) = state.objects[&receiver].properties.get(selector) {
+            context.reg_write(REG_X0, value)?;
+            return Ok(());
+        }
+    }
     match (class_method, selector) {
+        (true, "sessionWithConfiguration:delegate:delegateQueue:")
+            if class_name == "NSURLSession" =>
+        {
+            let session =
+                new_guest_object(context, profile, state, "NSURLSession", StoreValue::Empty)?;
+            let properties = &mut state
+                .objects
+                .get_mut(&session)
+                .expect("new session")
+                .properties;
+            for (name, register) in [
+                ("configuration", REG_X0 + 2),
+                ("delegate", REG_X0 + 3),
+                ("delegateQueue", REG_X0 + 4),
+            ] {
+                properties.insert(name.into(), context.reg_read(register)?);
+            }
+            context.reg_write(REG_X0, session)?;
+        }
         (true, "mainBundle") => {
             context.reg_write(REG_X0, new_main_bundle(context, profile, state)?)?;
         }
@@ -1744,6 +2083,32 @@ fn dispatch_message(
             properties.insert("processName".into(), name);
             properties.insert("environment".into(), environment);
             context.reg_write(REG_X0, process)?;
+        }
+        (true, "defaultSessionConfiguration" | "ephemeralSessionConfiguration") => {
+            let configuration = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSURLSessionConfiguration",
+                StoreValue::Empty,
+            )?;
+            let protocol_classes = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSArray",
+                StoreValue::Addresses(Vec::new()),
+            )?;
+            let properties = &mut state
+                .objects
+                .get_mut(&configuration)
+                .expect("new configuration")
+                .properties;
+            properties.insert("usesClassicLoadingMode".into(), 1);
+            properties.insert("protocolClasses".into(), protocol_classes);
+            properties.insert("HTTPShouldSetCookies".into(), 1);
+            properties.insert("HTTPMaximumConnectionsPerHost".into(), 6);
+            context.reg_write(REG_X0, configuration)?;
         }
         (true, "isMainThread") => context.reg_write(REG_X0, 1)?,
         (true, "UUID") => {
@@ -2195,6 +2560,7 @@ fn dispatch_message(
             let object = &state.objects[&receiver];
             let value = match &object.value {
                 StoreValue::Number(value) => *value,
+                StoreValue::Float(value) => *value as i64,
                 StoreValue::Boolean(value) => i64::from(*value),
                 StoreValue::String(value) => value.parse::<i64>().unwrap_or(0),
                 _ => 0,
@@ -2302,6 +2668,18 @@ fn dispatch_message(
     Ok(())
 }
 
+fn setter_property_key(selector: &str) -> Option<String> {
+    let name = selector.strip_prefix("set")?.strip_suffix(':')?.to_owned();
+    if name.is_empty() || name.contains(':') {
+        return None;
+    }
+    let mut key = name;
+    if key.len() < 2 || !key.as_bytes()[1].is_ascii_uppercase() {
+        key.replace_range(..1, &key[..1].to_ascii_lowercase());
+    }
+    Some(key)
+}
+
 fn collection_key(state: &StoreState, address: u64) -> String {
     if let Some(object) = state.objects.get(&address) {
         match &object.value {
@@ -2333,6 +2711,9 @@ fn export_object(
         StoreValue::Empty => Value::Null,
         StoreValue::String(value) => Value::String(value.clone()),
         StoreValue::Number(value) => Value::Number((*value).into()),
+        StoreValue::Float(value) => Value::Number(
+            serde_json::Number::from_f64(*value).context("nonfinite Store guest number")?,
+        ),
         StoreValue::Boolean(value) => Value::Bool(*value),
         StoreValue::Bytes(value) => {
             Value::String(base64::engine::general_purpose::STANDARD.encode(value))
@@ -2373,6 +2754,7 @@ fn foundation_equal(state: &StoreState, first: u64, second: u64, depth: usize) -
         (StoreValue::String(a), StoreValue::String(b)) => a == b,
         (StoreValue::Bytes(a), StoreValue::Bytes(b)) => a == b,
         (StoreValue::Number(a), StoreValue::Number(b)) => a == b,
+        (StoreValue::Float(a), StoreValue::Float(b)) => a == b,
         (StoreValue::Boolean(a), StoreValue::Boolean(b)) => a == b,
         (StoreValue::Number(a), StoreValue::Boolean(b))
         | (StoreValue::Boolean(b), StoreValue::Number(a)) => *a == i64::from(*b),
@@ -2486,6 +2868,9 @@ mod tests {
         let assets = SapAssetBundle::load_cached().unwrap();
         let mut runtime = StoreRuntime::open(&assets).unwrap();
         runtime.set_hardware_id(&[1, 2, 3, 4, 5, 6]).unwrap();
+        let nested = serde_json::json!({"values": [1, 2.5, true, null], "label": "测试"});
+        let imported = runtime.import_json(&nested).unwrap();
+        assert_eq!(runtime.export(imported).unwrap(), nested);
         assert!(!runtime.code_ranges.is_empty());
         let allocated = runtime.allocate(17).unwrap();
         assert_eq!(runtime.heap_cursor(), allocated + 32);
@@ -2597,6 +2982,11 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .eq_ignore_ascii_case("010203040506")
+        );
+        let encoder = runtime.new_request_encoder(0).unwrap();
+        assert_eq!(
+            runtime.state.borrow().objects[&encoder].class,
+            "AMSURLRequestEncoder"
         );
         assert!(
             runtime
