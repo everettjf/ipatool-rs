@@ -1267,6 +1267,53 @@ fn dispatch_message(
         context.reg_write(REG_PC, entry)?;
         return Ok(());
     }
+    if !class_method
+        && (class_is_kind_of(profile, &class_name, "ACAccount")
+            || matches!(class_name.as_str(), "ACAccountType" | "ACAccountCredential"))
+    {
+        if let Some(name) = selector
+            .strip_prefix("set")
+            .and_then(|rest| rest.strip_suffix(':'))
+            && !name.is_empty()
+            && !name.contains(':')
+        {
+            let mut key = name.to_owned();
+            if key.len() < 2 || !key.as_bytes()[1].is_ascii_uppercase() {
+                key.replace_range(..1, &key[..1].to_ascii_lowercase());
+            }
+            let value = context.reg_read(REG_X0 + 2)?;
+            state
+                .objects
+                .get_mut(&receiver)
+                .expect("known account")
+                .properties
+                .insert(key, value);
+            context.reg_write(REG_X0, 0)?;
+            return Ok(());
+        }
+        if matches!(
+            selector,
+            "accountType"
+                | "identifier"
+                | "username"
+                | "credential"
+                | "accountProperties"
+                | "authenticated"
+                | "active"
+                | "owningBundleID"
+                | "accountDescription"
+                | "parentAccount"
+                | "isDirty"
+        ) {
+            let value = state.objects[&receiver]
+                .properties
+                .get(selector)
+                .copied()
+                .unwrap_or(0);
+            context.reg_write(REG_X0, value)?;
+            return Ok(());
+        }
+    }
     match (class_method, selector) {
         (true, "mainBundle") => {
             context.reg_write(REG_X0, new_main_bundle(context, profile, state)?)?;
@@ -1277,26 +1324,7 @@ fn dispatch_message(
         }
         (true, "isMainThread") => context.reg_write(REG_X0, 1)?,
         (true, "UUID") => {
-            let mut bytes = [0u8; 16];
-            getrandom::fill(&mut bytes).context("generate Store guest UUID")?;
-            bytes[6] = (bytes[6] & 15) | 64;
-            bytes[8] = (bytes[8] & 63) | 128;
-            let value = [
-                &bytes[..4],
-                &bytes[4..6],
-                &bytes[6..8],
-                &bytes[8..10],
-                &bytes[10..],
-            ]
-            .into_iter()
-            .map(|group| {
-                group
-                    .iter()
-                    .map(|byte| format!("{byte:02X}"))
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("-");
+            let value = random_uuid_string()?;
             let address =
                 new_guest_object(context, profile, state, "NSUUID", StoreValue::String(value))?;
             context.reg_write(REG_X0, address)?;
@@ -1469,6 +1497,44 @@ fn dispatch_message(
                 value
             };
             context.reg_write(REG_X0, value)?;
+        }
+        (false, "initWithIdentifier:description:") if class_name == "ACAccountType" => {
+            let identifier = context.reg_read(REG_X0 + 2)?;
+            let description = context.reg_read(REG_X0 + 3)?;
+            let properties = &mut state
+                .objects
+                .get_mut(&receiver)
+                .expect("known account type")
+                .properties;
+            properties.insert("identifier".into(), identifier);
+            properties.insert("accountTypeDescription".into(), description);
+            context.reg_write(REG_X0, receiver)?;
+        }
+        (false, "initWithAccountType:") if class_is_kind_of(profile, &class_name, "ACAccount") => {
+            let account_type = context.reg_read(REG_X0 + 2)?;
+            let identifier = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(random_uuid_string()?),
+            )?;
+            let account_properties = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSMutableDictionary",
+                StoreValue::Entries(HashMap::new()),
+            )?;
+            let properties = &mut state
+                .objects
+                .get_mut(&receiver)
+                .expect("known account")
+                .properties;
+            properties.insert("identifier".into(), identifier);
+            properties.insert("accountType".into(), account_type);
+            properties.insert("accountProperties".into(), account_properties);
+            context.reg_write(REG_X0, receiver)?;
         }
         (false, "executableURL" | "bundleURL") => {
             let address = new_guest_object(
@@ -1781,6 +1847,29 @@ fn new_main_bundle(
     Ok(bundle)
 }
 
+fn random_uuid_string() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).context("generate Store guest UUID")?;
+    bytes[6] = (bytes[6] & 15) | 64;
+    bytes[8] = (bytes[8] & 63) | 128;
+    Ok([
+        &bytes[..4],
+        &bytes[4..6],
+        &bytes[6..8],
+        &bytes[8..10],
+        &bytes[10..],
+    ]
+    .into_iter()
+    .map(|group| {
+        group
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>()
+    })
+    .collect::<Vec<_>>()
+    .join("-"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1857,6 +1946,31 @@ mod tests {
             .new_object("AMSAuthenticateOptions", StoreValue::Empty)
             .unwrap();
         assert_eq!(runtime.invoke(options, "init", &[]).unwrap(), options);
+        for (selector, value) in [
+            ("setEphemeral:", 1),
+            ("setCanMakeAccountActive:", 0),
+            ("setAllowServerDialogs:", 0),
+            ("setCredentialSource:", 0),
+        ] {
+            runtime.invoke(options, selector, &[value]).unwrap();
+        }
+        let password = runtime
+            .new_object("NSString", StoreValue::String("secret".into()))
+            .unwrap();
+        runtime
+            .invoke(options, "setPassword:", &[password])
+            .unwrap();
+        let task = runtime
+            .new_object("AMSVerifyCredentialsTask", StoreValue::Empty)
+            .unwrap();
+        assert_eq!(runtime.invoke(task, "init", &[]).unwrap(), task);
+        let ephemeral = runtime
+            .invoke(account_address, "ams_createEphemeralAccount", &[])
+            .unwrap();
+        assert_eq!(
+            runtime.state.borrow().objects[&ephemeral].class,
+            "AMSEphemeralAccount"
+        );
         assert!(
             runtime
                 .call(objc_msg_send, &[u64::MAX, selector])
