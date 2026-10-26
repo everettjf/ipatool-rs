@@ -58,7 +58,7 @@ impl CredentialStore for MacKeychain {
     }
 }
 
-pub fn open_system_keychain() -> Result<Box<dyn CredentialStore>> {
+pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> {
     #[cfg(target_os = "macos")]
     {
         Ok(Box::new(MacKeychain))

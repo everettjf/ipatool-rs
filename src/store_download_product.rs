@@ -1,6 +1,6 @@
 //! Native Store download-product requests and version-history metadata.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -11,10 +11,11 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
+use zeroize::Zeroize;
 
 use crate::{
     App, CatalogClient, Platform,
-    credentials::Account,
+    credentials::{Account, CredentialStore, KBSYNC_CACHE_KEY, open_system_keychain},
     host::hardware_mac_address,
     ipa_metadata::{self, VersionMetadata},
     mac_preflight,
@@ -39,6 +40,21 @@ pub struct DownloadProductClient {
     hardware_id: [u8; 6],
     sender: Arc<Sender>,
     kbsync_generator: Option<Arc<KbsyncGenerator>>,
+    kbsync_cache: Mutex<Option<KbsyncCacheEntry>>,
+    credentials: Option<Arc<dyn CredentialStore + Send + Sync>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct KbsyncCacheEntry {
+    dsid: u64,
+    guid: String,
+    data: String,
+}
+
+impl Drop for KbsyncCacheEntry {
+    fn drop(&mut self) {
+        self.data.zeroize();
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -83,8 +99,10 @@ impl DownloadProductClient {
         let hardware_id = hardware_mac_address().context("read Store hardware identity")?;
         let state_directory = prepare_state_directory_from_environment()?;
         let transport = Arc::new(Transport::with_cookies(&state_directory)?);
+        let credentials = Arc::from(open_system_keychain()?);
         Ok(
             Self::with_sender(hardware_id, move |request| transport.send(request))
+                .with_credential_store(credentials)
                 .with_kbsync_generator(|hardware, dsid| {
                     let bundle =
                         SapAssetBundle::load_or_download().context("load StoreAgent assets")?;
@@ -101,7 +119,17 @@ impl DownloadProductClient {
             hardware_id,
             sender: Arc::new(sender),
             kbsync_generator: None,
+            kbsync_cache: Mutex::new(None),
+            credentials: None,
         }
+    }
+
+    pub fn with_credential_store(
+        mut self,
+        credentials: Arc<dyn CredentialStore + Send + Sync>,
+    ) -> Self {
+        self.credentials = Some(credentials);
+        self
     }
 
     pub fn with_kbsync_generator(
@@ -353,11 +381,31 @@ impl DownloadProductClient {
         if dsid == 0 || version.is_empty() {
             bail!("ent/download requires an account DSID and version ID");
         }
+        let guid = self.guid();
+        if let Some(cached) = self.cached_kbsync(dsid, &guid) {
+            match self.send_ent_download_request(account, app, version, &guid, &cached) {
+                Ok(response) => return Ok(response),
+                Err(_) => self.invalidate_kbsync(dsid, &guid, &cached),
+            }
+        }
         let blob = generator(self.hardware_id, dsid)?;
         if blob.is_empty() {
             bail!("KBSync generator returned an empty blob");
         }
-        let guid = self.guid();
+        let data = STANDARD.encode(blob);
+        let response = self.send_ent_download_request(account, app, version, &guid, &data)?;
+        self.store_kbsync(dsid, &guid, &data);
+        Ok(response)
+    }
+
+    fn send_ent_download_request(
+        &self,
+        account: &Account,
+        app: &App,
+        version: &str,
+        guid: &str,
+        kbsync: &str,
+    ) -> Result<DownloadProductResponse> {
         let serial = [
             0x54,
             0xc8,
@@ -372,7 +420,7 @@ impl DownloadProductClient {
         let parameters = serde_json::json!({
             "creditDisplay": "",
             "guid": guid,
-            "kbsync": STANDARD.encode(blob),
+            "kbsync": kbsync,
             "salableAdamId": app.id.to_string(),
             "serialNumber": STANDARD.encode(serial),
             "externalVersionId": version,
@@ -380,7 +428,7 @@ impl DownloadProductClient {
         let mut body = Vec::new();
         plist::to_writer_xml(&mut body, &parameters).context("encode ent/download plist")?;
         let mut url = Url::parse(ENT_DOWNLOAD_URL)?;
-        url.query_pairs_mut().append_pair("guid", &guid);
+        url.query_pairs_mut().append_pair("guid", guid);
         let mut headers = HeaderMap::new();
         headers.insert(
             CONTENT_TYPE,
@@ -442,6 +490,64 @@ impl DownloadProductClient {
             bail!("ent/download returned failure {}", result.data.failure_type);
         }
         Ok(result)
+    }
+
+    fn cached_kbsync(&self, dsid: u64, guid: &str) -> Option<String> {
+        let mut guard = self.kbsync_cache.lock().ok()?;
+        if let Some(entry) = guard.as_ref()
+            && entry.dsid == dsid
+            && entry.guid == guid
+            && !entry.data.is_empty()
+        {
+            return Some(entry.data.clone());
+        }
+        let encoded = self.credentials.as_ref()?.get(KBSYNC_CACHE_KEY).ok()??;
+        let entry: KbsyncCacheEntry = serde_json::from_slice(&encoded).ok()?;
+        if entry.dsid != dsid || entry.guid != guid {
+            return None;
+        }
+        if STANDARD.decode(&entry.data).ok()?.is_empty() {
+            return None;
+        }
+        let data = entry.data.clone();
+        *guard = Some(entry);
+        Some(data)
+    }
+
+    fn store_kbsync(&self, dsid: u64, guid: &str, data: &str) {
+        let entry = KbsyncCacheEntry {
+            dsid,
+            guid: guid.to_owned(),
+            data: data.to_owned(),
+        };
+        if let Ok(mut guard) = self.kbsync_cache.lock() {
+            *guard = Some(entry.clone());
+        }
+        if let Some(credentials) = &self.credentials
+            && let Ok(encoded) = serde_json::to_vec(&entry)
+        {
+            let _ = credentials.set(KBSYNC_CACHE_KEY, &encoded);
+        }
+    }
+
+    fn invalidate_kbsync(&self, dsid: u64, guid: &str, data: &str) {
+        let rejected = KbsyncCacheEntry {
+            dsid,
+            guid: guid.to_owned(),
+            data: data.to_owned(),
+        };
+        if let Ok(mut guard) = self.kbsync_cache.lock()
+            && guard.as_ref() == Some(&rejected)
+        {
+            *guard = None;
+        }
+        if let Some(credentials) = &self.credentials
+            && let Ok(Some(encoded)) = credentials.get(KBSYNC_CACHE_KEY)
+            && let Ok(saved) = serde_json::from_slice::<KbsyncCacheEntry>(&encoded)
+            && saved == rejected
+        {
+            let _ = credentials.remove(KBSYNC_CACHE_KEY);
+        }
     }
 
     fn send_request(
@@ -657,12 +763,42 @@ fn validate_fallback(response: &DownloadProductResponse, app: &App, version: &st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::{
+        collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use crate::{
         sap_assets::SapAssetBundle,
         store_backend::{StoreBackend, StoreBackendRequest},
     };
+
+    #[derive(Default)]
+    struct MemoryCredentials(Mutex<HashMap<String, Vec<u8>>>);
+
+    impl CredentialStore for MemoryCredentials {
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+
+        fn set(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.0.lock().unwrap().insert(key.into(), data.to_vec());
+            Ok(())
+        }
+
+        fn remove(&self, key: &str) -> Result<bool> {
+            Ok(self.0.lock().unwrap().remove(key).is_some())
+        }
+    }
+
+    fn ent_sender(request: Request) -> Result<Response> {
+        if request.url.path().ends_with("bag.xml") {
+            return Ok(response(serde_json::json!({"urlBag": {
+                "volumeStoreDownloadProduct": ENT_DOWNLOAD_URL
+            }})));
+        }
+        Ok(item_response("101"))
+    }
 
     fn account() -> Account {
         let mut account = Account::default();
@@ -1069,5 +1205,109 @@ mod tests {
         assert_eq!(native.body, guest.body);
         assert_eq!(native.no_redirects, guest.no_redirects);
         assert_eq!(native.timeout, guest.timeout);
+    }
+
+    #[test]
+    fn kbsync_cache_reused_across_clients_for_same_account_and_device() {
+        let credentials = Arc::new(MemoryCredentials::default());
+        let generated = Arc::new(AtomicUsize::new(0));
+        let build = || {
+            let generated = Arc::clone(&generated);
+            DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], ent_sender)
+                .with_credential_store(credentials.clone())
+                .with_kbsync_generator(move |_, _| {
+                    generated.fetch_add(1, Ordering::SeqCst);
+                    Ok(b"cached-kbsync".to_vec())
+                })
+        };
+        build()
+            .send_product(&account(), &app(), "101", || unreachable!())
+            .unwrap();
+        build()
+            .send_product(&account(), &app(), "101", || unreachable!())
+            .unwrap();
+        assert_eq!(generated.load(Ordering::SeqCst), 1);
+        let saved = credentials.get(KBSYNC_CACHE_KEY).unwrap().unwrap();
+        let saved: KbsyncCacheEntry = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(saved.dsid, 123456);
+        assert_eq!(saved.guid, "000102030405");
+        assert_eq!(saved.data, STANDARD.encode(b"cached-kbsync"));
+    }
+
+    #[test]
+    fn rejected_cached_kbsync_is_replaced_after_fresh_request_succeeds() {
+        let credentials = Arc::new(MemoryCredentials::default());
+        credentials
+            .set(
+                KBSYNC_CACHE_KEY,
+                &serde_json::to_vec(&KbsyncCacheEntry {
+                    dsid: 123456,
+                    guid: "000102030405".into(),
+                    data: STANDARD.encode(b"rejected"),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&sent);
+        let generated = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&generated);
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            if request.url.path().ends_with("bag.xml") {
+                return ent_sender(request);
+            }
+            let body: Value = plist::from_bytes(request.body.as_ref().unwrap()).unwrap();
+            let kbsync = body["kbsync"].as_str().unwrap().to_owned();
+            capture.lock().unwrap().push(kbsync.clone());
+            if kbsync == STANDARD.encode(b"rejected") {
+                bail!("Store rejected cached blob");
+            }
+            Ok(item_response("101"))
+        })
+        .with_credential_store(credentials.clone())
+        .with_kbsync_generator(move |_, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(b"fresh".to_vec())
+        });
+        client
+            .send_product(&account(), &app(), "101", || unreachable!())
+            .unwrap();
+        assert_eq!(generated.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            [STANDARD.encode(b"rejected"), STANDARD.encode(b"fresh")]
+        );
+        let saved = credentials.get(KBSYNC_CACHE_KEY).unwrap().unwrap();
+        let saved: KbsyncCacheEntry = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(saved.data, STANDARD.encode(b"fresh"));
+    }
+
+    #[test]
+    fn kbsync_cache_ignores_wrong_account_and_malformed_data() {
+        let credentials = Arc::new(MemoryCredentials::default());
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], ent_sender)
+            .with_credential_store(credentials.clone());
+        for entry in [
+            KbsyncCacheEntry {
+                dsid: 7,
+                guid: "000102030405".into(),
+                data: STANDARD.encode(b"old"),
+            },
+            KbsyncCacheEntry {
+                dsid: 123456,
+                guid: "wrong".into(),
+                data: STANDARD.encode(b"old"),
+            },
+            KbsyncCacheEntry {
+                dsid: 123456,
+                guid: "000102030405".into(),
+                data: "bad!".into(),
+            },
+        ] {
+            credentials
+                .set(KBSYNC_CACHE_KEY, &serde_json::to_vec(&entry).unwrap())
+                .unwrap();
+            assert!(client.cached_kbsync(123456, "000102030405").is_none());
+        }
     }
 }
