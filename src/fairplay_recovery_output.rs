@@ -16,7 +16,7 @@ use crate::fairplay_recovery_math::Encoding;
 
 struct EncodingRows<'a>(&'a Encoding);
 
-fn open_private_file(path: &Path, size: Option<u64>, limit: u64) -> Result<fs::File> {
+pub(crate) fn open_private_file(path: &Path, size: Option<u64>, limit: u64) -> Result<fs::File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]

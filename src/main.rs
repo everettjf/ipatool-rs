@@ -283,7 +283,7 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Build an FPSENR2 decoder directly from private schema-2 checkpoints.
+    /// Build an FPSENR2 decoder directly from private schema-1/2 checkpoints.
     BuildModelV2Checkpoints {
         #[arg(long)]
         recovered_model: PathBuf,
@@ -325,7 +325,7 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Build an FPSENR3 decoder directly from three private schema-2 checkpoints.
+    /// Build an FPSENR3 decoder directly from three private schema-1/2 checkpoints.
     BuildModelV3Checkpoints {
         #[arg(long)]
         recovered_model: PathBuf,
