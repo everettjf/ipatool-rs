@@ -117,6 +117,7 @@ impl HookContext {
         if data.is_empty() {
             return Ok(());
         }
+        self.check_memory(address, data.len())?;
         let code = unsafe {
             (self.operations.mem_write)(self.handle, address, data.as_ptr().cast(), data.len())
         };
@@ -126,16 +127,45 @@ impl HookContext {
             bail!("failed to write Unicorn memory: error {code}")
         }
     }
+
+    pub fn mem_read(&self, address: u64, size: usize) -> Result<Vec<u8>> {
+        self.check_memory(address, size)?;
+        let mut data = vec![0u8; size];
+        if size != 0 {
+            let code = unsafe {
+                (self.operations.mem_read)(self.handle, address, data.as_mut_ptr().cast(), size)
+            };
+            if code != 0 {
+                bail!("failed to read Unicorn memory: error {code}");
+            }
+        }
+        Ok(data)
+    }
+
+    fn check_memory(&self, address: u64, size: usize) -> Result<()> {
+        if size != 0 {
+            let check = self.operations.guard_slot.borrow().clone();
+            if let Some(check) = check {
+                check(address, size as u64)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 type CodeCallback = dyn FnMut(&HookContext, u64, u32);
 type FaultCallback = dyn FnMut(&HookContext, u64, u32) -> bool;
 
-#[derive(Clone, Copy)]
+type GuardCheck = Rc<dyn Fn(u64, u64) -> Result<()>>;
+type GuardSlot = Rc<RefCell<Option<GuardCheck>>>;
+
+#[derive(Clone)]
 struct HookOperations {
     stop: unsafe extern "C" fn(Handle) -> i32,
     mem_map: unsafe extern "C" fn(Handle, u64, usize, u32) -> i32,
+    mem_read: unsafe extern "C" fn(Handle, u64, *mut c_void, usize) -> i32,
     mem_write: unsafe extern "C" fn(Handle, u64, *const c_void, usize) -> i32,
+    guard_slot: GuardSlot,
 }
 
 struct HookData {
@@ -194,7 +224,7 @@ impl StdError for GuardError {
 }
 
 struct MemoryGuard {
-    check: Rc<dyn Fn(u64, u64) -> Result<()>>,
+    check: GuardCheck,
     failure: Rc<RefCell<Option<GuardError>>>,
     access_hook_id: u64,
     code_hook_id: u64,
@@ -229,7 +259,7 @@ extern "C" fn code_trampoline(handle: Handle, address: u64, size: u32, user_data
     let data = unsafe { &*user_data.cast::<HookData>() };
     let context = HookContext {
         handle,
-        operations: data.operations,
+        operations: data.operations.clone(),
     };
     let result = catch_unwind(AssertUnwindSafe(|| {
         let Ok(mut callback) = data.callback.try_borrow_mut() else {
@@ -257,7 +287,7 @@ extern "C" fn fault_trampoline(
     let data = unsafe { &*user_data.cast::<MemoryFaultData>() };
     let context = HookContext {
         handle,
-        operations: data.operations,
+        operations: data.operations.clone(),
     };
     let result = catch_unwind(AssertUnwindSafe(|| {
         let Ok(mut callback) = data.callback.try_borrow_mut() else {
@@ -289,7 +319,7 @@ extern "C" fn access_trampoline(
     let data = unsafe { &*user_data.cast::<MemoryAccessData>() };
     let context = HookContext {
         handle,
-        operations: data.operations,
+        operations: data.operations.clone(),
     };
     let result = catch_unwind(AssertUnwindSafe(|| {
         let Ok(mut callback) = data.callback.try_borrow_mut() else {
@@ -310,6 +340,7 @@ pub struct Engine {
     hooks: Vec<HookRegistration>,
     next_hook_id: u64,
     memory_guard: Option<MemoryGuard>,
+    guard_slot: GuardSlot,
 }
 
 impl Engine {
@@ -328,6 +359,7 @@ impl Engine {
             hooks: Vec::new(),
             next_hook_id: 1,
             memory_guard: None,
+            guard_slot: Rc::new(RefCell::new(None)),
         };
         let code = unsafe { (engine.api.control)(handle, CONTROL_CPU_MODEL, ARM64_CPU_MODEL_MAX) };
         if let Err(error) = engine.check(code) {
@@ -543,7 +575,7 @@ impl Engine {
         if self.memory_guard.is_some() {
             bail!("Unicorn memory validator is already installed");
         }
-        let check: Rc<dyn Fn(u64, u64) -> Result<()>> = Rc::new(check);
+        let check: GuardCheck = Rc::new(check);
         let failure = Rc::new(RefCell::new(None));
         let access_id =
             self.add_memory_access_hook(guard_callback(Rc::clone(&check), Rc::clone(&failure)))?;
@@ -559,11 +591,12 @@ impl Engine {
             }
         };
         self.memory_guard = Some(MemoryGuard {
-            check,
+            check: Rc::clone(&check),
             failure,
             access_hook_id: access_id,
             code_hook_id: code_id,
         });
+        *self.guard_slot.borrow_mut() = Some(Rc::clone(&check));
         Ok(())
     }
 
@@ -619,7 +652,9 @@ impl Engine {
         HookOperations {
             stop: self.api.emu_stop,
             mem_map: self.api.mem_map,
+            mem_read: self.api.mem_read,
             mem_write: self.api.mem_write,
+            guard_slot: Rc::clone(&self.guard_slot),
         }
     }
 
@@ -794,5 +829,43 @@ mod tests {
                 .unwrap_err()
         ));
         assert_eq!(engine.reg_read(REG_X0).unwrap(), 0);
+    }
+
+    #[test]
+    #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
+    fn hook_context_memory_access_obeys_guard() {
+        let mut engine = Engine::new().unwrap();
+        engine.mem_map(0x1000, 4096).unwrap();
+        engine.mem_map(0x2000, 4096).unwrap();
+        engine.mem_write(0x1000, &[0x1f, 0x20, 0x03, 0xd5]).unwrap();
+        let allow_data = Rc::new(Cell::new(false));
+        let allowed = Rc::clone(&allow_data);
+        engine
+            .guard_memory(move |address, size| {
+                if size != 0 && address < 0x3000 && address + size > 0x2000 && !allowed.get() {
+                    return Err(MissingPage.into());
+                }
+                Ok(())
+            })
+            .unwrap();
+        let denied = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&denied);
+        engine
+            .add_code_hook(0x1000, 0x1000, move |context, _, _| {
+                if is_missing_page(&context.mem_read(0x2000, 1).unwrap_err()) {
+                    observed.set(observed.get() + 1);
+                }
+                if is_missing_page(&context.mem_write(0x2000, &[42]).unwrap_err()) {
+                    observed.set(observed.get() + 1);
+                }
+                context.stop().unwrap();
+            })
+            .unwrap();
+        engine
+            .start_bounded(0x1000, 0x1004, Duration::from_secs(1), 10)
+            .unwrap();
+        assert_eq!(denied.get(), 2);
+        allow_data.set(true);
+        assert_eq!(engine.mem_read(0x2000, 1).unwrap(), [0]);
     }
 }
