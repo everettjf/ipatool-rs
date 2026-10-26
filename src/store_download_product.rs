@@ -15,6 +15,7 @@ use crate::{
     App, CatalogClient, Platform,
     credentials::Account,
     host::hardware_mac_address,
+    ipa_metadata::{self, VersionMetadata},
     state::prepare_state_directory_from_environment,
     store_backend::DEFAULT_USER_AGENT,
     store_purchase::PasswordTokenExpired,
@@ -108,33 +109,8 @@ impl DownloadProductClient {
         let response = self.send_product(account, app, &version, || {
             catalog.latest_external_version_id(app, country, platform)
         })?;
-        let result = response.data;
-        if matches!(result.failure_type.as_str(), "2034" | "2042") {
-            return Err(PasswordTokenExpired.into());
-        }
-        if result.failure_type == "9610" {
-            bail!("a license is required for this app");
-        }
-        if !result.failure_type.is_empty() {
-            bail!(
-                "App Store download metadata failed: {}",
-                if result.customer_message.is_empty() {
-                    &result.failure_type
-                } else {
-                    &result.customer_message
-                }
-            );
-        }
-        if result.items.is_empty() {
-            if result.customer_message.is_empty() {
-                bail!("App Store returned no download metadata");
-            }
-            bail!(
-                "App Store download metadata failed: {}",
-                result.customer_message
-            );
-        }
-        let metadata = &result.items[0].metadata;
+        let item = checked_item(&response)?;
+        let metadata = &item.metadata;
         let identifiers = metadata
             .get("softwareVersionExternalIdentifiers")
             .and_then(Value::as_array)
@@ -151,6 +127,57 @@ impl DownloadProductClient {
             external_version_identifiers,
             latest_external_version_id,
         })
+    }
+
+    pub fn get_version_metadata(
+        &self,
+        account: &Account,
+        app: &App,
+        version: &str,
+        platform: Platform,
+    ) -> Result<VersionMetadata> {
+        self.get_version_metadata_with(
+            account,
+            app,
+            version,
+            platform,
+            ipa_metadata::read_version_metadata_from_ipa,
+        )
+    }
+
+    fn get_version_metadata_with(
+        &self,
+        account: &Account,
+        app: &App,
+        version: &str,
+        platform: Platform,
+        read_ipa: impl FnOnce(&str) -> Result<VersionMetadata>,
+    ) -> Result<VersionMetadata> {
+        if version.is_empty() || platform == Platform::Unknown {
+            bail!("a version ID and platform are required");
+        }
+        let response = self.send_product(account, app, version, || Ok(version.to_owned()))?;
+        let item = checked_item(&response)?;
+        let software_platform = item
+            .metadata
+            .get("software-platform")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let product_type = item
+            .metadata
+            .get("product-type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if platform == Platform::Macos
+            && !software_platform.eq_ignore_ascii_case("ios")
+            && !(software_platform.is_empty() && product_type.eq_ignore_ascii_case("ios-app"))
+        {
+            bail!("macOS package version metadata requires the XAR package reader");
+        }
+        if item.url.is_empty() {
+            bail!("App Store download response has no IPA URL");
+        }
+        read_ipa(&item.url).context("read version metadata from IPA")
     }
 
     /// Try volumeStore, then the bag-provided redownload and update endpoints.
@@ -371,6 +398,39 @@ fn version_string(value: &Value) -> Result<String> {
     }
 }
 
+fn checked_item(response: &DownloadProductResponse) -> Result<&DownloadItem> {
+    let result = &response.data;
+    if matches!(result.failure_type.as_str(), "2034" | "2042") {
+        return Err(PasswordTokenExpired.into());
+    }
+    if result.failure_type == "9610" {
+        bail!("a license is required for this app");
+    }
+    if !result.failure_type.is_empty() {
+        bail!(
+            "App Store download metadata failed: {}",
+            if result.customer_message.is_empty() {
+                &result.failure_type
+            } else {
+                &result.customer_message
+            }
+        );
+    }
+    if response.status != 200 || result.items.is_empty() {
+        if result.customer_message.is_empty() {
+            bail!(
+                "App Store returned no download metadata (HTTP {})",
+                response.status
+            );
+        }
+        bail!(
+            "App Store download metadata failed: {}",
+            result.customer_message
+        );
+    }
+    Ok(&result.items[0])
+}
+
 fn validate_fallback(response: &DownloadProductResponse, app: &App, version: &str) -> Result<()> {
     if !response.data.failure_type.is_empty() || !response.data.customer_message.is_empty() {
         return Ok(());
@@ -588,5 +648,32 @@ mod tests {
             .list_versions(&catalog, &account(), &app(), Platform::Iphone)
             .unwrap_err();
         assert!(error.downcast_ref::<PasswordTokenExpired>().is_some());
+    }
+
+    #[test]
+    fn version_metadata_reads_selected_ipa_url_and_rejects_mac_package() {
+        let client =
+            DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| Ok(item_response("101")));
+        let metadata = client
+            .get_version_metadata_with(&account(), &app(), "101", Platform::Iphone, |url| {
+                assert_eq!(url, "https://example.test/app.ipa");
+                Ok(VersionMetadata {
+                    display_version: "1.0".into(),
+                    release_date: "2025-01-01T00:00:00Z".into(),
+                })
+            })
+            .unwrap();
+        assert_eq!(metadata.display_version, "1.0");
+        assert!(
+            client
+                .get_version_metadata_with(
+                    &account(),
+                    &app(),
+                    "101",
+                    Platform::Macos,
+                    |_| unreachable!()
+                )
+                .is_err()
+        );
     }
 }

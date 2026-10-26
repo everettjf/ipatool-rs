@@ -98,6 +98,17 @@ enum Command {
         #[arg(long, default_value = "iphone")]
         platform: String,
     },
+    /// Read one IPA version's display version and release date.
+    GetVersionMetadata {
+        #[arg(short = 'i', long)]
+        app_id: Option<i64>,
+        #[arg(short = 'b', long)]
+        bundle_identifier: Option<String>,
+        #[arg(long)]
+        external_version_id: String,
+        #[arg(long, default_value = "iphone")]
+        platform: String,
+    },
     /// Resolve the latest external version ID from the public platform catalog.
     LatestVersionId {
         #[arg(long)]
@@ -426,6 +437,68 @@ fn run() -> Result<()> {
                                 for id in output.external_version_identifiers {
                                     println!("{id}");
                                 }
+                            }
+                        }
+                        break;
+                    }
+                    Err(error)
+                        if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
+                    {
+                        let authentication_backend = NativeAuthenticationBackend::open()?;
+                        account = store_login::login(
+                            &authentication_backend,
+                            &account_store,
+                            LoginInput {
+                                email: account.email.clone(),
+                                password: account.password.clone(),
+                                auth_code: String::new(),
+                            },
+                        )?;
+                        refreshed = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Command::GetVersionMetadata {
+            app_id,
+            bundle_identifier,
+            external_version_id,
+            platform,
+        } => {
+            if app_id.is_none_or(|id| id <= 0)
+                && bundle_identifier.as_deref().is_none_or(str::is_empty)
+            {
+                bail!("either the app ID or the bundle identifier must be specified");
+            }
+            if external_version_id.is_empty() {
+                bail!("an external version ID is required");
+            }
+            let platform = Platform::parse(&platform)?.context("platform is required")?;
+            let account_store = AccountStore::new(open_system_keychain()?);
+            let mut account = account_store.load()?;
+            let backend = DownloadProductClient::open()?;
+            let catalog = CatalogClient::new()?;
+            let mut refreshed = false;
+            loop {
+                let app = if let Some(bundle_id) =
+                    bundle_identifier.as_deref().filter(|id| !id.is_empty())
+                {
+                    let country = country_code_from_storefront(&account.store_front)?;
+                    catalog.lookup(None, Some(bundle_id), country, Some(platform))?
+                } else {
+                    App {
+                        id: app_id.context("app ID is required")?,
+                        ..App::default()
+                    }
+                };
+                match backend.get_version_metadata(&account, &app, &external_version_id, platform) {
+                    Ok(metadata) => {
+                        match cli.format {
+                            Format::Json => println!("{}", serde_json::to_string(&metadata)?),
+                            Format::Text => {
+                                println!("displayVersion: {}", metadata.display_version);
+                                println!("releaseDate: {}", metadata.release_date);
                             }
                         }
                         break;
