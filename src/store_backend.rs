@@ -8,7 +8,9 @@ use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
 
 use crate::auth::{SapConfig, sap_config_from_bag_value};
+use crate::host::hardware_mac_address;
 use crate::sap_assets::SapAssetBundle;
+use crate::state::prepare_state_directory_from_environment;
 use crate::store_runtime::{StoreRuntime, StoreStandardRequest};
 use crate::transport::{
     DEFAULT_AUTHENTICATION_TIMEOUT, Request as HostRequest, Response as HostResponse, Transport,
@@ -49,6 +51,14 @@ enum Operation {
 }
 
 impl StoreBackend {
+    pub fn open() -> Result<Self> {
+        let hardware_id = hardware_mac_address().context("read Store hardware identity")?;
+        let state_directory = prepare_state_directory_from_environment()?;
+        let transport = Arc::new(Transport::with_cookies(&state_directory)?);
+        let assets = SapAssetBundle::load_or_download().context("load pinned Apple frameworks")?;
+        Ok(Self::new(&assets, hardware_id, transport))
+    }
+
     pub fn new(assets: &SapAssetBundle, hardware_id: [u8; 6], transport: Arc<Transport>) -> Self {
         Self::with_sender(
             assets.apple_media_services.clone(),
@@ -68,6 +78,10 @@ impl StoreBackend {
             sender: Arc::new(sender),
             bag: Mutex::new(None),
         }
+    }
+
+    pub fn hardware_id(&self) -> [u8; 6] {
+        self.hardware_id
     }
 
     pub fn bag(&self) -> Result<Value> {

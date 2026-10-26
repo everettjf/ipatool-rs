@@ -159,6 +159,64 @@ fn ioreg_hardware_mac(data: &[u8], interface: &str) -> Result<[u8; 6]> {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn ioreg_best_hardware_mac(data: &[u8]) -> Result<[u8; 6]> {
+    let root: Value = plist::from_bytes(data).context("parse IORegistry")?;
+    fn usable(mac: &[u8; 6]) -> bool {
+        mac[0] & 1 == 0 && *mac != [0; 6] && *mac != [2, 0, 0, 0, 0, 0]
+    }
+    fn visit(node: &Value, parent: Option<&Value>, candidates: &mut Vec<(u8, [u8; 6])>) {
+        let Some(dict) = node.as_dictionary() else {
+            return;
+        };
+        if let Some(name) = dict.get("BSD Name").and_then(Value::as_string)
+            && dict.get("IOBuiltin").and_then(Value::as_boolean) == Some(true)
+            && let Some(mac) = parent
+                .and_then(Value::as_dictionary)
+                .and_then(|parent| parent.get("IOMACAddress"))
+                .and_then(Value::as_data)
+                .and_then(|mac| <[u8; 6]>::try_from(mac).ok())
+            && usable(&mac)
+        {
+            candidates.push((u8::from(name != "en0"), mac));
+        }
+        if let Some(children) = dict
+            .get("IORegistryEntryChildren")
+            .and_then(Value::as_array)
+        {
+            for child in children {
+                visit(child, Some(node), candidates);
+            }
+        }
+    }
+    let mut candidates = Vec::new();
+    visit(&root, None, &mut candidates);
+    candidates.sort_unstable();
+    candidates
+        .first()
+        .map(|(_, mac)| *mac)
+        .context("no usable built-in hardware MAC address in IORegistry")
+}
+
+/// Hardware identity used by the Store guest and SAP signer on macOS.
+pub fn hardware_mac_address() -> Result<[u8; 6]> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/sbin/ioreg")
+            .args(["-a", "-l", "-p", "IOService"])
+            .output()
+            .context("read IORegistry hardware identity")?;
+        if !output.status.success() {
+            bail!("IORegistry hardware identity query failed");
+        }
+        ioreg_best_hardware_mac(&output.stdout)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        bail!("automatic Store hardware identity is not yet implemented for this platform")
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn system_version(flag: &str) -> Result<String> {
     let output = Command::new("/usr/bin/sw_vers")
@@ -259,5 +317,45 @@ mod tests {
             [1, 2, 3, 4, 5, 6]
         );
         assert!(ioreg_hardware_mac(&encoded, "en9").is_err());
+    }
+
+    #[test]
+    fn prefers_en0_physical_mac_and_rejects_unusable_addresses() {
+        let interface = |name: &str, mac: Vec<u8>| {
+            let mut child = plist::Dictionary::new();
+            child.insert("BSD Name".into(), Value::String(name.into()));
+            child.insert("IOBuiltin".into(), Value::Boolean(true));
+            let mut parent = plist::Dictionary::new();
+            parent.insert("IOMACAddress".into(), Value::Data(mac));
+            parent.insert(
+                "IORegistryEntryChildren".into(),
+                Value::Array(vec![Value::Dictionary(child)]),
+            );
+            Value::Dictionary(parent)
+        };
+        let mut root = plist::Dictionary::new();
+        root.insert(
+            "IORegistryEntryChildren".into(),
+            Value::Array(vec![
+                interface("en4", vec![0x10, 0, 0, 0, 0, 1]),
+                interface("en0", vec![0x02, 0, 0, 0, 0, 0]),
+                interface("en0", vec![0x20, 0, 0, 0, 0, 2]),
+            ]),
+        );
+        let mut encoded = Vec::new();
+        plist::to_writer_xml(&mut encoded, &Value::Dictionary(root)).unwrap();
+        assert_eq!(
+            ioreg_best_hardware_mac(&encoded).unwrap(),
+            [0x20, 0, 0, 0, 0, 2]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "depends on a local macOS hardware interface"]
+    fn reads_local_hardware_mac() {
+        let mac = hardware_mac_address().unwrap();
+        assert_eq!(mac.len(), 6);
+        assert_eq!(mac[0] & 1, 0);
     }
 }
