@@ -11,7 +11,7 @@ use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
 use ipatool_rs::fairplay_checkpoint::FairplayCheckpoint;
-use ipatool_rs::fairplay_checkpoint_run::CheckpointRunner;
+use ipatool_rs::fairplay_checkpoint_run::{CheckpointRunner, VirtualFileStat};
 use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
 use ipatool_rs::fairplay_download_capture::write_download_capture;
 use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2};
@@ -244,6 +244,12 @@ enum FairplayEnrollCommand {
         instruction_limit: usize,
         #[arg(long, default_value_t = 30)]
         timeout_seconds: u64,
+        #[arg(long = "file-payload", value_name = "SUFFIX=PATH")]
+        file_payloads: Vec<String>,
+        #[arg(long = "file-stat", value_name = "SUFFIX=MODE,UID,GID")]
+        file_stats: Vec<String>,
+        #[arg(long)]
+        missing_files_are_enoent: bool,
     },
     /// Transform a private 192/224-byte source with the embedded 26A428 state model.
     EvaluateState {
@@ -1039,6 +1045,9 @@ fn run() -> Result<()> {
                 stop_address,
                 instruction_limit,
                 timeout_seconds,
+                file_payloads,
+                file_stats,
+                missing_files_are_enoent,
             } => {
                 if timeout_seconds == 0 || timeout_seconds > 300 {
                     bail!("FairPlay timeout must be between 1 and 300 seconds");
@@ -1060,6 +1069,34 @@ fn run() -> Result<()> {
                 let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
                 let stop = parse_address(&stop_address)?;
                 let mut runner = CheckpointRunner::new(&snapshot, &binary)?;
+                runner.set_missing_files_are_enoent(missing_files_are_enoent);
+                for specification in file_payloads {
+                    let (suffix, path) = specification
+                        .split_once('=')
+                        .context("--file-payload requires SUFFIX=PATH")?;
+                    if suffix.is_empty() || path.is_empty() {
+                        bail!("--file-payload requires nonempty SUFFIX and PATH");
+                    }
+                    let data = read_private_bytes(&PathBuf::from(path), 128 * 1024 * 1024)?;
+                    runner.add_file_payload(suffix, data)?;
+                }
+                for specification in file_stats {
+                    let (suffix, fields) = specification
+                        .split_once('=')
+                        .context("--file-stat requires SUFFIX=MODE,UID,GID")?;
+                    let parts = fields.split(',').collect::<Vec<_>>();
+                    if suffix.is_empty() || parts.len() != 3 {
+                        bail!("--file-stat requires SUFFIX=MODE,UID,GID");
+                    }
+                    runner.add_file_stat(
+                        suffix,
+                        VirtualFileStat {
+                            mode: u16::try_from(parse_address(parts[0])?)?,
+                            uid: u32::try_from(parse_address(parts[1])?)?,
+                            gid: u32::try_from(parse_address(parts[2])?)?,
+                        },
+                    )?;
+                }
                 runner.run_until(
                     stop,
                     Duration::from_secs(timeout_seconds),
@@ -1464,6 +1501,8 @@ fn parse_nonnegative_i32(value: &str) -> Result<i32> {
 fn parse_address(value: &str) -> Result<u64> {
     if let Some(hex) = value.strip_prefix("0x") {
         Ok(u64::from_str_radix(hex, 16)?)
+    } else if let Some(octal) = value.strip_prefix("0o") {
+        Ok(u64::from_str_radix(octal, 8)?)
     } else {
         Ok(value.parse()?)
     }
@@ -1878,6 +1917,44 @@ mod tests {
         assert_eq!(paths.0, PathBuf::from("/tmp/App.decrypted.ipa"));
         assert_eq!(paths.1, PathBuf::from("/tmp/App.decrypted.json"));
         assert!(fairplay_download_paths(std::path::Path::new("/tmp/App.pkg"), None, None).is_err());
+    }
+
+    #[test]
+    fn fairplay_checkpoint_virtual_file_options_parse() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "continue-checkpoint",
+            "--checkpoint",
+            "/private/entry.pkl.gz",
+            "--fairplayd",
+            "/private/fairplayd",
+            "--stop-address",
+            "0x1000",
+            "--file-payload",
+            "SC Info.demo=/private/state",
+            "--file-stat",
+            "SC Info.demo=0o666,265,265",
+            "--missing-files-are-enoent",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::FairplayEnroll {
+                command:
+                    FairplayEnrollCommand::ContinueCheckpoint {
+                        file_payloads,
+                        file_stats,
+                        missing_files_are_enoent,
+                        ..
+                    },
+            } => {
+                assert_eq!(file_payloads, ["SC Info.demo=/private/state"]);
+                assert_eq!(file_stats, ["SC Info.demo=0o666,265,265"]);
+                assert!(missing_files_are_enoent);
+            }
+            _ => panic!("unexpected command"),
+        }
+        assert_eq!(parse_address("0o666").unwrap(), 0o666);
     }
 
     #[test]

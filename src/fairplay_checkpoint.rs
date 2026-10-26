@@ -401,6 +401,13 @@ impl FairplayCheckpoint {
             .map(|value| value.unwrap_or(0x1234_5678))
     }
 
+    pub(crate) fn optional_metadata(&self, name: &str) -> Option<&Value> {
+        let Value::Dict(root) = self.root.as_ref()? else {
+            return None;
+        };
+        root.get(&HashableValue::String(name.into()))
+    }
+
     /// Preserve original metadata when writing a resumed schema-2 snapshot.
     pub(crate) fn clone_root(&self) -> Result<Value> {
         if let Some(root) = &self.root {

@@ -33,6 +33,9 @@ const PAGE_BYTES: u64 = 4096;
 const MAX_SNAPSHOT_PAGES: usize = 30_000;
 const MAX_EXTERNAL_BYTES: u64 = 0x1000_0000;
 const EXTERNAL_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_VIRTUAL_FILE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_VIRTUAL_FILES: usize = 1024;
+const DARWIN_STAT_BYTES: usize = 144;
 const RET_X30: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
 const SYNTHETIC_ERRNO_ADDRESS: u64 = 0x7100_fff0_0000;
 const SYNTHETIC_NOOP_CALLBACK: u64 = 0x7200_0000_0000;
@@ -51,6 +54,160 @@ const STATIC_ALLOCATION_STRIDE: u64 = 0x10_0000;
 
 struct HostState {
     random_state: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct VirtualFileStat {
+    pub mode: u16,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl Default for VirtualFileStat {
+    fn default() -> Self {
+        Self {
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+        }
+    }
+}
+
+struct OpenVirtualFile {
+    data: Zeroizing<Vec<u8>>,
+    offset: usize,
+    path: Vec<u8>,
+    suffix: Vec<u8>,
+}
+
+struct VirtualFileState {
+    payloads: BTreeMap<Vec<u8>, Zeroizing<Vec<u8>>>,
+    stats: BTreeMap<Vec<u8>, VirtualFileStat>,
+    open: BTreeMap<u64, OpenVirtualFile>,
+    next_fd: u64,
+    removed: BTreeSet<Vec<u8>>,
+    missing_are_enoent: bool,
+}
+
+fn pickle_u64(value: &Value) -> Result<u64> {
+    match value {
+        Value::I64(value) => Ok(u64::try_from(*value)?),
+        Value::Int(value) => Ok(value.to_string().parse()?),
+        _ => bail!("FairPlay virtual file number has invalid type"),
+    }
+}
+
+fn pickle_field<'a>(fields: &'a BTreeMap<HashableValue, Value>, name: &str) -> Result<&'a Value> {
+    fields
+        .get(&HashableValue::String(name.into()))
+        .with_context(|| format!("FairPlay open-file entry has no {name}"))
+}
+
+impl VirtualFileState {
+    fn from_checkpoint(checkpoint: &FairplayCheckpoint) -> Result<Self> {
+        let mut state = Self {
+            payloads: BTreeMap::new(),
+            stats: BTreeMap::new(),
+            open: BTreeMap::new(),
+            next_fd: 100,
+            removed: BTreeSet::new(),
+            missing_are_enoent: false,
+        };
+        if let Some(value) = checkpoint.optional_metadata("next_fd") {
+            state.next_fd = pickle_u64(value)?;
+        }
+        if let Some(value) = checkpoint.optional_metadata("open_files") {
+            let Value::Dict(entries) = value else {
+                bail!("FairPlay open_files is not a dictionary");
+            };
+            if entries.len() > MAX_VIRTUAL_FILES {
+                bail!("FairPlay checkpoint has too many open files");
+            }
+            for (key, value) in entries {
+                let descriptor = match key {
+                    HashableValue::I64(value) => u64::try_from(*value)?,
+                    HashableValue::Int(value) => value.to_string().parse()?,
+                    _ => bail!("FairPlay open-file descriptor has invalid type"),
+                };
+                if descriptor >= state.next_fd {
+                    bail!("FairPlay checkpoint has invalid next_fd");
+                }
+                let Value::Dict(fields) = value else {
+                    bail!("FairPlay open-file entry is not a dictionary");
+                };
+                let Value::Bytes(data) = pickle_field(fields, "data")? else {
+                    bail!("FairPlay open-file data is not bytes");
+                };
+                let Value::Bytes(path) = pickle_field(fields, "path")? else {
+                    bail!("FairPlay open-file path is not bytes");
+                };
+                let Value::Bytes(suffix) = pickle_field(fields, "suffix")? else {
+                    bail!("FairPlay open-file suffix is not bytes");
+                };
+                let offset = usize::try_from(pickle_u64(pickle_field(fields, "offset")?)?)?;
+                if data.len() > MAX_VIRTUAL_FILE_BYTES {
+                    bail!("FairPlay open-file size exceeds limit");
+                }
+                state.open.insert(
+                    descriptor,
+                    OpenVirtualFile {
+                        data: Zeroizing::new(data.clone()),
+                        offset,
+                        path: path.clone(),
+                        suffix: suffix.clone(),
+                    },
+                );
+            }
+        }
+        if let Some(value) = checkpoint.optional_metadata("removed_file_suffixes") {
+            let Value::List(suffixes) = value else {
+                bail!("FairPlay removed_file_suffixes is not a list");
+            };
+            for suffix in suffixes {
+                let Value::String(suffix) = suffix else {
+                    bail!("FairPlay removed-file suffix is not a string");
+                };
+                state.removed.insert(suffix.as_bytes().to_vec());
+            }
+        }
+        Ok(state)
+    }
+
+    fn match_file(&self, path: &[u8]) -> Option<(&Vec<u8>, &Zeroizing<Vec<u8>>)> {
+        self.payloads
+            .iter()
+            .filter(|(suffix, _)| !self.removed.contains(*suffix) && path.ends_with(suffix))
+            .max_by_key(|(suffix, _)| suffix.len())
+    }
+
+    fn snapshot(&self) -> (Value, Value, Value) {
+        let open = self
+            .open
+            .iter()
+            .map(|(&descriptor, entry)| {
+                let fields = [
+                    ("data", Value::Bytes(entry.data.to_vec())),
+                    ("offset", Value::Int(entry.offset.into())),
+                    ("path", Value::Bytes(entry.path.clone())),
+                    ("suffix", Value::Bytes(entry.suffix.clone())),
+                ]
+                .into_iter()
+                .map(|(name, value)| (HashableValue::String(name.into()), value))
+                .collect();
+                (HashableValue::Int(descriptor.into()), Value::Dict(fields))
+            })
+            .collect();
+        let removed = self
+            .removed
+            .iter()
+            .map(|suffix| Value::String(String::from_utf8_lossy(suffix).into_owned()))
+            .collect();
+        (
+            Value::Dict(open),
+            Value::Int(self.next_fd.into()),
+            Value::List(removed),
+        )
+    }
 }
 
 struct AllocationState {
@@ -203,6 +360,7 @@ pub struct CheckpointRunner {
     allocation_state: Rc<RefCell<AllocationState>>,
     once_tokens: Rc<RefCell<BTreeSet<u64>>>,
     host_state: Rc<RefCell<HostState>>,
+    virtual_files: Rc<RefCell<VirtualFileState>>,
     errno_mapped: bool,
 }
 
@@ -260,14 +418,155 @@ fn guest_string_length(context: &HookContext, address: u64, limit: u64) -> Resul
     Ok(limit)
 }
 
+fn guest_path(context: &HookContext, address: u64) -> Result<Vec<u8>> {
+    let length = guest_string_length(context, address, 0x10000)?;
+    if length == 0x10000 {
+        bail!("unterminated FairPlay virtual file path");
+    }
+    context.mem_read(address, length as usize)
+}
+
+fn set_guest_errno(context: &HookContext, errno: u32) -> Result<()> {
+    context.mem_write(SYNTHETIC_ERRNO_ADDRESS, &errno.to_le_bytes())
+}
+
+fn write_guest_stat(
+    context: &HookContext,
+    address: u64,
+    size: usize,
+    metadata: VirtualFileStat,
+) -> Result<()> {
+    let mut stat = [0u8; DARWIN_STAT_BYTES];
+    stat[4..6].copy_from_slice(&(0o100000 | (metadata.mode & 0o7777)).to_le_bytes());
+    stat[6..8].copy_from_slice(&1u16.to_le_bytes());
+    stat[16..20].copy_from_slice(&metadata.uid.to_le_bytes());
+    stat[20..24].copy_from_slice(&metadata.gid.to_le_bytes());
+    stat[96..104].copy_from_slice(&(size as u64).to_le_bytes());
+    context.mem_write(address, &stat)
+}
+
+fn run_virtual_file_external(
+    context: &HookContext,
+    symbol: &str,
+    files: &Rc<RefCell<VirtualFileState>>,
+) -> Result<()> {
+    match symbol {
+        "open" | "open_dprotected_np" | "stat" | "lstat" | "unlink" => {
+            let path = guest_path(context, guest_register(context, 0)?)?;
+            let mut files = files.borrow_mut();
+            let Some(suffix) = files.match_file(&path).map(|(suffix, _)| suffix.clone()) else {
+                if symbol == "unlink" || files.missing_are_enoent {
+                    set_guest_errno(context, 2)?;
+                    context.reg_write(199, 0xffff_ffff)?;
+                    return Ok(());
+                }
+                bail!("unmodeled FairPlay virtual file for {symbol}");
+            };
+            match symbol {
+                "open" | "open_dprotected_np" => {
+                    if files.open.len() >= MAX_VIRTUAL_FILES {
+                        bail!("too many FairPlay virtual files are open");
+                    }
+                    let open_bytes = files.open.values().try_fold(0usize, |sum, entry| {
+                        sum.checked_add(entry.data.len())
+                            .context("FairPlay virtual file memory overflow")
+                    })?;
+                    if open_bytes.saturating_add(files.payloads[&suffix].len())
+                        > MAX_VIRTUAL_FILE_BYTES
+                    {
+                        bail!("FairPlay open-file data exceeds memory limit");
+                    }
+                    let data = files.payloads[&suffix].to_vec();
+                    let descriptor = files.next_fd;
+                    files.next_fd = files
+                        .next_fd
+                        .checked_add(1)
+                        .context("FairPlay fd overflow")?;
+                    files.open.insert(
+                        descriptor,
+                        OpenVirtualFile {
+                            data: Zeroizing::new(data),
+                            offset: 0,
+                            path,
+                            suffix,
+                        },
+                    );
+                    context.reg_write(199, descriptor)?;
+                }
+                "stat" | "lstat" => {
+                    let metadata = files.stats.get(&suffix).copied().unwrap_or_default();
+                    write_guest_stat(
+                        context,
+                        guest_register(context, 1)?,
+                        files.payloads[&suffix].len(),
+                        metadata,
+                    )?;
+                    context.reg_write(199, 0)?;
+                }
+                "unlink" => {
+                    files.removed.insert(suffix);
+                    context.reg_write(199, 0)?;
+                }
+                _ => unreachable!(),
+            }
+        }
+        "fstat" | "read" | "close" => {
+            let descriptor = guest_register(context, 0)?;
+            let mut files = files.borrow_mut();
+            match symbol {
+                "fstat" => {
+                    if let Some(entry) = files.open.get(&descriptor) {
+                        let metadata = files.stats.get(&entry.suffix).copied().unwrap_or_default();
+                        write_guest_stat(
+                            context,
+                            guest_register(context, 1)?,
+                            entry.data.len(),
+                            metadata,
+                        )?;
+                        context.reg_write(199, 0)?;
+                    } else {
+                        set_guest_errno(context, 9)?;
+                        context.reg_write(199, 0xffff_ffff)?;
+                    }
+                }
+                "read" => {
+                    if let Some(entry) = files.open.get_mut(&descriptor) {
+                        let count =
+                            usize::try_from(guest_register(context, 2)?.min(MAX_EXTERNAL_BYTES))?;
+                        let start = entry.offset.min(entry.data.len());
+                        let end = start.saturating_add(count).min(entry.data.len());
+                        let data = &entry.data[start..end];
+                        context.mem_write(guest_register(context, 1)?, data)?;
+                        entry.offset = entry.offset.saturating_add(data.len());
+                        context.reg_write(199, data.len() as u64)?;
+                    } else {
+                        set_guest_errno(context, 9)?;
+                        context.reg_write(199, 0xffff_ffff)?;
+                    }
+                }
+                "close" => {
+                    files.open.remove(&descriptor);
+                    context.reg_write(199, 0)?;
+                }
+                _ => unreachable!(),
+            }
+        }
+        _ => bail!("unmodeled FairPlay virtual file function {symbol}"),
+    }
+    Ok(())
+}
+
 fn run_modeled_external(
     context: &HookContext,
     symbol: &str,
     allocations: &Rc<RefCell<AllocationState>>,
     once_tokens: &Rc<RefCell<BTreeSet<u64>>>,
     host_state: &Rc<RefCell<HostState>>,
+    virtual_files: &Rc<RefCell<VirtualFileState>>,
 ) -> Result<()> {
     match symbol {
+        "open" | "open_dprotected_np" | "stat" | "lstat" | "fstat" | "read" | "close"
+        | "unlink" => run_virtual_file_external(context, symbol, virtual_files)?,
         "malloc" | "malloc_type_malloc" | "calloc" | "malloc_type_calloc" => {
             let size = if matches!(symbol, "calloc" | "malloc_type_calloc") {
                 guest_register(context, 0)?
@@ -351,7 +650,26 @@ fn run_modeled_external(
             let length = guest_register(context, 1)?;
             let flags = guest_register(context, 3)?;
             let descriptor = guest_register(context, 4)?;
-            if matches!(descriptor, 0xffff_ffff | u64::MAX) && flags & 0x1000 != 0 {
+            let files = virtual_files.borrow();
+            if let Some(entry) = files.open.get(&descriptor) {
+                let accessible = length
+                    .checked_add(0x3fff)
+                    .context("FairPlay mmap length overflow")?
+                    & !0x3fff;
+                let address = allocations.borrow_mut().allocate(context, accessible)?;
+                let offset = usize::try_from(guest_register(context, 5)?)?;
+                if offset < entry.data.len() {
+                    let available = (entry.data.len() - offset).min(accessible as usize);
+                    for (index, chunk) in entry.data[offset..offset + available]
+                        .chunks(EXTERNAL_CHUNK_BYTES)
+                        .enumerate()
+                    {
+                        context
+                            .mem_write(address + (index * EXTERNAL_CHUNK_BYTES) as u64, chunk)?;
+                    }
+                }
+                context.reg_write(199, address)?;
+            } else if matches!(descriptor, 0xffff_ffff | u64::MAX) && flags & 0x1000 != 0 {
                 let address = allocations.borrow_mut().allocate(context, length)?;
                 context.reg_write(199, address)?;
             } else {
@@ -372,7 +690,7 @@ fn install_modeled_external(
     failure: &Rc<RefCell<Option<String>>>,
     allocations: &Rc<RefCell<AllocationState>>,
     once_tokens: &Rc<RefCell<BTreeSet<u64>>>,
-    host_state: &Rc<RefCell<HostState>>,
+    services: (&Rc<RefCell<HostState>>, &Rc<RefCell<VirtualFileState>>),
 ) -> Result<bool> {
     let symbol = symbol.trim_start_matches('_');
     if !matches!(
@@ -396,6 +714,14 @@ fn install_modeled_external(
             | "error"
             | "mmap"
             | "munmap"
+            | "open"
+            | "open_dprotected_np"
+            | "stat"
+            | "lstat"
+            | "fstat"
+            | "read"
+            | "close"
+            | "unlink"
     ) {
         return Ok(false);
     }
@@ -415,7 +741,8 @@ fn install_modeled_external(
     let failure = Rc::clone(failure);
     let allocations = Rc::clone(allocations);
     let once_tokens = Rc::clone(once_tokens);
-    let host_state = Rc::clone(host_state);
+    let host_state = Rc::clone(services.0);
+    let virtual_files = Rc::clone(services.1);
     engine.add_code_hook(address, address, move |context, _, _| {
         if let Err(error) = run_modeled_external(
             context,
@@ -423,6 +750,7 @@ fn install_modeled_external(
             &allocations,
             &once_tokens,
             &host_state,
+            &virtual_files,
         ) {
             *failure.borrow_mut() = Some(format!("FairPlay external {symbol_name}: {error:#}"));
             let _ = context.stop();
@@ -460,11 +788,22 @@ impl CheckpointRunner {
         let host_state = Rc::new(RefCell::new(HostState {
             random_state: checkpoint.random_state()?,
         }));
+        let virtual_files = Rc::new(RefCell::new(VirtualFileState::from_checkpoint(checkpoint)?));
         let source_pages = checkpoint.page_addresses()?;
-        let errno_mapped = image
-            .externals
-            .values()
-            .any(|symbol| matches!(symbol.trim_start_matches('_'), "error" | "mmap"));
+        let errno_mapped = image.externals.values().any(|symbol| {
+            matches!(
+                symbol.trim_start_matches('_'),
+                "error"
+                    | "mmap"
+                    | "open"
+                    | "open_dprotected_np"
+                    | "stat"
+                    | "lstat"
+                    | "fstat"
+                    | "read"
+                    | "unlink"
+            )
+        });
         if errno_mapped && !source_pages.contains(&SYNTHETIC_ERRNO_ADDRESS) {
             engine.mem_map(SYNTHETIC_ERRNO_ADDRESS, PAGE_BYTES as usize)?;
         }
@@ -487,7 +826,7 @@ impl CheckpointRunner {
                 &external_failure,
                 &allocation_state,
                 &once_tokens,
-                &host_state,
+                (&host_state, &virtual_files),
             )? {
                 modeled_imports += 1;
             }
@@ -502,8 +841,52 @@ impl CheckpointRunner {
             allocation_state,
             once_tokens,
             host_state,
+            virtual_files,
             errno_mapped,
         })
+    }
+
+    pub fn add_file_payload(&mut self, suffix: &str, data: Zeroizing<Vec<u8>>) -> Result<()> {
+        if suffix.is_empty() || suffix.len() > 4096 || data.len() > MAX_VIRTUAL_FILE_BYTES {
+            bail!("FairPlay virtual file suffix or payload exceeds limit");
+        }
+        let mut files = self.virtual_files.borrow_mut();
+        if files.payloads.len() >= MAX_VIRTUAL_FILES
+            && !files.payloads.contains_key(suffix.as_bytes())
+        {
+            bail!("too many FairPlay virtual file payloads");
+        }
+        let total = files
+            .payloads
+            .iter()
+            .try_fold(0usize, |sum, (key, payload)| {
+                if key.as_slice() == suffix.as_bytes() {
+                    Ok(sum)
+                } else {
+                    sum.checked_add(payload.len())
+                        .context("FairPlay virtual file memory overflow")
+                }
+            })?;
+        if total.saturating_add(data.len()) > MAX_VIRTUAL_FILE_BYTES {
+            bail!("FairPlay virtual file payloads exceed memory limit");
+        }
+        files.payloads.insert(suffix.as_bytes().to_vec(), data);
+        Ok(())
+    }
+
+    pub fn add_file_stat(&mut self, suffix: &str, metadata: VirtualFileStat) -> Result<()> {
+        if suffix.is_empty() || suffix.len() > 4096 {
+            bail!("FairPlay virtual file suffix exceeds limit");
+        }
+        self.virtual_files
+            .borrow_mut()
+            .stats
+            .insert(suffix.as_bytes().to_vec(), metadata);
+        Ok(())
+    }
+
+    pub fn set_missing_files_are_enoent(&mut self, enabled: bool) {
+        self.virtual_files.borrow_mut().missing_are_enoent = enabled;
     }
 
     pub fn run_until(
@@ -612,6 +995,7 @@ impl CheckpointRunner {
             .context("fairplayd path is not UTF-8")?
             .to_owned();
         let pc = self.engine.reg_read(REG_PC)?;
+        let (open_files, next_fd, removed_file_suffixes) = self.virtual_files.borrow().snapshot();
         let mut root = SensitiveValue(source.clone_root()?);
         let Value::Dict(ref mut fields) = root.0 else {
             bail!("checkpoint root is not a dictionary");
@@ -641,6 +1025,9 @@ impl CheckpointRunner {
                 "random_state",
                 Value::I64(i64::from(self.host_state.borrow().random_state)),
             ),
+            ("open_files", open_files),
+            ("next_fd", next_fd),
+            ("removed_file_suffixes", removed_file_suffixes),
         ];
         for (name, value) in updates {
             if let Some(mut old) = fields.insert(HashableValue::String(name.into()), value) {
@@ -687,6 +1074,9 @@ mod tests {
         let host_state = Rc::new(RefCell::new(HostState {
             random_state: source.random_state().unwrap(),
         }));
+        let virtual_files = Rc::new(RefCell::new(
+            VirtualFileState::from_checkpoint(&source).unwrap(),
+        ));
         let call = |engine: &mut Engine, index: u64, symbol: &str, args: [u64; 3]| {
             let address = EXTERNAL_BASE + index * EXTERNAL_STRIDE;
             assert!(
@@ -697,7 +1087,7 @@ mod tests {
                     &failure,
                     &allocations,
                     &once_tokens,
-                    &host_state,
+                    (&host_state, &virtual_files),
                 )
                 .unwrap()
             );
@@ -734,7 +1124,7 @@ mod tests {
                 &failure,
                 &allocations,
                 &once_tokens,
-                &host_state,
+                (&host_state, &virtual_files),
             )
             .unwrap()
         );
@@ -762,6 +1152,9 @@ mod tests {
         let host_state = Rc::new(RefCell::new(HostState {
             random_state: source.random_state().unwrap(),
         }));
+        let virtual_files = Rc::new(RefCell::new(
+            VirtualFileState::from_checkpoint(&source).unwrap(),
+        ));
         install_modeled_external(
             &mut engine,
             EXTERNAL_BASE,
@@ -769,7 +1162,7 @@ mod tests {
             &failure,
             &allocations,
             &once_tokens,
-            &host_state,
+            (&host_state, &virtual_files),
         )
         .unwrap();
         engine.reg_write(199, 0x9000).unwrap();
@@ -806,7 +1199,7 @@ mod tests {
             &runner.external_failure,
             &runner.allocation_state,
             &runner.once_tokens,
-            &runner.host_state,
+            (&runner.host_state, &runner.virtual_files),
         )
         .unwrap();
         runner.engine.reg_write(199, 5000).unwrap();
@@ -831,7 +1224,7 @@ mod tests {
             &runner.external_failure,
             &runner.allocation_state,
             &runner.once_tokens,
-            &runner.host_state,
+            (&runner.host_state, &runner.virtual_files),
         )
         .unwrap();
         runner.engine.reg_write(199, 2).unwrap();
@@ -932,7 +1325,7 @@ mod tests {
                 &runner.external_failure,
                 &runner.allocation_state,
                 &runner.once_tokens,
-                &runner.host_state,
+                (&runner.host_state, &runner.virtual_files),
             )
             .unwrap();
         };
@@ -997,7 +1390,7 @@ mod tests {
                 &runner.external_failure,
                 &runner.allocation_state,
                 &runner.once_tokens,
-                &runner.host_state,
+                (&runner.host_state, &runner.virtual_files),
             )
             .unwrap();
             runner.engine.reg_write(199, x0).unwrap();
@@ -1036,7 +1429,7 @@ mod tests {
             &runner.external_failure,
             &runner.allocation_state,
             &runner.once_tokens,
-            &runner.host_state,
+            (&runner.host_state, &runner.virtual_files),
         )
         .unwrap();
         runner.engine.reg_write(200, 8192).unwrap();
@@ -1093,6 +1486,139 @@ mod tests {
         let mut replay = CheckpointRunner::new(&resumed, SYNTHETIC_BINARY).unwrap();
         let next = expected.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         assert_eq!(call(&mut replay, 0, "_arc4random", 0), u64::from(next));
+    }
+
+    #[test]
+    fn virtual_file_operations_resume_with_open_offset_and_removed_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let binary_path = directory.path().join("fairplayd.arm64e");
+        let output_path = directory.path().join("resumed.pkl.gz");
+        std::fs::write(&binary_path, SYNTHETIC_BINARY).unwrap();
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        runner.engine.mem_map(0x8000, PAGE_BYTES as usize).unwrap();
+        runner.engine.mem_map(0x9000, PAGE_BYTES as usize).unwrap();
+        runner.engine.mem_map(0xa000, PAGE_BYTES as usize).unwrap();
+        runner
+            .engine
+            .mem_map(SYNTHETIC_ERRNO_ADDRESS, PAGE_BYTES as usize)
+            .unwrap();
+        runner.errno_mapped = true;
+        runner
+            .engine
+            .mem_write(0x8000, b"/var/db/fpsd/SC Info.demo\0")
+            .unwrap();
+        runner
+            .add_file_payload("SC Info.demo", Zeroizing::new(b"abcdef".to_vec()))
+            .unwrap();
+        runner
+            .add_file_stat(
+                "SC Info.demo",
+                VirtualFileStat {
+                    mode: 0o666,
+                    uid: 265,
+                    gid: 265,
+                },
+            )
+            .unwrap();
+        runner.set_missing_files_are_enoent(true);
+        let call = |runner: &mut CheckpointRunner, index: u64, symbol: &str, args: [u64; 6]| {
+            let address = EXTERNAL_BASE + index * EXTERNAL_STRIDE;
+            install_modeled_external(
+                &mut runner.engine,
+                address,
+                symbol,
+                &runner.external_failure,
+                &runner.allocation_state,
+                &runner.once_tokens,
+                (&runner.host_state, &runner.virtual_files),
+            )
+            .unwrap();
+            for (index, value) in args.into_iter().enumerate() {
+                runner.engine.reg_write(199 + index as i32, value).unwrap();
+            }
+            runner.engine.reg_write(2, 0x5000).unwrap();
+            runner
+                .engine
+                .start_bounded(address, 0x5000, Duration::from_secs(2), 4)
+                .unwrap();
+            assert!(runner.external_failure.borrow().is_none());
+            runner.engine.reg_read(199).unwrap()
+        };
+
+        let descriptor = call(&mut runner, 0, "_open", [0x8000, 0, 0, 0, 0, 0]);
+        assert_eq!(descriptor, 100);
+        assert_eq!(
+            call(&mut runner, 1, "_stat", [0x8000, 0xa000, 0, 0, 0, 0]),
+            0
+        );
+        let stat = runner.engine.mem_read(0xa000, DARWIN_STAT_BYTES).unwrap();
+        assert_eq!(u16::from_le_bytes(stat[4..6].try_into().unwrap()), 0o100666);
+        assert_eq!(u32::from_le_bytes(stat[16..20].try_into().unwrap()), 265);
+        assert_eq!(u64::from_le_bytes(stat[96..104].try_into().unwrap()), 6);
+        assert_eq!(
+            call(&mut runner, 2, "_fstat", [descriptor, 0xa000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            call(&mut runner, 3, "_read", [descriptor, 0x9000, 3, 0, 0, 0]),
+            3
+        );
+        assert_eq!(runner.engine.mem_read(0x9000, 3).unwrap(), b"abc");
+        let mapped = call(&mut runner, 4, "_mmap", [0, 6, 0, 0, descriptor, 0]);
+        assert_eq!(runner.engine.mem_read(mapped, 6).unwrap(), b"abcdef");
+        assert_eq!(call(&mut runner, 5, "_unlink", [0x8000, 0, 0, 0, 0, 0]), 0);
+        runner
+            .engine
+            .reg_write(REG_PC, source.pc().unwrap())
+            .unwrap();
+        runner
+            .write_checkpoint(&source, &binary_path, &output_path)
+            .unwrap();
+
+        let resumed = FairplayCheckpoint::load_private(&output_path).unwrap();
+        let mut replay = CheckpointRunner::new(&resumed, SYNTHETIC_BINARY).unwrap();
+        replay.engine.mem_map(0x8000, PAGE_BYTES as usize).unwrap();
+        replay.engine.mem_map(0x9000, PAGE_BYTES as usize).unwrap();
+        replay
+            .engine
+            .mem_write(0x8000, b"/var/db/fpsd/SC Info.demo\0")
+            .unwrap();
+        replay
+            .add_file_payload("SC Info.demo", Zeroizing::new(b"abcdef".to_vec()))
+            .unwrap();
+        replay.set_missing_files_are_enoent(true);
+        assert_eq!(
+            call(&mut replay, 0, "_open", [0x8000, 0, 0, 0, 0, 0]),
+            0xffff_ffff
+        );
+        assert_eq!(
+            replay.engine.mem_read(SYNTHETIC_ERRNO_ADDRESS, 4).unwrap(),
+            2u32.to_le_bytes()
+        );
+        assert_eq!(
+            call(&mut replay, 1, "_read", [descriptor, 0x9000, 6, 0, 0, 0]),
+            3
+        );
+        assert_eq!(replay.engine.mem_read(0x9000, 3).unwrap(), b"def");
+        assert_eq!(
+            call(&mut replay, 2, "_close", [descriptor, 0, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            call(&mut replay, 3, "_read", [descriptor, 0x9000, 1, 0, 0, 0]),
+            0xffff_ffff
+        );
+        assert_eq!(
+            replay.engine.mem_read(SYNTHETIC_ERRNO_ADDRESS, 4).unwrap(),
+            9u32.to_le_bytes()
+        );
     }
 
     #[test]
