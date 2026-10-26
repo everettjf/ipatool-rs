@@ -8,6 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
+use ipatool_rs::fairplay_checkpoint::FairplayCheckpoint;
 use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
 use ipatool_rs::fairplay_download_capture::write_download_capture;
 use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2};
@@ -298,6 +299,29 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         fairplayd_sha256: String,
         #[arg(long, help = "Absolute source offset within the SINF, e.g. 0x1e0")]
+        source_offset: String,
+        #[arg(long, default_value = "0x98")]
+        final_xor: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Build an FPSENR3 decoder directly from three private schema-2 checkpoints.
+    BuildModelV3Checkpoints {
+        #[arg(long)]
+        recovered_model: PathBuf,
+        #[arg(long)]
+        whitebox_checkpoint: PathBuf,
+        #[arg(long)]
+        postcodec_entry_checkpoint: PathBuf,
+        #[arg(long)]
+        postcodec_exit_checkpoint: PathBuf,
+        #[arg(long, default_value = "0x710000014ee0")]
+        buffer_address: String,
+        #[arg(long)]
+        sinf: PathBuf,
+        #[arg(long)]
+        selector: String,
+        #[arg(long)]
         source_offset: String,
         #[arg(long, default_value = "0x98")]
         final_xor: String,
@@ -1177,6 +1201,66 @@ fn run() -> Result<()> {
                     ),
                 }
             }
+            FairplayEnrollCommand::BuildModelV3Checkpoints {
+                recovered_model,
+                whitebox_checkpoint,
+                postcodec_entry_checkpoint,
+                postcodec_exit_checkpoint,
+                buffer_address,
+                sinf,
+                selector,
+                source_offset,
+                final_xor,
+                output,
+            } => {
+                let recovered = read_private_model(&recovered_model)?;
+                let whitebox = FairplayCheckpoint::load_private(&whitebox_checkpoint)?;
+                let post_entry = FairplayCheckpoint::load_private(&postcodec_entry_checkpoint)?;
+                let post_exit = FairplayCheckpoint::load_private(&postcodec_exit_checkpoint)?;
+                if whitebox.binary_hash != post_entry.binary_hash
+                    || whitebox.binary_hash != post_exit.binary_hash
+                {
+                    bail!("version-3 checkpoints have different fairplayd builds");
+                }
+                let buffer_address = parse_address(&buffer_address)?;
+                let whitebox_entry =
+                    whitebox.read_block::<FIRST_TRANSFORM_BYTES>(buffer_address)?;
+                let postcodec_entry =
+                    post_entry.read_block::<FIRST_TRANSFORM_BYTES>(buffer_address)?;
+                let postcodec_exit =
+                    post_exit.read_block::<FIRST_TRANSFORM_BYTES>(buffer_address)?;
+                let sinf = read_private_bytes(&sinf, 1024 * 1024)?;
+                let selector = parse_enrollment_selector(&selector)?;
+                let source_offset = parse_nonnegative_i32(&source_offset)?;
+                let final_xor = parse_byte(&final_xor)?;
+                let model = build_fpsenr3(V3Material {
+                    recovered: &recovered,
+                    selector,
+                    fairplayd_sha256: whitebox.binary_hash,
+                    source_offset,
+                    final_xor,
+                    whitebox_entry: &whitebox_entry,
+                    postcodec_entry: &postcodec_entry,
+                    postcodec_exit: &postcodec_exit,
+                    sinf: &sinf,
+                })?;
+                write_private_binary(&output, &model)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "fairplay.enrollment-model.v3",
+                            "output": output,
+                            "selector": selector.identifier(),
+                            "bytes": model.len(),
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Built private FairPlay v3 enrollment model from checkpoints in {}",
+                        output.display()
+                    ),
+                }
+            }
         },
     }
     if cli.verbose {
@@ -1213,12 +1297,16 @@ fn parse_sha256(value: &str) -> Result<[u8; 32]> {
 }
 
 fn parse_nonnegative_i32(value: &str) -> Result<i32> {
-    let parsed = if let Some(hex) = value.strip_prefix("0x") {
-        u32::from_str_radix(hex, 16)?
-    } else {
-        value.parse::<u32>()?
-    };
+    let parsed = u32::try_from(parse_address(value)?)?;
     i32::try_from(parsed).context("SINF source offset exceeds signed 32-bit range")
+}
+
+fn parse_address(value: &str) -> Result<u64> {
+    if let Some(hex) = value.strip_prefix("0x") {
+        Ok(u64::from_str_radix(hex, 16)?)
+    } else {
+        Ok(value.parse()?)
+    }
 }
 
 fn parse_byte(value: &str) -> Result<u8> {
@@ -1508,6 +1596,39 @@ mod tests {
         assert_eq!(parse_byte("0x98").unwrap(), 0x98);
         assert!(parse_nonnegative_i32("0x80000000").is_err());
         assert!(parse_byte("256").is_err());
+    }
+
+    #[test]
+    fn build_model_v3_checkpoints_accepts_private_sources() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "build-model-v3-checkpoints",
+            "--recovered-model",
+            "/private/recovered.json",
+            "--whitebox-checkpoint",
+            "/private/whitebox.pkl.gz",
+            "--postcodec-entry-checkpoint",
+            "/private/post-entry.pkl.gz",
+            "--postcodec-exit-checkpoint",
+            "/private/post-exit.pkl.gz",
+            "--sinf",
+            "/private/installed.sinf",
+            "--selector",
+            "0000000b:0000000d",
+            "--source-offset",
+            "0x1e0",
+            "--output",
+            "/private/enrollment.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::BuildModelV3Checkpoints { .. }
+            }
+        ));
+        assert_eq!(parse_address("0x710000014ee0").unwrap(), 0x7100_0001_4ee0);
     }
 
     #[test]

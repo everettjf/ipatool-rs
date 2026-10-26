@@ -50,6 +50,7 @@ rmcp = { version = "3.7.0", default-features = false, features = ["server", "mac
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
 schemars = "1"
 flate2 = "1"
+serde-pickle = "1.2.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
