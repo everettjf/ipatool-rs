@@ -5,6 +5,7 @@ pub mod cookies;
 pub mod credentials;
 pub mod fairplay;
 pub mod host;
+pub mod machimage;
 pub mod platform;
 pub mod state;
 pub mod store_memory;
