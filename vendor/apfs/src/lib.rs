@@ -375,7 +375,23 @@ impl<R: Read + Seek> ApfsVolume<R> {
         &mut self,
         path: &str,
         name: &str,
-    ) -> Result<extents::ApfsForkReader<'_, R>> {
+    ) -> Result<extents::ApfsForkReader<&mut R>> {
+        let (extents, size) = self.xattr_stream_info(path, name)?;
+        Ok(extents::ApfsForkReader::new(
+            &mut self.reader,
+            self.block_size,
+            extents,
+            size,
+        ))
+    }
+
+    /// Return the physical extent map for an xattr data stream. A caller can
+    /// use it with its own device handle to keep several forks open at once.
+    pub fn xattr_stream_info(
+        &mut self,
+        path: &str,
+        name: &str,
+    ) -> Result<(Vec<catalog::FileExtentRecord>, u64)> {
         let (oid, _) = catalog::resolve_path(
             &mut self.reader,
             self.catalog_root_block,
@@ -400,13 +416,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             }
             None => return Err(ApfsError::FileNotFound(format!("{path}: {name}"))),
         };
-        let extents = self.data_extents(obj_id)?;
-        Ok(extents::ApfsForkReader::new(
-            &mut self.reader,
-            self.block_size,
-            extents,
-            size,
-        ))
+        Ok((self.data_extents(obj_id)?, size))
     }
 
     /// The `com.apple.decmpfs` header of a transparently compressed inode, or
@@ -476,14 +486,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
         }
 
         // File extents are keyed by private_id, not the inode OID
-        let file_extents = catalog::lookup_extents(
-            &mut self.reader,
-            self.catalog_root_block,
-            self.vol_omap_root_block,
-            self.block_size,
-            self.sealed_tree_base,
-            inode.private_id,
-        )?;
+        let file_extents = self.data_extents(inode.private_id)?;
 
         extents::read_file_data(
             &mut self.reader,
@@ -499,7 +502,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
     /// Fails on a transparently compressed file: its data fork is empty, so a
     /// reader over the extents would report a successful read of nothing. Use
     /// [`Self::read_file`] for those.
-    pub fn open_file(&mut self, path: &str) -> Result<extents::ApfsForkReader<'_, R>> {
+    pub fn open_file(&mut self, path: &str) -> Result<extents::ApfsForkReader<&mut R>> {
         let (oid, _) = catalog::resolve_path(
             &mut self.reader,
             self.catalog_root_block,
@@ -526,14 +529,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
         )?;
 
         // File extents are keyed by private_id, not the inode OID
-        let file_extents = catalog::lookup_extents(
-            &mut self.reader,
-            self.catalog_root_block,
-            self.vol_omap_root_block,
-            self.block_size,
-            self.sealed_tree_base,
-            inode.private_id,
-        )?;
+        let file_extents = self.data_extents(inode.private_id)?;
 
         Ok(extents::ApfsForkReader::new(
             &mut self.reader,

@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod cookies;
 pub mod credentials;
 pub mod decmpfs;
+pub mod dyld_cache;
 pub mod fairplay;
 pub mod host;
 pub mod lzbitmap;

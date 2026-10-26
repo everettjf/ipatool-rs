@@ -107,17 +107,17 @@ pub fn read_file_data<R: Read + Seek, W: Write>(
 }
 
 /// A reader that presents a file's extents as a contiguous Read + Seek stream.
-pub struct ApfsForkReader<'a, R: Read + Seek> {
-    reader: &'a mut R,
+pub struct ApfsForkReader<R: Read + Seek> {
+    reader: R,
     logical_size: u64,
     /// (logical_start, physical_start, length_bytes)
     extent_map: Vec<(u64, u64, u64)>,
     position: u64,
 }
 
-impl<'a, R: Read + Seek> ApfsForkReader<'a, R> {
+impl<R: Read + Seek> ApfsForkReader<R> {
     pub fn new(
-        reader: &'a mut R,
+        reader: R,
         block_size: u32,
         extents: Vec<FileExtentRecord>,
         logical_size: u64,
@@ -184,7 +184,7 @@ enum Mapping {
     Hole { available: u64 },
 }
 
-impl<R: Read + Seek> Read for ApfsForkReader<'_, R> {
+impl<R: Read + Seek> Read for ApfsForkReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.position >= self.logical_size {
             return Ok(0);
@@ -233,7 +233,7 @@ impl<R: Read + Seek> Read for ApfsForkReader<'_, R> {
     }
 }
 
-impl<R: Read + Seek> Seek for ApfsForkReader<'_, R> {
+impl<R: Read + Seek> Seek for ApfsForkReader<R> {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         let new_pos = match pos {
             SeekFrom::Start(offset) => offset as i64,

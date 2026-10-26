@@ -1,7 +1,9 @@
 //! Bounded parsing of AEA cryptex headers and FCS metadata.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::rc::Rc;
 use std::time::Duration;
 
 use aes::Aes256;
@@ -154,6 +156,64 @@ impl Seek for AeaReader<'_> {
         self.cursor = u64::try_from(target)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid AEA seek"))?;
         Ok(self.cursor)
+    }
+}
+
+/// Independent file positions backed by one authenticated AEA segment cache.
+/// This lets several APFS data forks share the same remote image efficiently.
+pub struct SharedAeaReader<'a> {
+    inner: Rc<RefCell<AeaReader<'a>>>,
+    position: u64,
+    size: u64,
+}
+
+impl<'a> SharedAeaReader<'a> {
+    pub fn new(reader: AeaReader<'a>) -> Self {
+        let size = reader.size();
+        Self {
+            inner: Rc::new(RefCell::new(reader)),
+            position: 0,
+            size,
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+impl Clone for SharedAeaReader<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+            position: self.position,
+            size: self.size,
+        }
+    }
+}
+
+impl Read for SharedAeaReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self
+            .inner
+            .borrow_mut()
+            .read_at(buffer, self.position)
+            .map_err(io::Error::other)?;
+        self.position += count as u64;
+        Ok(count)
+    }
+}
+
+impl Seek for SharedAeaReader<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let target = match position {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
+            SeekFrom::End(delta) => i128::from(self.size) + i128::from(delta),
+        };
+        self.position = u64::try_from(target)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid shared AEA seek"))?;
+        Ok(self.position)
     }
 }
 
@@ -978,7 +1038,8 @@ mod tests {
     fn pinned_aea_image_opens_apfs_volume() {
         let restore = crate::sap_archive::PinnedRestore::open().unwrap();
         let image = AeaReader::open(&restore.remote, restore.file_system).unwrap();
-        let mut volume = apfs::ApfsVolume::open(image).unwrap();
+        let shared = SharedAeaReader::new(image);
+        let mut volume = apfs::ApfsVolume::open(shared.clone()).unwrap();
         eprintln!("APFS volume: {}", volume.volume_info().name);
         let entries = volume.list_directory("/").unwrap();
         assert!(!entries.is_empty());
@@ -999,7 +1060,8 @@ mod tests {
         let restore = crate::sap_archive::PinnedRestore::open().unwrap();
         let image = AeaReader::open(&restore.remote, restore.system_os).unwrap();
         assert_eq!(image.size(), 2_879_389_696);
-        let mut volume = apfs::ApfsVolume::open(image).unwrap();
+        let shared = SharedAeaReader::new(image);
+        let mut volume = apfs::ApfsVolume::open(shared.clone()).unwrap();
         eprintln!("SystemOS APFS volume: {}", volume.volume_info().name);
         let root = volume.list_directory("/").unwrap();
         eprintln!(
@@ -1011,9 +1073,15 @@ mod tests {
         assert!(stat.size > 568);
         assert_eq!(stat.compression.unwrap().compression_type, 14);
         eprintln!("SystemOS shared cache size: {}", stat.size);
-        let mut fork = volume
-            .open_xattr_stream(path, "com.apple.ResourceFork")
+        let (extents, fork_size) = volume
+            .xattr_stream_info(path, "com.apple.ResourceFork")
             .unwrap();
+        let mut fork = apfs::extents::ApfsForkReader::new(
+            shared.clone(),
+            volume.volume_info().block_size,
+            extents,
+            fork_size,
+        );
         let mut table_size = [0u8; 4];
         std::io::Read::read_exact(&mut fork, &mut table_size).unwrap();
         eprintln!(
@@ -1029,5 +1097,66 @@ mod tests {
             "SystemOS subcache count: {}",
             u32::from_le_bytes(header[396..400].try_into().unwrap())
         );
+        let index = crate::dyld_cache::PrimaryIndex::read(&mut cache).unwrap();
+        assert_eq!(index.subcaches.len(), 79);
+        let image = index
+            .image_address("/System/Library/PrivateFrameworks/AppleMediaServices.framework/Versions/A/AppleMediaServices")
+            .unwrap()
+            .unwrap();
+        eprintln!("AppleMediaServices shared-cache address: {image:#x}");
+        let primary = crate::dyld_cache::MemberHeader::read(&mut cache).unwrap();
+        eprintln!(
+            "Primary shared-cache mappings: {:?}",
+            primary
+                .mappings
+                .iter()
+                .map(|mapping| (mapping.address, mapping.size))
+                .collect::<Vec<_>>()
+        );
+        let base = primary.mappings[0].address;
+        let candidate = index.candidate_for_address(base, image).unwrap();
+        eprintln!(
+            "Candidate AppleMediaServices subcache: {} at {:#x}",
+            candidate.suffix, candidate.vm_offset
+        );
+        let candidate_path = format!("{path}{}", candidate.suffix);
+        let candidate_stat = volume.stat(&candidate_path).unwrap();
+        assert_eq!(candidate_stat.compression.unwrap().compression_type, 14);
+        let (extents, fork_size) = volume
+            .xattr_stream_info(&candidate_path, "com.apple.ResourceFork")
+            .unwrap();
+        let fork = apfs::extents::ApfsForkReader::new(
+            shared.clone(),
+            volume.volume_info().block_size,
+            extents,
+            fork_size,
+        );
+        let mut member =
+            crate::decmpfs::LzBitmapForkReader::open(fork, candidate_stat.size).unwrap();
+        let member_header = crate::dyld_cache::MemberHeader::read(&mut member).unwrap();
+        assert_eq!(member_header.uuid, candidate.uuid);
+        let mapping = member_header.mapping_for_address(image).unwrap();
+        let image_offset = mapping.file_offset + image - mapping.address;
+        let segments = crate::dyld_cache::read_image_segments(&mut member, image_offset).unwrap();
+        eprintln!(
+            "AppleMediaServices segments: {:?}",
+            segments
+                .iter()
+                .map(|segment| (&segment.name, segment.address, segment.file_size))
+                .collect::<Vec<_>>()
+        );
+        eprintln!(
+            "AppleMediaServices segment members: {:?}",
+            segments
+                .iter()
+                .map(|segment| (
+                    &segment.name,
+                    index
+                        .candidate_for_address(base, segment.address)
+                        .map(|entry| entry.suffix.as_str())
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert!(segments.iter().any(|segment| segment.name == "__LINKEDIT"));
     }
 }
