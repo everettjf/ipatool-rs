@@ -2,7 +2,11 @@
 
 use anyhow::{Context, Result, bail};
 
-use crate::{store_memory::MemoryRegion, unicorn_runtime::Engine};
+use crate::{
+    machfixups::{self, Fixup, FixupKind},
+    store_memory::MemoryRegion,
+    unicorn_runtime::Engine,
+};
 
 const PAGE_SIZE: u64 = 4096;
 const MAX_IMAGE_SPAN: u64 = 1 << 30;
@@ -28,7 +32,8 @@ pub struct Image {
     base: u64,
     segments: Vec<Segment>,
     code_ranges: Vec<(u64, u64)>,
-    prelinked: bool,
+    fixups: Vec<Fixup>,
+    loaded_base: Option<u64>,
 }
 
 pub trait Memory {
@@ -66,6 +71,7 @@ impl Image {
         }
         let mut segments = Vec::new();
         let mut code_ranges = Vec::new();
+        let mut chained_command = None;
         let mut command_offset = 32usize;
         for _ in 0..command_count {
             let command = read_le_u32(&data, command_offset)?;
@@ -115,6 +121,14 @@ impl Image {
                     file_offset,
                     file_size,
                 });
+            } else if command == 0x8000_0034 {
+                if size < 16 {
+                    bail!("open {name}: truncated chained-fixups command");
+                }
+                chained_command = Some((
+                    read_le_u32(&data, command_offset + 8)?,
+                    read_le_u32(&data, command_offset + 12)?,
+                ));
             }
             command_offset = command_end;
         }
@@ -123,13 +137,20 @@ impl Image {
             .find(|segment| segment.name == "__TEXT")
             .map_or(0, |segment| segment.address);
         validate_segments(&name, data.len(), &segments)?;
+        let fixups = if let Some((offset, size)) = chained_command {
+            machfixups::parse(&data, offset, size)
+                .with_context(|| format!("parse {name} chained fixups"))?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             name,
             data,
             base,
             segments,
             code_ranges,
-            prelinked: false,
+            fixups,
+            loaded_base: None,
         })
     }
 
@@ -222,13 +243,64 @@ impl Image {
         &self.segments
     }
 
+    pub fn fixup_count(&self) -> usize {
+        self.fixups.len()
+    }
+
+    /// Apply chained arm64e pointers before placing the image at `load_base`.
+    pub fn relocate<F>(&mut self, load_base: u64, mut resolve: F) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<u64>,
+    {
+        if self.loaded_base.is_some() {
+            bail!("{} is already prepared", self.name);
+        }
+        let mut patches = Vec::with_capacity(self.fixups.len());
+        for fixup in &self.fixups {
+            let offset = usize::try_from(fixup.file_offset).context("fixup offset overflows")?;
+            let end = offset.checked_add(8).context("fixup range overflows")?;
+            if end > self.data.len()
+                || !self.segments.iter().any(|segment| {
+                    fixup.file_offset >= segment.file_offset
+                        && fixup.file_offset.checked_add(8).is_some_and(|end| {
+                            segment
+                                .file_offset
+                                .checked_add(segment.file_size)
+                                .is_some_and(|limit| end <= limit)
+                        })
+                })
+            {
+                bail!(
+                    "chained fixup at {:#x} exceeds a file-backed segment of {}",
+                    fixup.file_offset,
+                    self.name
+                );
+            }
+            let value = match &fixup.kind {
+                FixupKind::Rebase { target } => load_base
+                    .checked_add(*target)
+                    .context("chained rebase address overflows")?,
+                FixupKind::Bind { name, addend } => resolve(name)
+                    .with_context(|| format!("resolve {name} for {}", self.name))?
+                    .checked_add_signed(*addend)
+                    .with_context(|| format!("chained addend overflows for {name}"))?,
+            };
+            patches.push((offset, value));
+        }
+        for (offset, value) in patches {
+            self.data[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        self.loaded_base = Some(load_base);
+        Ok(())
+    }
+
     /// Cache images stay at their preferred address. Resolve the supplied
     /// external cache pointers in writable file-backed segments before load.
     pub fn prepare_prelinked<F>(&mut self, external: &[(u64, String)], mut resolve: F) -> Result<()>
     where
         F: FnMut(&str) -> Result<u64>,
     {
-        if self.prelinked {
+        if self.loaded_base.is_some() {
             bail!("{} is already prepared", self.name);
         }
         let mut replacements = std::collections::HashMap::new();
@@ -253,11 +325,12 @@ impl Image {
                 offset += 8;
             }
         }
-        self.prelinked = true;
+        self.loaded_base = Some(self.base);
         Ok(())
     }
 
     pub fn mapped_regions(&self) -> Result<Vec<MemoryRegion>> {
+        let loaded_base = self.loaded_base.unwrap_or(self.base);
         let mut ranges = Vec::new();
         for segment in &self.segments {
             if segment.name == "__PAGEZERO" || segment.size == 0 {
@@ -266,15 +339,17 @@ impl Image {
             if segment.address < self.base {
                 bail!("segment {} precedes image base", segment.name);
             }
-            let end = segment
-                .address
+            let address = loaded_base
+                .checked_add(segment.address - self.base)
+                .context("segment relocated address overflows")?;
+            let end = address
                 .checked_add(segment.size)
                 .context("segment address range overflows")?;
             let aligned_end = end
                 .checked_add(PAGE_SIZE - 1)
                 .context("segment mapped range overflows")?
                 & !(PAGE_SIZE - 1);
-            ranges.push((segment.address & !(PAGE_SIZE - 1), aligned_end));
+            ranges.push((address & !(PAGE_SIZE - 1), aligned_end));
         }
         if ranges.is_empty() {
             bail!("{} has no loadable segments", self.name);
@@ -309,9 +384,9 @@ impl Image {
     }
 
     pub fn load(&self, memory: &mut impl Memory) -> Result<()> {
-        if !self.prelinked {
-            bail!("{} must be prepared before loading", self.name);
-        }
+        let loaded_base = self
+            .loaded_base
+            .with_context(|| format!("{} must be prepared before loading", self.name))?;
         for region in self.mapped_regions()? {
             memory
                 .map(region.address, region.size)
@@ -324,7 +399,12 @@ impl Image {
             let start = segment.file_offset as usize;
             let end = start + segment.file_size as usize;
             memory
-                .write(segment.address, &self.data[start..end])
+                .write(
+                    loaded_base
+                        .checked_add(segment.address - self.base)
+                        .context("segment relocated address overflows")?,
+                    &self.data[start..end],
+                )
                 .with_context(|| format!("write segment {} from {}", segment.name, self.name))?;
         }
         Ok(())
@@ -509,6 +589,7 @@ pub fn rewrite_instruction_section(data: &mut [u8], offset: u64, size: u64) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[derive(Default)]
     struct RecordedMemory {
@@ -614,7 +695,8 @@ mod tests {
                 },
             ],
             code_ranges: Vec::new(),
-            prelinked: false,
+            fixups: Vec::new(),
+            loaded_base: None,
         };
         image
             .prepare_prelinked(&[(old, "import".into())], |name| {
@@ -625,6 +707,108 @@ mod tests {
         assert_eq!(&image.data[0..8], &old.to_le_bytes());
         assert_eq!(&image.data[16..24], &replacement.to_le_bytes());
         assert!(image.prepare_prelinked(&[], |_| unreachable!()).is_err());
+    }
+
+    #[test]
+    fn chained_relocation_uses_load_base_and_signed_bind_addends() {
+        let mut image = Image {
+            name: "fixture".into(),
+            data: vec![0; 24],
+            base: 0x1000,
+            segments: vec![Segment {
+                name: "__DATA".into(),
+                address: 0x1000,
+                size: 24,
+                file_offset: 0,
+                file_size: 24,
+            }],
+            code_ranges: Vec::new(),
+            fixups: vec![
+                Fixup {
+                    file_offset: 0,
+                    kind: FixupKind::Rebase { target: 0x1234 },
+                },
+                Fixup {
+                    file_offset: 8,
+                    kind: FixupKind::Bind {
+                        name: "_symbol".into(),
+                        addend: -4,
+                    },
+                },
+            ],
+            loaded_base: None,
+        };
+        image
+            .relocate(0x4000, |name| {
+                assert_eq!(name, "_symbol");
+                Ok(0x9000)
+            })
+            .unwrap();
+        assert_eq!(
+            u64::from_le_bytes(image.data[0..8].try_into().unwrap()),
+            0x5234
+        );
+        assert_eq!(
+            u64::from_le_bytes(image.data[8..16].try_into().unwrap()),
+            0x8ffc
+        );
+        let mut memory = RecordedMemory::default();
+        image.load(&mut memory).unwrap();
+        assert_eq!(memory.maps, vec![(0x4000, 0x1000)]);
+        assert_eq!(memory.writes[0].0, 0x4000);
+        assert!(image.relocate(0x5000, |_| unreachable!()).is_err());
+    }
+
+    #[test]
+    fn parses_pinned_local_framework_fixups_when_available() {
+        let frameworks = [
+            (
+                "/System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP",
+                "2c30fa2b5f695fd66c0360dce72f54757d03ddb7107549715c12cb359a003b46",
+            ),
+            (
+                "/System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Resources/commerce",
+                "76de40a4a32f691947cb926ce3b128d2fc446f7cac9755f831c406cf5a316ac9",
+            ),
+        ];
+        for (path, expected_hash) in frameworks {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            if format!("{:x}", Sha256::digest(&bytes)) != expected_hash {
+                continue;
+            }
+            let mut image = Image::open(path, &bytes).unwrap();
+            assert!(image.fixup_count() > 100, "{path} has no chained fixups");
+            assert!(
+                image
+                    .fixups
+                    .iter()
+                    .any(|fixup| matches!(fixup.kind, FixupKind::Rebase { .. }))
+            );
+            assert!(
+                image
+                    .fixups
+                    .iter()
+                    .any(|fixup| matches!(fixup.kind, FixupKind::Bind { .. }))
+            );
+            let fixups = image.fixups.clone();
+            let load_base = 0x1000_0000_0000;
+            let import_base = 0x2000_0000_0000;
+            image.relocate(load_base, |_| Ok(import_base)).unwrap();
+            for fixup in &fixups {
+                let offset = fixup.file_offset as usize;
+                let actual = u64::from_le_bytes(image.data[offset..offset + 8].try_into().unwrap());
+                let expected = match fixup.kind {
+                    FixupKind::Rebase { target } => load_base + target,
+                    FixupKind::Bind { addend, .. } => {
+                        import_base.checked_add_signed(addend).unwrap()
+                    }
+                };
+                assert_eq!(actual, expected, "{path} fixup at {offset:#x}");
+            }
+            eprintln!("{path}: {} chained fixups relocated", image.fixup_count());
+        }
     }
 
     #[test]

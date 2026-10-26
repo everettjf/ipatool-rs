@@ -10,6 +10,7 @@ pub mod dyld_export;
 pub mod fairplay;
 pub mod host;
 pub mod lzbitmap;
+pub mod machfixups;
 pub mod machimage;
 pub mod platform;
 pub mod sap_aea;
