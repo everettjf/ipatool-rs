@@ -1,12 +1,13 @@
 //! Embedded Store runtime profile, extracted from the Go source snapshot.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::Read,
     sync::{Arc, OnceLock},
 };
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -27,6 +28,20 @@ pub struct ProfileData {
     pub pages: Vec<u8>,
     pub plugin: Vec<u8>,
     pub index: ProfileIndex,
+    pub runtime: RuntimeIndex,
+}
+
+/// Address and selector lookups prepared once from the immutable Store profile.
+pub struct RuntimeIndex {
+    pub classes_by_name: HashMap<String, usize>,
+    pub class_names_by_address: HashMap<u64, String>,
+    pub methods: HashMap<String, u64>,
+    pub entry_names: HashMap<u64, String>,
+    pub calls_by_address: HashMap<u64, usize>,
+    pub selectors_by_address: HashMap<u64, String>,
+    pub selector_addresses: HashMap<String, u64>,
+    pub strings: HashMap<u64, String>,
+    pub constants: HashMap<u64, ProfileConstant>,
 }
 
 #[derive(Deserialize)]
@@ -61,6 +76,124 @@ pub struct ProfileIndex {
     pub pages: Vec<Page>,
     #[serde(rename = "Calls")]
     pub calls: Vec<Call>,
+    #[serde(rename = "Classes")]
+    pub classes: Vec<ProfileClass>,
+    #[serde(rename = "Strings", default, deserialize_with = "null_default")]
+    pub strings: HashMap<String, String>,
+    #[serde(rename = "Constants", default, deserialize_with = "null_default")]
+    pub constants: HashMap<String, ProfileConstant>,
+    #[serde(rename = "MetadataPatches", default, deserialize_with = "null_default")]
+    pub metadata_patches: Vec<MetadataPatch>,
+    #[serde(rename = "Symbols", default, deserialize_with = "null_default")]
+    pub symbols: HashMap<String, u64>,
+    #[serde(rename = "Bridges", default, deserialize_with = "null_default")]
+    pub bridges: HashMap<String, u64>,
+    #[serde(rename = "ObjCMetadata", default, deserialize_with = "null_default")]
+    pub objc_metadata: HashMap<String, u64>,
+    #[serde(rename = "SwiftSingletons", default, deserialize_with = "null_default")]
+    pub swift_singletons: HashMap<String, u64>,
+    #[serde(rename = "SwiftForeign", default, deserialize_with = "null_default")]
+    pub swift_foreign: HashMap<String, u64>,
+    #[serde(
+        rename = "SwiftDictionaries",
+        default,
+        deserialize_with = "null_default"
+    )]
+    pub swift_dictionaries: HashMap<String, DictionaryLayout>,
+    #[serde(rename = "SwiftGlobals", default, deserialize_with = "null_default")]
+    pub swift_globals: HashMap<String, u64>,
+    #[serde(rename = "SwiftTypes", default, deserialize_with = "null_default")]
+    pub swift_types: HashMap<String, u64>,
+    #[serde(rename = "SwiftWitnesses", default, deserialize_with = "null_default")]
+    pub swift_witnesses: HashMap<String, u64>,
+    #[serde(rename = "SwiftAccessors", default, deserialize_with = "null_default")]
+    pub swift_accessors: HashMap<String, u64>,
+    #[serde(rename = "Features", default, deserialize_with = "null_default")]
+    pub features: HashMap<String, bool>,
+}
+
+#[derive(Deserialize)]
+pub struct ProfileClass {
+    #[serde(rename = "MetaAddress")]
+    pub meta_address: u64,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Address")]
+    pub address: u64,
+    #[serde(rename = "Super")]
+    pub superclass: String,
+    #[serde(rename = "Size")]
+    pub size: u64,
+    #[serde(rename = "Ivars", default, deserialize_with = "null_default")]
+    pub ivars: HashMap<String, u64>,
+    #[serde(rename = "Methods", default, deserialize_with = "null_default")]
+    pub methods: Vec<ProfileMethod>,
+}
+
+#[derive(Deserialize)]
+pub struct ProfileMethod {
+    #[serde(rename = "Selector")]
+    pub selector: String,
+    #[serde(rename = "Address")]
+    pub address: u64,
+    #[serde(rename = "ClassMethod")]
+    pub class_method: bool,
+    #[serde(rename = "Types")]
+    pub types: String,
+}
+
+#[derive(Deserialize)]
+pub struct ProfileConstant {
+    #[serde(rename = "IsBoolean", default)]
+    pub is_boolean: bool,
+    #[serde(rename = "Boolean", default)]
+    pub boolean: bool,
+    #[serde(rename = "Kind")]
+    pub kind: String,
+    #[serde(rename = "Text", default)]
+    pub text: String,
+    #[serde(rename = "Number", default)]
+    pub number: i64,
+    #[serde(rename = "Entries", default, deserialize_with = "null_default")]
+    pub entries: HashMap<String, u64>,
+    #[serde(rename = "Items", default, deserialize_with = "null_default")]
+    pub items: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+pub struct DictionaryLayout {
+    #[serde(rename = "Metadata")]
+    pub metadata: u64,
+    #[serde(rename = "KeyStride")]
+    pub key_stride: u64,
+    #[serde(rename = "ValueStride")]
+    pub value_stride: u64,
+}
+
+#[derive(Deserialize)]
+pub struct MetadataPatch {
+    #[serde(rename = "Address")]
+    pub address: u64,
+    #[serde(rename = "Data", deserialize_with = "decode_patch_bytes")]
+    pub data: Vec<u8>,
+}
+
+fn null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn decode_patch_bytes<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Deserialize)]
@@ -126,6 +259,63 @@ impl ProfileData {
     }
 }
 
+impl RuntimeIndex {
+    fn prepare(profile: &mut ProfileIndex) -> Result<Self> {
+        let mut prepared = Self {
+            classes_by_name: HashMap::with_capacity(profile.classes.len()),
+            class_names_by_address: HashMap::with_capacity(profile.classes.len() * 2),
+            methods: HashMap::new(),
+            entry_names: HashMap::new(),
+            calls_by_address: HashMap::with_capacity(profile.calls.len()),
+            selectors_by_address: HashMap::new(),
+            selector_addresses: HashMap::new(),
+            strings: HashMap::with_capacity(profile.strings.len()),
+            constants: HashMap::with_capacity(profile.constants.len()),
+        };
+        for (index, class) in profile.classes.iter().enumerate() {
+            prepared.classes_by_name.insert(class.name.clone(), index);
+            prepared
+                .class_names_by_address
+                .insert(class.address, class.name.clone());
+            if class.meta_address != 0 {
+                prepared
+                    .class_names_by_address
+                    .insert(class.meta_address, class.name.clone());
+            }
+            for method in &class.methods {
+                let prefix = if method.class_method { '+' } else { '-' };
+                let key = format!("{prefix}[{} {}]", class.name, method.selector);
+                prepared.methods.insert(key.clone(), method.address);
+                prepared.entry_names.insert(method.address, key);
+            }
+        }
+        for (address, value) in std::mem::take(&mut profile.strings) {
+            let address = address
+                .parse::<u64>()
+                .with_context(|| format!("invalid Store string address {address}"))?;
+            prepared.strings.insert(address, value);
+        }
+        for (address, value) in std::mem::take(&mut profile.constants) {
+            let address = address
+                .parse::<u64>()
+                .with_context(|| format!("invalid Store constant address {address}"))?;
+            prepared.constants.insert(address, value);
+        }
+        for (index, call) in profile.calls.iter().enumerate() {
+            prepared.calls_by_address.insert(call.address, index);
+            if !call.selector.is_empty() {
+                prepared
+                    .selectors_by_address
+                    .insert(call.selector_address, call.selector.clone());
+                prepared
+                    .selector_addresses
+                    .insert(call.selector.clone(), call.selector_address);
+            }
+        }
+        Ok(prepared)
+    }
+}
+
 /// Decode and validate the committed profile once per process.
 pub fn load() -> Result<Arc<ProfileData>> {
     if let Some(profile) = PROFILE.get() {
@@ -146,7 +336,7 @@ fn decode_profile() -> Result<ProfileData> {
     )?;
     let pages = decode_artifact(&manifest.artifacts.pages, "pages.zst", PAGES, 256 << 20)?;
     let plugin = decode_artifact(&manifest.artifacts.plugin, "plugin.zst", PLUGIN, 64 << 20)?;
-    let index: ProfileIndex =
+    let mut index: ProfileIndex =
         serde_json::from_slice(&metadata).context("invalid Store metadata index")?;
     if index.uuid != manifest.framework_uuid || index.plugin_uuid != manifest.plugin_uuid {
         bail!("Store profile uses unexpected Apple images");
@@ -160,6 +350,13 @@ fn decode_profile() -> Result<ProfileData> {
     {
         bail!("incomplete Store profile");
     }
+    // Dyld lazy-import trampoline present in the pinned shared-cache image.
+    index.calls.push(Call {
+        address: 0x1a2d_0fb94,
+        symbol: "CRIsAutoSubmitEnabled".into(),
+        selector: String::new(),
+        selector_address: 0,
+    });
     for (index, page) in index.pages.iter().enumerate() {
         if page.address % 4096 != 0 || page.offset != (index as u64) * 4096 {
             bail!("invalid Store page index");
@@ -178,11 +375,13 @@ fn decode_profile() -> Result<ProfileData> {
         .chain(index.calls.iter().map(|call| call.address & !4095))
         .collect::<Vec<_>>();
     group_pages(&addresses).context("invalid Store page mapping")?;
+    let runtime = RuntimeIndex::prepare(&mut index)?;
     Ok(ProfileData {
         metadata,
         pages,
         plugin,
         index,
+        runtime,
     })
 }
 
@@ -223,7 +422,47 @@ mod tests {
         assert_eq!(first.pages.len(), 20_893_696);
         assert_eq!(first.plugin.len(), 138_088);
         assert_eq!(first.index.pages.len(), 5101);
-        assert_eq!(first.index.calls.len(), 13369);
+        assert_eq!(first.index.calls.len(), 13370);
+        assert_eq!(first.index.classes.len(), 6006);
+        assert_eq!(first.index.metadata_patches.len(), 1988);
+        let account = first
+            .index
+            .classes
+            .iter()
+            .find(|class| class.name == "ACAccount")
+            .unwrap();
+        assert!(!account.methods.is_empty());
+        assert!(account.ivars.contains_key("_accountStore"));
+        assert!(!first.runtime.strings.is_empty());
+        assert!(!first.runtime.constants.is_empty());
+        assert_eq!(
+            first.runtime.classes_by_name["ACAccount"],
+            first
+                .index
+                .classes
+                .iter()
+                .position(|class| class.name == "ACAccount")
+                .unwrap()
+        );
+        assert_eq!(
+            first.runtime.class_names_by_address[&account.address],
+            "ACAccount"
+        );
+        let method = &account.methods[0];
+        let prefix = if method.class_method { '+' } else { '-' };
+        let key = format!("{prefix}[ACAccount {}]", method.selector);
+        assert_eq!(first.runtime.methods[&key], method.address);
+        assert_eq!(
+            first.runtime.calls_by_address[&0x1a2d_0fb94],
+            first.index.calls.len() - 1
+        );
+        assert!(
+            first
+                .index
+                .metadata_patches
+                .iter()
+                .all(|patch| !patch.data.is_empty())
+        );
         assert!(Arc::ptr_eq(&first, &load().unwrap()));
     }
 
