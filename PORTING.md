@@ -15,7 +15,7 @@ This checklist records behavior in that source tree; the Go README and source ar
 | `list-versions` | Pending | Platform-specific version lookup |
 | `latest-version-id` | Added as a Rust diagnostic command | Public platform version lookup; historical version listing still pending |
 | `get-version-metadata` | Pending | Platform-specific metadata requests |
-| `fairplay-doctor` | Pending | Mach-O, capture, SINF and model validators |
+| `fairplay-doctor` | IPA/model matching and private JSON report implemented; capture and live-host checks pending | Mach-O, capture, SINF and model validators |
 | `fairplay-enroll collect`, `fairplay-enroll recover` | Pending | Native capture, FairPlay binary profiles, recovery runtime |
 | `fairplay-decrypt` | Pending | Page keys, Mach-O crypt regions, IPA reconstruction, report |
 | `mcp` | Pending | Authenticated tool handlers and stdio protocol |

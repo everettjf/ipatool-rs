@@ -1,5 +1,8 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
 use ipatool_rs::{App, CatalogClient, Platform, SearchOutput};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -57,6 +60,17 @@ enum Command {
         #[arg(long, default_value = "US")]
         country: String,
     },
+    /// Diagnose IPA SINF and enrollment model compatibility.
+    FairplayDoctor {
+        #[arg(long)]
+        capture: Option<PathBuf>,
+        #[arg(long)]
+        ipa: Option<PathBuf>,
+        #[arg(long)]
+        model: Option<PathBuf>,
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -109,6 +123,21 @@ fn run() -> Result<()> {
             match cli.format {
                 Format::Text => println!("{id}"),
                 Format::Json => println!("{}", serde_json::json!({ "externalVersionID": id })),
+            }
+        }
+        Command::FairplayDoctor {
+            capture,
+            ipa,
+            model,
+            report,
+        } => {
+            let output = doctor_fairplay(capture.as_deref(), ipa.as_deref(), model.as_deref());
+            if let Some(path) = report.as_deref() {
+                write_doctor_report(path, &output)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&output)?);
+            if !output.ready {
+                bail!("FairPlay diagnostics are not ready; see errors and next_actions");
             }
         }
     }

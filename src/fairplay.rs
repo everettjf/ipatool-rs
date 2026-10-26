@@ -1,10 +1,16 @@
 //! Offline FairPlay SINF and enrollment model inspection.
 
-use std::{fs, io::Read, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{Read, Write},
+    path::Path,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use zeroize::Zeroizing;
 use zip::ZipArchive;
 
@@ -299,6 +305,151 @@ pub fn inspect_model_path(path: &Path) -> Result<Vec<EnrollmentModelDiagnostic>>
     Ok(result)
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct FairPlayDoctorReport {
+    pub schema: &'static str,
+    pub created_at: String,
+    pub ready: bool,
+    pub capture_verified: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sinf: Vec<SinfDiagnostic>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<EnrollmentModelDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatible_model: Option<String>,
+    pub checks: BTreeMap<String, bool>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub next_actions: Vec<String>,
+}
+
+/// Diagnose IPA and model compatibility offline. Capture and live-host checks
+/// are explicitly reported as unavailable until their native ports land.
+pub fn doctor_fairplay(
+    capture_path: Option<&Path>,
+    ipa_path: Option<&Path>,
+    model_path: Option<&Path>,
+) -> FairPlayDoctorReport {
+    let mut report = FairPlayDoctorReport {
+        schema: "ipatool-fairplay-doctor-v1",
+        created_at: OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_default(),
+        ready: false,
+        capture_verified: false,
+        sinf: Vec::new(),
+        models: Vec::new(),
+        compatible_model: None,
+        checks: BTreeMap::new(),
+        errors: Vec::new(),
+        warnings: Vec::new(),
+        next_actions: Vec::new(),
+    };
+
+    if capture_path.is_some() {
+        report.errors.push(
+            "capture: native enrollment capture validation is not yet implemented in Rust".into(),
+        );
+    }
+    if let Some(path) = ipa_path {
+        match inspect_ipa_sinfs(path) {
+            Ok(sinfs) => {
+                let current = sinfs.iter().all(|sinf| sinf.current_layout);
+                report.checks.insert("ipa_sinf".into(), true);
+                report.checks.insert("current_sinf_layout".into(), current);
+                if !current {
+                    report
+                        .warnings
+                        .push("one or more SINF files use an unsupported or legacy layout".into());
+                }
+                report.sinf = sinfs;
+            }
+            Err(error) => report.errors.push(format!("ipa: {error:#}")),
+        }
+    }
+    if !report.sinf.is_empty() || capture_path.is_some() {
+        report.warnings.push("SINF geometry cannot prove account age; current support assumes a newly created, natively enrolled Apple Account".into());
+    }
+    if let Some(path) = model_path {
+        match inspect_model_path(path) {
+            Ok(models) => {
+                report.checks.insert("model_valid".into(), true);
+                report.models = models;
+            }
+            Err(error) => report.errors.push(format!("model: {error:#}")),
+        }
+    }
+    if !report.sinf.is_empty() && !report.models.is_empty() {
+        report.compatible_model = report.models.iter().find_map(|model| {
+            let id = model.selector_id.as_deref()?;
+            report
+                .sinf
+                .iter()
+                .any(|sinf| sinf.selector_id == id)
+                .then(|| model.path.clone())
+        });
+        let matched = report.compatible_model.is_some();
+        report.checks.insert("selector_match".into(), matched);
+        if !matched {
+            report
+                .errors
+                .push("no enrollment model matches the IPA SINF selector".into());
+        }
+    }
+    if capture_path.is_none() {
+        report
+            .next_actions
+            .push("collect native enrollment with fairplay-enroll collect".into());
+    }
+    if report.compatible_model.is_some() {
+        report
+            .next_actions
+            .push("run fairplay-decrypt with the compatible model".into());
+    }
+    if ipa_path.is_none() && model_path.is_none() && capture_path.is_none() {
+        report
+            .errors
+            .push("host: local FairPlay host inspection is not yet implemented in Rust".into());
+    }
+    report.ready = !report.sinf.is_empty()
+        && report.errors.is_empty()
+        && report.checks.get("current_sinf_layout") == Some(&true)
+        && (model_path.is_none() || report.checks.get("selector_match") == Some(&true));
+    report
+}
+
+pub fn write_doctor_report(path: &Path, report: &FairPlayDoctorReport) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        #[cfg(not(unix))]
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options
+        .open(path)
+        .with_context(|| format!("create private report: {}", path.display()))?;
+    serde_json::to_writer_pretty(&mut output, report)?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,5 +563,62 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
             assert!(inspect_enrollment_model(&path).is_err());
         }
+    }
+
+    #[test]
+    fn doctor_matches_ipa_sinf_to_private_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let ipa = directory.path().join("app.ipa");
+        let selector = SinfSelector {
+            user: 0x12345678,
+            key: 2,
+        };
+        let file = fs::File::create(&ipa).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "Payload/App.app/SC_Info/App.sinf",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(&sinf(selector, 448)).unwrap();
+        zip.finish().unwrap();
+        let model_path = directory.path().join("model.bin");
+        fs::write(&model_path, model(selector)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let report = doctor_fairplay(None, Some(&ipa), Some(&model_path));
+        assert!(report.ready, "{:?}", report.errors);
+        assert!(report.checks["selector_match"]);
+        assert_eq!(
+            report.compatible_model.as_deref(),
+            Some(model_path.to_str().unwrap())
+        );
+        let report_path = directory.path().join("reports/doctor.json");
+        write_doctor_report(&report_path, &report).unwrap();
+        assert!(write_doctor_report(&report_path, &report).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(report_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_does_not_claim_capture_is_verified() {
+        let report = doctor_fairplay(Some(Path::new("capture")), None, None);
+        assert!(!report.ready);
+        assert!(!report.capture_verified);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.starts_with("capture:"))
+        );
     }
 }

@@ -9,6 +9,7 @@ cargo run -- search "notes" --country US --limit 5
 cargo run -- --format json search "notes" --platform ipad
 cargo run -- lookup --app-id 497799835
 cargo run -- latest-version-id --app-id 874139669 --platform iphone
+cargo run -- fairplay-doctor --ipa /private/path/app.ipa --model /private/path/model.bin
 ```
 
 `search` supports iPhone, iPad, Apple TV, Apple Watch, visionOS and macOS platform aliases. It derives platforms from catalog metadata, filters Watch results, and uses the visionOS storefront when appropriate. `lookup` accepts an app ID or bundle identifier. These read-only commands use the public catalog; `--country` defaults to `US` until account storefront support is ported.
@@ -24,7 +25,8 @@ cargo run -- latest-version-id --app-id 874139669 --platform iphone
 | Latest public external version ID for non-macOS platforms | Implemented, with offline unit tests; iPhone live lookup checked |
 | Shared HTTP request/response decoding and state directory migration | Implemented as library modules; account integration pending |
 | Authentication URL bag, endpoint validation, 2FA and phone routing helpers | Implemented as library modules; SAP signing and login execution pending |
-| FairPlay SINF, IPA SINF and enrollment model inspection | Implemented as library modules; doctor CLI and decryption pending |
+| FairPlay SINF, IPA SINF and enrollment model inspection | Implemented as library modules; decryption pending |
+| `fairplay-doctor` IPA/model matching | Implemented; capture and live-host checks pending |
 | Account authentication and secure credential storage | Pending |
 | Purchases, owned apps, version history and metadata | Pending |
 | iOS and macOS package downloads and SINF replication | Pending |
