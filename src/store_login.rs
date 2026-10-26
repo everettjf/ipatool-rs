@@ -1,19 +1,30 @@
 //! App Store login protocol over the pinned Store request backend.
 
-use std::{error::Error, fmt, thread, time::Duration};
+use std::{error::Error, fmt, sync::Arc, thread, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use reqwest::{
+    Method,
+    header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT},
+};
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    auth::{SapConfig, normalize_auth_code, phone_number_storefront, resolve_auth_redirect},
+    auth::{
+        SapConfig, normalize_auth_code, phone_number_storefront, resolve_auth_redirect,
+        sap_config_from_bag_value, validate_auth_endpoint,
+    },
     credentials::{Account, AccountStore, CredentialStore},
+    host::hardware_mac_address,
     sap_signer::Signer,
-    store_backend::{StoreBackend, StoreBackendRequest},
-    transport::{DEFAULT_AUTHENTICATION_TIMEOUT, Response, is_authentication_redirect},
+    state::prepare_state_directory_from_environment,
+    store_backend::{DEFAULT_USER_AGENT, StoreBackend, StoreBackendRequest},
+    transport::{
+        DEFAULT_AUTHENTICATION_TIMEOUT, Request, Response, Transport, is_authentication_redirect,
+    },
 };
 
 const BAD_LOGIN: &str = "MZFinance.BadLogin.Configurator_message";
@@ -22,6 +33,141 @@ const MAX_REDIRECTS: usize = 4;
 const MAX_HTTP_ATTEMPTS: usize = 3;
 
 type LoginSigner<'a> = dyn FnMut(&[u8]) -> Result<Vec<u8>> + 'a;
+type AuthenticationSender = dyn Fn(Request) -> Result<Response> + Send + Sync;
+
+/// Direct HTTP login backend. The SAP signer remains a separate dependency.
+pub struct NativeAuthenticationBackend {
+    hardware_id: [u8; 6],
+    sender: Arc<AuthenticationSender>,
+}
+
+impl NativeAuthenticationBackend {
+    pub fn open() -> Result<Self> {
+        let hardware_id = hardware_mac_address().context("read Store hardware identity")?;
+        let state_directory = prepare_state_directory_from_environment()?;
+        let transport = Arc::new(Transport::with_cookies(&state_directory)?);
+        Ok(Self::with_sender(hardware_id, move |request| {
+            transport.send(request)
+        }))
+    }
+
+    pub fn with_sender(
+        hardware_id: [u8; 6],
+        sender: impl Fn(Request) -> Result<Response> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            hardware_id,
+            sender: Arc::new(sender),
+        }
+    }
+}
+
+impl AuthenticationBackend for NativeAuthenticationBackend {
+    fn hardware_id(&self) -> [u8; 6] {
+        self.hardware_id
+    }
+
+    fn sap_config(&self) -> Result<SapConfig> {
+        let guid = self
+            .hardware_id
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        let url = url::Url::parse(&format!(
+            "https://init.itunes.apple.com/bag.xml?guid={guid}"
+        ))?;
+        let mut request = Request::get(url);
+        request
+            .headers
+            .insert("Accept", HeaderValue::from_static("application/xml"));
+        request
+            .headers
+            .insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
+        request.no_redirects = true;
+        request.timeout = Some(DEFAULT_AUTHENTICATION_TIMEOUT);
+        let response = (self.sender)(request).context("request Apple URL bag")?;
+        response.ensure_success()?;
+        let bag: serde_json::Value = response.plist(false)?;
+        sap_config_from_bag_value(&bag)
+    }
+
+    fn send_authentication(
+        &self,
+        request: StoreBackendRequest<'_>,
+        signer: &mut LoginSigner<'_>,
+    ) -> Result<Response> {
+        if request.method != "POST"
+            || request.body.is_some()
+            || request.raw
+            || request.response_format != "plist"
+        {
+            bail!("invalid native authentication request");
+        }
+        let url = url::Url::parse(request.url).context("invalid authentication URL")?;
+        validate_auth_endpoint(&url)?;
+        let mut parameters = request
+            .parameters
+            .context("authentication parameters are missing")?
+            .clone();
+        let fields = parameters
+            .as_object_mut()
+            .context("authentication parameters must be a dictionary")?;
+        let guid = self
+            .hardware_id
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        if fields.get("guid").and_then(serde_json::Value::as_str) != Some(guid.as_str()) {
+            bail!("authentication hardware identity mismatch");
+        }
+        for (key, value) in [
+            ("createSession", serde_json::json!(true)),
+            ("credentialSource", serde_json::json!(0)),
+            ("deviceOffersCheck", serde_json::json!("true")),
+            ("isSilentAuthentication", serde_json::json!(false)),
+            (
+                "passwordSettings",
+                serde_json::json!({"free": "always", "paid": "always"}),
+            ),
+        ] {
+            fields.insert(key.into(), value);
+        }
+        let mut body = Vec::new();
+        plist::to_writer_xml(&mut body, &parameters).context("encode authentication plist")?;
+        let signature = signer(&body).context("sign authentication request")?;
+        if signature.is_empty() {
+            bail!("authentication signer returned an empty signature");
+        }
+        let mut headers = request.headers.clone();
+        headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
+        headers.insert(
+            "Accept-Encoding",
+            HeaderValue::from_static("br, gzip, deflate"),
+        );
+        headers.insert("Accept-Language", HeaderValue::from_static("en"));
+        headers.insert(
+            "X-Apple-Client-Application",
+            HeaderValue::from_static("me.majd.ipatool"),
+        );
+        headers.insert("X-Apple-TZ", HeaderValue::from_static("0"));
+        headers.insert(
+            "X-Apple-ActionSignature",
+            HeaderValue::from_str(&STANDARD.encode(signature))?,
+        );
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&body.len().to_string())?,
+        );
+        (self.sender)(Request {
+            method: Method::POST,
+            url,
+            headers,
+            body: Some(body),
+            no_redirects: request.no_redirects,
+            timeout: request.timeout,
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct AuthCodeRequired;
@@ -76,8 +222,8 @@ impl AuthenticationBackend for StoreBackend {
 }
 
 /// Complete the login protocol with the real SAP signer and save the account.
-pub fn login<S: CredentialStore>(
-    backend: &StoreBackend,
+pub fn login<B: AuthenticationBackend, S: CredentialStore>(
+    backend: &B,
     accounts: &AccountStore<S>,
     input: LoginInput,
 ) -> Result<Account> {
@@ -615,5 +761,80 @@ mod tests {
         assert_eq!(account.directory_services_id, "123");
         assert_eq!(accounts.load().unwrap().password_token, "token");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn native_login_matches_pinned_guest_request() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let guest_request = Arc::new(Mutex::new(None));
+        let guest_seen = Arc::clone(&guest_request);
+        let guest = StoreBackend::with_sender(
+            assets.apple_media_services,
+            [0, 1, 2, 3, 4, 5],
+            move |request| {
+                if request.url.host_str() == Some("init.itunes.apple.com") {
+                    return Ok(fixture_bag());
+                }
+                *guest_seen.lock().unwrap() = Some(request);
+                Ok(fixture_success())
+            },
+        );
+        let native_request = Arc::new(Mutex::new(None));
+        let native_seen = Arc::clone(&native_request);
+        let native = NativeAuthenticationBackend::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            if request.url.host_str() == Some("init.itunes.apple.com") {
+                return Ok(fixture_bag());
+            }
+            *native_seen.lock().unwrap() = Some(request);
+            Ok(fixture_success())
+        });
+        for account in [
+            login_with_signer(
+                &guest,
+                &AccountStore::new(MemoryStore::default()),
+                fixture_login_input(),
+                &mut |_| Ok(vec![1, 2, 3]),
+            )
+            .unwrap(),
+            login_with_signer(
+                &native,
+                &AccountStore::new(MemoryStore::default()),
+                fixture_login_input(),
+                &mut |_| Ok(vec![1, 2, 3]),
+            )
+            .unwrap(),
+        ] {
+            assert_eq!(account.password_token, "token");
+        }
+        let guest_request = guest_request.lock().unwrap().take().unwrap();
+        let native_request = native_request.lock().unwrap().take().unwrap();
+        assert_eq!(native_request.method, guest_request.method);
+        assert_eq!(native_request.url, guest_request.url);
+        assert_eq!(native_request.headers, guest_request.headers);
+        assert_eq!(native_request.body, guest_request.body);
+        assert_eq!(native_request.no_redirects, guest_request.no_redirects);
+        assert_eq!(native_request.timeout, guest_request.timeout);
+    }
+
+    fn fixture_bag() -> Response {
+        fixture_response(
+            200,
+            r#"<plist version="1.0"><dict><key>urlBag</key><dict><key>authenticateAccount</key><string>https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate</string></dict></dict></plist>"#,
+        )
+    }
+
+    fn fixture_success() -> Response {
+        fixture_response(
+            200,
+            r#"<plist version="1.0"><dict><key>passwordToken</key><string>token</string><key>dsPersonId</key><string>123</string><key>accountInfo</key><dict><key>appleId</key><string>test@example.com</string></dict></dict></plist>"#,
+        )
+    }
+
+    fn fixture_login_input() -> LoginInput {
+        LoginInput {
+            email: "test@example.com".into(),
+            password: "secret".into(),
+            auth_code: String::new(),
+        }
     }
 }

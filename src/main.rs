@@ -8,8 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
-use ipatool_rs::store_backend::StoreBackend;
-use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput};
+use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
 use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
 use ipatool_rs::store_purchase::{
     self, LicenseAlreadyExists, NativePurchaseBackend, PasswordTokenExpired,
@@ -170,7 +169,7 @@ fn run() -> Result<()> {
                         ),
                     });
                     let mut auth_code = Zeroizing::new(auth_code.unwrap_or_default());
-                    let backend = StoreBackend::open()?;
+                    let backend = NativeAuthenticationBackend::open()?;
                     let mut code_prompts = 0;
                     let account = loop {
                         let result = store_login::login(
@@ -294,7 +293,7 @@ fn run() -> Result<()> {
                     Err(error)
                         if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
                     {
-                        let authentication_backend = StoreBackend::open()?;
+                        let authentication_backend = NativeAuthenticationBackend::open()?;
                         account = store_login::login(
                             &authentication_backend,
                             &account_store,
@@ -342,7 +341,7 @@ fn run() -> Result<()> {
                     Err(error)
                         if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
                     {
-                        let authentication_backend = StoreBackend::open()?;
+                        let authentication_backend = NativeAuthenticationBackend::open()?;
                         account = store_login::login(
                             &authentication_backend,
                             &account_store,
