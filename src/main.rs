@@ -1,6 +1,8 @@
 use std::{
-    io::{self, IsTerminal, Write},
+    fs::File,
+    io::{self, IsTerminal, Read, Write},
     path::PathBuf,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -9,6 +11,7 @@ use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
 use ipatool_rs::fairplay_checkpoint::FairplayCheckpoint;
+use ipatool_rs::fairplay_checkpoint_run::CheckpointRunner;
 use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
 use ipatool_rs::fairplay_download_capture::write_download_capture;
 use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2};
@@ -223,6 +226,19 @@ enum FairplayEnrollCommand {
         product_version: Option<String>,
         #[arg(long)]
         build_version: Option<String>,
+    },
+    /// Resume a matching private FairPlay checkpoint for a bounded instruction span.
+    ContinueCheckpoint {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long)]
+        fairplayd: PathBuf,
+        #[arg(long, help = "Instruction address at which to stop")]
+        stop_address: String,
+        #[arg(long, default_value_t = 100_000)]
+        instruction_limit: usize,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
     },
     /// Transform a private 192/224-byte source with the embedded 26A428 state model.
     EvaluateState {
@@ -1008,6 +1024,56 @@ fn run() -> Result<()> {
                         manifest.files.len(),
                         manifest.app.selector_id,
                         output.display()
+                    ),
+                }
+            }
+            FairplayEnrollCommand::ContinueCheckpoint {
+                checkpoint,
+                fairplayd,
+                stop_address,
+                instruction_limit,
+                timeout_seconds,
+            } => {
+                if timeout_seconds == 0 || timeout_seconds > 300 {
+                    bail!("FairPlay timeout must be between 1 and 300 seconds");
+                }
+                const MAX_FAIRPLAYD_BYTES: u64 = 256 * 1024 * 1024;
+                let file = File::open(&fairplayd)
+                    .with_context(|| format!("open fairplayd {}", fairplayd.display()))?;
+                let metadata = file.metadata()?;
+                if !metadata.file_type().is_file() || metadata.len() > MAX_FAIRPLAYD_BYTES {
+                    bail!("fairplayd has invalid file type or size");
+                }
+                let mut binary = Vec::new();
+                file.take(MAX_FAIRPLAYD_BYTES + 1)
+                    .read_to_end(&mut binary)
+                    .context("read fairplayd image")?;
+                if binary.len() as u64 > MAX_FAIRPLAYD_BYTES {
+                    bail!("fairplayd exceeds size limit");
+                }
+                let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
+                let stop = parse_address(&stop_address)?;
+                let mut runner = CheckpointRunner::new(&snapshot, &binary)?;
+                runner.run_until(
+                    stop,
+                    Duration::from_secs(timeout_seconds),
+                    instruction_limit,
+                )?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "fairplay.checkpoint-run.v1",
+                            "start_pc": format!("{:#x}", runner.start_pc),
+                            "stop_pc": format!("{stop:#x}"),
+                            "checkpoint_pages": runner.checkpoint_pages,
+                            "fairplayd_fixups": runner.image.fixups,
+                            "external_imports": runner.image.externals.len(),
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Resumed FairPlay checkpoint from {:#x} to {stop:#x}",
+                        runner.start_pc
                     ),
                 }
             }

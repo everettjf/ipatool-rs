@@ -842,6 +842,21 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the host's Apple fairplayd image"]
+    fn parses_local_fairplayd_image_when_available() {
+        let path = "/System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/fairplayd";
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let mut image = Image::open("fairplayd", &bytes).unwrap();
+        assert!(image.base() != 0);
+        assert!(image.fixup_count() > 100);
+        let base = image.base();
+        image.relocate(base, |_| Ok(0xf100_0000_0000_0000)).unwrap();
+        assert!(!image.mapped_regions().unwrap().is_empty());
+    }
+
+    #[test]
     fn rejects_invalid_segment_ranges() {
         let segment = Segment {
             name: "__DATA".into(),

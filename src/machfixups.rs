@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 
 const ARM64E_USERLAND24: u16 = 12;
 const IMPORT_FORMAT: u32 = 1;
+const IMPORT_ADDEND_FORMAT: u32 = 2;
 const START_NONE: u16 = 0xffff;
 const START_MULTI: u16 = 0x8000;
 const MAX_IMPORTS: usize = 1 << 20;
@@ -24,6 +25,7 @@ pub struct Fixup {
 #[derive(Debug, Clone)]
 struct Import {
     name: String,
+    addend: i64,
 }
 
 /// Parse `LC_DYLD_CHAINED_FIXUPS` in the selected 64-bit arm64e Mach-O slice.
@@ -39,13 +41,22 @@ pub fn parse(data: &[u8], payload_offset: u32, payload_size: u32) -> Result<Vec<
     let imports_count = u32_at(payload, 16)? as usize;
     let imports_format = u32_at(payload, 20)?;
     let symbols_format = u32_at(payload, 24)?;
-    if version != 0 || imports_format != IMPORT_FORMAT || symbols_format != 0 {
+    if version != 0
+        || !matches!(imports_format, IMPORT_FORMAT | IMPORT_ADDEND_FORMAT)
+        || symbols_format != 0
+    {
         bail!("unsupported chained-fixups metadata format");
     }
     if imports_count > MAX_IMPORTS {
         bail!("too many chained imports");
     }
-    let imports = parse_imports(payload, imports_offset, symbols_offset, imports_count)?;
+    let imports = parse_imports(
+        payload,
+        imports_offset,
+        symbols_offset,
+        imports_count,
+        imports_format,
+    )?;
     let segment_count = u32_at(payload, starts_offset)? as usize;
     if segment_count > MAX_SEGMENTS {
         bail!("too many chained-fixups segments");
@@ -133,18 +144,20 @@ fn parse_imports(
     imports_offset: usize,
     symbols_offset: usize,
     count: usize,
+    format: u32,
 ) -> Result<Vec<Import>> {
+    let stride = if format == IMPORT_ADDEND_FORMAT { 8 } else { 4 };
     let bytes = range(
         payload,
         imports_offset,
-        count.checked_mul(4).context("import table overflow")?,
+        count.checked_mul(stride).context("import table overflow")?,
     )?;
     let strings = payload
         .get(symbols_offset..)
         .context("chained symbol pool exceeds payload")?;
     let mut imports = Vec::with_capacity(count);
-    for entry in bytes.as_chunks::<4>().0 {
-        let encoded = u32::from_le_bytes(*entry);
+    for entry in bytes.chunks_exact(stride) {
+        let encoded = u32::from_le_bytes(entry[..4].try_into()?);
         let name_offset = (encoded >> 9) as usize;
         let tail = strings
             .get(name_offset..)
@@ -155,6 +168,11 @@ fn parse_imports(
             .context("unterminated chained import name")?;
         imports.push(Import {
             name: String::from_utf8(tail[..end].to_vec()).context("invalid chained import name")?,
+            addend: if stride == 8 {
+                i32::from_le_bytes(entry[4..8].try_into()?) as i64
+            } else {
+                0
+            },
         });
     }
     Ok(imports)
@@ -195,12 +213,10 @@ fn walk_chain(
         let authenticated = raw >> 63 != 0;
         let kind = if bound {
             let ordinal = (raw & 0x00ff_ffff) as usize;
-            let name = imports
+            let import = imports
                 .get(ordinal)
-                .with_context(|| format!("chained import ordinal {ordinal} is invalid"))?
-                .name
-                .clone();
-            let addend = if authenticated {
+                .with_context(|| format!("chained import ordinal {ordinal} is invalid"))?;
+            let pointer_addend = if authenticated {
                 0
             } else {
                 let encoded = ((raw >> 32) & 0x7ffff) as i64;
@@ -210,7 +226,14 @@ fn walk_chain(
                     encoded
                 }
             };
-            FixupKind::Bind { name, addend }
+            let addend = import
+                .addend
+                .checked_add(pointer_addend)
+                .context("chained import addend overflows")?;
+            FixupKind::Bind {
+                name: import.name.clone(),
+                addend,
+            }
         } else {
             let target = if authenticated {
                 raw & 0xffff_ffff
@@ -297,6 +320,37 @@ mod tests {
                     name: "name".into(),
                     addend: -1
                 }
+            }]
+        );
+    }
+
+    #[test]
+    fn combines_import_addend_with_pointer_addend() {
+        let mut data = vec![0u8; 512];
+        let payload = 128usize;
+        data[payload + 4..payload + 8].copy_from_slice(&32u32.to_le_bytes());
+        data[payload + 8..payload + 12].copy_from_slice(&64u32.to_le_bytes());
+        data[payload + 12..payload + 16].copy_from_slice(&72u32.to_le_bytes());
+        data[payload + 16..payload + 20].copy_from_slice(&1u32.to_le_bytes());
+        data[payload + 20..payload + 24].copy_from_slice(&2u32.to_le_bytes());
+        data[payload + 32..payload + 36].copy_from_slice(&1u32.to_le_bytes());
+        data[payload + 36..payload + 40].copy_from_slice(&8u32.to_le_bytes());
+        let start = payload + 40;
+        data[start..start + 4].copy_from_slice(&24u32.to_le_bytes());
+        data[start + 4..start + 6].copy_from_slice(&64u16.to_le_bytes());
+        data[start + 6..start + 8].copy_from_slice(&12u16.to_le_bytes());
+        data[start + 20..start + 22].copy_from_slice(&1u16.to_le_bytes());
+        data[payload + 68..payload + 72].copy_from_slice(&(-7i32).to_le_bytes());
+        data[payload + 72..payload + 77].copy_from_slice(b"name\0");
+        data[..8].copy_from_slice(&((1u64 << 62) | (5u64 << 32)).to_le_bytes());
+        assert_eq!(
+            parse(&data, payload as u32, 84).unwrap(),
+            vec![Fixup {
+                file_offset: 0,
+                kind: FixupKind::Bind {
+                    name: "name".into(),
+                    addend: -2,
+                },
             }]
         );
     }
