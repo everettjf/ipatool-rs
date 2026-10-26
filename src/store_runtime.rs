@@ -47,8 +47,8 @@ pub struct StoreRuntime {
     hook_error: Rc<RefCell<Option<String>>>,
 }
 
-/// Inputs for the ordinary Store request path. Authentication and purchase use
-/// additional Apple guest objects and are handled separately.
+/// Inputs for a Store request. Authentication uses additional Apple guest
+/// objects and is handled separately.
 pub struct StoreStandardRequest<'a> {
     pub method: &'a str,
     pub url: &'a str,
@@ -500,6 +500,26 @@ impl StoreRuntime {
     /// Prepare, send, and decode one ordinary Store request through the pinned
     /// Apple code. The host HTTP transport must be installed with set_transport.
     pub fn execute_standard(&mut self, input: StoreStandardRequest<'_>) -> Result<HostResponse> {
+        self.execute_request(input, false)
+    }
+
+    /// Prepare, send, and decode a free-app purchase through the pinned Apple
+    /// code. The host HTTP transport must be installed with set_transport.
+    pub fn execute_purchase(&mut self, input: StoreStandardRequest<'_>) -> Result<HostResponse> {
+        if input.method != "POST" {
+            bail!("purchase requests must use POST");
+        }
+        if input.parameters.is_none() {
+            bail!("purchase parameters are required");
+        }
+        self.execute_request(input, true)
+    }
+
+    fn execute_request(
+        &mut self,
+        input: StoreStandardRequest<'_>,
+        purchase: bool,
+    ) -> Result<HostResponse> {
         self.set_hardware_id(input.hardware_id)?;
         self.set_transport_policy(true, input.no_redirects, input.timeout);
 
@@ -538,7 +558,13 @@ impl StoreRuntime {
         let delegate = self.new_object("NSObject", StoreValue::Empty)?;
         self.invoke(session, "setDelegate:", &[delegate])?;
 
-        let request = if let Some(parameters) = input.parameters {
+        let request = if purchase {
+            self.encode_purchase_request(
+                account,
+                bag,
+                input.parameters.expect("validated purchase parameters"),
+            )?
+        } else if let Some(parameters) = input.parameters {
             self.encode_request(account, bag, input.method, input.url, parameters)?
         } else {
             let request = self.new_object("AMSURLRequest", StoreValue::Empty)?;
@@ -1295,6 +1321,8 @@ fn dispatch_call(
     }
     let symbol = call.symbol.trim_start_matches('_');
     match symbol {
+        "res_9_ninit" => context.reg_write(REG_X0, u32::MAX as u64)?,
+        "res_9_ndestroy" => {}
         "CRIsAutoSubmitEnabled"
         | "CFURLResponseCopyPeerAddress"
         | "os_signpost_enabled"
@@ -5393,6 +5421,28 @@ fn dispatch_message(
         context.reg_write(REG_PC, entry)?;
         return Ok(());
     }
+    if !class_method && class_name == "NSURLSessionDataTask" && selector == "_timingData" {
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "NSURLSessionConfiguration"
+        && matches!(
+            selector,
+            "_allowsTCPFastOpen" | "_allowsTLSSessionTickets" | "URLCache"
+        )
+    {
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if class_method && class_name == "NSURLCache" && selector == "sharedURLCache" {
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if !class_method && class_name == "NSHTTPURLResponse" && selector == "_CFURLResponse" {
+        context.reg_write(REG_X0, receiver)?;
+        return Ok(());
+    }
     if !class_method
         && class_name == "AMSPurchaseRequestEncoder"
         && selector == "requestByEncodingRequestAndReturnSigningErrors:parameters:"
@@ -6773,6 +6823,13 @@ fn dispatch_message(
                 .is_ok();
             context.reg_write(REG_X0, u64::from(valid))?;
         }
+        (true, "isValidJSONObject:") if class_name == "NSJSONSerialization" => {
+            let object = context.reg_read(REG_X0 + 2)?;
+            let valid = export_object(state, object, &mut HashSet::new(), 0).is_ok_and(|value| {
+                (value.is_object() || value.is_array()) && serde_json::to_vec(&value).is_ok()
+            });
+            context.reg_write(REG_X0, u64::from(valid))?;
+        }
         (true, "propertyListWithData:options:format:error:")
             if class_name == "NSPropertyListSerialization" =>
         {
@@ -6925,6 +6982,17 @@ fn dispatch_message(
             )?;
             context.reg_write(REG_X0, date)?;
         }
+        (true, "date" | "now") if class_name == "NSDate" => {
+            let seconds = time::OffsetDateTime::now_utc().unix_timestamp_nanos() as f64 / 1e9;
+            let date = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSDate",
+                StoreValue::Float(seconds),
+            )?;
+            context.reg_write(REG_X0, date)?;
+        }
         (true, "dateWithTimeIntervalSinceNow:" | "dateWithTimeIntervalSince1970:")
             if class_name == "NSDate" =>
         {
@@ -6943,6 +7011,38 @@ fn dispatch_message(
                 StoreValue::Float(seconds),
             )?;
             context.reg_write(REG_X0, date)?;
+        }
+        (
+            false,
+            "timeIntervalSinceNow" | "timeIntervalSince1970" | "timeIntervalSinceReferenceDate",
+        ) if class_name == "NSDate" => {
+            let seconds = match state.objects[&receiver].value {
+                StoreValue::Float(seconds) => seconds,
+                StoreValue::Number(seconds) => seconds as f64,
+                _ => bail!("invalid Store date value"),
+            };
+            let interval = match selector {
+                "timeIntervalSinceNow" => {
+                    seconds - time::OffsetDateTime::now_utc().unix_timestamp_nanos() as f64 / 1e9
+                }
+                "timeIntervalSinceReferenceDate" => seconds - 978_307_200.0,
+                _ => seconds,
+            };
+            context.reg_write(40, interval.to_bits())?;
+        }
+        (false, "timeIntervalSinceDate:") if class_name == "NSDate" => {
+            let other = context.reg_read(REG_X0 + 2)?;
+            let seconds = match state.objects[&receiver].value {
+                StoreValue::Float(seconds) => seconds,
+                StoreValue::Number(seconds) => seconds as f64,
+                _ => bail!("invalid Store date value"),
+            };
+            let other_seconds = match state.objects[&other].value {
+                StoreValue::Float(seconds) => seconds,
+                StoreValue::Number(seconds) => seconds as f64,
+                _ => bail!("invalid Store comparison date"),
+            };
+            context.reg_write(40, (seconds - other_seconds).to_bits())?;
         }
         (true, "requestWithURL:")
             if matches!(class_name.as_str(), "NSURLRequest" | "NSMutableURLRequest") =>
@@ -7229,6 +7329,22 @@ fn dispatch_message(
                 state,
                 "NSNumber",
                 StoreValue::Boolean(value),
+            )?;
+            context.reg_write(REG_X0, address)?;
+        }
+        (true, "numberWithDouble:" | "numberWithFloat:") if class_name == "NSNumber" => {
+            let bits = context.reg_read(40)?;
+            let value = if selector == "numberWithFloat:" {
+                f32::from_bits(bits as u32) as f64
+            } else {
+                f64::from_bits(bits)
+            };
+            let address = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSNumber",
+                StoreValue::Float(value),
             )?;
             context.reg_write(REG_X0, address)?;
         }
@@ -7860,6 +7976,21 @@ fn dispatch_message(
                 _ => 0,
             };
             context.reg_write(REG_X0, value as u64)?;
+        }
+        (false, "doubleValue" | "floatValue") => {
+            let value = match &state.objects[&receiver].value {
+                StoreValue::Number(value) => *value as f64,
+                StoreValue::Float(value) => *value,
+                StoreValue::Boolean(value) => f64::from(u8::from(*value)),
+                StoreValue::String(value) => value.parse::<f64>().unwrap_or(0.0),
+                _ => bail!("unsupported Store numeric conversion"),
+            };
+            let bits = if selector == "floatValue" {
+                f32::to_bits(value as f32) as u64
+            } else {
+                f64::to_bits(value)
+            };
+            context.reg_write(40, bits)?;
         }
         (false, "init") => {
             let object = state.objects.get_mut(&receiver).expect("known receiver");
@@ -8858,6 +8989,60 @@ mod tests {
         assert_eq!(
             runtime.object_string(url).unwrap(),
             "https://buy.itunes.apple.com/request"
+        );
+    }
+
+    #[test]
+    fn executes_free_purchase_with_pinned_apple_code() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        runtime.set_transport(|request| {
+            assert_eq!(request.method, Method::POST);
+            assert_eq!(request.url.as_str(), "https://buy.itunes.apple.com/request");
+            let body: Value = plist::from_bytes(request.body.as_ref().unwrap()).unwrap();
+            assert_eq!(body["salableAdamId"], "1234");
+            assert_eq!(body["price"], "0");
+            Ok(HostResponse {
+                status: 200,
+                headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
+                body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
+            })
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Dsid", HeaderValue::from_static("123456"));
+        headers.insert("X-Token", HeaderValue::from_static("test-token"));
+        headers.insert(
+            "X-Apple-Store-Front",
+            HeaderValue::from_static("143441-1,29"),
+        );
+        let parameters = serde_json::json!({
+            "salableAdamId": "1234",
+            "pricingParameters": "STDQ",
+            "price": "0",
+            "productType": "C",
+            "appleId": "test@example.com",
+            "password": "test"
+        });
+        let bag = serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/request"});
+        let response = runtime
+            .execute_purchase(StoreStandardRequest {
+                method: "POST",
+                url: "https://buy.itunes.apple.com/request",
+                headers: &headers,
+                parameters: Some(&parameters),
+                body: None,
+                bag: Some(&bag),
+                hardware_id: &[0, 1, 2, 3, 4, 5],
+                raw: false,
+                response_format: "plist",
+                no_redirects: false,
+                timeout: None,
+            })
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            plist::from_bytes::<Value>(&response.body).unwrap()["status"],
+            0
         );
     }
 }
