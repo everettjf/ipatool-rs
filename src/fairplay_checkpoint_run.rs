@@ -34,6 +34,7 @@ const MAX_SNAPSHOT_PAGES: usize = 30_000;
 const MAX_EXTERNAL_BYTES: u64 = 0x1000_0000;
 const EXTERNAL_CHUNK_BYTES: usize = 64 * 1024;
 const RET_X30: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
+const SYNTHETIC_ERRNO_ADDRESS: u64 = 0x7100_fff0_0000;
 const SYNTHETIC_NOOP_CALLBACK: u64 = 0x7200_0000_0000;
 const PTHREAD_ONCE_STUB: [u32; 6] = [
     0xa9bf_7bfd, // stp x29, x30, [sp, #-16]!
@@ -47,6 +48,10 @@ const SYNTHETIC_ALLOCATION_BASE: u64 = 0x7101_0000_0000;
 const STATIC_ALLOCATION_START: u64 = 0x7000_1000_0000;
 const STATIC_ALLOCATION_END: u64 = 0x7000_2000_0000;
 const STATIC_ALLOCATION_STRIDE: u64 = 0x10_0000;
+
+struct HostState {
+    random_state: u32,
+}
 
 struct AllocationState {
     next: u64,
@@ -197,6 +202,8 @@ pub struct CheckpointRunner {
     external_failure: Rc<RefCell<Option<String>>>,
     allocation_state: Rc<RefCell<AllocationState>>,
     once_tokens: Rc<RefCell<BTreeSet<u64>>>,
+    host_state: Rc<RefCell<HostState>>,
+    errno_mapped: bool,
 }
 
 fn guest_register(context: &HookContext, index: i32) -> Result<u64> {
@@ -258,6 +265,7 @@ fn run_modeled_external(
     symbol: &str,
     allocations: &Rc<RefCell<AllocationState>>,
     once_tokens: &Rc<RefCell<BTreeSet<u64>>>,
+    host_state: &Rc<RefCell<HostState>>,
 ) -> Result<()> {
     match symbol {
         "malloc" | "malloc_type_malloc" | "calloc" | "malloc_type_calloc" => {
@@ -319,6 +327,39 @@ fn run_modeled_external(
                 tokens.insert(token);
             }
         }
+        "arc4random" => {
+            let mut state = host_state.borrow_mut();
+            state.random_state = state
+                .random_state
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
+            context.reg_write(199, u64::from(state.random_state))?;
+        }
+        "gettimeofday" => {
+            let destination = guest_register(context, 0)?;
+            if destination != 0 {
+                let mut time = [0u8; 16];
+                time[..8].copy_from_slice(&1_700_000_000u64.to_le_bytes());
+                context.mem_write(destination, &time)?;
+            }
+            context.reg_write(199, 0)?;
+        }
+        "getpid" => context.reg_write(199, 1234)?,
+        "kqueue" => context.reg_write(199, 0x900)?,
+        "error" => context.reg_write(199, SYNTHETIC_ERRNO_ADDRESS)?,
+        "mmap" => {
+            let length = guest_register(context, 1)?;
+            let flags = guest_register(context, 3)?;
+            let descriptor = guest_register(context, 4)?;
+            if matches!(descriptor, 0xffff_ffff | u64::MAX) && flags & 0x1000 != 0 {
+                let address = allocations.borrow_mut().allocate(context, length)?;
+                context.reg_write(199, address)?;
+            } else {
+                context.mem_write(SYNTHETIC_ERRNO_ADDRESS, &9u32.to_le_bytes())?;
+                context.reg_write(199, u64::MAX)?;
+            }
+        }
+        "munmap" => context.reg_write(199, 0)?,
         _ => bail!("unmodeled external function {symbol}"),
     }
     Ok(())
@@ -331,6 +372,7 @@ fn install_modeled_external(
     failure: &Rc<RefCell<Option<String>>>,
     allocations: &Rc<RefCell<AllocationState>>,
     once_tokens: &Rc<RefCell<BTreeSet<u64>>>,
+    host_state: &Rc<RefCell<HostState>>,
 ) -> Result<bool> {
     let symbol = symbol.trim_start_matches('_');
     if !matches!(
@@ -347,6 +389,13 @@ fn install_modeled_external(
             | "malloc_type_calloc"
             | "free"
             | "pthread_once"
+            | "arc4random"
+            | "gettimeofday"
+            | "getpid"
+            | "kqueue"
+            | "error"
+            | "mmap"
+            | "munmap"
     ) {
         return Ok(false);
     }
@@ -366,9 +415,15 @@ fn install_modeled_external(
     let failure = Rc::clone(failure);
     let allocations = Rc::clone(allocations);
     let once_tokens = Rc::clone(once_tokens);
+    let host_state = Rc::clone(host_state);
     engine.add_code_hook(address, address, move |context, _, _| {
-        if let Err(error) = run_modeled_external(context, &symbol_name, &allocations, &once_tokens)
-        {
+        if let Err(error) = run_modeled_external(
+            context,
+            &symbol_name,
+            &allocations,
+            &once_tokens,
+            &host_state,
+        ) {
             *failure.borrow_mut() = Some(format!("FairPlay external {symbol_name}: {error:#}"));
             let _ = context.stop();
         }
@@ -402,12 +457,25 @@ impl CheckpointRunner {
         let once_tokens = Rc::new(RefCell::new(
             checkpoint.once_tokens()?.into_iter().collect(),
         ));
+        let host_state = Rc::new(RefCell::new(HostState {
+            random_state: checkpoint.random_state()?,
+        }));
+        let source_pages = checkpoint.page_addresses()?;
+        let errno_mapped = image
+            .externals
+            .values()
+            .any(|symbol| matches!(symbol.trim_start_matches('_'), "error" | "mmap"));
+        if errno_mapped && !source_pages.contains(&SYNTHETIC_ERRNO_ADDRESS) {
+            engine.mem_map(SYNTHETIC_ERRNO_ADDRESS, PAGE_BYTES as usize)?;
+        }
         if image
             .externals
             .values()
             .any(|symbol| symbol.trim_start_matches('_') == "pthread_once")
         {
-            engine.mem_map(SYNTHETIC_NOOP_CALLBACK, PAGE_BYTES as usize)?;
+            if !source_pages.contains(&SYNTHETIC_NOOP_CALLBACK) {
+                engine.mem_map(SYNTHETIC_NOOP_CALLBACK, PAGE_BYTES as usize)?;
+            }
             engine.mem_write(SYNTHETIC_NOOP_CALLBACK, &RET_X30)?;
         }
         let mut modeled_imports = 0;
@@ -419,6 +487,7 @@ impl CheckpointRunner {
                 &external_failure,
                 &allocation_state,
                 &once_tokens,
+                &host_state,
             )? {
                 modeled_imports += 1;
             }
@@ -432,6 +501,8 @@ impl CheckpointRunner {
             external_failure,
             allocation_state,
             once_tokens,
+            host_state,
+            errno_mapped,
         })
     }
 
@@ -481,6 +552,9 @@ impl CheckpointRunner {
         let mut addresses: BTreeSet<u64> = source.page_addresses()?.into_iter().collect();
         addresses.extend(self.image.data_pages.iter().copied());
         addresses.extend(self.allocation_state.borrow().new_pages.iter().copied());
+        if self.errno_mapped {
+            addresses.insert(SYNTHETIC_ERRNO_ADDRESS);
+        }
         if addresses.is_empty() || addresses.len() > MAX_SNAPSHOT_PAGES {
             bail!("FairPlay output checkpoint page count is outside the bounded range");
         }
@@ -563,6 +637,10 @@ impl CheckpointRunner {
                         .collect(),
                 ),
             ),
+            (
+                "random_state",
+                Value::I64(i64::from(self.host_state.borrow().random_state)),
+            ),
         ];
         for (name, value) in updates {
             if let Some(mut old) = fields.insert(HashableValue::String(name.into()), value) {
@@ -606,6 +684,9 @@ mod tests {
             AllocationState::from_checkpoint(&source).unwrap(),
         ));
         let once_tokens = Rc::new(RefCell::new(BTreeSet::new()));
+        let host_state = Rc::new(RefCell::new(HostState {
+            random_state: source.random_state().unwrap(),
+        }));
         let call = |engine: &mut Engine, index: u64, symbol: &str, args: [u64; 3]| {
             let address = EXTERNAL_BASE + index * EXTERNAL_STRIDE;
             assert!(
@@ -616,6 +697,7 @@ mod tests {
                     &failure,
                     &allocations,
                     &once_tokens,
+                    &host_state,
                 )
                 .unwrap()
             );
@@ -652,6 +734,7 @@ mod tests {
                 &failure,
                 &allocations,
                 &once_tokens,
+                &host_state,
             )
             .unwrap()
         );
@@ -676,6 +759,9 @@ mod tests {
             AllocationState::from_checkpoint(&source).unwrap(),
         ));
         let once_tokens = Rc::new(RefCell::new(BTreeSet::new()));
+        let host_state = Rc::new(RefCell::new(HostState {
+            random_state: source.random_state().unwrap(),
+        }));
         install_modeled_external(
             &mut engine,
             EXTERNAL_BASE,
@@ -683,6 +769,7 @@ mod tests {
             &failure,
             &allocations,
             &once_tokens,
+            &host_state,
         )
         .unwrap();
         engine.reg_write(199, 0x9000).unwrap();
@@ -719,6 +806,7 @@ mod tests {
             &runner.external_failure,
             &runner.allocation_state,
             &runner.once_tokens,
+            &runner.host_state,
         )
         .unwrap();
         runner.engine.reg_write(199, 5000).unwrap();
@@ -743,6 +831,7 @@ mod tests {
             &runner.external_failure,
             &runner.allocation_state,
             &runner.once_tokens,
+            &runner.host_state,
         )
         .unwrap();
         runner.engine.reg_write(199, 2).unwrap();
@@ -843,6 +932,7 @@ mod tests {
                 &runner.external_failure,
                 &runner.allocation_state,
                 &runner.once_tokens,
+                &runner.host_state,
             )
             .unwrap();
         };
@@ -881,6 +971,128 @@ mod tests {
         replay.engine.reg_write(203, 0).unwrap();
         call(&mut replay);
         assert_eq!(replay.engine.reg_read(203).unwrap(), 0);
+    }
+
+    #[test]
+    fn deterministic_host_calls_and_random_state_survive_checkpoint_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let binary_path = directory.path().join("fairplayd.arm64e");
+        let output_path = directory.path().join("resumed.pkl.gz");
+        std::fs::write(&binary_path, SYNTHETIC_BINARY).unwrap();
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        runner.engine.mem_map(0x8000, PAGE_BYTES as usize).unwrap();
+        let call = |runner: &mut CheckpointRunner, index: u64, symbol: &str, x0: u64| {
+            let address = EXTERNAL_BASE + index * EXTERNAL_STRIDE;
+            install_modeled_external(
+                &mut runner.engine,
+                address,
+                symbol,
+                &runner.external_failure,
+                &runner.allocation_state,
+                &runner.once_tokens,
+                &runner.host_state,
+            )
+            .unwrap();
+            runner.engine.reg_write(199, x0).unwrap();
+            runner.engine.reg_write(2, 0x5000).unwrap();
+            runner
+                .engine
+                .start_bounded(address, 0x5000, Duration::from_secs(2), 4)
+                .unwrap();
+            assert!(runner.external_failure.borrow().is_none());
+            runner.engine.reg_read(199).unwrap()
+        };
+
+        let expected = source
+            .random_state()
+            .unwrap()
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        assert_eq!(call(&mut runner, 0, "_arc4random", 0), u64::from(expected));
+        assert_eq!(call(&mut runner, 1, "_gettimeofday", 0x8000), 0);
+        assert_eq!(
+            runner.engine.mem_read(0x8000, 16).unwrap(),
+            [1_700_000_000u64.to_le_bytes(), [0; 8]].concat()
+        );
+        assert_eq!(call(&mut runner, 2, "_getpid", 0), 1234);
+        assert_eq!(call(&mut runner, 3, "_kqueue", 0), 0x900);
+        runner
+            .engine
+            .mem_map(SYNTHETIC_ERRNO_ADDRESS, PAGE_BYTES as usize)
+            .unwrap();
+        runner.errno_mapped = true;
+        let mmap_address = EXTERNAL_BASE + 4 * EXTERNAL_STRIDE;
+        install_modeled_external(
+            &mut runner.engine,
+            mmap_address,
+            "_mmap",
+            &runner.external_failure,
+            &runner.allocation_state,
+            &runner.once_tokens,
+            &runner.host_state,
+        )
+        .unwrap();
+        runner.engine.reg_write(200, 8192).unwrap();
+        runner.engine.reg_write(202, 0x1000).unwrap();
+        runner.engine.reg_write(203, u64::MAX).unwrap();
+        runner.engine.reg_write(2, 0x5000).unwrap();
+        runner
+            .engine
+            .start_bounded(mmap_address, 0x5000, Duration::from_secs(2), 4)
+            .unwrap();
+        let mapped = runner.engine.reg_read(199).unwrap();
+        assert_eq!(mapped, SYNTHETIC_ALLOCATION_BASE);
+        runner
+            .engine
+            .mem_write(mapped + PAGE_BYTES, b"mapped")
+            .unwrap();
+        runner.engine.reg_write(202, 0).unwrap();
+        runner.engine.reg_write(203, 17).unwrap();
+        runner
+            .engine
+            .start_bounded(mmap_address, 0x5000, Duration::from_secs(2), 4)
+            .unwrap();
+        assert_eq!(runner.engine.reg_read(199).unwrap(), u64::MAX);
+        assert_eq!(
+            runner.engine.mem_read(SYNTHETIC_ERRNO_ADDRESS, 4).unwrap(),
+            9u32.to_le_bytes()
+        );
+        assert_eq!(call(&mut runner, 5, "_error", 0), SYNTHETIC_ERRNO_ADDRESS);
+        assert_eq!(call(&mut runner, 6, "_munmap", mapped), 0);
+        runner
+            .engine
+            .reg_write(REG_PC, source.pc().unwrap())
+            .unwrap();
+        runner
+            .write_checkpoint(&source, &binary_path, &output_path)
+            .unwrap();
+
+        let resumed = FairplayCheckpoint::load_private(&output_path).unwrap();
+        assert_eq!(resumed.random_state().unwrap(), expected);
+        assert_eq!(
+            resumed
+                .read_block::<6>(mapped + PAGE_BYTES)
+                .unwrap()
+                .as_slice(),
+            b"mapped"
+        );
+        assert_eq!(
+            resumed
+                .read_block::<4>(SYNTHETIC_ERRNO_ADDRESS)
+                .unwrap()
+                .as_slice(),
+            &9u32.to_le_bytes()
+        );
+        let mut replay = CheckpointRunner::new(&resumed, SYNTHETIC_BINARY).unwrap();
+        let next = expected.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        assert_eq!(call(&mut replay, 0, "_arc4random", 0), u64::from(next));
     }
 
     #[test]

@@ -391,6 +391,16 @@ impl FairplayCheckpoint {
         tokens.iter().map(value_u64).collect()
     }
 
+    pub fn random_state(&self) -> Result<u32> {
+        let Some(Value::Dict(root)) = &self.root else {
+            return Ok(0x1234_5678);
+        };
+        root.get(&HashableValue::String("random_state".into()))
+            .map(|value| Ok(u32::try_from(value_u64(value)?)?))
+            .transpose()
+            .map(|value| value.unwrap_or(0x1234_5678))
+    }
+
     /// Preserve original metadata when writing a resumed schema-2 snapshot.
     pub(crate) fn clone_root(&self) -> Result<Value> {
         if let Some(root) = &self.root {
