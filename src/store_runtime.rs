@@ -27,6 +27,22 @@ pub struct StoreRuntime {
     pub heap_cursor: u64,
     dynamic_selectors: HashMap<String, u64>,
     dynamic_selector_addresses: HashMap<u64, String>,
+    pub objects: HashMap<u64, StoreObject>,
+}
+
+pub struct StoreObject {
+    pub class: String,
+    pub value: StoreValue,
+    pub properties: HashMap<String, u64>,
+}
+
+pub enum StoreValue {
+    Empty,
+    String(String),
+    Number(i64),
+    Boolean(bool),
+    Addresses(Vec<u64>),
+    Entries(HashMap<String, u64>),
 }
 
 struct ImageMemory<'a> {
@@ -113,6 +129,36 @@ impl StoreRuntime {
                 .mem_write(patch.address, &patch.data)
                 .with_context(|| format!("apply Store metadata patch at {:#x}", patch.address))?;
         }
+        let mut objects =
+            HashMap::with_capacity(profile.runtime.strings.len() + profile.runtime.constants.len());
+        for (&address, value) in &profile.runtime.strings {
+            objects.insert(
+                address,
+                StoreObject {
+                    class: "NSString".into(),
+                    value: StoreValue::String(value.clone()),
+                    properties: HashMap::new(),
+                },
+            );
+        }
+        for (&address, constant) in &profile.runtime.constants {
+            let value = match constant.kind.as_str() {
+                "NSString" => StoreValue::String(constant.text.clone()),
+                "NSNumber" if constant.is_boolean => StoreValue::Boolean(constant.boolean),
+                "NSNumber" => StoreValue::Number(constant.number),
+                "NSDictionary" => StoreValue::Entries(constant.entries.clone()),
+                "NSArray" | "NSSet" => StoreValue::Addresses(constant.items.clone()),
+                _ => StoreValue::Empty,
+            };
+            objects.insert(
+                address,
+                StoreObject {
+                    class: constant.kind.clone(),
+                    value,
+                    properties: HashMap::new(),
+                },
+            );
+        }
         Ok(Self {
             engine,
             profile,
@@ -120,6 +166,7 @@ impl StoreRuntime {
             heap_cursor: HEAP_BASE,
             dynamic_selectors: HashMap::new(),
             dynamic_selector_addresses: HashMap::new(),
+            objects,
         })
     }
 
@@ -217,6 +264,55 @@ impl StoreRuntime {
         }
         bail!("unterminated Store guest C string")
     }
+
+    pub fn new_object(&mut self, class: &str, value: StoreValue) -> Result<u64> {
+        let class_index = self.profile.runtime.classes_by_name.get(class).copied();
+        let size = class_index.map_or(256, |index| self.profile.index.classes[index].size.max(16));
+        let address = self.allocate(size)?;
+        if let Some(index) = class_index {
+            self.write_u64(address, self.profile.index.classes[index].address)?;
+        }
+        self.objects.insert(
+            address,
+            StoreObject {
+                class: class.to_owned(),
+                value,
+                properties: HashMap::new(),
+            },
+        );
+        Ok(address)
+    }
+
+    pub fn set_ivar(&mut self, address: u64, name: &str, value: u64) -> Result<()> {
+        let object = self
+            .objects
+            .get(&address)
+            .context("unknown Store guest object")?;
+        let mut class_name = object.class.as_str();
+        while let Some(&index) = self.profile.runtime.classes_by_name.get(class_name) {
+            let class = &self.profile.index.classes[index];
+            if let Some(&offset) = class.ivars.get(name) {
+                return self.write_u64(address + offset, value);
+            }
+            class_name = &class.superclass;
+        }
+        bail!("unknown Store ivar {}.{name}", object.class)
+    }
+
+    pub fn object_string(&self, address: u64) -> Result<&str> {
+        if address == 0 {
+            return Ok("");
+        }
+        match &self
+            .objects
+            .get(&address)
+            .context("unknown Store string object")?
+            .value
+        {
+            StoreValue::String(value) => Ok(value),
+            _ => bail!("Store object is not a string"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +347,22 @@ mod tests {
         assert_eq!(
             runtime.method_address("ACAccount", &method.selector, method.class_method),
             Some(method.address)
+        );
+        let ivar_offset = account.ivars["_accountStore"];
+        let account_address = account.address;
+        let object = runtime.new_object("ACAccount", StoreValue::Empty).unwrap();
+        runtime.set_ivar(object, "_accountStore", 42).unwrap();
+        assert_eq!(runtime.read_u64(object + ivar_offset).unwrap(), 42);
+        assert_eq!(runtime.read_u64(object).unwrap(), account_address);
+        let string = runtime
+            .new_object("NSString", StoreValue::String("example".into()))
+            .unwrap();
+        assert_eq!(runtime.object_string(string).unwrap(), "example");
+        let (&profile_string_address, profile_string_value) =
+            runtime.profile.runtime.strings.iter().next().unwrap();
+        assert_eq!(
+            runtime.object_string(profile_string_address).unwrap(),
+            profile_string_value
         );
         let patch = &runtime.profile.index.metadata_patches[0];
         assert_eq!(
