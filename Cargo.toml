@@ -13,7 +13,7 @@ path = "src/main.rs"
 getrandom = "0.4"
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "gzip", "brotli", "deflate"] }
 plist = "1.10"
 regex = "1.13"
 sha2 = "0.10"

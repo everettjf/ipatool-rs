@@ -1,20 +1,143 @@
-//! Free-app purchase protocol over the pinned Store request backend.
+//! Free-app purchase protocol with native and pinned Store backends.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, sync::Arc};
 
 use anyhow::{Context, Result, bail};
-use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::{
+    Method,
+    header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT},
+};
 use serde::Deserialize;
+use url::Url;
 
 use crate::{
     catalog::App,
     credentials::Account,
+    host::hardware_mac_address,
     platform::Platform,
-    store_backend::{StoreBackend, StoreBackendRequest},
-    transport::Response,
+    state::prepare_state_directory_from_environment,
+    store_backend::{PURCHASE_USER_AGENT, StoreBackend, StoreBackendRequest},
+    transport::{Request, Response, Transport},
 };
 
 const PURCHASE_PATH: &str = "/WebObjects/MZFinance.woa/wa/buyProduct";
+
+type PurchaseSender = dyn Fn(Request) -> Result<Response> + Send + Sync;
+
+/// Sends the purchase plist directly from Rust without the Store framework guest.
+pub struct NativePurchaseBackend {
+    hardware_id: [u8; 6],
+    sender: Arc<PurchaseSender>,
+}
+
+impl NativePurchaseBackend {
+    pub fn open() -> Result<Self> {
+        let hardware_id = hardware_mac_address().context("read Store hardware identity")?;
+        let state_directory = prepare_state_directory_from_environment()?;
+        let transport = Arc::new(Transport::with_cookies(&state_directory)?);
+        Ok(Self::with_sender(hardware_id, move |request| {
+            transport.send(request)
+        }))
+    }
+
+    pub fn with_sender(
+        hardware_id: [u8; 6],
+        sender: impl Fn(Request) -> Result<Response> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            hardware_id,
+            sender: Arc::new(sender),
+        }
+    }
+}
+
+impl PurchaseBackend for NativePurchaseBackend {
+    fn hardware_id(&self) -> [u8; 6] {
+        self.hardware_id
+    }
+
+    fn send_purchase(&self, request: StoreBackendRequest<'_>) -> Result<Response> {
+        if request.method != "POST" || request.body.is_some() {
+            bail!("invalid native purchase request");
+        }
+        let url = Url::parse(request.url).context("invalid purchase URL")?;
+        let host = url.host_str().context("purchase URL has no host")?;
+        let pod = host
+            .strip_prefix('p')
+            .and_then(|value| value.strip_suffix("-buy.itunes.apple.com"));
+        if url.scheme() != "https"
+            || url.path() != PURCHASE_PATH
+            || url.query().is_some()
+            || !(host == "buy.itunes.apple.com"
+                || pod.is_some_and(|id| {
+                    !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
+                }))
+        {
+            bail!("unsupported native purchase URL");
+        }
+        let parameters = request
+            .parameters
+            .context("native purchase parameters are missing")?;
+        let mut parameters = parameters.clone();
+        let fields = parameters
+            .as_object_mut()
+            .context("native purchase parameters must be a dictionary")?;
+        fields.insert("hasBeenAuthedForBuy".into(), serde_json::Value::Bool(true));
+        fields.insert(
+            "clientCorrelationKey".into(),
+            serde_json::Value::String(random_correlation_key()?),
+        );
+        let mut body = Vec::new();
+        plist::to_writer_xml(&mut body, &parameters).context("encode native purchase plist")?;
+        let mut headers = request.headers.clone();
+        headers.insert(USER_AGENT, HeaderValue::from_static(PURCHASE_USER_AGENT));
+        headers.insert(
+            "Accept-Encoding",
+            HeaderValue::from_static("br, gzip, deflate"),
+        );
+        headers.insert("Accept-Language", HeaderValue::from_static("en"));
+        headers.insert(
+            "X-Apple-Client-Application",
+            HeaderValue::from_static("me.majd.ipatool"),
+        );
+        headers.insert("X-Apple-TZ", HeaderValue::from_static("0"));
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&body.len().to_string())?,
+        );
+        (self.sender)(Request {
+            method: Method::POST,
+            url,
+            headers,
+            body: Some(body),
+            no_redirects: request.no_redirects,
+            timeout: request.timeout,
+        })
+    }
+}
+
+fn random_correlation_key() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).context("generate purchase correlation key")?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok([
+        &bytes[..4],
+        &bytes[4..6],
+        &bytes[6..8],
+        &bytes[8..10],
+        &bytes[10..],
+    ]
+    .into_iter()
+    .map(|group| {
+        group
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>()
+    })
+    .collect::<Vec<_>>()
+    .join("-"))
+}
 
 #[derive(Debug)]
 pub struct PasswordTokenExpired;
@@ -199,6 +322,38 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[derive(Debug, PartialEq)]
+    struct WirePurchase {
+        url: String,
+        body_len: usize,
+        body: plist::Value,
+        headers: Vec<(String, String)>,
+    }
+
+    fn wire_purchase(request: &Request) -> WirePurchase {
+        let mut headers: Vec<_> = request
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_str().unwrap().to_owned()))
+            .collect();
+        headers.sort();
+        let mut body: plist::Value = plist::from_bytes(request.body.as_ref().unwrap()).unwrap();
+        let key = body
+            .as_dictionary_mut()
+            .unwrap()
+            .remove("clientCorrelationKey")
+            .unwrap();
+        let key = key.as_string().unwrap();
+        assert_eq!(key.len(), 36);
+        assert_eq!(key.as_bytes()[14], b'4');
+        WirePurchase {
+            url: request.url.to_string(),
+            body_len: request.body.as_ref().unwrap().len(),
+            body,
+            headers,
+        }
+    }
+
     struct FixtureBackend {
         responses: Mutex<Vec<Response>>,
         pricing: Mutex<Vec<String>>,
@@ -375,5 +530,45 @@ mod tests {
         };
         purchase(&backend, &fixture_account(), &app, Some(Platform::Iphone)).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn native_purchase_matches_pinned_store_wire_request() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let guest_request = Arc::new(Mutex::new(None));
+        let observed_guest = Arc::clone(&guest_request);
+        let guest = StoreBackend::with_sender(
+            assets.apple_media_services,
+            [0, 1, 2, 3, 4, 5],
+            move |request| {
+                if request.url.host_str() == Some("init.itunes.apple.com") {
+                    return Ok(response(
+                        r#"<plist version="1.0"><dict><key>urlBag</key><dict><key>buyProduct</key><string>https://buy.itunes.apple.com/stale</string></dict></dict></plist>"#,
+                    ));
+                }
+                *observed_guest.lock().unwrap() = Some(wire_purchase(&request));
+                Ok(response(
+                    r#"<plist version="1.0"><dict><key>jingleDocType</key><string>purchaseSuccess</string><key>status</key><integer>0</integer></dict></plist>"#,
+                ))
+            },
+        );
+        let native_request = Arc::new(Mutex::new(None));
+        let observed_native = Arc::clone(&native_request);
+        let native = NativePurchaseBackend::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            *observed_native.lock().unwrap() = Some(wire_purchase(&request));
+            Ok(response(
+                r#"<plist version="1.0"><dict><key>jingleDocType</key><string>purchaseSuccess</string><key>status</key><integer>0</integer></dict></plist>"#,
+            ))
+        });
+        let app = App {
+            id: 1234,
+            ..App::default()
+        };
+        purchase(&guest, &fixture_account(), &app, Some(Platform::Iphone)).unwrap();
+        purchase(&native, &fixture_account(), &app, Some(Platform::Iphone)).unwrap();
+        assert_eq!(
+            *native_request.lock().unwrap(),
+            *guest_request.lock().unwrap()
+        );
     }
 }
