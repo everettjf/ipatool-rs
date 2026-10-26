@@ -6,6 +6,9 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     arm64_compat::emulate_invalid_instruction,
+    sap_assets::SapAssetBundle,
+    sap_images::SapImages,
+    sap_shims::SapShims,
     sap_signer::SapGuest,
     unicorn_runtime::{Engine, REG_PC, REG_X0},
 };
@@ -162,13 +165,29 @@ pub struct SapEntrypoints {
 pub struct SapRuntimeGuest {
     machine: Option<GuestMachine>,
     entries: SapEntrypoints,
+    shims: Option<SapShims>,
 }
 
 impl SapRuntimeGuest {
+    pub fn open(bundle: &SapAssetBundle) -> Result<Self> {
+        let mut images = SapImages::open(bundle)?;
+        let entries = images.entrypoints();
+        let mut machine = GuestMachine::new()?;
+        let mut shims = SapShims::new()?;
+        shims.install(machine.engine())?;
+        images.load(machine.engine(), |name| shims.resolve(name))?;
+        Ok(Self {
+            machine: Some(machine),
+            entries,
+            shims: Some(shims),
+        })
+    }
+
     pub fn new(machine: GuestMachine, entries: SapEntrypoints) -> Self {
         Self {
             machine: Some(machine),
             entries,
+            shims: None,
         }
     }
 
@@ -180,9 +199,15 @@ impl SapRuntimeGuest {
             .machine
             .as_mut()
             .context("SAP guest machine is closed")?;
+        if let Some(shims) = self.shims.as_mut() {
+            shims.take_fault();
+        }
         machine.begin_call()?;
         let result = call(machine, self.entries);
         let clear = machine.clear_scratch();
+        if let Some(fault) = self.shims.as_mut().and_then(SapShims::take_fault) {
+            bail!("SAP guest service failed: {fault}");
+        }
         match (result, clear) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -274,19 +299,18 @@ impl SapGuest for SapRuntimeGuest {
     }
 
     fn teardown(&mut self, context: u64) -> Result<()> {
-        let machine = self
-            .machine
-            .as_mut()
-            .context("SAP guest machine is closed")?;
-        let status = machine.invoke(self.entries.teardown, &[context])?;
-        if status as i32 != 0 {
-            bail!("SAP teardown returned {}", status as i32);
-        }
-        Ok(())
+        self.with_scratch(|machine, entries| {
+            let status = machine.invoke(entries.teardown, &[context])?;
+            if status as i32 != 0 {
+                bail!("SAP teardown returned {}", status as i32);
+            }
+            Ok(())
+        })
     }
 
     fn close(&mut self) -> Result<()> {
         self.machine.take();
+        self.shims.take();
         Ok(())
     }
 }
@@ -353,6 +377,19 @@ fn consume_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "downloads pinned macOS restore assets when the cache is empty"]
+    fn opens_pinned_sap_runtime() {
+        let bundle = SapAssetBundle::load_or_download().unwrap();
+        let mut guest = SapRuntimeGuest::open(&bundle).unwrap();
+        assert!(guest.entries.initialize != 0);
+        assert!(guest.entries.sign != 0);
+        let context = guest.initialize(&[1; 20]).unwrap();
+        assert_ne!(context, 0);
+        guest.teardown(context).unwrap();
+        guest.close().unwrap();
+    }
     use std::{cell::Cell, rc::Rc};
 
     #[test]

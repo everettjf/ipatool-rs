@@ -21,6 +21,7 @@ pub mod sap_machine;
 pub mod sap_prelinked;
 pub mod sap_protocol;
 pub mod sap_remote;
+pub mod sap_shims;
 pub mod sap_signer;
 pub mod sap_system_os;
 pub mod state;
