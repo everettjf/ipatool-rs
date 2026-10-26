@@ -26,7 +26,7 @@ cargo run -- fairplay-doctor --ipa /private/path/app.ipa --model /private/path/m
 | Shared HTTP request/response decoding and state directory migration | Implemented as library modules; account integration pending |
 | Authentication URL bag, endpoint validation, 2FA and phone routing helpers | Implemented as library modules; SAP signing and login execution pending |
 | FairPlay SINF, IPA SINF and enrollment model inspection | Implemented as library modules; decryption pending |
-| `fairplay-doctor` capture, IPA and model matching | Implemented; live-host checks pending |
+| `fairplay-doctor` host, capture, IPA and model checks | Implemented; current macOS host output compared with Go |
 | Account authentication and secure credential storage | Pending |
 | Purchases, owned apps, version history and metadata | Pending |
 | iOS and macOS package downloads and SINF replication | Pending |

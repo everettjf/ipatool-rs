@@ -18,6 +18,7 @@ use crate::capture::{
     EnrollmentCaptureManifest, FairPlayBuildSupport, capture_file_path, load_enrollment_capture,
     model_matches_capture_build,
 };
+use crate::host::{FairPlayHostDiagnostic, inspect_local_fairplay_host};
 
 const MODEL_V1_BYTES: usize = 8 + 4 + 4 + 32 + 16 + 16 + 16 * 256;
 const MODEL_V2_BYTES: usize = 8 + 4 + 4 + 32 + 4 + 4 + 16 + 16 + 16 * 256;
@@ -327,6 +328,8 @@ pub struct FairPlayDoctorReport {
     pub created_at: String,
     pub ready: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<FairPlayHostDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub capture: Option<EnrollmentCaptureDiagnostic>,
     pub capture_verified: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -344,8 +347,7 @@ pub struct FairPlayDoctorReport {
     pub next_actions: Vec<String>,
 }
 
-/// Diagnose capture, IPA and model compatibility offline. Live-host checks
-/// remain unavailable until the native host port lands.
+/// Diagnose local host, capture, IPA and model compatibility.
 pub fn doctor_fairplay(
     capture_path: Option<&Path>,
     ipa_path: Option<&Path>,
@@ -357,6 +359,7 @@ pub fn doctor_fairplay(
             .format(&Rfc3339)
             .unwrap_or_default(),
         ready: false,
+        host: None,
         capture: None,
         capture_verified: false,
         sinf: Vec::new(),
@@ -370,6 +373,27 @@ pub fn doctor_fairplay(
 
     let mut capture_manifest: Option<EnrollmentCaptureManifest> = None;
     let mut resolved_ipa: Option<PathBuf> = ipa_path.map(Path::to_path_buf);
+    if capture_path.is_none() {
+        match inspect_local_fairplay_host() {
+            Ok(host) => {
+                report
+                    .checks
+                    .insert("supported_fairplayd".into(), host.fairplay_support.recovery);
+                report.checks.insert(
+                    "native_state_accessible".into(),
+                    host.state_accessible && host.state_files != 0,
+                );
+                report
+                    .checks
+                    .insert("hardware_iomac".into(), host.hardware_iomac_present);
+                report.host = Some(host);
+            }
+            Err(error) if ipa_path.is_none() && model_path.is_none() => {
+                report.errors.push(format!("host: {error:#}"))
+            }
+            Err(_) => {}
+        }
+    }
     if let Some(path) = capture_path {
         match load_enrollment_capture(path, true) {
             Ok(manifest) => {
@@ -465,9 +489,20 @@ pub fn doctor_fairplay(
         }
     }
     match capture_manifest.as_ref() {
-        None => report
-            .next_actions
-            .push("collect native enrollment with fairplay-enroll collect".into()),
+        None => {
+            if report
+                .host
+                .as_ref()
+                .is_some_and(|host| !host.state_accessible)
+            {
+                report
+                    .next_actions
+                    .push("rerun collection with permission to read /private/var/db/fpsd".into());
+            }
+            report
+                .next_actions
+                .push("collect native enrollment with fairplay-enroll collect".into());
+        }
         Some(capture) if !capture.fairplay.recovery => report
             .next_actions
             .push("add and validate an exact evaluator for this fairplayd hash".into()),
@@ -487,19 +522,22 @@ pub fn doctor_fairplay(
             .next_actions
             .push("run fairplay-decrypt with the compatible model".into());
     }
-    if resolved_ipa.is_none() && model_path.is_none() && capture_path.is_none() {
-        report
-            .errors
-            .push("host: local FairPlay host inspection is not yet implemented in Rust".into());
-    }
-    report.ready = !report.sinf.is_empty()
-        && report.errors.is_empty()
-        && report.checks.get("current_sinf_layout") == Some(&true)
-        && (capture_manifest.is_none()
-            || report.checks.get("capture_integrity") == Some(&true)
-                && report.checks.get("supported_fairplayd") == Some(&true)
-                && report.checks.get("capture_selector_match") == Some(&true))
-        && (model_path.is_none() || report.checks.get("selector_match") == Some(&true));
+    report.ready = if !report.sinf.is_empty() || capture_manifest.is_some() || model_path.is_some()
+    {
+        report.errors.is_empty()
+            && report.checks.get("current_sinf_layout") == Some(&true)
+            && (capture_manifest.is_none()
+                || report.checks.get("capture_integrity") == Some(&true)
+                    && report.checks.get("supported_fairplayd") == Some(&true)
+                    && report.checks.get("capture_selector_match") == Some(&true))
+            && (model_path.is_none() || report.checks.get("selector_match") == Some(&true))
+    } else if report.host.is_some() {
+        report.checks.get("supported_fairplayd") == Some(&true)
+            && report.checks.get("native_state_accessible") == Some(&true)
+            && report.checks.get("hardware_iomac") == Some(&true)
+    } else {
+        false
+    };
     report
 }
 
