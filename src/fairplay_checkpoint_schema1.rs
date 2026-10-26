@@ -12,6 +12,26 @@ const MAX_PAGES: usize = 65_536;
 const MAX_STACK: usize = 4096;
 const MAX_MEMO: usize = 100_000;
 const MAX_STRING: usize = 1024 * 1024;
+const MAX_ONCE_TOKENS: usize = 65_536;
+
+#[derive(Default)]
+pub struct Schema1Metadata {
+    pub working_sinf: u64,
+    pub priv_offset: u64,
+    pub priv_length: u64,
+    pub state_slot: u64,
+    pub once_tokens: Vec<u64>,
+}
+
+impl Drop for Schema1Metadata {
+    fn drop(&mut self) {
+        self.working_sinf.zeroize();
+        self.priv_offset.zeroize();
+        self.priv_length.zeroize();
+        self.state_slot.zeroize();
+        self.once_tokens.zeroize();
+    }
+}
 
 pub struct SparsePage {
     bytes: Box<[u8; PAGE_BYTES]>,
@@ -70,6 +90,7 @@ pub struct Schema1Checkpoint {
     pub nzcv: u64,
     pub registers: HashMap<String, u128>,
     pub pages: HashMap<u64, SparsePage>,
+    pub metadata: Schema1Metadata,
 }
 
 impl Drop for Schema1Checkpoint {
@@ -94,7 +115,7 @@ enum MapKind {
 enum Slot {
     Mark,
     Map(MapKind),
-    List,
+    List(Option<Vec<u64>>),
     Int(i128),
     Wide(u128),
     Text(String),
@@ -112,6 +133,11 @@ struct Parser<R> {
     registers: HashMap<String, u128>,
     pages: HashMap<u64, SparsePage>,
     memory_entries: usize,
+    working_sinf: Option<u64>,
+    priv_offset: Option<u64>,
+    priv_length: Option<u64>,
+    state_slot: Option<u64>,
+    once_tokens: Option<Vec<u64>>,
 }
 
 impl<R: Read> Parser<R> {
@@ -127,6 +153,11 @@ impl<R: Read> Parser<R> {
             registers: HashMap::new(),
             pages: HashMap::new(),
             memory_entries: 0,
+            working_sinf: None,
+            priv_offset: None,
+            priv_length: None,
+            state_slot: None,
+            once_tokens: None,
         }
     }
 
@@ -210,6 +241,31 @@ impl<R: Read> Parser<R> {
         }
     }
 
+    fn list_for_next_value(&self) -> Option<Vec<u64>> {
+        match self.stack.last() {
+            Some(Slot::Text(key)) if key == "once_tokens" => Some(Vec::new()),
+            _ => None,
+        }
+    }
+
+    fn slot_u64(value: Slot) -> Result<u64> {
+        match value {
+            Slot::Int(value) => Ok(u64::try_from(value)?),
+            Slot::Wide(value) => Ok(u64::try_from(value)?),
+            _ => bail!("checkpoint metadata contains a noninteger value"),
+        }
+    }
+
+    fn extend_list(list: &mut Vec<u64>, values: Vec<Slot>) -> Result<()> {
+        if list.len().saturating_add(values.len()) > MAX_ONCE_TOKENS {
+            bail!("checkpoint once-token list exceeds limit");
+        }
+        for value in values {
+            list.push(Self::slot_u64(value)?);
+        }
+        Ok(())
+    }
+
     fn assign(&mut self, kind: MapKind, key: Slot, value: Slot) -> Result<()> {
         match kind {
             MapKind::Root => match (key, value) {
@@ -220,6 +276,21 @@ impl<R: Read> Parser<R> {
                     self.hash = Some(hash)
                 }
                 (Slot::Text(key), Slot::Text(pc)) if key == "pc" => self.pc = Some(pc),
+                (Slot::Text(key), value) if key == "working_sinf" => {
+                    self.working_sinf = Some(Self::slot_u64(value)?);
+                }
+                (Slot::Text(key), value) if key == "priv_offset" => {
+                    self.priv_offset = Some(Self::slot_u64(value)?);
+                }
+                (Slot::Text(key), value) if key == "priv_length" => {
+                    self.priv_length = Some(Self::slot_u64(value)?);
+                }
+                (Slot::Text(key), value) if key == "state_slot" => {
+                    self.state_slot = Some(Self::slot_u64(value)?);
+                }
+                (Slot::Text(key), Slot::List(Some(tokens))) if key == "once_tokens" => {
+                    self.once_tokens = Some(tokens);
+                }
                 _ => {}
             },
             MapKind::Registers => {
@@ -328,7 +399,10 @@ impl<R: Read> Parser<R> {
                     let kind = self.map_for_next_value();
                     self.push(Slot::Map(kind))?;
                 }
-                b']' => self.push(Slot::List)?,
+                b']' => {
+                    let list = self.list_for_next_value();
+                    self.push(Slot::List(list))?;
+                }
                 b')' => self.push(Slot::Other)?,
                 b'(' => self.push(Slot::Mark)?,
                 0x94 => {
@@ -407,15 +481,19 @@ impl<R: Read> Parser<R> {
                 b's' => self.set_item()?,
                 b'u' => self.set_items()?,
                 b'a' => {
-                    self.pop()?;
-                    if !matches!(self.stack.last(), Some(Slot::List)) {
-                        bail!("checkpoint pickle APPEND target is not a list");
+                    let value = self.pop()?;
+                    match self.stack.last_mut() {
+                        Some(Slot::List(Some(list))) => Self::extend_list(list, vec![value])?,
+                        Some(Slot::List(None)) => {}
+                        _ => bail!("checkpoint pickle APPEND target is not a list"),
                     }
                 }
                 b'e' => {
-                    self.marked_values()?;
-                    if !matches!(self.stack.last(), Some(Slot::List)) {
-                        bail!("checkpoint pickle APPENDS target is not a list");
+                    let values = self.marked_values()?;
+                    match self.stack.last_mut() {
+                        Some(Slot::List(Some(list))) => Self::extend_list(list, values)?,
+                        Some(Slot::List(None)) => {}
+                        _ => bail!("checkpoint pickle APPENDS target is not a list"),
                     }
                 }
                 0x85 => {
@@ -474,6 +552,15 @@ impl<R: Read> Parser<R> {
             nzcv,
             registers: self.registers,
             pages: self.pages,
+            metadata: Schema1Metadata {
+                working_sinf: self
+                    .working_sinf
+                    .context("checkpoint has no working_sinf")?,
+                priv_offset: self.priv_offset.context("checkpoint has no priv_offset")?,
+                priv_length: self.priv_length.context("checkpoint has no priv_length")?,
+                state_slot: self.state_slot.context("checkpoint has no state_slot")?,
+                once_tokens: self.once_tokens.context("checkpoint has no once_tokens")?,
+            },
         })
     }
 }

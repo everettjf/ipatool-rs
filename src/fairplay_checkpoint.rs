@@ -1,7 +1,7 @@
 //! Read the private Python checkpoints used by FairPlay recovery.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     io::{Cursor, Read, Seek, SeekFrom},
     path::Path,
 };
@@ -12,7 +12,7 @@ use serde_pickle::{DeOptions, HashableValue, Value};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    fairplay_checkpoint_schema1::{self, SparsePage},
+    fairplay_checkpoint_schema1::{self, Schema1Metadata, SparsePage},
     fairplay_recovery_output::open_private_file,
     store_memory::{MemoryRegion, exclude_mapped_regions},
     unicorn_runtime::Engine,
@@ -37,6 +37,7 @@ pub struct FairplayCheckpoint {
     sparse_registers: HashMap<String, u128>,
     sparse_pc: u64,
     sparse_nzcv: u64,
+    sparse_metadata: Option<Schema1Metadata>,
 }
 
 impl Drop for FairplayCheckpoint {
@@ -95,6 +96,7 @@ impl FairplayCheckpoint {
                 sparse_registers: std::mem::take(&mut parsed.registers),
                 sparse_pc: parsed.pc,
                 sparse_nzcv: parsed.nzcv,
+                sparse_metadata: Some(std::mem::take(&mut parsed.metadata)),
             });
         }
         let mut plain = Zeroizing::new(Vec::new());
@@ -119,6 +121,7 @@ impl FairplayCheckpoint {
             sparse_registers: HashMap::new(),
             sparse_pc: 0,
             sparse_nzcv: 0,
+            sparse_metadata: None,
         };
         if value_u64(checkpoint.field("schema")?)? != 2 {
             bail!("only page-packed FairPlay checkpoint schema 2 is supported");
@@ -360,11 +363,43 @@ impl FairplayCheckpoint {
         pages.keys().map(page_key_u64).collect()
     }
 
-    /// Preserve the original metadata when writing a resumed schema-2 snapshot.
+    /// Preserve original metadata when writing a resumed schema-2 snapshot.
     pub(crate) fn clone_root(&self) -> Result<Value> {
-        self.root
-            .clone()
-            .context("schema-1 checkpoints cannot yet be exported as schema 2")
+        if let Some(root) = &self.root {
+            return Ok(root.clone());
+        }
+        let metadata = self
+            .sparse_metadata
+            .as_ref()
+            .context("schema-1 checkpoint metadata is missing")?;
+        let mut fields = BTreeMap::new();
+        let mut insert = |name: &str, value: Value| {
+            fields.insert(HashableValue::String(name.into()), value);
+        };
+        insert(
+            "binary_sha256",
+            Value::String(
+                self.binary_hash
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+            ),
+        );
+        insert("working_sinf", Value::Int(metadata.working_sinf.into()));
+        insert("priv_offset", Value::Int(metadata.priv_offset.into()));
+        insert("priv_length", Value::Int(metadata.priv_length.into()));
+        insert("state_slot", Value::Int(metadata.state_slot.into()));
+        insert(
+            "once_tokens",
+            Value::List(
+                metadata
+                    .once_tokens
+                    .iter()
+                    .map(|&token| Value::Int(token.into()))
+                    .collect(),
+            ),
+        );
+        Ok(Value::Dict(fields))
     }
 
     fn field(&self, name: &str) -> Result<&Value> {
@@ -496,6 +531,16 @@ mod tests {
         );
         assert!(checkpoint.read_block::<433>(address).is_err());
         assert!(checkpoint.read_block::<1>(0xf000_0000_0000_0123).is_err());
+        let Value::Dict(metadata) = checkpoint.clone_root().unwrap() else {
+            panic!("checkpoint metadata must be a dictionary");
+        };
+        let tokens = metadata
+            .get(&HashableValue::String("once_tokens".into()))
+            .unwrap();
+        assert_eq!(
+            tokens,
+            &Value::List(vec![Value::Int(4660.into()), Value::Int(22136.into())])
+        );
     }
 
     #[test]

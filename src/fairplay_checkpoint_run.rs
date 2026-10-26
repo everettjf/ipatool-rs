@@ -277,6 +277,8 @@ mod tests {
         include_bytes!("../tests/fixtures/fairplay-checkpoint-run-synthetic.macho");
     const SYNTHETIC_CHECKPOINT: &[u8] =
         include_bytes!("../tests/fixtures/fairplay-checkpoint-run-synthetic.pkl.gz");
+    const SYNTHETIC_SCHEMA1_CHECKPOINT: &[u8] =
+        include_bytes!("../tests/fixtures/fairplay-checkpoint-run-schema1-synthetic.pkl.gz");
 
     #[test]
     fn resumes_checked_macho_and_checkpoint_to_target() {
@@ -319,6 +321,46 @@ mod tests {
         assert_eq!(
             resumed.page_addresses().unwrap(),
             source.page_addresses().unwrap()
+        );
+        let replay = CheckpointRunner::new(&resumed, SYNTHETIC_BINARY).unwrap();
+        assert_eq!(replay.engine.reg_read(199).unwrap(), 43);
+    }
+
+    #[test]
+    fn upgrades_sparse_schema1_checkpoint_without_losing_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let binary_path = directory.path().join("fairplayd.arm64e");
+        let output_path = directory.path().join("resumed.pkl.gz");
+        std::fs::write(&binary_path, SYNTHETIC_BINARY).unwrap();
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_SCHEMA1_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        let stop = source.pc().unwrap() + 8;
+        runner.run_until(stop, Duration::from_secs(2), 8).unwrap();
+        assert_eq!(
+            runner
+                .write_checkpoint(&source, &binary_path, &output_path)
+                .unwrap(),
+            1
+        );
+        let resumed = FairplayCheckpoint::load_private(&output_path).unwrap();
+        assert_eq!(resumed.pc().unwrap(), stop);
+        assert_eq!(resumed.register_u64("x0").unwrap(), 43);
+        assert_eq!(resumed.binary_hash, source.binary_hash);
+        let Value::Dict(fields) = resumed.clone_root().unwrap() else {
+            panic!("resumed checkpoint root is not a dictionary");
+        };
+        assert_eq!(
+            fields.get(&HashableValue::String("once_tokens".into())),
+            Some(&Value::List(vec![
+                Value::I64(0x1234),
+                Value::I64(0x5678),
+            ]))
         );
         let replay = CheckpointRunner::new(&resumed, SYNTHETIC_BINARY).unwrap();
         assert_eq!(replay.engine.reg_read(199).unwrap(), 43);
