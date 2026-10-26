@@ -20,6 +20,8 @@ use ipatool_rs::storefront::country_code_from_storefront;
 use ipatool_rs::{App, CatalogClient, Platform, SearchOutput};
 use zeroize::Zeroizing;
 
+mod mcp;
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Format {
     Text,
@@ -45,6 +47,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve App Store tools over MCP using stdio.
+    Mcp,
     /// Generate a shell completion script for the current command set.
     Completion { shell: Shell },
     /// Inspect or remove the account stored by ipatool in the system keychain.
@@ -224,6 +228,7 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Mcp => mcp::serve()?,
         Command::Completion { shell } => {
             let mut command = Cli::command();
             generate(shell, &mut command, "ipatool", &mut std::io::stdout());
