@@ -87,7 +87,7 @@ pub fn decrypt_macho(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::fairplay_supf::{PAGE_BYTES, SupfArchitecture};
     use aes::{
@@ -95,9 +95,7 @@ mod tests {
         cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray},
     };
 
-    #[test]
-    fn decrypts_signed_encrypted_image_and_rejects_tampered_source() {
-        let logical = [0x31; 16];
+    pub(crate) fn encrypted_fixture(logical: [u8; 16]) -> (Vec<u8>, [u8; 32], Vec<u8>) {
         let mut record = [0u8; 32];
         for (index, byte) in record.iter_mut().enumerate() {
             *byte = index as u8 + 1;
@@ -156,6 +154,13 @@ mod tests {
         signature.extend_from_slice(&directory);
         source[68..72].copy_from_slice(&(signature.len() as u32).to_le_bytes());
         source[PAGE_BYTES * 2..PAGE_BYTES * 2 + signature.len()].copy_from_slice(&signature);
+        (source, record, plaintext)
+    }
+
+    #[test]
+    fn decrypts_signed_encrypted_image_and_rejects_tampered_source() {
+        let logical = [0x31; 16];
+        let (source, record, plaintext) = encrypted_fixture(logical);
         let supf = Supf {
             variant: 5,
             architectures: vec![SupfArchitecture {

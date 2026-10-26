@@ -8,6 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
+use ipatool_rs::fairplay_ipa::decrypt_ipa;
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
 use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
@@ -145,6 +146,15 @@ enum Command {
         model: Option<PathBuf>,
         #[arg(long)]
         report: Option<PathBuf>,
+    },
+    /// Decrypt a personalized IPA with a private FairPlay enrollment model.
+    FairplayDecrypt {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -653,6 +663,29 @@ fn run() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&output)?);
             if !output.ready {
                 bail!("FairPlay diagnostics are not ready; see errors and next_actions");
+            }
+        }
+        Command::FairplayDecrypt {
+            input,
+            model,
+            output,
+        } => {
+            if !input
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("ipa"))
+            {
+                bail!("FairPlay input must be an IPA file");
+            }
+            let output = output.unwrap_or_else(|| input.with_extension("decrypted.ipa"));
+            let result = decrypt_ipa(&input, &output, &model)?;
+            match cli.format {
+                Format::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+                Format::Text => println!(
+                    "Decrypted {} images ({} pages) to {}",
+                    result.encrypted_images,
+                    result.decrypted_pages,
+                    output.display()
+                ),
             }
         }
     }
