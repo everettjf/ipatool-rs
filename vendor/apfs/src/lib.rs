@@ -112,6 +112,7 @@ pub struct ApfsVolume<R: Read + Seek> {
     block_size: u32,
     vol_omap_root_block: u64,
     catalog_root_block: u64,
+    sealed_tree_base: u64,
     info: VolumeInfo,
 }
 
@@ -178,6 +179,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             block_size,
             vol_omap_root_block,
             catalog_root_block,
+            sealed_tree_base: vol_sb.root_tree_oid,
             info,
         })
     }
@@ -198,6 +200,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
                 self.catalog_root_block,
                 self.vol_omap_root_block,
                 self.block_size,
+                self.sealed_tree_base,
                 path,
             )?;
             if inode.kind() != catalog::INODE_DIR_TYPE {
@@ -217,6 +220,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             parent,
         )?;
         self.resolve_entry_sizes(&mut entries)?;
@@ -261,6 +265,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             oid,
             catalog::SYMLINK_XATTR_NAME,
         )?
@@ -282,6 +287,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             path,
         )?;
         self.read_xattr(oid, name)
@@ -299,6 +305,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             path,
         )?;
         let names = catalog::list_xattr_names(
@@ -306,6 +313,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             oid,
         )?;
         Ok(classify(names))
@@ -317,6 +325,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             oid,
             name,
         )?;
@@ -330,6 +339,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
                     self.catalog_root_block,
                     self.vol_omap_root_block,
                     self.block_size,
+                    self.sealed_tree_base,
                     obj_id,
                 )?;
                 let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
@@ -389,6 +399,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             path,
         )?;
 
@@ -416,6 +427,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             inode.private_id,
         )?;
 
@@ -439,6 +451,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             path,
         )?;
         if let Some(header) = self.compression(oid)? {
@@ -454,6 +467,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             path,
         )?;
 
@@ -463,6 +477,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             inode.private_id,
         )?;
 
@@ -481,6 +496,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             path,
         )?;
 
@@ -528,6 +544,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             path,
         ) {
             Ok(_) => Ok(true),
@@ -547,6 +564,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             self.catalog_root_block,
             self.vol_omap_root_block,
             self.block_size,
+            self.sealed_tree_base,
             parent_oid,
         )?;
         self.resolve_entry_sizes(&mut dir_entries)?;

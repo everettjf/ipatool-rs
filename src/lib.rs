@@ -6,6 +6,7 @@ pub mod cookies;
 pub mod credentials;
 pub mod fairplay;
 pub mod host;
+pub mod lzbitmap;
 pub mod machimage;
 pub mod platform;
 pub mod sap_aea;

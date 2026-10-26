@@ -84,6 +84,7 @@ pub fn omap_lookup<R: Read + Seek>(
         OMAP_VAL_SIZE,
         &compare_fn,
         None,
+        None,
     )?;
 
     if let Some(val) = result {
@@ -99,6 +100,7 @@ pub fn omap_lookup<R: Read + Seek>(
         OMAP_KEY_SIZE,
         OMAP_VAL_SIZE,
         &compare_fn,
+        None,
         None,
     )?;
 

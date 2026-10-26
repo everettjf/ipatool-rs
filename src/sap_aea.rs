@@ -992,4 +992,24 @@ mod tests {
             assert!(stat.size > 0);
         }
     }
+
+    #[test]
+    #[ignore = "downloads the pinned SystemOS cryptex and locates the shared cache"]
+    fn pinned_system_os_exposes_shared_cache() {
+        let restore = crate::sap_archive::PinnedRestore::open().unwrap();
+        let image = AeaReader::open(&restore.remote, restore.system_os).unwrap();
+        assert_eq!(image.size(), 2_879_389_696);
+        let mut volume = apfs::ApfsVolume::open(image).unwrap();
+        eprintln!("SystemOS APFS volume: {}", volume.volume_info().name);
+        let root = volume.list_directory("/").unwrap();
+        eprintln!(
+            "SystemOS root: {:?}",
+            root.iter().map(|entry| &entry.name).collect::<Vec<_>>()
+        );
+        let path = "/System/Library/dyld/dyld_shared_cache_arm64e";
+        let stat = volume.stat(path).unwrap();
+        assert!(stat.size > 568);
+        assert_eq!(stat.compression.unwrap().compression_type, 14);
+        eprintln!("SystemOS shared cache size: {}", stat.size);
+    }
 }

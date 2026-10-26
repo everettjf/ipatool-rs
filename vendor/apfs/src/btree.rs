@@ -168,10 +168,6 @@ pub struct TocEntry {
 
 /// A parsed APFS B-tree node with extracted key-value pairs.
 pub struct BTreeNode {
-    #[expect(
-        dead_code,
-        reason = "mirrors the on-disk layout; parsed and kept so the struct documents the format"
-    )]
     pub header: ObjectHeader,
     pub node_header: BTreeNodeHeader,
     pub toc: Vec<TocEntry>,
@@ -323,6 +319,7 @@ struct BTreeParams {
     fixed_key_size: u32,
     fixed_val_size: u32,
     omap_root: Option<u64>,
+    sealed_tree_base: Option<u64>,
 }
 
 /// Resolve a child OID to a physical block number.
@@ -337,6 +334,19 @@ fn resolve_child_oid<R: Read + Seek>(
     match omap_root {
         Some(omap) => omap::omap_lookup(reader, omap, block_size, child_oid),
         None => Ok(child_oid),
+    }
+}
+
+fn catalog_child_oid(node: &BTreeNode, index: usize, params: &BTreeParams) -> Result<u64> {
+    let child = node.child_oid(index)?;
+    if node.header.type_and_flags & object::OBJECT_NOHEADER != 0 {
+        let base = params.sealed_tree_base.ok_or_else(|| {
+            ApfsError::InvalidBTree("sealed tree has no root OID".into())
+        })?;
+        base.checked_add(child)
+            .ok_or_else(|| ApfsError::InvalidBTree("sealed child OID overflow".into()))
+    } else {
+        Ok(child)
     }
 }
 
@@ -368,6 +378,7 @@ pub fn btree_lookup<R: Read + Seek, F>(
     fixed_val_size: u32,
     compare_fn: &F,
     omap_root: Option<u64>,
+    sealed_tree_base: Option<u64>,
 ) -> Result<Option<Vec<u8>>>
 where
     F: Fn(&[u8]) -> Result<std::cmp::Ordering>,
@@ -398,6 +409,7 @@ where
         fixed_key_size: fks,
         fixed_val_size: fvs,
         omap_root,
+        sealed_tree_base,
     };
     btree_lookup_node(reader, &node, &params, compare_fn)
 }
@@ -479,7 +491,7 @@ where
             None => return Ok(None),
         };
 
-        let child_oid = node.child_oid(child_idx)?;
+        let child_oid = catalog_child_oid(node, child_idx, params)?;
         let child_block =
             resolve_child_oid(reader, child_oid, params.block_size, params.omap_root)?;
 
@@ -507,6 +519,7 @@ pub fn btree_scan<R: Read + Seek, F>(
     fixed_val_size: u32,
     compare_fn: &F,
     omap_root: Option<u64>,
+    sealed_tree_base: Option<u64>,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>
 where
     F: Fn(&[u8]) -> Result<std::cmp::Ordering>,
@@ -536,6 +549,7 @@ where
         fixed_key_size: fks,
         fixed_val_size: fvs,
         omap_root,
+        sealed_tree_base,
     };
     let mut results = Vec::new();
     btree_scan_node(reader, &node, &params, compare_fn, &mut results)?;
@@ -594,7 +608,7 @@ where
             {
                 return Ok(false);
             }
-            let child_oid = node.child_oid(i)?;
+            let child_oid = catalog_child_oid(node, i, params)?;
             let child_block =
                 resolve_child_oid(reader, child_oid, params.block_size, params.omap_root)?;
             let (_, child_data) = object::read_object(reader, child_block, params.block_size)?;

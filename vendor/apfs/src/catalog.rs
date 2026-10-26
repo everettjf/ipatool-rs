@@ -353,6 +353,7 @@ pub fn list_directory<R: Read + Seek>(
     catalog_root: u64,
     omap_root: u64,
     block_size: u32,
+    sealed_tree_base: u64,
     parent_oid: u64,
 ) -> Result<Vec<DirEntry>> {
     let compare_fn = catalog_key(parent_oid, J_TYPE_DIR_REC);
@@ -365,6 +366,7 @@ pub fn list_directory<R: Read + Seek>(
         0, // variable-size keys and values
         &compare_fn,
         Some(omap_root),
+        Some(sealed_tree_base),
     )?;
 
     let mut dir_entries = Vec::new();
@@ -387,7 +389,7 @@ pub fn list_directory<R: Read + Seek>(
 
         // Look up the inode for size/timestamps
         let (size, create_time, modify_time) =
-            match lookup_inode(reader, catalog_root, omap_root, block_size, drec.file_id) {
+            match lookup_inode(reader, catalog_root, omap_root, block_size, sealed_tree_base, drec.file_id) {
                 Ok(inode) => (inode.size(), inode.create_time, inode.modify_time),
                 Err(_) => (0, 0, 0),
             };
@@ -411,6 +413,7 @@ pub fn lookup_inode<R: Read + Seek>(
     catalog_root: u64,
     omap_root: u64,
     block_size: u32,
+    sealed_tree_base: u64,
     oid: u64,
 ) -> Result<InodeVal> {
     let compare_fn = catalog_key(oid, J_TYPE_INODE);
@@ -423,6 +426,7 @@ pub fn lookup_inode<R: Read + Seek>(
         0,
         &compare_fn,
         Some(omap_root),
+        Some(sealed_tree_base),
     )?;
 
     match val {
@@ -437,6 +441,7 @@ pub fn lookup_extents<R: Read + Seek>(
     catalog_root: u64,
     omap_root: u64,
     block_size: u32,
+    sealed_tree_base: u64,
     file_oid: u64,
 ) -> Result<Vec<FileExtentRecord>> {
     let compare_fn = catalog_key(file_oid, J_TYPE_FILE_EXTENT);
@@ -449,6 +454,7 @@ pub fn lookup_extents<R: Read + Seek>(
         0,
         &compare_fn,
         Some(omap_root),
+        Some(sealed_tree_base),
     )?;
 
     let mut extents = Vec::new();
@@ -501,10 +507,11 @@ pub fn lookup_xattr<R: Read + Seek>(
     catalog_root: u64,
     omap_root: u64,
     block_size: u32,
+    sealed_tree_base: u64,
     oid: u64,
     name: &str,
 ) -> Result<Option<Vec<u8>>> {
-    match lookup_xattr_value(reader, catalog_root, omap_root, block_size, oid, name)? {
+    match lookup_xattr_value(reader, catalog_root, omap_root, block_size, sealed_tree_base, oid, name)? {
         Some(XattrValue::Embedded(data)) => Ok(Some(data)),
         Some(XattrValue::DataStream { .. }) => Err(ApfsError::Unsupported(
             "xattr is stored as a data stream, not embedded in the record".into(),
@@ -520,6 +527,7 @@ pub fn lookup_xattr_value<R: Read + Seek>(
     catalog_root: u64,
     omap_root: u64,
     block_size: u32,
+    sealed_tree_base: u64,
     oid: u64,
     name: &str,
 ) -> Result<Option<XattrValue>> {
@@ -536,6 +544,7 @@ pub fn lookup_xattr_value<R: Read + Seek>(
         0,
         &compare_fn,
         Some(omap_root),
+        Some(sealed_tree_base),
     )?;
 
     match value {
@@ -550,6 +559,7 @@ pub fn list_xattr_names<R: Read + Seek>(
     catalog_root: u64,
     omap_root: u64,
     block_size: u32,
+    sealed_tree_base: u64,
     oid: u64,
 ) -> Result<Vec<String>> {
     let compare_fn = catalog_key(oid, J_TYPE_XATTR);
@@ -561,6 +571,7 @@ pub fn list_xattr_names<R: Read + Seek>(
         0,
         &compare_fn,
         Some(omap_root),
+        Some(sealed_tree_base),
     )?;
 
     let mut names = Vec::with_capacity(records.len());
@@ -641,13 +652,14 @@ pub fn resolve_path<R: Read + Seek>(
     catalog_root: u64,
     omap_root: u64,
     block_size: u32,
+    sealed_tree_base: u64,
     path: &str,
 ) -> Result<(u64, InodeVal)> {
     let path = path.trim_matches('/');
 
     if path.is_empty() {
         // Root directory
-        let inode = lookup_inode(reader, catalog_root, omap_root, block_size, ROOT_DIR_RECORD)?;
+        let inode = lookup_inode(reader, catalog_root, omap_root, block_size, sealed_tree_base, ROOT_DIR_RECORD)?;
         return Ok((ROOT_DIR_RECORD, inode));
     }
 
@@ -661,13 +673,14 @@ pub fn resolve_path<R: Read + Seek>(
             omap_root,
             catalog_root,
             block_size,
+            sealed_tree_base,
             current_parent,
             component,
         )?;
 
         if i == components.len() - 1 {
             // Final component — look up its inode
-            let inode = lookup_inode(reader, catalog_root, omap_root, block_size, drec.file_id)?;
+            let inode = lookup_inode(reader, catalog_root, omap_root, block_size, sealed_tree_base, drec.file_id)?;
             return Ok((drec.file_id, inode));
         }
 
@@ -688,6 +701,7 @@ fn lookup_drec<R: Read + Seek>(
     omap_root: u64,
     catalog_root: u64,
     block_size: u32,
+    sealed_tree_base: u64,
     parent_oid: u64,
     name: &str,
 ) -> Result<DrecVal> {
@@ -702,6 +716,7 @@ fn lookup_drec<R: Read + Seek>(
         0,
         &compare_fn,
         Some(omap_root),
+        Some(sealed_tree_base),
     )?;
 
     for (key, val) in &entries {

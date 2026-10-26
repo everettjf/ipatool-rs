@@ -138,6 +138,7 @@ fn test_list_root() {
         catalog_root,
         omap_root,
         block_size,
+        0,
         ROOT_DIR_RECORD,
     )
     .unwrap();
@@ -154,13 +155,14 @@ fn test_resolve_path() {
         catalog_root,
         omap_root,
         block_size,
+        0,
         ROOT_DIR_RECORD,
     )
     .unwrap();
     let first = entries.first().expect("Root should have entries");
     let path = format!("/{}", first.name);
     let (oid, inode) =
-        resolve_path(&mut reader, catalog_root, omap_root, block_size, &path).unwrap();
+        resolve_path(&mut reader, catalog_root, omap_root, block_size, 0, &path).unwrap();
     assert!(oid > 0);
     assert!(inode.kind() != 0);
 }

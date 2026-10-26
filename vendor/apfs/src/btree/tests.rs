@@ -61,7 +61,7 @@ fn compare_to(search: u64) -> impl Fn(&[u8]) -> Result<std::cmp::Ordering> {
 fn lookup_reads_a_checksummed_node() {
     let block = synthetic_root_leaf(42, 7);
     let mut reader = Cursor::new(block);
-    let found = btree_lookup(&mut reader, 0, BLOCK_SIZE, 0, 0, &compare_to(42), None)
+    let found = btree_lookup(&mut reader, 0, BLOCK_SIZE, 0, 0, &compare_to(42), None, None)
         .expect("lookup on a valid node");
     assert_eq!(found.as_deref(), Some(&7u64.to_le_bytes()[..]));
 }
@@ -71,7 +71,7 @@ fn lookup_rejects_a_corrupt_node() {
     let mut block = synthetic_root_leaf(42, 7);
     block[100] ^= 0xFF;
     let mut reader = Cursor::new(block);
-    let err = btree_lookup(&mut reader, 0, BLOCK_SIZE, 0, 0, &compare_to(42), None)
+    let err = btree_lookup(&mut reader, 0, BLOCK_SIZE, 0, 0, &compare_to(42), None, None)
         .expect_err("corrupt node must not be traversed");
     assert!(matches!(err, ApfsError::InvalidChecksum), "{err:?}");
 }
@@ -83,7 +83,7 @@ fn comparator_errors_propagate_instead_of_reading_as_a_miss() {
     let failing = |_key: &[u8]| -> Result<std::cmp::Ordering> {
         Err(ApfsError::CorruptedData("undecodable key".into()))
     };
-    let err = btree_lookup(&mut reader, 0, BLOCK_SIZE, 0, 0, &failing, None)
+    let err = btree_lookup(&mut reader, 0, BLOCK_SIZE, 0, 0, &failing, None, None)
         .expect_err("an undecodable key must fail the lookup, not report a miss");
     assert!(matches!(err, ApfsError::CorruptedData(_)), "{err:?}");
 }
@@ -93,7 +93,7 @@ fn scan_rejects_a_corrupt_node() {
     let mut block = synthetic_root_leaf(42, 7);
     block[100] ^= 0xFF;
     let mut reader = Cursor::new(block);
-    let err = btree_scan(&mut reader, 0, BLOCK_SIZE, 0, 0, &compare_to(42), None)
+    let err = btree_scan(&mut reader, 0, BLOCK_SIZE, 0, 0, &compare_to(42), None, None)
         .expect_err("corrupt node must not be scanned");
     assert!(matches!(err, ApfsError::InvalidChecksum), "{err:?}");
 }
@@ -137,8 +137,26 @@ fn scan_starts_at_the_child_before_the_matching_range() {
         0,
         &compare_to(25),
         None,
+        None,
     )
     .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].1, 7u64.to_le_bytes());
+}
+
+#[test]
+fn sealed_child_oid_is_relative_to_catalog_root_oid() {
+    let mut block = synthetic_root_leaf(42, 7);
+    block[24..28].copy_from_slice(
+        &(object::OBJECT_NOHEADER | object::OBJECT_TYPE_BTREE).to_le_bytes(),
+    );
+    let node = BTreeNode::parse(&block).unwrap();
+    let params = BTreeParams {
+        block_size: BLOCK_SIZE,
+        fixed_key_size: 0,
+        fixed_val_size: 0,
+        omap_root: Some(5),
+        sealed_tree_base: Some(100),
+    };
+    assert_eq!(catalog_child_oid(&node, 0, &params).unwrap(), 107);
 }

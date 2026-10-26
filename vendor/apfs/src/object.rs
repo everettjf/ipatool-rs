@@ -12,6 +12,10 @@ pub const OBJECT_TYPE_SPACEMAN: u32 = 0x05;
 pub const OBJECT_TYPE_OMAP: u32 = 0x0B;
 pub const OBJECT_TYPE_CHECKPOINT_MAP: u32 = 0x0C;
 pub const OBJECT_TYPE_FS: u32 = 0x0D;
+const OBJECT_TYPE_FSTREE: u32 = 0x0E;
+pub(crate) const OBJECT_NOHEADER: u32 = 0x2000_0000;
+const BTNODE_ROOT: u16 = 0x0001;
+const BTNODE_NOHEADER: u16 = 0x0010;
 
 // Object flag masks (upper 16 bits of type_and_flags)
 pub const OBJ_PHYSICAL: u32 = 0x00000000;
@@ -81,6 +85,26 @@ pub fn read_object<R: Read + Seek>(
     let mut block = vec![0u8; block_size as usize];
     reader.read_exact(&mut block)?;
 
+    // Sealed filesystem B-tree nodes omit the usual object header. The
+    // decrypted restore image is already authenticated by AEA; reconstruct
+    // the header expected by the generic APFS B-tree parser.
+    if block_size == 4096
+        && block[..ObjectHeader::SIZE].iter().all(|byte| *byte == 0)
+        && u16::from_le_bytes(block[32..34].try_into().unwrap()) & BTNODE_NOHEADER != 0
+    {
+        let flags = u16::from_le_bytes(block[32..34].try_into().unwrap());
+        let object_type = if flags & BTNODE_ROOT != 0 {
+            OBJECT_TYPE_BTREE
+        } else {
+            OBJECT_TYPE_BTREE_NODE
+        };
+        block[8..16].copy_from_slice(&block_number.to_le_bytes());
+        block[24..28].copy_from_slice(&(OBJECT_NOHEADER | object_type).to_le_bytes());
+        block[28..32].copy_from_slice(&OBJECT_TYPE_FSTREE.to_le_bytes());
+        let checksum = fletcher::fletcher64(&block[8..]);
+        block[..8].copy_from_slice(&checksum.to_le_bytes());
+    }
+
     if !fletcher::verify_object(&block) {
         return Err(ApfsError::InvalidChecksum);
     }
@@ -101,4 +125,35 @@ pub fn read_block<R: Read + Seek>(
     let mut block = vec![0u8; block_size as usize];
     reader.read_exact(&mut block)?;
     Ok(block)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn restores_sealed_tree_node_header() {
+        for (flags, expected_type) in [
+            (BTNODE_NOHEADER, OBJECT_TYPE_BTREE_NODE),
+            (BTNODE_NOHEADER | BTNODE_ROOT, OBJECT_TYPE_BTREE),
+        ] {
+            let mut raw = vec![0u8; 4096];
+            raw[32..34].copy_from_slice(&flags.to_le_bytes());
+            let (header, block) = read_object(&mut Cursor::new(raw), 0, 4096).unwrap();
+            assert_eq!(header.object_type(), expected_type);
+            assert_eq!(header.subtype, OBJECT_TYPE_FSTREE);
+            assert!(fletcher::verify_object(&block));
+        }
+    }
+
+    #[test]
+    fn does_not_repair_invalid_ordinary_block() {
+        let mut raw = vec![0u8; 4096];
+        raw[32..34].copy_from_slice(&BTNODE_ROOT.to_le_bytes());
+        assert!(matches!(
+            read_object(&mut Cursor::new(raw), 0, 4096),
+            Err(ApfsError::InvalidChecksum)
+        ));
+    }
 }
