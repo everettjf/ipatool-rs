@@ -9,8 +9,8 @@ use crate::{
     machimage::{Image, Memory},
     sap_assets::SapAssetBundle,
     store_memory::{MemoryRegion, exclude_mapped_regions},
-    store_profile::{self, ProfileData},
-    unicorn_runtime::{Engine, REG_PC, REG_X0},
+    store_profile::{self, Call, ProfileData},
+    unicorn_runtime::{Engine, HookContext, REG_PC, REG_X0},
 };
 
 const AMS_SHA256: &str = "95f4558aa2c0ccd9f96ed479e336b630b46bf4b4e0baabc1c1ac8c7d55e21ab4";
@@ -28,11 +28,15 @@ pub struct StoreRuntime {
     pub engine: Engine,
     pub profile: Arc<ProfileData>,
     pub code_ranges: Vec<(u64, u64)>,
-    pub heap_cursor: u64,
+    state: Rc<RefCell<StoreState>>,
+    hook_error: Rc<RefCell<Option<String>>>,
+}
+
+struct StoreState {
+    heap_cursor: u64,
     dynamic_selectors: HashMap<String, u64>,
     dynamic_selector_addresses: HashMap<u64, String>,
-    pub objects: HashMap<u64, StoreObject>,
-    hook_error: Rc<RefCell<Option<String>>>,
+    objects: HashMap<u64, StoreObject>,
 }
 
 pub struct StoreObject {
@@ -164,41 +168,26 @@ impl StoreRuntime {
                 },
             );
         }
+        let state = Rc::new(RefCell::new(StoreState {
+            heap_cursor: HEAP_BASE,
+            dynamic_selectors: HashMap::new(),
+            dynamic_selector_addresses: HashMap::new(),
+            objects,
+        }));
         let hook_error = Rc::new(RefCell::new(None));
         let error_slot = Rc::clone(&hook_error);
         let hook_profile = Arc::clone(&profile);
         let hook_code_ranges = code_ranges.clone();
+        let hook_state = Rc::clone(&state);
         engine.add_code_hook(0, u64::MAX, move |context, address, _| {
             if let Some(&index) = hook_profile.runtime.calls_by_address.get(&address) {
                 let call = &hook_profile.index.calls[index];
-                match call.symbol.trim_start_matches('_') {
-                    "CRIsAutoSubmitEnabled" | "CFURLResponseCopyPeerAddress" => {
-                        context
-                            .reg_write(REG_X0, 0)
-                            .expect("write Store guest return");
-                    }
-                    "getuid" | "geteuid" => {
-                        context
-                            .reg_write(REG_X0, 501)
-                            .expect("write Store guest return");
-                    }
-                    "getgid" | "getegid" => {
-                        context
-                            .reg_write(REG_X0, 20)
-                            .expect("write Store guest return");
-                    }
-                    "getpid" => {
-                        context
-                            .reg_write(REG_X0, 123)
-                            .expect("write Store guest return");
-                    }
-                    _ => {
-                        *error_slot.borrow_mut() = Some(format!(
-                            "unsupported Store bridge call at {address:#x}: {} {}",
-                            call.symbol, call.selector
-                        ));
-                        context.stop().expect("stop Store guest after bridge error");
-                    }
+                if let Err(error) =
+                    dispatch_call(context, &hook_profile, &mut hook_state.borrow_mut(), call)
+                {
+                    *error_slot.borrow_mut() =
+                        Some(format!("Store bridge at {address:#x}: {error:#}"));
+                    context.stop().expect("stop Store guest after bridge error");
                 }
             } else if address != RETURN_PC
                 && !hook_code_ranges
@@ -215,30 +204,17 @@ impl StoreRuntime {
             engine,
             profile,
             code_ranges,
-            heap_cursor: HEAP_BASE,
-            dynamic_selectors: HashMap::new(),
-            dynamic_selector_addresses: HashMap::new(),
-            objects,
+            state,
             hook_error,
         })
     }
 
     pub fn allocate(&mut self, size: u64) -> Result<u64> {
-        let size = size
-            .max(1)
-            .checked_add(15)
-            .context("Store allocation size overflow")?
-            & !15;
-        let next = self
-            .heap_cursor
-            .checked_add(size)
-            .context("Store heap address overflow")?;
-        if next > HEAP_BASE + HEAP_SIZE as u64 {
-            bail!("Store guest heap exhausted");
-        }
-        let address = self.heap_cursor;
-        self.heap_cursor = next;
-        Ok(address)
+        self.state.borrow_mut().allocate(size)
+    }
+
+    pub fn heap_cursor(&self) -> u64 {
+        self.state.borrow().heap_cursor
     }
 
     pub fn read_u64(&self, address: u64) -> Result<u64> {
@@ -264,35 +240,24 @@ impl StoreRuntime {
         selector: &str,
         class_method: bool,
     ) -> Option<u64> {
-        let mut name = class_name;
-        let prefix = if class_method { '+' } else { '-' };
-        loop {
-            let key = format!("{prefix}[{name} {selector}]");
-            if let Some(&address) = self.profile.runtime.methods.get(&key) {
-                return Some(address);
-            }
-            let &index = self.profile.runtime.classes_by_name.get(name)?;
-            let superclass = &self.profile.index.classes[index].superclass;
-            if superclass.is_empty() {
-                return None;
-            }
-            name = superclass;
-        }
+        method_address(&self.profile, class_name, selector, class_method)
     }
 
     pub fn selector_address(&mut self, selector: &str) -> Result<u64> {
         if let Some(&address) = self.profile.runtime.selector_addresses.get(selector) {
             return Ok(address);
         }
-        if let Some(&address) = self.dynamic_selectors.get(selector) {
+        if let Some(&address) = self.state.borrow().dynamic_selectors.get(selector) {
             return Ok(address);
         }
         let address = self.allocate((selector.len() + 1) as u64)?;
         self.engine.mem_write(address, selector.as_bytes())?;
         self.engine
             .mem_write(address + selector.len() as u64, &[0])?;
-        self.dynamic_selectors.insert(selector.to_owned(), address);
-        self.dynamic_selector_addresses
+        let mut state = self.state.borrow_mut();
+        state.dynamic_selectors.insert(selector.to_owned(), address);
+        state
+            .dynamic_selector_addresses
             .insert(address, selector.to_owned());
         Ok(address)
     }
@@ -304,7 +269,7 @@ impl StoreRuntime {
         if let Some(value) = self.profile.runtime.selectors_by_address.get(&address) {
             return Ok(value.clone());
         }
-        if let Some(value) = self.dynamic_selector_addresses.get(&address) {
+        if let Some(value) = self.state.borrow().dynamic_selector_addresses.get(&address) {
             return Ok(value.clone());
         }
         let mut bytes = Vec::new();
@@ -325,7 +290,7 @@ impl StoreRuntime {
         if let Some(index) = class_index {
             self.write_u64(address, self.profile.index.classes[index].address)?;
         }
-        self.objects.insert(
+        self.state.borrow_mut().objects.insert(
             address,
             StoreObject {
                 class: class.to_owned(),
@@ -337,32 +302,38 @@ impl StoreRuntime {
     }
 
     pub fn set_ivar(&mut self, address: u64, name: &str, value: u64) -> Result<()> {
-        let object = self
+        let class_name = self
+            .state
+            .borrow()
             .objects
             .get(&address)
-            .context("unknown Store guest object")?;
-        let mut class_name = object.class.as_str();
-        while let Some(&index) = self.profile.runtime.classes_by_name.get(class_name) {
+            .context("unknown Store guest object")?
+            .class
+            .clone();
+        let mut current = class_name.as_str();
+        while let Some(&index) = self.profile.runtime.classes_by_name.get(current) {
             let class = &self.profile.index.classes[index];
             if let Some(&offset) = class.ivars.get(name) {
                 return self.write_u64(address + offset, value);
             }
-            class_name = &class.superclass;
+            current = &class.superclass;
         }
-        bail!("unknown Store ivar {}.{name}", object.class)
+        bail!("unknown Store ivar {class_name}.{name}")
     }
 
-    pub fn object_string(&self, address: u64) -> Result<&str> {
+    pub fn object_string(&self, address: u64) -> Result<String> {
         if address == 0 {
-            return Ok("");
+            return Ok(String::new());
         }
         match &self
+            .state
+            .borrow()
             .objects
             .get(&address)
             .context("unknown Store string object")?
             .value
         {
-            StoreValue::String(value) => Ok(value),
+            StoreValue::String(value) => Ok(value.clone()),
             _ => bail!("Store object is not a string"),
         }
     }
@@ -404,6 +375,171 @@ impl StoreRuntime {
     }
 }
 
+impl StoreState {
+    fn allocate(&mut self, size: u64) -> Result<u64> {
+        let size = size
+            .max(1)
+            .checked_add(15)
+            .context("Store allocation size overflow")?
+            & !15;
+        let next = self
+            .heap_cursor
+            .checked_add(size)
+            .context("Store heap address overflow")?;
+        if next > HEAP_BASE + HEAP_SIZE as u64 {
+            bail!("Store guest heap exhausted");
+        }
+        let address = self.heap_cursor;
+        self.heap_cursor = next;
+        Ok(address)
+    }
+}
+
+fn method_address(
+    profile: &ProfileData,
+    class_name: &str,
+    selector: &str,
+    class_method: bool,
+) -> Option<u64> {
+    let mut name = class_name;
+    let prefix = if class_method { '+' } else { '-' };
+    loop {
+        let key = format!("{prefix}[{name} {selector}]");
+        if let Some(&address) = profile.runtime.methods.get(&key) {
+            return Some(address);
+        }
+        let &index = profile.runtime.classes_by_name.get(name)?;
+        let superclass = &profile.index.classes[index].superclass;
+        if superclass.is_empty() {
+            return None;
+        }
+        name = superclass;
+    }
+}
+
+fn dispatch_call(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    call: &Call,
+) -> Result<()> {
+    if !call.selector.is_empty() {
+        return dispatch_message(
+            context,
+            profile,
+            state,
+            &call.selector,
+            call.selector_address,
+        );
+    }
+    let symbol = call.symbol.trim_start_matches('_');
+    match symbol {
+        "CRIsAutoSubmitEnabled" | "CFURLResponseCopyPeerAddress" => {
+            context.reg_write(REG_X0, 0)?;
+        }
+        "getuid" | "geteuid" => context.reg_write(REG_X0, 501)?,
+        "getgid" | "getegid" => context.reg_write(REG_X0, 20)?,
+        "getpid" => context.reg_write(REG_X0, 123)?,
+        "objc_msgSend" => {
+            let selector_address = context.reg_read(REG_X0 + 1)?;
+            let selector = guest_cstring(context, profile, state, selector_address)?;
+            return dispatch_message(context, profile, state, &selector, selector_address);
+        }
+        _ => bail!(
+            "unsupported Store bridge call: {} {}",
+            call.symbol,
+            call.selector
+        ),
+    }
+    Ok(())
+}
+
+fn guest_cstring(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &StoreState,
+    address: u64,
+) -> Result<String> {
+    if address == 0 {
+        return Ok(String::new());
+    }
+    if let Some(value) = profile.runtime.selectors_by_address.get(&address) {
+        return Ok(value.clone());
+    }
+    if let Some(value) = state.dynamic_selector_addresses.get(&address) {
+        return Ok(value.clone());
+    }
+    let mut bytes = Vec::new();
+    for offset in 0..16_384u64 {
+        let byte = context.mem_read(address + offset, 1)?[0];
+        if byte == 0 {
+            return String::from_utf8(bytes).context("Store guest C string is not UTF-8");
+        }
+        bytes.push(byte);
+    }
+    bail!("unterminated Store guest C string")
+}
+
+fn dispatch_message(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    selector: &str,
+    selector_address: u64,
+) -> Result<()> {
+    let receiver = context.reg_read(REG_X0)?;
+    if receiver == 0 {
+        context.reg_write(REG_X0, 0)?;
+        context.reg_write(REG_X0 + 1, 0)?;
+        return Ok(());
+    }
+    let class = profile.runtime.class_names_by_address.get(&receiver);
+    let class_method = class.is_some();
+    let class_name = if let Some(name) = class {
+        name.clone()
+    } else {
+        state
+            .objects
+            .get(&receiver)
+            .with_context(|| format!("unknown Store receiver {receiver:#x} for {selector}"))?
+            .class
+            .clone()
+    };
+    if let Some(entry) = method_address(profile, &class_name, selector, class_method) {
+        context.reg_write(REG_X0 + 1, selector_address)?;
+        context.reg_write(REG_PC, entry)?;
+        return Ok(());
+    }
+    match (class_method, selector) {
+        (true, "alloc" | "allocWithZone:") => {
+            let class_index = profile.runtime.classes_by_name[&class_name];
+            let class = &profile.index.classes[class_index];
+            let size = class.size.max(16);
+            let address = state.allocate(size)?;
+            context.mem_write(address, &class.address.to_le_bytes())?;
+            state.objects.insert(
+                address,
+                StoreObject {
+                    class: class_name,
+                    value: StoreValue::Empty,
+                    properties: HashMap::new(),
+                },
+            );
+            context.reg_write(REG_X0, address)?;
+        }
+        (true, "class") | (false, "init" | "retain" | "autorelease") => {
+            context.reg_write(REG_X0, receiver)?;
+        }
+        (false, "class") => {
+            let class_index = profile.runtime.classes_by_name[&class_name];
+            context.reg_write(REG_X0, profile.index.classes[class_index].address)?;
+        }
+        (false, "release") => context.reg_write(REG_X0, 0)?,
+        _ => bail!("unsupported Store message {class_name} {selector}"),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,7 +556,7 @@ mod tests {
         let mut runtime = StoreRuntime::open(&assets).unwrap();
         assert!(!runtime.code_ranges.is_empty());
         let allocated = runtime.allocate(17).unwrap();
-        assert_eq!(runtime.heap_cursor, allocated + 32);
+        assert_eq!(runtime.heap_cursor(), allocated + 32);
         runtime.write_u64(allocated, 0x1234_5678_90ab_cdef).unwrap();
         assert_eq!(runtime.read_u64(allocated).unwrap(), 0x1234_5678_90ab_cdef);
         let selector = runtime.selector_address("codexStoreProbe:").unwrap();
@@ -451,23 +587,37 @@ mod tests {
             runtime.profile.runtime.strings.iter().next().unwrap();
         assert_eq!(
             runtime.object_string(profile_string_address).unwrap(),
-            profile_string_value
+            profile_string_value.as_str()
         );
         assert_eq!(runtime.call(0x1a2d_0fb94, &[]).unwrap(), 0);
-        let unsupported = runtime
+        let objc_msg_send = runtime
             .profile
             .index
             .calls
             .iter()
-            .find(|call| !call.selector.is_empty())
+            .find(|call| call.symbol.trim_start_matches('_') == "objc_msgSend")
             .unwrap()
             .address;
+        assert_eq!(runtime.call(objc_msg_send, &[0, 0]).unwrap(), 0);
+        assert!(runtime.method_address("ACAccount", "alloc", true).is_none());
+        let alloc_selector = runtime.selector_address("alloc").unwrap();
+        let allocated_account = runtime
+            .call(objc_msg_send, &[account_address, alloc_selector])
+            .unwrap();
+        assert_eq!(
+            runtime.read_u64(allocated_account).unwrap(),
+            account_address
+        );
+        assert_eq!(
+            runtime.state.borrow().objects[&allocated_account].class,
+            "ACAccount"
+        );
         assert!(
             runtime
-                .call(unsupported, &[])
+                .call(objc_msg_send, &[u64::MAX, selector])
                 .unwrap_err()
                 .to_string()
-                .contains("unsupported Store bridge call")
+                .contains("unknown Store receiver")
         );
         let patch = &runtime.profile.index.metadata_patches[0];
         assert_eq!(
