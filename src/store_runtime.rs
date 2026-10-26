@@ -1,8 +1,16 @@
 //! StoreAgent guest memory prepared from the pinned AMS images and profile.
 
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
@@ -39,6 +47,8 @@ struct StoreState {
     dynamic_selector_addresses: HashMap<u64, String>,
     objects: HashMap<u64, StoreObject>,
     callbacks: HashMap<u64, CallbackResume>,
+    hardware_id: Option<[u8; 6]>,
+    preferences: HashMap<String, u64>,
 }
 
 struct CallbackResume {
@@ -57,11 +67,13 @@ pub struct StoreObject {
     pub properties: HashMap<String, u64>,
 }
 
+#[derive(Clone)]
 pub enum StoreValue {
     Empty,
     String(String),
     Number(i64),
     Boolean(bool),
+    Bytes(Vec<u8>),
     Addresses(Vec<u64>),
     Entries(HashMap<String, u64>),
 }
@@ -186,6 +198,8 @@ impl StoreRuntime {
             dynamic_selector_addresses: HashMap::new(),
             objects,
             callbacks: HashMap::new(),
+            hardware_id: None,
+            preferences: HashMap::new(),
         }));
         let hook_error = Rc::new(RefCell::new(None));
         let error_slot = Rc::clone(&hook_error);
@@ -236,6 +250,14 @@ impl StoreRuntime {
 
     pub fn heap_cursor(&self) -> u64 {
         self.state.borrow().heap_cursor
+    }
+
+    pub fn set_hardware_id(&mut self, hardware_id: &[u8]) -> Result<()> {
+        let hardware_id: [u8; 6] = hardware_id
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Store hardware identity must be six bytes"))?;
+        self.state.borrow_mut().hardware_id = Some(hardware_id);
+        Ok(())
     }
 
     pub fn read_u64(&self, address: u64) -> Result<u64> {
@@ -359,6 +381,10 @@ impl StoreRuntime {
         }
     }
 
+    pub fn export(&self, address: u64) -> Result<Value> {
+        export_object(&self.state.borrow(), address, &mut HashSet::new(), 0)
+    }
+
     pub fn invoke(&mut self, receiver: u64, selector: &str, arguments: &[u64]) -> Result<u64> {
         let entry = self
             .profile
@@ -373,6 +399,61 @@ impl StoreRuntime {
         args.extend_from_slice(&[receiver, selector_address]);
         args.extend_from_slice(arguments);
         self.call(entry, &args)
+    }
+
+    /// Run Apple's pinned credential-parameter builder in the Store guest.
+    /// `bag` is a guest pointer to a prepared frozen bag, or zero.
+    pub fn build_authentication_parameters(
+        &mut self,
+        email: &str,
+        password: &str,
+        hardware_id: &[u8],
+        bag: u64,
+    ) -> Result<Value> {
+        self.set_hardware_id(hardware_id)?;
+        let account_class = self
+            .class_address("ACAccount")
+            .context("Store profile is missing ACAccount")?;
+        let account = self.invoke(account_class, "ams_createEphemeralAccount", &[])?;
+        let username = self.new_object("NSString", StoreValue::String(email.into()))?;
+        self.invoke(account, "setUsername:", &[username])?;
+
+        let options = self.new_object("AMSAuthenticateOptions", StoreValue::Empty)?;
+        self.invoke(options, "init", &[])?;
+        for (selector, value) in [
+            ("setEphemeral:", 1),
+            ("setCanMakeAccountActive:", 0),
+            ("setAllowServerDialogs:", 0),
+            ("setCredentialSource:", 0),
+        ] {
+            self.invoke(options, selector, &[value])?;
+        }
+        let password_object = self.new_object("NSString", StoreValue::String(password.into()))?;
+        self.invoke(options, "setPassword:", &[password_object])?;
+
+        let task = self.new_object("AMSVerifyCredentialsTask", StoreValue::Empty)?;
+        self.invoke(task, "init", &[])?;
+        for (name, value) in [("_account", account), ("_options", options), ("_bag", bag)] {
+            self.set_ivar(task, name, value)?;
+        }
+        let parameters = self.invoke(
+            task,
+            "_createAuthenticateRequestParametersForAccount:",
+            &[account],
+        )?;
+        let parameters = self.export(parameters)?;
+        let expected_guid = hardware_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if !parameters
+            .get("guid")
+            .and_then(Value::as_str)
+            .is_some_and(|guid| guid.eq_ignore_ascii_case(&expected_guid))
+        {
+            bail!("Store authentication hardware identity mismatch");
+        }
+        Ok(parameters)
     }
 
     /// Execute a pinned guest entry. Bridge calls not yet ported fail explicitly.
@@ -535,6 +616,7 @@ fn responds_to(profile: &ProfileData, state: &StoreState, receiver: u64, selecto
                 | "setObject:forKeyedSubscript:"
         ),
         StoreValue::Addresses(_) => matches!(selector, "count" | "length"),
+        StoreValue::Bytes(_) => matches!(selector, "count" | "length"),
         StoreValue::Empty => false,
     }
 }
@@ -598,6 +680,7 @@ fn dispatch_call(
         | "objc_retainAutorelease"
         | "objc_release"
         | "objc_autoreleasePoolPop" => {}
+        "Block_release" | "Block_object_dispose" => {}
         "objc_autoreleasePoolPush" => context.reg_write(REG_X0, 0)?,
         "objc_getProperty" => {
             let object = context.reg_read(REG_X0)?;
@@ -708,6 +791,219 @@ fn dispatch_call(
         "CFBundleGetMainBundle" => {
             let bundle = new_main_bundle(context, profile, state)?;
             context.reg_write(REG_X0, bundle)?;
+        }
+        "NSUserName"
+        | "NSFullUserName"
+        | "NSTemporaryDirectory"
+        | "CPSharedResourcesDirectory"
+        | "NSHomeDirectory" => {
+            let value = match symbol {
+                "NSUserName" | "NSFullUserName" => "ipatool",
+                "NSTemporaryDirectory" => "/ipatool/tmp/",
+                _ => "/ipatool",
+            };
+            let address = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(value.into()),
+            )?;
+            context.reg_write(REG_X0, address)?;
+        }
+        "IOMasterPort" => {
+            let output = context.reg_read(REG_X0 + 1)?;
+            context.mem_write(output, &1u32.to_le_bytes())?;
+            context.reg_write(REG_X0, 0)?;
+        }
+        "IOServiceMatching" | "IOBSDNameMatching" => {
+            let (key, argument) = if symbol == "IOServiceMatching" {
+                ("IOProviderClass", REG_X0)
+            } else {
+                ("IOBSDName", REG_X0 + 2)
+            };
+            let value = guest_cstring(context, profile, state, context.reg_read(argument)?)?;
+            let string = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(value),
+            )?;
+            let dictionary = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSDictionary",
+                StoreValue::Entries(HashMap::from([(key.into(), string)])),
+            )?;
+            context.reg_write(REG_X0, dictionary)?;
+        }
+        "IOServiceGetMatchingService" => context.reg_write(REG_X0, 0)?,
+        "IOServiceGetMatchingServices" => {
+            let output = context.reg_read(REG_X0 + 2)?;
+            context.mem_write(output, &1u32.to_le_bytes())?;
+            context.reg_write(REG_X0, 0)?;
+        }
+        "IOIteratorNext" => context.reg_write(REG_X0, 1)?,
+        "IORegistryEntryGetParentEntry" => {
+            let output = context.reg_read(REG_X0 + 2)?;
+            context.mem_write(output, &2u32.to_le_bytes())?;
+            context.reg_write(REG_X0, 0)?;
+        }
+        "IORegistryEntryCreateCFProperty" | "IORegistryEntrySearchCFProperty" => {
+            let service = context.reg_read(REG_X0)?;
+            if service == 0 {
+                context.reg_write(REG_X0, 0)?;
+            } else {
+                let argument = if symbol == "IORegistryEntrySearchCFProperty" {
+                    REG_X0 + 2
+                } else {
+                    REG_X0 + 1
+                };
+                let key_address = context.reg_read(argument)?;
+                let StoreValue::String(key) = &state
+                    .objects
+                    .get(&key_address)
+                    .context("unknown IOKit property name")?
+                    .value
+                else {
+                    bail!("IOKit property name is not a string");
+                };
+                let value = match key.as_str() {
+                    "IOBuiltin" | "IOPrimaryInterface" => StoreValue::Boolean(true),
+                    "IOMACAddress" => StoreValue::Bytes(
+                        state
+                            .hardware_id
+                            .context("Store hardware identity is missing")?
+                            .to_vec(),
+                    ),
+                    _ => bail!("unsupported IOKit property {key}"),
+                };
+                let class = if matches!(value, StoreValue::Bytes(_)) {
+                    "NSData"
+                } else {
+                    "NSNumber"
+                };
+                let object = new_guest_object(context, profile, state, class, value)?;
+                context.reg_write(REG_X0, object)?;
+            }
+        }
+        "IOObjectRelease" | "CFRelease" => context.reg_write(REG_X0, 0)?,
+        "CFGetTypeID" => {
+            let address = context.reg_read(REG_X0)?;
+            let object = state
+                .objects
+                .get(&address)
+                .context("CFGetTypeID of unknown object")?;
+            let kind = match object.value {
+                StoreValue::Boolean(_) => 4,
+                StoreValue::Bytes(_) => 1,
+                StoreValue::String(_) => 2,
+                _ => 3,
+            };
+            context.reg_write(REG_X0, kind)?;
+        }
+        "CFBooleanGetTypeID" => context.reg_write(REG_X0, 4)?,
+        "CFDataGetTypeID" => context.reg_write(REG_X0, 1)?,
+        "CFStringGetTypeID" => context.reg_write(REG_X0, 2)?,
+        "CFBooleanGetValue" => {
+            let address = context.reg_read(REG_X0)?;
+            let object = state
+                .objects
+                .get(&address)
+                .context("unknown CFBoolean object")?;
+            let StoreValue::Boolean(value) = object.value else {
+                bail!("CFBooleanGetValue requires boolean object");
+            };
+            context.reg_write(REG_X0, u64::from(value))?;
+        }
+        "CFDataGetLength" => {
+            let address = context.reg_read(REG_X0)?;
+            let StoreValue::Bytes(value) = &state
+                .objects
+                .get(&address)
+                .context("unknown CFData object")?
+                .value
+            else {
+                bail!("CFDataGetLength requires byte data");
+            };
+            context.reg_write(REG_X0, value.len() as u64)?;
+        }
+        "CFDataGetBytePtr" => {
+            let address = context.reg_read(REG_X0)?;
+            let StoreValue::Bytes(value) = &state
+                .objects
+                .get(&address)
+                .context("unknown CFData object")?
+                .value
+            else {
+                bail!("CFDataGetBytePtr requires byte data");
+            };
+            let value = value.clone();
+            let pointer = state.allocate(value.len() as u64)?;
+            context.mem_write(pointer, &value)?;
+            context.reg_write(REG_X0, pointer)?;
+        }
+        "CFDataGetBytes" => {
+            let address = context.reg_read(REG_X0)?;
+            let start = context.reg_read(REG_X0 + 1)? as usize;
+            let length = context.reg_read(REG_X0 + 2)? as usize;
+            let destination = context.reg_read(REG_X0 + 3)?;
+            let StoreValue::Bytes(value) = &state
+                .objects
+                .get(&address)
+                .context("unknown CFData object")?
+                .value
+            else {
+                bail!("CFDataGetBytes requires byte data");
+            };
+            let end = start
+                .checked_add(length)
+                .context("CFData range overflows")?;
+            context.mem_write(
+                destination,
+                value.get(start..end).context("CFData range exceeds data")?,
+            )?;
+            context.reg_write(REG_X0, 0)?;
+        }
+        "CFPreferencesAppSynchronize" | "CFPreferencesSynchronize" => {
+            context.reg_write(REG_X0, 1)?;
+        }
+        "CFPreferencesGetAppBooleanValue" | "CFPreferencesGetAppIntegerValue" => {
+            let key = object_string_value(state, context.reg_read(REG_X0)?)?;
+            let app = object_string_value(state, context.reg_read(REG_X0 + 1)?)?;
+            let object = state
+                .preferences
+                .get(&format!("{app}/{key}"))
+                .and_then(|address| state.objects.get(address));
+            let value = match object.map(|object| &object.value) {
+                Some(StoreValue::Boolean(value)) => Some(i64::from(*value)),
+                Some(StoreValue::Number(value)) => Some(*value),
+                _ => None,
+            };
+            let output = context.reg_read(REG_X0 + 2)?;
+            if output != 0 {
+                context.mem_write(output, &[u8::from(value.is_some())])?;
+            }
+            context.reg_write(REG_X0, value.unwrap_or(0) as u64)?;
+        }
+        "CFPreferencesCopyAppValue" | "CFPreferencesCopyValue" => {
+            let key = object_string_value(state, context.reg_read(REG_X0)?)?;
+            let app = object_string_value(state, context.reg_read(REG_X0 + 1)?)?;
+            let value = state
+                .preferences
+                .get(&format!("{app}/{key}"))
+                .copied()
+                .unwrap_or(0);
+            context.reg_write(REG_X0, value)?;
+        }
+        "CFPreferencesSetAppValue" | "CFPreferencesSetValue" => {
+            let key = object_string_value(state, context.reg_read(REG_X0)?)?.to_owned();
+            let value = context.reg_read(REG_X0 + 1)?;
+            let app = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
+            state.preferences.insert(format!("{app}/{key}"), value);
+            context.reg_write(REG_X0, 0)?;
         }
         "dispatch_once" => {
             let predicate = context.reg_read(REG_X0)?;
@@ -1234,6 +1530,107 @@ fn guest_selector_address(
     Ok(address)
 }
 
+fn object_string_value(state: &StoreState, address: u64) -> Result<&str> {
+    if address == 0 {
+        return Ok("");
+    }
+    let object = state
+        .objects
+        .get(&address)
+        .context("unknown Store string object")?;
+    let StoreValue::String(value) = &object.value else {
+        bail!("Store object is not a string");
+    };
+    Ok(value)
+}
+
+fn guest_format(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &StoreState,
+    format: &str,
+    stack_pointer: u64,
+) -> Result<String> {
+    let mut output = Vec::new();
+    let bytes = format.as_bytes();
+    let mut index = 0;
+    let mut offset = 0u64;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            output.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if index >= bytes.len() {
+            bail!("incomplete Store format");
+        }
+        if bytes[index] == b'%' {
+            output.push(b'%');
+            index += 1;
+            continue;
+        }
+        let width_start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let width_text = std::str::from_utf8(&bytes[width_start..index])?;
+        let width = if width_text.is_empty() {
+            0
+        } else {
+            width_text.parse::<usize>()?
+        };
+        if width > 1024 {
+            bail!("Store format width exceeds limit");
+        }
+        while index < bytes.len() && matches!(bytes[index], b'l' | b'z') {
+            index += 1;
+        }
+        let Some(&specifier) = bytes.get(index) else {
+            bail!("invalid Store format");
+        };
+        index += 1;
+        let value = read_guest_u64(context, stack_pointer + offset)?;
+        offset += 8;
+        let rendered = match specifier {
+            b'@' => {
+                if value == 0 {
+                    "(null)".to_owned()
+                } else {
+                    let object = state.objects.get(&value).context("unknown format object")?;
+                    match &object.value {
+                        StoreValue::String(value) => value.clone(),
+                        StoreValue::Number(value) => value.to_string(),
+                        StoreValue::Boolean(value) => value.to_string(),
+                        _ => bail!("unsupported formatted Store object"),
+                    }
+                }
+            }
+            b'd' | b'i' => (value as i64).to_string(),
+            b'u' => value.to_string(),
+            b'x' => {
+                if width_text.starts_with('0') {
+                    format!("{value:0width$x}")
+                } else {
+                    format!("{value:width$x}")
+                }
+            }
+            b'X' => {
+                if width_text.starts_with('0') {
+                    format!("{value:0width$X}")
+                } else {
+                    format!("{value:width$X}")
+                }
+            }
+            b'p' => format!("0x{value:x}"),
+            b's' => guest_cstring(context, profile, state, value)?,
+            _ => bail!("unsupported Store format specifier {}", specifier as char),
+        };
+        output.extend_from_slice(rendered.as_bytes());
+    }
+    String::from_utf8(output).context("formatted Store string is not UTF-8")
+}
+
 fn dispatch_message(
     context: &HookContext,
     profile: &ProfileData,
@@ -1322,6 +1719,32 @@ fn dispatch_message(
             let address = new_guest_object(context, profile, state, "NSThread", StoreValue::Empty)?;
             context.reg_write(REG_X0, address)?;
         }
+        (true, "processInfo") => {
+            let process =
+                new_guest_object(context, profile, state, "NSProcessInfo", StoreValue::Empty)?;
+            let name = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String("ipatool".into()),
+            )?;
+            let environment = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSDictionary",
+                StoreValue::Entries(HashMap::new()),
+            )?;
+            let properties = &mut state
+                .objects
+                .get_mut(&process)
+                .expect("new process")
+                .properties;
+            properties.insert("processName".into(), name);
+            properties.insert("environment".into(), environment);
+            context.reg_write(REG_X0, process)?;
+        }
         (true, "isMainThread") => context.reg_write(REG_X0, 1)?,
         (true, "UUID") => {
             let value = random_uuid_string()?;
@@ -1332,6 +1755,68 @@ fn dispatch_message(
         (true, "alloc" | "allocWithZone:") => {
             let address =
                 new_guest_object(context, profile, state, &class_name, StoreValue::Empty)?;
+            context.reg_write(REG_X0, address)?;
+        }
+        (true, "set" | "setWithCapacity:" | "array" | "arrayWithCapacity:") => {
+            let address = new_guest_object(
+                context,
+                profile,
+                state,
+                &class_name,
+                StoreValue::Addresses(Vec::new()),
+            )?;
+            context.reg_write(REG_X0, address)?;
+        }
+        (true, "setWithObject:" | "arrayWithObject:") => {
+            let value = context.reg_read(REG_X0 + 2)?;
+            let address = new_guest_object(
+                context,
+                profile,
+                state,
+                &class_name,
+                StoreValue::Addresses(vec![value]),
+            )?;
+            context.reg_write(REG_X0, address)?;
+        }
+        (true, "dictionaryWithObjects:forKeys:count:") => {
+            let values = context.reg_read(REG_X0 + 2)?;
+            let keys = context.reg_read(REG_X0 + 3)?;
+            let count = context.reg_read(REG_X0 + 4)?;
+            if count > 65_536 {
+                bail!("Store guest dictionary exceeds runtime limit");
+            }
+            let mut entries = HashMap::new();
+            for index in 0..count {
+                let key_address = read_guest_u64(context, keys + index * 8)?;
+                let key = object_string_value(state, key_address)?.to_owned();
+                entries.insert(key, read_guest_u64(context, values + index * 8)?);
+            }
+            let address = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSDictionary",
+                StoreValue::Entries(entries),
+            )?;
+            context.reg_write(REG_X0, address)?;
+        }
+        (true, "setWithObjects:count:" | "arrayWithObjects:count:") => {
+            let values = context.reg_read(REG_X0 + 2)?;
+            let count = context.reg_read(REG_X0 + 3)?;
+            if count > 65_536 {
+                bail!("Store guest array exceeds runtime limit");
+            }
+            let mut items = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                items.push(read_guest_u64(context, values + index * 8)?);
+            }
+            let address = new_guest_object(
+                context,
+                profile,
+                state,
+                &class_name,
+                StoreValue::Addresses(items),
+            )?;
             context.reg_write(REG_X0, address)?;
         }
         (true, "numberWithBool:") => {
@@ -1416,6 +1901,7 @@ fn dispatch_message(
             let object = &state.objects[&receiver];
             let count = match &object.value {
                 StoreValue::String(value) => value.len(),
+                StoreValue::Bytes(value) => value.len(),
                 StoreValue::Addresses(values) => values.len(),
                 StoreValue::Entries(values) => values.len(),
                 _ => bail!("count of {class_name}"),
@@ -1734,7 +2220,76 @@ fn dispatch_message(
             }
             context.reg_write(REG_X0, receiver)?;
         }
-        (true, "class") | (false, "retain" | "autorelease" | "copy" | "copyWithZone:") => {
+        (false, "initWithCapacity:") => {
+            let value = if class_name == "NSMutableString" {
+                StoreValue::String(String::new())
+            } else if class_name.contains("Array") {
+                StoreValue::Addresses(Vec::new())
+            } else {
+                StoreValue::Entries(HashMap::new())
+            };
+            state
+                .objects
+                .get_mut(&receiver)
+                .expect("known receiver")
+                .value = value;
+            context.reg_write(REG_X0, receiver)?;
+        }
+        (false, "appendFormat:" | "initWithFormat:") => {
+            let format_address = context.reg_read(REG_X0 + 2)?;
+            let format = object_string_value(state, format_address)?.to_owned();
+            let stack_pointer = context.reg_read(REG_SP)?;
+            let formatted = guest_format(context, profile, state, &format, stack_pointer)?;
+            let object = state.objects.get_mut(&receiver).expect("known string");
+            if selector == "appendFormat:" {
+                let StoreValue::String(value) = &mut object.value else {
+                    bail!("appendFormat: on nonstring object");
+                };
+                value.push_str(&formatted);
+                context.reg_write(REG_X0, 0)?;
+            } else {
+                object.value = StoreValue::String(formatted);
+                context.reg_write(REG_X0, receiver)?;
+            }
+        }
+        (false, "copy" | "mutableCopy" | "mutableCopyWithZone:") => {
+            let object = &state.objects[&receiver];
+            let mutable = selector != "copy";
+            let target = match object.class.as_str() {
+                "NSArray" | "NSMutableArray" => {
+                    if mutable {
+                        "NSMutableArray"
+                    } else {
+                        "NSArray"
+                    }
+                }
+                "NSSet" | "NSMutableSet" => {
+                    if mutable {
+                        "NSMutableSet"
+                    } else {
+                        "NSSet"
+                    }
+                }
+                "NSDictionary" | "NSMutableDictionary" => {
+                    if mutable {
+                        "NSMutableDictionary"
+                    } else {
+                        "NSDictionary"
+                    }
+                }
+                "NSMutableString" if !mutable => "NSString",
+                _ if !mutable => {
+                    context.reg_write(REG_X0, receiver)?;
+                    return Ok(());
+                }
+                _ => object.class.as_str(),
+            };
+            let target = target.to_owned();
+            let value = object.value.clone();
+            let address = new_guest_object(context, profile, state, &target, value)?;
+            context.reg_write(REG_X0, address)?;
+        }
+        (true, "class") | (false, "retain" | "autorelease" | "copyWithZone:") => {
             context.reg_write(REG_X0, receiver)?;
         }
         (false, "class") => {
@@ -1758,6 +2313,51 @@ fn collection_key(state: &StoreState, address: u64) -> String {
     format!("#object:{address:x}")
 }
 
+fn export_object(
+    state: &StoreState,
+    address: u64,
+    active: &mut HashSet<u64>,
+    depth: usize,
+) -> Result<Value> {
+    if address == 0 {
+        return Ok(Value::Null);
+    }
+    if depth > 32 || !active.insert(address) {
+        bail!("cyclic or excessively nested Store guest value");
+    }
+    let object = state
+        .objects
+        .get(&address)
+        .with_context(|| format!("unknown exported Store object {address:#x}"))?;
+    let result = match &object.value {
+        StoreValue::Empty => Value::Null,
+        StoreValue::String(value) => Value::String(value.clone()),
+        StoreValue::Number(value) => Value::Number((*value).into()),
+        StoreValue::Boolean(value) => Value::Bool(*value),
+        StoreValue::Bytes(value) => {
+            Value::String(base64::engine::general_purpose::STANDARD.encode(value))
+        }
+        StoreValue::Addresses(values) => Value::Array(
+            values
+                .iter()
+                .map(|&address| export_object(state, address, active, depth + 1))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        StoreValue::Entries(values) => {
+            let mut result = serde_json::Map::with_capacity(values.len());
+            for (key, &address) in values {
+                result.insert(
+                    key.clone(),
+                    export_object(state, address, active, depth + 1)?,
+                );
+            }
+            Value::Object(result)
+        }
+    };
+    active.remove(&address);
+    Ok(result)
+}
+
 fn foundation_equal(state: &StoreState, first: u64, second: u64, depth: usize) -> bool {
     if first == second {
         return true;
@@ -1771,6 +2371,7 @@ fn foundation_equal(state: &StoreState, first: u64, second: u64, depth: usize) -
     };
     match (&first.value, &second.value) {
         (StoreValue::String(a), StoreValue::String(b)) => a == b,
+        (StoreValue::Bytes(a), StoreValue::Bytes(b)) => a == b,
         (StoreValue::Number(a), StoreValue::Number(b)) => a == b,
         (StoreValue::Boolean(a), StoreValue::Boolean(b)) => a == b,
         (StoreValue::Number(a), StoreValue::Boolean(b))
@@ -1884,6 +2485,7 @@ mod tests {
     fn boots_pinned_store_profile() {
         let assets = SapAssetBundle::load_cached().unwrap();
         let mut runtime = StoreRuntime::open(&assets).unwrap();
+        runtime.set_hardware_id(&[1, 2, 3, 4, 5, 6]).unwrap();
         assert!(!runtime.code_ranges.is_empty());
         let allocated = runtime.allocate(17).unwrap();
         assert_eq!(runtime.heap_cursor(), allocated + 32);
@@ -1971,6 +2573,31 @@ mod tests {
             runtime.state.borrow().objects[&ephemeral].class,
             "AMSEphemeralAccount"
         );
+        let username = runtime
+            .new_object("NSString", StoreValue::String("test@example.com".into()))
+            .unwrap();
+        runtime
+            .invoke(ephemeral, "setUsername:", &[username])
+            .unwrap();
+        runtime.set_ivar(task, "_account", ephemeral).unwrap();
+        runtime.set_ivar(task, "_options", options).unwrap();
+        runtime.set_ivar(task, "_bag", 0).unwrap();
+        let parameters = runtime
+            .invoke(
+                task,
+                "_createAuthenticateRequestParametersForAccount:",
+                &[ephemeral],
+            )
+            .unwrap();
+        let parameters = runtime.export(parameters).unwrap();
+        assert_eq!(parameters["appleId"], "test@example.com");
+        assert_eq!(parameters["password"], "secret");
+        assert!(
+            parameters["guid"]
+                .as_str()
+                .unwrap()
+                .eq_ignore_ascii_case("010203040506")
+        );
         assert!(
             runtime
                 .call(objc_msg_send, &[u64::MAX, selector])
@@ -1991,5 +2618,24 @@ mod tests {
             runtime.engine.mem_read(synthetic, 4).unwrap(),
             [0xc0, 0x03, 0x5f, 0xd6]
         );
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn builds_authentication_parameters_with_pinned_apple_code() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let parameters = runtime
+            .build_authentication_parameters("test@example.com", "secret", &[1, 2, 3, 4, 5, 6], 0)
+            .unwrap();
+        assert_eq!(parameters["appleId"], "test@example.com");
+        assert_eq!(parameters["password"], "secret");
+        assert!(
+            parameters["guid"]
+                .as_str()
+                .unwrap()
+                .eq_ignore_ascii_case("010203040506")
+        );
+        assert!(parameters["createSession"].is_boolean());
     }
 }
