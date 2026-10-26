@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::store_memory::group_pages;
+use crate::{store_memory::group_pages, unicorn_runtime::Engine};
 
 const MANIFEST: &str = include_str!("../assets/store/manifest.json");
 const METADATA: &[u8] = include_bytes!("../assets/store/metadata.zst");
@@ -22,6 +22,7 @@ pub struct ProfileData {
     pub metadata: Vec<u8>,
     pub pages: Vec<u8>,
     pub plugin: Vec<u8>,
+    pub index: ProfileIndex,
 }
 
 #[derive(Deserialize)]
@@ -47,21 +48,60 @@ struct Artifact {
 }
 
 #[derive(Deserialize)]
-struct MetadataIndex {
+pub struct ProfileIndex {
     #[serde(rename = "UUID")]
-    uuid: String,
+    pub uuid: String,
     #[serde(rename = "PluginUUID")]
-    plugin_uuid: String,
+    pub plugin_uuid: String,
     #[serde(rename = "Pages")]
-    pages: Vec<Page>,
+    pub pages: Vec<Page>,
+    #[serde(rename = "Calls")]
+    pub calls: Vec<Call>,
 }
 
 #[derive(Deserialize)]
-struct Page {
+pub struct Page {
     #[serde(rename = "Address")]
-    address: u64,
+    pub address: u64,
     #[serde(rename = "Offset")]
-    offset: u64,
+    pub offset: u64,
+}
+
+#[derive(Deserialize)]
+pub struct Call {
+    #[serde(rename = "Address")]
+    pub address: u64,
+    #[serde(rename = "Symbol")]
+    pub symbol: String,
+    #[serde(rename = "Selector")]
+    pub selector: String,
+    #[serde(rename = "SelectorAddress")]
+    pub selector_address: u64,
+}
+
+impl ProfileData {
+    /// Map and initialize the exported Store pages in a fresh Unicorn engine.
+    /// Image segments and call stubs are installed by the runtime separately.
+    pub fn map_pages(&self, engine: &mut Engine) -> Result<()> {
+        let addresses = self
+            .index
+            .pages
+            .iter()
+            .map(|page| page.address)
+            .collect::<Vec<_>>();
+        for region in group_pages(&addresses)? {
+            engine
+                .mem_map(region.address, region.size as usize)
+                .with_context(|| format!("map Store region at {:#x}", region.address))?;
+        }
+        for page in &self.index.pages {
+            let offset = page.offset as usize;
+            engine
+                .mem_write(page.address, &self.pages[offset..offset + 4096])
+                .with_context(|| format!("load Store page at {:#x}", page.address))?;
+        }
+        Ok(())
+    }
 }
 
 /// Decode and validate the committed profile once per process.
@@ -84,12 +124,13 @@ fn decode_profile() -> Result<ProfileData> {
     )?;
     let pages = decode_artifact(&manifest.artifacts.pages, "pages.zst", PAGES, 256 << 20)?;
     let plugin = decode_artifact(&manifest.artifacts.plugin, "plugin.zst", PLUGIN, 64 << 20)?;
-    let index: MetadataIndex =
+    let index: ProfileIndex =
         serde_json::from_slice(&metadata).context("invalid Store metadata index")?;
     if index.uuid != manifest.framework_uuid || index.plugin_uuid != manifest.plugin_uuid {
         bail!("Store profile uses unexpected Apple images");
     }
     if index.pages.is_empty()
+        || index.calls.is_empty()
         || pages.is_empty()
         || pages.len() % 4096 != 0
         || index.pages.len() != pages.len() / 4096
@@ -112,6 +153,7 @@ fn decode_profile() -> Result<ProfileData> {
         metadata,
         pages,
         plugin,
+        index,
     })
 }
 
@@ -151,7 +193,28 @@ mod tests {
         assert_eq!(first.metadata.len(), 4_807_917);
         assert_eq!(first.pages.len(), 20_893_696);
         assert_eq!(first.plugin.len(), 138_088);
+        assert_eq!(first.index.pages.len(), 5101);
+        assert_eq!(first.index.calls.len(), 13369);
         assert!(Arc::ptr_eq(&first, &load().unwrap()));
+    }
+
+    #[test]
+    #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
+    fn maps_and_initializes_exported_store_pages() {
+        let profile = load().unwrap();
+        let mut engine = Engine::new().unwrap();
+        profile.map_pages(&mut engine).unwrap();
+        for page in [
+            &profile.index.pages[0],
+            &profile.index.pages[profile.index.pages.len() / 2],
+            profile.index.pages.last().unwrap(),
+        ] {
+            let offset = page.offset as usize;
+            assert_eq!(
+                engine.mem_read(page.address, 4096).unwrap(),
+                profile.pages[offset..offset + 4096]
+            );
+        }
     }
 
     #[test]
