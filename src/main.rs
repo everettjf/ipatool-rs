@@ -8,6 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
+use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
@@ -159,6 +160,40 @@ enum Command {
         report: Option<PathBuf>,
         #[arg(long)]
         force: bool,
+    },
+    /// Collect private native FairPlay enrollment material.
+    FairplayEnroll {
+        #[command(subcommand)]
+        command: FairplayEnrollCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FairplayEnrollCommand {
+    /// Collect an installed app and matching private FairPlay state.
+    Collect {
+        #[arg(long)]
+        app: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        ipa: Option<PathBuf>,
+        #[arg(long)]
+        fairplayd: Option<PathBuf>,
+        #[arg(long)]
+        system_state: Option<PathBuf>,
+        #[arg(long)]
+        shared_state: Option<PathBuf>,
+        #[arg(long)]
+        adi_state: Option<PathBuf>,
+        #[arg(long = "iomac-file")]
+        iomac_file: Option<PathBuf>,
+        #[arg(long, default_value = "en0")]
+        interface: String,
+        #[arg(long)]
+        product_version: Option<String>,
+        #[arg(long)]
+        build_version: Option<String>,
     },
 }
 
@@ -696,6 +731,44 @@ fn run() -> Result<()> {
                 ),
             }
         }
+        Command::FairplayEnroll { command } => match command {
+            FairplayEnrollCommand::Collect {
+                app,
+                output,
+                ipa,
+                fairplayd,
+                system_state,
+                shared_state,
+                adi_state,
+                iomac_file,
+                interface,
+                product_version,
+                build_version,
+            } => {
+                let manifest = collect_enrollment(&EnrollmentCollectOptions {
+                    app,
+                    ipa,
+                    output: output.clone(),
+                    fairplayd,
+                    system_state,
+                    shared_state,
+                    adi_state,
+                    iomac_file,
+                    interface,
+                    product_version,
+                    build_version,
+                })?;
+                match cli.format {
+                    Format::Json => println!("{}", serde_json::to_string_pretty(&manifest)?),
+                    Format::Text => println!(
+                        "Collected {} private files for selector {} in {}",
+                        manifest.files.len(),
+                        manifest.app.selector_id,
+                        output.display()
+                    ),
+                }
+            }
+        },
     }
     if cli.verbose {
         // Accepted for CLI compatibility. HTTP diagnostics will be added with the transport port.

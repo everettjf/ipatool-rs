@@ -13,6 +13,7 @@ pub mod dyld_export;
 pub mod fairplay;
 pub mod fairplay_arm64;
 pub mod fairplay_codesign;
+pub mod fairplay_collect;
 pub mod fairplay_decrypt;
 pub mod fairplay_ipa;
 pub mod fairplay_key;

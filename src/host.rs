@@ -217,6 +217,26 @@ pub fn hardware_mac_address() -> Result<[u8; 6]> {
     }
 }
 
+/// Read the six-byte IOMACAddress of a specific built-in network interface.
+pub fn hardware_mac_for_interface(interface: &str) -> Result<[u8; 6]> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/sbin/ioreg")
+            .args(["-a", "-l", "-p", "IOService"])
+            .output()
+            .context("read IORegistry hardware identity")?;
+        if !output.status.success() {
+            bail!("IORegistry hardware identity query failed");
+        }
+        ioreg_hardware_mac(&output.stdout, interface)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = interface;
+        bail!("automatic FairPlay hardware identity requires macOS")
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn system_version(flag: &str) -> Result<String> {
     let output = Command::new("/usr/bin/sw_vers")
