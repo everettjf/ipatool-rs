@@ -1,6 +1,7 @@
 //! Embedded Store runtime profile, extracted from the Go source snapshot.
 
 use std::{
+    collections::HashSet,
     io::Read,
     sync::{Arc, OnceLock},
 };
@@ -80,15 +81,18 @@ pub struct Call {
 }
 
 impl ProfileData {
-    /// Map and initialize the exported Store pages in a fresh Unicorn engine.
-    /// Image segments and call stubs are installed by the runtime separately.
-    pub fn map_pages(&self, engine: &mut Engine) -> Result<()> {
-        let addresses = self
+    /// Map exported pages and install return stubs for all pinned call sites in
+    /// a fresh Unicorn engine. Mach-O image segments are loaded separately.
+    pub fn map_pages_and_calls(&self, engine: &mut Engine) -> Result<()> {
+        let mut addresses = self
             .index
             .pages
             .iter()
             .map(|page| page.address)
             .collect::<Vec<_>>();
+        addresses.extend(self.index.calls.iter().map(|call| call.address & !4095));
+        addresses.sort_unstable();
+        addresses.dedup();
         for region in group_pages(&addresses)? {
             engine
                 .mem_map(region.address, region.size as usize)
@@ -99,6 +103,11 @@ impl ProfileData {
             engine
                 .mem_write(page.address, &self.pages[offset..offset + 4096])
                 .with_context(|| format!("load Store page at {:#x}", page.address))?;
+        }
+        for call in &self.index.calls {
+            engine
+                .mem_write(call.address, &[0xc0, 0x03, 0x5f, 0xd6])
+                .with_context(|| format!("install Store call at {:#x}", call.address))?;
         }
         Ok(())
     }
@@ -143,10 +152,17 @@ fn decode_profile() -> Result<ProfileData> {
             bail!("invalid Store page index");
         }
     }
+    let mut call_addresses = HashSet::with_capacity(index.calls.len());
+    for call in &index.calls {
+        if call.address % 4 != 0 || !call_addresses.insert(call.address) {
+            bail!("invalid Store call index");
+        }
+    }
     let addresses = index
         .pages
         .iter()
         .map(|page| page.address)
+        .chain(index.calls.iter().map(|call| call.address & !4095))
         .collect::<Vec<_>>();
     group_pages(&addresses).context("invalid Store page mapping")?;
     Ok(ProfileData {
@@ -200,19 +216,37 @@ mod tests {
 
     #[test]
     #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
-    fn maps_and_initializes_exported_store_pages() {
+    fn maps_store_pages_and_call_stubs() {
         let profile = load().unwrap();
         let mut engine = Engine::new().unwrap();
-        profile.map_pages(&mut engine).unwrap();
-        for page in [
-            &profile.index.pages[0],
-            &profile.index.pages[profile.index.pages.len() / 2],
-            profile.index.pages.last().unwrap(),
-        ] {
+        profile.map_pages_and_calls(&mut engine).unwrap();
+        let call_pages = profile
+            .index
+            .calls
+            .iter()
+            .map(|call| call.address & !4095)
+            .collect::<HashSet<_>>();
+        for page in profile
+            .index
+            .pages
+            .iter()
+            .filter(|page| !call_pages.contains(&page.address))
+            .take(3)
+        {
             let offset = page.offset as usize;
             assert_eq!(
                 engine.mem_read(page.address, 4096).unwrap(),
                 profile.pages[offset..offset + 4096]
+            );
+        }
+        for call in [
+            &profile.index.calls[0],
+            &profile.index.calls[profile.index.calls.len() / 2],
+            profile.index.calls.last().unwrap(),
+        ] {
+            assert_eq!(
+                engine.mem_read(call.address, 4).unwrap(),
+                [0xc0, 0x03, 0x5f, 0xd6]
             );
         }
     }
