@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use url::Url;
 
-use crate::{App, CatalogClient, Platform, catalog::validate_country, vision};
+use crate::{App, CatalogClient, Platform, catalog::validate_country, macos, vision};
 
 impl CatalogClient {
     pub fn latest_external_version_id(
@@ -24,14 +24,19 @@ impl CatalogClient {
             return vision::product_version_id(&body, app.id);
         }
 
+        if platform == Platform::Macos {
+            let url = macos::product_url(app.id, country)?;
+            let body = self.get(url)?.body;
+            let body = String::from_utf8(body)?;
+            return macos::product_version_id(&body, app);
+        }
+
         let catalogs: &[&str] = match platform {
             Platform::Iphone | Platform::Ipad | Platform::Watchos => {
                 &["enterprisestore", "iphone", "ipad"]
             }
             Platform::Appletv => &["atv9"],
-            Platform::Macos => {
-                bail!("macOS version lookup requires the Store account and package metadata")
-            }
+            Platform::Macos => unreachable!("handled above"),
             Platform::Unknown | Platform::Visionos => bail!("invalid platform"),
         };
         let mut last_error = String::new();

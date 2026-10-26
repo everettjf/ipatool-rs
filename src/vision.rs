@@ -27,7 +27,7 @@ pub fn product_url(app_id: i64, country: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn serialized_server_data(body: &str) -> Result<&str> {
+pub(crate) fn serialized_server_data(body: &str) -> Result<&str> {
     let marker = [format!("id=\"{SCRIPT_ID}\""), format!("id='{SCRIPT_ID}'")]
         .into_iter()
         .filter_map(|needle| body.find(&needle))

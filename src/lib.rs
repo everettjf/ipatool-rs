@@ -13,6 +13,7 @@ pub mod host;
 pub mod lzbitmap;
 pub mod machfixups;
 pub mod machimage;
+pub mod macos;
 pub mod platform;
 pub mod sap_aea;
 pub mod sap_archive;
