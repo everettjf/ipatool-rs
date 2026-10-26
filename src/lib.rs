@@ -10,6 +10,7 @@ pub mod state;
 pub mod store_memory;
 pub mod store_profile;
 pub mod transport;
+pub mod unicorn_runtime;
 pub mod version;
 pub mod vision;
 
