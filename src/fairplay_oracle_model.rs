@@ -221,6 +221,38 @@ pub struct OracleState<'a> {
     touched: BTreeSet<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaultKind {
+    None,
+    Index,
+    Pointer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OracleFault {
+    pub pc: u64,
+    pub register: u8,
+    pub shift: u8,
+    pub value: u8,
+    pub kind: FaultKind,
+    pub restore: bool,
+    pub table_bytes: u16,
+    pub entry_bytes: u8,
+}
+
+impl OracleFault {
+    pub const NONE: Self = Self {
+        pc: 0,
+        register: 0,
+        shift: 0,
+        value: 0,
+        kind: FaultKind::None,
+        restore: false,
+        table_bytes: 0,
+        entry_bytes: 0,
+    };
+}
+
 impl Drop for OracleState<'_> {
     fn drop(&mut self) {
         self.registers.zeroize();
@@ -357,6 +389,52 @@ impl<'a> OracleState<'a> {
             "lo" => !self.flags[2],
             "hi" => self.flags[2] && !self.flags[1],
             _ => panic!("unsupported generated condition {name}"),
+        }
+    }
+
+    pub fn before_fault(&mut self, selected: OracleFault, pc: u64) -> Result<(u64, bool)> {
+        if selected.kind == FaultKind::None || selected.pc != pc {
+            return Ok((0, false));
+        }
+        let register = selected.register as usize;
+        if register >= self.registers.len() {
+            bail!("invalid oracle fault register");
+        }
+        let old = self.registers[register];
+        self.registers[register] = match selected.kind {
+            FaultKind::None => old,
+            FaultKind::Index => {
+                if let Some(values) = self.model.domain(pc, selected.register) {
+                    let needle = old as u32 as u64;
+                    let index = values.binary_search(&needle).map_err(|_| {
+                        anyhow::anyhow!("index value {needle:#x} is outside the learned domain")
+                    })?;
+                    values[index ^ selected.value as usize]
+                } else {
+                    (old as u32 ^ (selected.value as u32).wrapping_shl(selected.shift as u32))
+                        as u64
+                }
+            }
+            FaultKind::Pointer => {
+                let table = selected.table_bytes as u64;
+                let entry = selected.entry_bytes as u64;
+                if !table.is_power_of_two() || entry == 0 {
+                    bail!("invalid pointer-fault geometry");
+                }
+                let base = old & !(table - 1);
+                let offset = old - base;
+                if offset >= table || !offset.is_multiple_of(entry) {
+                    bail!("pointer fault is outside its table");
+                }
+                base.wrapping_add(((offset / entry) ^ selected.value as u64).wrapping_mul(entry))
+            }
+        };
+        Ok((old, selected.restore))
+    }
+
+    pub fn after_fault(&mut self, selected: OracleFault, pc: u64, old: u64, restore: bool) {
+        if restore && selected.pc == pc && (selected.register as usize) < self.registers.len() {
+            self.registers[selected.register as usize] = old;
         }
     }
 
