@@ -1,7 +1,9 @@
 //! Typed ARM64 Unicorn operations over the pinned dynamic library.
 
 use std::{
+    cell::RefCell,
     ffi::{CStr, c_char, c_void},
+    panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     time::Duration,
 };
@@ -19,6 +21,7 @@ const PROT_ALL: u32 = 7;
 const QUERY_TIMEOUT: i32 = 4;
 const CONTROL_CPU_MODEL: u32 = 7 | 1 << 26 | 1 << 30;
 const ARM64_CPU_MODEL_MAX: u32 = 3;
+const HOOK_CODE: i32 = 1 << 2;
 
 type Handle = *mut c_void;
 
@@ -36,6 +39,17 @@ struct Api {
     reg_write: unsafe extern "C" fn(Handle, i32, *const c_void) -> i32,
     emu_start: unsafe extern "C" fn(Handle, u64, u64, u64, usize) -> i32,
     emu_stop: unsafe extern "C" fn(Handle) -> i32,
+    hook_add: unsafe extern "C" fn(
+        Handle,
+        *mut usize,
+        i32,
+        *mut c_void,
+        *mut c_void,
+        u64,
+        u64,
+        ...
+    ) -> i32,
+    hook_del: unsafe extern "C" fn(Handle, usize) -> i32,
 }
 
 impl Api {
@@ -63,7 +77,60 @@ impl Api {
             reg_write: unsafe { symbol(library, b"uc_reg_write")? },
             emu_start: unsafe { symbol(library, b"uc_emu_start")? },
             emu_stop: unsafe { symbol(library, b"uc_emu_stop")? },
+            hook_add: unsafe { symbol(library, b"uc_hook_add")? },
+            hook_del: unsafe { symbol(library, b"uc_hook_del")? },
         })
+    }
+}
+
+pub struct HookContext {
+    handle: Handle,
+    stop: unsafe extern "C" fn(Handle) -> i32,
+}
+
+impl HookContext {
+    pub fn stop(&self) -> Result<()> {
+        let code = unsafe { (self.stop)(self.handle) };
+        if code == 0 {
+            Ok(())
+        } else {
+            bail!("failed to stop Unicorn emulator: error {code}")
+        }
+    }
+}
+
+type CodeCallback = dyn FnMut(&HookContext, u64, u32);
+
+struct HookData {
+    callback: RefCell<Box<CodeCallback>>,
+    failure: RefCell<Option<String>>,
+    stop: unsafe extern "C" fn(Handle) -> i32,
+}
+
+struct HookRegistration {
+    id: u64,
+    handle: usize,
+    _data: Box<HookData>,
+}
+
+extern "C" fn code_trampoline(handle: Handle, address: u64, size: u32, user_data: *mut c_void) {
+    if user_data.is_null() {
+        return;
+    }
+    let data = unsafe { &*user_data.cast::<HookData>() };
+    let context = HookContext {
+        handle,
+        stop: data.stop,
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(mut callback) = data.callback.try_borrow_mut() else {
+            panic!("reentrant Unicorn code hook");
+        };
+        callback(&context, address, size);
+    }));
+    if result.is_err() {
+        *data.failure.borrow_mut() = Some("Unicorn code hook panicked".to_owned());
+        unsafe { (data.stop)(handle) };
     }
 }
 
@@ -71,6 +138,8 @@ pub struct Engine {
     api: Api,
     handle: Handle,
     _library: UnicornLibrary,
+    hooks: Vec<HookRegistration>,
+    next_hook_id: u64,
 }
 
 impl Engine {
@@ -86,6 +155,8 @@ impl Engine {
             api,
             handle,
             _library: library,
+            hooks: Vec::new(),
+            next_hook_id: 1,
         };
         let code = unsafe { (engine.api.control)(handle, CONTROL_CPU_MODEL, ARM64_CPU_MODEL_MAX) };
         if let Err(error) = engine.check(code) {
@@ -161,9 +232,17 @@ impl Engine {
         let micros = u64::try_from(timeout.as_micros())
             .unwrap_or(u64::MAX)
             .max(1);
-        self.check(unsafe {
+        let result = self.check(unsafe {
             (self.api.emu_start)(self.handle, begin, end, micros, instruction_limit)
-        })?;
+        });
+        if let Some(failure) = self
+            .hooks
+            .iter()
+            .find_map(|hook| hook._data.failure.borrow().clone())
+        {
+            bail!("{failure}");
+        }
+        result?;
         let mut timed_out = 0u64;
         self.check(unsafe { (self.api.query)(self.handle, QUERY_TIMEOUT, &mut timed_out) })?;
         if timed_out != 0 {
@@ -176,10 +255,56 @@ impl Engine {
         self.check(unsafe { (self.api.emu_stop)(self.handle) })
     }
 
+    pub fn add_code_hook<F>(&mut self, begin: u64, end: u64, callback: F) -> Result<u64>
+    where
+        F: FnMut(&HookContext, u64, u32) + 'static,
+    {
+        let id = self.next_hook_id;
+        let next_id = id.checked_add(1).context("Unicorn hook ID overflow")?;
+        let data = Box::new(HookData {
+            callback: RefCell::new(Box::new(callback)),
+            failure: RefCell::new(None),
+            stop: self.api.emu_stop,
+        });
+        let mut hook_handle = 0usize;
+        let user_data = (&*data as *const HookData).cast_mut().cast::<c_void>();
+        let trampoline = code_trampoline as *const () as *mut c_void;
+        self.check(unsafe {
+            (self.api.hook_add)(
+                self.handle,
+                &mut hook_handle,
+                HOOK_CODE,
+                trampoline,
+                user_data,
+                begin,
+                end,
+            )
+        })?;
+        self.next_hook_id = next_id;
+        self.hooks.push(HookRegistration {
+            id,
+            handle: hook_handle,
+            _data: data,
+        });
+        Ok(id)
+    }
+
+    pub fn remove_hook(&mut self, id: u64) -> Result<()> {
+        let position = self
+            .hooks
+            .iter()
+            .position(|hook| hook.id == id)
+            .context("Unicorn hook not found")?;
+        self.check(unsafe { (self.api.hook_del)(self.handle, self.hooks[position].handle) })?;
+        self.hooks.remove(position);
+        Ok(())
+    }
+
     pub fn close(mut self) -> Result<()> {
         if self.handle.is_null() {
             return Ok(());
         }
+        self.remove_all_hooks();
         let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
         self.check(unsafe { (self.api.close)(handle) })
     }
@@ -194,8 +319,15 @@ impl Engine {
 
     fn close_handle(&mut self) {
         if !self.handle.is_null() {
+            self.remove_all_hooks();
             let handle = std::mem::replace(&mut self.handle, ptr::null_mut());
             unsafe { (self.api.close)(handle) };
+        }
+    }
+
+    fn remove_all_hooks(&mut self) {
+        for hook in self.hooks.drain(..) {
+            unsafe { (self.api.hook_del)(self.handle, hook.handle) };
         }
     }
 }
@@ -216,4 +348,40 @@ fn api_error(api: &Api, code: i32) -> anyhow::Error {
             .into_owned()
     };
     anyhow::anyhow!("Unicorn error {code}: {message}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
+    fn code_hook_stops_and_can_be_removed() {
+        let mut engine = Engine::new().unwrap();
+        engine.mem_map(0x1000, 4096).unwrap();
+        engine
+            .mem_write(0x1000, &[0x20, 0x00, 0x80, 0xd2, 0x00, 0x04, 0x00, 0x91])
+            .unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&calls);
+        let hook = engine
+            .add_code_hook(0x1004, 0x1004, move |context, address, size| {
+                assert_eq!((address, size), (0x1004, 4));
+                observed.set(observed.get() + 1);
+                context.stop().unwrap();
+            })
+            .unwrap();
+        engine
+            .start_bounded(0x1000, 0x1008, Duration::from_secs(1), 10)
+            .unwrap();
+        assert_eq!(engine.reg_read(REG_X0).unwrap(), 1);
+        assert_eq!(calls.get(), 1);
+        engine.remove_hook(hook).unwrap();
+        engine.reg_write(REG_X0, 0).unwrap();
+        engine
+            .start_bounded(0x1000, 0x1008, Duration::from_secs(1), 10)
+            .unwrap();
+        assert_eq!(engine.reg_read(REG_X0).unwrap(), 2);
+    }
 }
