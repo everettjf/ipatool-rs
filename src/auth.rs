@@ -6,6 +6,7 @@ use reqwest::{
     header::{ACCEPT, HeaderValue},
 };
 use serde::Deserialize;
+use serde_json::Value;
 use url::Url;
 
 use crate::transport::{DEFAULT_AUTHENTICATION_TIMEOUT, Request, Transport};
@@ -179,6 +180,12 @@ pub fn fetch_bag(transport: &Transport, mac_address: &str) -> Result<SapConfig> 
         .context("failed to request Apple URL bag")?;
     response.ensure_success()?;
     let parsed: BagResponse = response.plist(false)?;
+    config_from_bag(parsed)
+}
+
+pub fn sap_config_from_bag_value(value: &Value) -> Result<SapConfig> {
+    let parsed: BagResponse =
+        serde_json::from_value(value.clone()).context("invalid Store URL bag")?;
     config_from_bag(parsed)
 }
 

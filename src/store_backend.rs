@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
 
+use crate::auth::{SapConfig, sap_config_from_bag_value};
 use crate::sap_assets::SapAssetBundle;
 use crate::store_runtime::{StoreRuntime, StoreStandardRequest};
 use crate::transport::{
@@ -104,6 +105,10 @@ impl StoreBackend {
         }
         *self.bag.lock().expect("Store bag lock poisoned") = Some(bag.clone());
         Ok(bag)
+    }
+
+    pub fn sap_config(&self) -> Result<SapConfig> {
+        sap_config_from_bag_value(&self.bag()?)
     }
 
     pub fn execute_standard(&self, input: StoreBackendRequest<'_>) -> Result<HostResponse> {
@@ -235,6 +240,7 @@ mod tests {
         assert_eq!(response.status, 200);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(backend.bag().is_ok());
+        assert_eq!(backend.sap_config().unwrap().version, 200);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
