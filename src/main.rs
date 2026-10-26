@@ -11,7 +11,7 @@ use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
 use ipatool_rs::fairplay_checkpoint::FairplayCheckpoint;
-use ipatool_rs::fairplay_checkpoint_run::{CheckpointRunner, VirtualFileStat};
+use ipatool_rs::fairplay_checkpoint_run::{CheckpointRunner, MemoryTraceOptions, VirtualFileStat};
 use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
 use ipatool_rs::fairplay_download_capture::write_download_capture;
 use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2};
@@ -34,6 +34,7 @@ use ipatool_rs::store_purchase::{
 };
 use ipatool_rs::storefront::country_code_from_storefront;
 use ipatool_rs::{App, CatalogClient, Platform, SearchOutput};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 mod mcp;
@@ -246,6 +247,17 @@ enum FairplayEnrollCommand {
         instruction_limit: usize,
         #[arg(long, default_value_t = 30)]
         timeout_seconds: u64,
+        #[arg(
+            long,
+            help = "Write bounded guest memory read/write events as private JSON"
+        )]
+        memory_trace_output: Option<PathBuf>,
+        #[arg(long, help = "Trace only reads when paired with memory trace output")]
+        trace_memory_reads: bool,
+        #[arg(long, help = "Trace only writes when paired with memory trace output")]
+        trace_memory_writes: bool,
+        #[arg(long, default_value_t = 1_000_000)]
+        max_memory_events: usize,
         #[arg(long = "file-payload", value_name = "SUFFIX=PATH")]
         file_payloads: Vec<String>,
         #[arg(long = "file-stat", value_name = "SUFFIX=MODE,UID,GID")]
@@ -1052,6 +1064,10 @@ fn run() -> Result<()> {
                 stop_hit,
                 instruction_limit,
                 timeout_seconds,
+                memory_trace_output,
+                trace_memory_reads,
+                trace_memory_writes,
+                max_memory_events,
                 file_payloads,
                 file_stats,
                 missing_files_are_enoent,
@@ -1077,6 +1093,7 @@ fn run() -> Result<()> {
                 }
                 let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
                 let stop = parse_address(&stop_address)?;
+                let binary_sha256 = format!("{:x}", Sha256::digest(&binary));
                 let mut runner = CheckpointRunner::new(&snapshot, &binary)?;
                 if let Some(path) = mac_address_file {
                     let input = read_private_bytes(&path, 64)?;
@@ -1113,16 +1130,47 @@ fn run() -> Result<()> {
                         },
                     )?;
                 }
-                runner.run_until_hit(
-                    stop,
-                    stop_hit,
-                    Duration::from_secs(timeout_seconds),
-                    instruction_limit,
-                )?;
+                if memory_trace_output.is_none() && (trace_memory_reads || trace_memory_writes) {
+                    bail!("memory trace flags require --memory-trace-output");
+                }
+                let trace = if memory_trace_output.is_some() {
+                    let trace_both = !trace_memory_reads && !trace_memory_writes;
+                    Some(runner.run_until_hit_with_memory_trace(
+                        stop,
+                        stop_hit,
+                        Duration::from_secs(timeout_seconds),
+                        instruction_limit,
+                        MemoryTraceOptions {
+                            reads: trace_memory_reads || trace_both,
+                            writes: trace_memory_writes || trace_both,
+                            max_events: max_memory_events,
+                        },
+                    )?)
+                } else {
+                    runner.run_until_hit(
+                        stop,
+                        stop_hit,
+                        Duration::from_secs(timeout_seconds),
+                        instruction_limit,
+                    )?;
+                    None
+                };
                 let written_pages = output_checkpoint
                     .as_ref()
                     .map(|output| runner.write_checkpoint(&snapshot, &fairplayd, output))
                     .transpose()?;
+                if let (Some(output), Some(trace)) = (&memory_trace_output, trace) {
+                    let report = serde_json::json!({
+                        "schema": "fairplay.checkpoint-memory-trace.v1",
+                        "binary_sha256": binary_sha256,
+                        "start_pc": format!("{:#x}", runner.start_pc),
+                        "stop_pc": format!("{stop:#x}"),
+                        "stop_hit": stop_hit,
+                        "memory_read_events": trace.memory_read_events,
+                        "memory_write_events": trace.memory_write_events,
+                    });
+                    write_private_binary(output, &serde_json::to_vec_pretty(&report)?)?;
+                }
                 match cli.format {
                     Format::Json => println!(
                         "{}",
@@ -1138,6 +1186,7 @@ fn run() -> Result<()> {
                             "compatibility_instruction_sites": runner.compatibility_instruction_sites,
                             "output_checkpoint": output_checkpoint,
                             "output_pages": written_pages,
+                            "memory_trace_output": memory_trace_output,
                         })
                     ),
                     Format::Text => {
@@ -1974,6 +2023,11 @@ mod tests {
             "0x1000",
             "--stop-hit",
             "432",
+            "--memory-trace-output",
+            "/private/oracle-trace.json",
+            "--trace-memory-reads",
+            "--max-memory-events",
+            "200000",
             "--file-payload",
             "SC Info.demo=/private/state",
             "--file-stat",
@@ -1993,6 +2047,9 @@ mod tests {
                         file_stats,
                         missing_files_are_enoent,
                         stop_hit,
+                        memory_trace_output,
+                        trace_memory_reads,
+                        max_memory_events,
                         mac_address_file,
                         iokit15_output,
                         ..
@@ -2002,6 +2059,12 @@ mod tests {
                 assert_eq!(file_stats, ["SC Info.demo=0o666,265,265"]);
                 assert!(missing_files_are_enoent);
                 assert_eq!(stop_hit, 432);
+                assert_eq!(
+                    memory_trace_output,
+                    Some(PathBuf::from("/private/oracle-trace.json"))
+                );
+                assert!(trace_memory_reads);
+                assert_eq!(max_memory_events, 200_000);
                 assert_eq!(mac_address_file, Some(PathBuf::from("/private/iomac.bin")));
                 assert_eq!(iokit15_output, Some(PathBuf::from("/private/iokit15.bin")));
             }

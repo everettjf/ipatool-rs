@@ -13,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use flate2::{Compression, write::GzEncoder};
+use serde::Serialize;
 use serde_pickle::{HashableValue, SerOptions, Value};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
@@ -65,6 +66,65 @@ pub struct VirtualFileStat {
     pub mode: u16,
     pub uid: u32,
     pub gid: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MemoryTraceEvent {
+    pub ordinal: usize,
+    pub pc: String,
+    pub address: String,
+    pub size: u32,
+}
+
+#[derive(Default, Debug, Serialize)]
+pub struct MemoryTrace {
+    pub memory_read_events: Vec<MemoryTraceEvent>,
+    pub memory_write_events: Vec<MemoryTraceEvent>,
+    #[serde(skip)]
+    next_ordinal: usize,
+}
+
+pub struct MemoryTraceOptions {
+    pub reads: bool,
+    pub writes: bool,
+    pub max_events: usize,
+}
+
+fn record_memory_event(
+    context: &HookContext,
+    address: u64,
+    size: u32,
+    is_read: bool,
+    trace: &RefCell<MemoryTrace>,
+    maximum: usize,
+    failure: &RefCell<Option<String>>,
+) {
+    let mut trace = trace.borrow_mut();
+    if trace.next_ordinal >= maximum {
+        *failure.borrow_mut() = Some("FairPlay memory trace event limit reached".to_owned());
+        let _ = context.stop();
+        return;
+    }
+    let pc = match context.reg_read(REG_PC) {
+        Ok(pc) => pc,
+        Err(error) => {
+            *failure.borrow_mut() = Some(format!("read FairPlay trace PC: {error:#}"));
+            let _ = context.stop();
+            return;
+        }
+    };
+    let event = MemoryTraceEvent {
+        ordinal: trace.next_ordinal,
+        pc: format!("{pc:#x}"),
+        address: format!("{address:#x}"),
+        size,
+    };
+    trace.next_ordinal += 1;
+    if is_read {
+        trace.memory_read_events.push(event);
+    } else {
+        trace.memory_write_events.push(event);
+    }
 }
 
 impl Default for VirtualFileStat {
@@ -1482,6 +1542,70 @@ impl CheckpointRunner {
         Ok(())
     }
 
+    pub fn run_until_hit_with_memory_trace(
+        &mut self,
+        stop_pc: u64,
+        stop_hit: usize,
+        timeout: Duration,
+        instruction_limit: usize,
+        options: MemoryTraceOptions,
+    ) -> Result<MemoryTrace> {
+        if !options.reads && !options.writes {
+            bail!("FairPlay memory trace needs read or write events");
+        }
+        if options.max_events == 0 || options.max_events > 2_000_000 {
+            bail!("FairPlay memory trace event limit is outside the bounded range");
+        }
+        let trace = Rc::new(RefCell::new(MemoryTrace::default()));
+        let failure = Rc::new(RefCell::new(None));
+        let mut hooks = Vec::with_capacity(2);
+        if options.reads {
+            let trace = Rc::clone(&trace);
+            let failure = Rc::clone(&failure);
+            let max_events = options.max_events;
+            hooks.push(
+                self.engine
+                    .add_memory_read_hook(move |context, address, size| {
+                        record_memory_event(
+                            context, address, size, true, &trace, max_events, &failure,
+                        );
+                    })?,
+            );
+        }
+        if options.writes {
+            let trace = Rc::clone(&trace);
+            let failure = Rc::clone(&failure);
+            let max_events = options.max_events;
+            let added = self
+                .engine
+                .add_memory_write_hook(move |context, address, size| {
+                    record_memory_event(
+                        context, address, size, false, &trace, max_events, &failure,
+                    );
+                });
+            match added {
+                Ok(hook) => hooks.push(hook),
+                Err(error) => {
+                    for hook in hooks {
+                        self.engine.remove_hook(hook)?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let execution = self.run_until_hit(stop_pc, stop_hit, timeout, instruction_limit);
+        for hook in hooks {
+            self.engine.remove_hook(hook)?;
+        }
+        if let Some(message) = failure.borrow().as_deref() {
+            bail!("{message}");
+        }
+        execution?;
+        Ok(Rc::try_unwrap(trace)
+            .map_err(|_| anyhow::anyhow!("FairPlay trace hook retained state"))?
+            .into_inner())
+    }
+
     /// Save a private schema-2 checkpoint that Python and Rust can both resume.
     pub fn write_checkpoint(
         &self,
@@ -2496,6 +2620,72 @@ mod tests {
             bounded
                 .run_until_hit(0x3000, 0, Duration::from_secs(2), 10)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn traces_guest_memory_accesses_in_execution_order() {
+        let checkpoint = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&checkpoint, SYNTHETIC_BINARY).unwrap();
+        runner.engine.mem_map(0x3000, PAGE_BYTES as usize).unwrap();
+        runner.engine.mem_map(0x4000, PAGE_BYTES as usize).unwrap();
+        runner
+            .engine
+            .mem_write(0x3000, &0xf940_0020u32.to_le_bytes())
+            .unwrap(); // ldr x0, [x1]
+        runner
+            .engine
+            .mem_write(0x3004, &0xf900_0420u32.to_le_bytes())
+            .unwrap(); // str x0, [x1, #8]
+        runner
+            .engine
+            .mem_write(0x4000, &42u64.to_le_bytes())
+            .unwrap();
+        runner.engine.reg_write(REG_PC, 0x3000).unwrap();
+        runner.engine.reg_write(200, 0x4000).unwrap();
+        let trace = runner
+            .run_until_hit_with_memory_trace(
+                0x3008,
+                1,
+                Duration::from_secs(2),
+                10,
+                MemoryTraceOptions {
+                    reads: true,
+                    writes: true,
+                    max_events: 10,
+                },
+            )
+            .unwrap();
+        assert_eq!(trace.memory_read_events.len(), 1);
+        assert_eq!(trace.memory_write_events.len(), 1);
+        assert_eq!(trace.memory_read_events[0].ordinal, 0);
+        assert_eq!(trace.memory_read_events[0].pc, "0x3000");
+        assert_eq!(trace.memory_read_events[0].address, "0x4000");
+        assert_eq!(trace.memory_write_events[0].ordinal, 1);
+        assert_eq!(trace.memory_write_events[0].pc, "0x3004");
+        assert_eq!(trace.memory_write_events[0].address, "0x4008");
+        assert_eq!(
+            runner.engine.mem_read(0x4008, 8).unwrap(),
+            42u64.to_le_bytes()
+        );
+
+        runner.engine.reg_write(REG_PC, 0x3000).unwrap();
+        assert!(
+            runner
+                .run_until_hit_with_memory_trace(
+                    0x3008,
+                    1,
+                    Duration::from_secs(2),
+                    10,
+                    MemoryTraceOptions {
+                        reads: true,
+                        writes: true,
+                        max_events: 1,
+                    },
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("memory trace event limit")
         );
     }
 

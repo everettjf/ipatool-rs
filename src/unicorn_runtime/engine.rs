@@ -27,6 +27,8 @@ const CONTROL_CPU_MODEL: u32 = 7 | 1 << 26 | 1 << 30;
 const ARM64_CPU_MODEL_MAX: u32 = 3;
 const HOOK_CODE: i32 = 1 << 2;
 const HOOK_UNMAPPED_MEMORY: i32 = 1 << 4 | 1 << 5 | 1 << 6;
+const HOOK_MEMORY_READ: i32 = 1 << 10;
+const HOOK_MEMORY_WRITE: i32 = 1 << 11;
 const HOOK_MEMORY_ACCESS: i32 = 1 << 10 | 1 << 11;
 
 type Handle = *mut c_void;
@@ -578,7 +580,21 @@ impl Engine {
         Ok(id)
     }
 
-    fn add_memory_access_hook<F>(&mut self, callback: F) -> Result<u64>
+    pub fn add_memory_read_hook<F>(&mut self, callback: F) -> Result<u64>
+    where
+        F: FnMut(&HookContext, u64, u32) + 'static,
+    {
+        self.add_memory_access_hook(HOOK_MEMORY_READ, callback)
+    }
+
+    pub fn add_memory_write_hook<F>(&mut self, callback: F) -> Result<u64>
+    where
+        F: FnMut(&HookContext, u64, u32) + 'static,
+    {
+        self.add_memory_access_hook(HOOK_MEMORY_WRITE, callback)
+    }
+
+    fn add_memory_access_hook<F>(&mut self, hook_kind: i32, callback: F) -> Result<u64>
     where
         F: FnMut(&HookContext, u64, u32) + 'static,
     {
@@ -598,7 +614,7 @@ impl Engine {
             (self.api.hook_add)(
                 self.handle,
                 &mut hook_handle,
-                HOOK_MEMORY_ACCESS,
+                hook_kind,
                 trampoline,
                 user_data,
                 1,
@@ -623,8 +639,10 @@ impl Engine {
         }
         let check: GuardCheck = Rc::new(check);
         let failure = Rc::new(RefCell::new(None));
-        let access_id =
-            self.add_memory_access_hook(guard_callback(Rc::clone(&check), Rc::clone(&failure)))?;
+        let access_id = self.add_memory_access_hook(
+            HOOK_MEMORY_ACCESS,
+            guard_callback(Rc::clone(&check), Rc::clone(&failure)),
+        )?;
         let code_id = match self.add_code_hook(
             1,
             0,
