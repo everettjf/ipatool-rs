@@ -1026,9 +1026,7 @@ impl StoreRuntime {
     }
 
     /// Ask Apple's purchase encoder for a free-app request and verify the
-    /// encoded product and price before the request can leave the host. This
-    /// path is still under development: its pinned integration test currently
-    /// returns a Store promise timeout.
+    /// encoded product and price before the request can leave the host.
     pub fn encode_purchase_request(
         &mut self,
         account: u64,
@@ -4634,7 +4632,7 @@ fn resume_callback(
             for (register, value) in saved {
                 context.reg_write(register, value)?;
             }
-            context.reg_write(REG_X0, 0)?;
+            context.reg_write(REG_X0, u64::from(poll_after.is_none()))?;
             if let Some((parent, continuation)) = poll_after {
                 state.current_swift_task = Some(parent);
                 poll_swift_continuation(context, state, parent, continuation)?;
@@ -5385,6 +5383,16 @@ fn dispatch_message(
             .class
             .clone()
     };
+    if !class_method
+        && selector == "copy"
+        && let Some(entry) = method_address(profile, &class_name, "copyWithZone:", false)
+    {
+        let zone_selector = selector_address_for_hook(context, profile, state, "copyWithZone:")?;
+        context.reg_write(REG_X0 + 1, zone_selector)?;
+        context.reg_write(REG_X0 + 2, 0)?;
+        context.reg_write(REG_PC, entry)?;
+        return Ok(());
+    }
     if !class_method
         && class_name == "AMSPurchaseRequestEncoder"
         && selector == "requestByEncodingRequestAndReturnSigningErrors:parameters:"
@@ -6202,18 +6210,9 @@ fn dispatch_message(
             selector,
             "copy" | "copyWithZone:" | "mutableCopy" | "mutableCopyWithZone:"
         ) {
-            if matches!(selector, "copy" | "copyWithZone:") && class_name != "NSMutableURLRequest" {
-                context.reg_write(REG_X0, receiver)?;
-                return Ok(());
-            }
             let object = &state.objects[&receiver];
             let (value, properties) = (object.value.clone(), object.properties.clone());
-            let target = if matches!(selector, "copy" | "copyWithZone:") {
-                "NSURLRequest"
-            } else {
-                "NSMutableURLRequest"
-            };
-            let copied = new_guest_object(context, profile, state, target, value)?;
+            let copied = new_guest_object(context, profile, state, &class_name, value)?;
             state
                 .objects
                 .get_mut(&copied)
@@ -8826,24 +8825,19 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "purchase encoding promise still times out in the Store guest"]
     fn encodes_free_purchase_with_pinned_apple_code() {
         let assets = SapAssetBundle::load_cached().unwrap();
         let mut runtime = StoreRuntime::open(&assets).unwrap();
-        runtime.set_hardware_id(&[1, 2, 3, 4, 5, 6]).unwrap();
+        runtime.set_hardware_id(&[0, 1, 2, 3, 4, 5]).unwrap();
         let mut saved = Account::default();
-        saved.email = "saved@example.com".into();
-        saved.password_token = "saved-token".into();
-        saved.directory_services_id = "12345".into();
+        saved.email = "test@example.com".into();
+        saved.password_token = "test-token".into();
+        saved.directory_services_id = "123456".into();
         saved.store_front = "143441-1,29".into();
         let account = runtime.ephemeral_account(Some(&saved)).unwrap();
         let bag = runtime
             .frozen_bag_from_values(&serde_json::json!({
-                "buyProduct": "https://buy.itunes.apple.com/request",
-                "redirect-cookie-removal-exclusion-list": [],
-                "clientIDDomains": [],
-                "storefront-header-suffix": "29",
-                "absinthe-requests": false
+                "buyProduct": "https://buy.itunes.apple.com/request"
             }))
             .unwrap();
         let request = runtime
@@ -8854,7 +8848,9 @@ mod tests {
                     "salableAdamId": "1234",
                     "pricingParameters": "STDQ",
                     "price": "0",
-                    "productType": "C"
+                    "productType": "C",
+                    "appleId": "test@example.com",
+                    "password": "test"
                 }),
             )
             .unwrap();
