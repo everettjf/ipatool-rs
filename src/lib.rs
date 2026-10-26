@@ -12,6 +12,7 @@ pub mod dyld_cache;
 pub mod dyld_export;
 pub mod fairplay;
 pub mod fairplay_key;
+pub mod fairplay_page;
 pub mod host;
 pub mod ipa_metadata;
 pub mod ipa_patch;
