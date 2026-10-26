@@ -16,6 +16,7 @@ pub mod fairplay_codesign;
 pub mod fairplay_collect;
 pub mod fairplay_decrypt;
 pub mod fairplay_download_capture;
+pub mod fairplay_enrollment_model;
 pub mod fairplay_frame;
 pub mod fairplay_ipa;
 pub mod fairplay_key;
