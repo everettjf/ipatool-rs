@@ -582,6 +582,41 @@ impl StoreRuntime {
         Ok(result)
     }
 
+    pub fn new_session(&mut self) -> Result<u64> {
+        let session = self.new_object("AMSURLSession", StoreValue::Empty)?;
+        let session = self.invoke(
+            session,
+            "initWithConfiguration:delegate:delegateQueue:",
+            &[0, 0, 0],
+        )?;
+        self.invoke(session, "setUseFallbackBag:", &[0])?;
+        Ok(session)
+    }
+
+    pub fn configure_request(
+        &mut self,
+        request: u64,
+        account: u64,
+        bag: u64,
+        raw: bool,
+    ) -> Result<()> {
+        let properties = self.invoke(request, "properties", &[])?;
+        for (selector, value) in [
+            ("setAccount:", account),
+            ("setBag:", bag),
+            ("setKnownToBeTrusted:", 1),
+            ("setShouldSetCookiesFromResponse:", 0),
+            ("setShouldSetStorefrontFromResponse:", 0),
+            ("setDisableLoadURLMetrics:", 1),
+            ("setDisableBiometricsResponseHandling:", 1),
+            ("setMaxRetryCount:", 0),
+            ("setDisableResponseDecoding:", u64::from(raw)),
+        ] {
+            self.invoke(properties, selector, &[value])?;
+        }
+        Ok(())
+    }
+
     pub fn encode_request(
         &mut self,
         account: u64,
@@ -815,6 +850,19 @@ fn dispatch_call(
             context.reg_write(REG_X0, 0)?;
         }
         "getuid" | "geteuid" => context.reg_write(REG_X0, 501)?,
+        "swift_getObjCClassFromMetadata" => {
+            let metadata = context.reg_read(REG_X0)?;
+            if !profile
+                .runtime
+                .class_names_by_address
+                .contains_key(&metadata)
+            {
+                if read_guest_u64(context, metadata)? != 0x305 {
+                    bail!("unknown Objective-C class metadata");
+                }
+                context.reg_write(REG_X0, read_guest_u64(context, metadata + 8)?)?;
+            }
+        }
         "getgid" | "getegid" => context.reg_write(REG_X0, 20)?,
         "getpid" => context.reg_write(REG_X0, 123)?,
         "NSSearchPathForDirectoriesInDomains" => {
@@ -910,6 +958,19 @@ fn dispatch_call(
             context.reg_write(REG_X0, transaction)?;
         }
         "chkstk_darwin" | "free" => {}
+        "platform_memmove" | "platform_memcpy" | "memcpy" | "memmove" | "memcpy_chk"
+        | "memmove_chk" => {
+            let destination = context.reg_read(REG_X0)?;
+            let source = context.reg_read(REG_X0 + 1)?;
+            let size = context.reg_read(REG_X0 + 2)?;
+            if size > HEAP_SIZE as u64 {
+                bail!("guest copy exceeds memory budget");
+            }
+            if size != 0 {
+                context.mem_write(destination, &context.mem_read(source, size as usize)?)?;
+            }
+            context.reg_write(REG_X0, destination)?;
+        }
         "malloc_size" => {
             let address = context.reg_read(REG_X0)?;
             context.reg_write(
@@ -1574,37 +1635,7 @@ fn dispatch_call(
         "dispatch_async" => {
             let queue = context.reg_read(REG_X0)?;
             let block = context.reg_read(REG_X0 + 1)?;
-            if block == 0 {
-                bail!("cannot dispatch null block");
-            }
-            let flags = read_guest_u64(context, block + 8)? as u32;
-            let copied = if flags & (1 << 28) != 0 {
-                block
-            } else {
-                let descriptor = read_guest_u64(context, block + 24)?;
-                let size = read_guest_u64(context, descriptor + 8)?;
-                if !(32..=1_048_576).contains(&size) {
-                    bail!("invalid guest block size {size}");
-                }
-                let copied = state.allocate(size)?;
-                context.mem_write(copied, &context.mem_read(block, size as usize)?)?;
-                if flags & (1 << 25) != 0 {
-                    begin_callback(
-                        context,
-                        state,
-                        read_guest_u64(context, descriptor + 16)?,
-                        &[copied, block],
-                        CallbackAction::QueueBlock {
-                            block: copied,
-                            queue,
-                        },
-                    )?;
-                    return Ok(());
-                }
-                copied
-            };
-            state.pending.push((copied, queue));
-            context.reg_write(REG_X0, 0)?;
+            copy_and_queue_block(context, state, queue, block)?;
         }
         "dispatch_set_target_queue" => {
             let queue = context.reg_read(REG_X0)?;
@@ -1615,6 +1646,29 @@ fn dispatch_call(
                 .context("unknown dispatch queue")?
                 .properties
                 .insert("targetQueue".into(), target);
+        }
+        "dispatch_suspend" => {
+            let queue = context.reg_read(REG_X0)?;
+            let object = state
+                .objects
+                .get_mut(&queue)
+                .context("unknown suspended queue")?;
+            let count = object.properties.entry("suspendCount".into()).or_default();
+            *count += 1;
+            context.reg_write(REG_X0, 0)?;
+        }
+        "dispatch_resume" => {
+            let queue = context.reg_read(REG_X0)?;
+            let object = state
+                .objects
+                .get_mut(&queue)
+                .context("unknown resumed queue")?;
+            let count = object.properties.entry("suspendCount".into()).or_default();
+            if *count == 0 {
+                bail!("resuming active dispatch queue");
+            }
+            *count -= 1;
+            context.reg_write(REG_X0, 0)?;
         }
         "dispatch_queue_create"
         | "dispatch_get_global_queue"
@@ -1728,6 +1782,15 @@ fn dispatch_call(
                 }
             };
             context.reg_write(REG_X0, queue)?;
+        }
+        "$sSo17OS_dispatch_queueC8DispatchE5async5group3qos5flags7executeySo0a1_b1_F0CSg_AC0D3QoSVAC0D13WorkItemFlagsVyyXBtF" =>
+        {
+            if context.reg_read(REG_X0)? != 0 {
+                bail!("Swift dispatch group is unsupported");
+            }
+            let queue = context.reg_read(REG_X0 + 20)?;
+            let block = context.reg_read(REG_X0 + 3)?;
+            copy_and_queue_block(context, state, queue, block)?;
         }
         "$sSo18OS_dispatch_sourceC8DispatchE16makeSignalSource6signal5queueSo0a1_b1_c1_H0_ps5Int32V_So0a1_b1_I0CSgtFZ" =>
         {
@@ -2014,6 +2077,12 @@ fn dispatch_call(
                 context.reg_read(REG_X0 + 1)?,
             )?;
         }
+        "$s10ObjectiveC8SelectorV2eeoiySbAC_ACtFZ" => {
+            context.reg_write(
+                REG_X0,
+                u64::from(context.reg_read(REG_X0)? == context.reg_read(REG_X0 + 1)?),
+            )?;
+        }
         "objc_msgSend" => {
             let selector_address = context.reg_read(REG_X0 + 1)?;
             let selector = guest_cstring(context, profile, state, selector_address)?;
@@ -2065,6 +2134,19 @@ fn dispatch_call(
                 write_guest_u64(context, destination, read_guest_u64(context, source)?)?;
                 context.reg_write(REG_X0, destination)?;
             } else if symbol.contains("SwiftRetainableBox") && symbol.contains("7destroy") {
+            } else if symbol.contains("tuple_initializeWithCopy")
+                || symbol.contains("tuple_assignWithCopy")
+            {
+                let destination = context.reg_read(REG_X0)?;
+                let source = context.reg_read(REG_X0 + 1)?;
+                let metadata = context.reg_read(REG_X0 + 2)?;
+                let witnesses = read_guest_u64(context, metadata - 8)?;
+                let size = read_guest_u64(context, witnesses + 64)?;
+                if size > 1024 {
+                    bail!("tuple copy exceeds budget");
+                }
+                context.mem_write(destination, &context.mem_read(source, size as usize)?)?;
+                context.reg_write(REG_X0, destination)?;
             } else if let Some(&value) = profile.index.swift_globals.get(symbol) {
                 context.reg_write(REG_X0, value)?;
             } else if let Some(&value) = profile.index.swift_accessors.get(symbol) {
@@ -2089,6 +2171,46 @@ fn read_guest_u64(context: &HookContext, address: u64) -> Result<u64> {
 
 fn write_guest_u64(context: &HookContext, address: u64, value: u64) -> Result<()> {
     context.mem_write(address, &value.to_le_bytes())
+}
+
+fn copy_and_queue_block(
+    context: &HookContext,
+    state: &mut StoreState,
+    queue: u64,
+    block: u64,
+) -> Result<()> {
+    if block == 0 {
+        bail!("cannot dispatch null block");
+    }
+    let flags = read_guest_u64(context, block + 8)? as u32;
+    let copied = if flags & (1 << 28) != 0 {
+        block
+    } else {
+        let descriptor = read_guest_u64(context, block + 24)?;
+        let size = read_guest_u64(context, descriptor + 8)?;
+        if !(32..=1_048_576).contains(&size) {
+            bail!("invalid guest block size {size}");
+        }
+        let copied = state.allocate(size)?;
+        context.mem_write(copied, &context.mem_read(block, size as usize)?)?;
+        if flags & (1 << 25) != 0 {
+            begin_callback(
+                context,
+                state,
+                read_guest_u64(context, descriptor + 16)?,
+                &[copied, block],
+                CallbackAction::QueueBlock {
+                    block: copied,
+                    queue,
+                },
+            )?;
+            return Ok(());
+        }
+        copied
+    };
+    state.pending.push((copied, queue));
+    context.reg_write(REG_X0, 0)?;
+    Ok(())
 }
 
 fn begin_callback(
@@ -2730,6 +2852,12 @@ fn dispatch_message(
         context.reg_write(REG_PC, entry)?;
         return Ok(());
     }
+    if class_method && selector == "instanceMethodForSelector:" {
+        let target = guest_cstring(context, profile, state, context.reg_read(REG_X0 + 2)?)?;
+        let method = method_address(profile, &class_name, &target, false).unwrap_or(0);
+        context.reg_write(REG_X0, method)?;
+        return Ok(());
+    }
     if !class_method && matches!(class_name.as_str(), "ACAccountStore" | "ACDAccountStore") {
         if selector == "accountTypeWithIdentifier:completion:" {
             let identifier = context.reg_read(REG_X0 + 2)?;
@@ -3319,6 +3447,30 @@ fn dispatch_message(
             context.reg_write(REG_X0, value)?;
             return Ok(());
         }
+    }
+    if !class_method && class_name == "NSURLSession" && selector == "dataTaskWithRequest:" {
+        let request = context.reg_read(REG_X0 + 2)?;
+        let task = new_guest_object(
+            context,
+            profile,
+            state,
+            "NSURLSessionDataTask",
+            StoreValue::Empty,
+        )?;
+        state
+            .objects
+            .get_mut(&task)
+            .expect("new data task")
+            .properties
+            .extend([
+                ("currentRequest".into(), request),
+                ("originalRequest".into(), request),
+                ("session".into(), receiver),
+                ("taskIdentifier".into(), task),
+                ("state".into(), 1),
+            ]);
+        context.reg_write(REG_X0, task)?;
+        return Ok(());
     }
     if !class_method
         && (matches!(
@@ -4808,6 +4960,23 @@ mod tests {
         assert_eq!(
             runtime.object_string(url).unwrap(),
             "https://example.com/test"
+        );
+        runtime.configure_request(request, 0, 0, false).unwrap();
+        let session = runtime.new_session().unwrap();
+        assert_eq!(
+            runtime.state.borrow().objects[&session].class,
+            "AMSURLSession"
+        );
+        let task = runtime
+            .invoke(session, "dataTaskWithRequest:", &[request])
+            .unwrap();
+        assert_eq!(
+            runtime.state.borrow().objects[&task].class,
+            "NSURLSessionDataTask"
+        );
+        assert_eq!(
+            runtime.invoke(task, "currentRequest", &[]).unwrap(),
+            request
         );
         let joined_call = runtime
             .profile
