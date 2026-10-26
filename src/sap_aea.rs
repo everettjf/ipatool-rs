@@ -1157,6 +1157,46 @@ mod tests {
                 ))
                 .collect::<Vec<_>>()
         );
+        for suffix in [".25.dylddata", ".79.dyldlinkedit"] {
+            let entry = index
+                .subcaches
+                .iter()
+                .find(|entry| entry.suffix == suffix)
+                .unwrap();
+            let member_path = format!("{path}{suffix}");
+            let stat = volume.stat(&member_path).unwrap();
+            assert_eq!(stat.compression.unwrap().compression_type, 14);
+            let (extents, fork_size) = volume
+                .xattr_stream_info(&member_path, "com.apple.ResourceFork")
+                .unwrap();
+            let fork = apfs::extents::ApfsForkReader::new(
+                shared.clone(),
+                volume.volume_info().block_size,
+                extents,
+                fork_size,
+            );
+            let mut reader = crate::decmpfs::LzBitmapForkReader::open(fork, stat.size).unwrap();
+            let header = crate::dyld_cache::MemberHeader::read(&mut reader).unwrap();
+            assert_eq!(header.uuid, entry.uuid);
+            for segment in &segments {
+                if index
+                    .candidate_for_address(base, segment.address)
+                    .unwrap()
+                    .suffix
+                    == suffix
+                {
+                    assert!(
+                        header.mapping_for_address(segment.address).is_some(),
+                        "{suffix} lacks {}",
+                        segment.name
+                    );
+                }
+            }
+            eprintln!(
+                "Verified AppleMediaServices member {suffix}: {} bytes",
+                stat.size
+            );
+        }
         assert!(segments.iter().any(|segment| segment.name == "__LINKEDIT"));
     }
 }

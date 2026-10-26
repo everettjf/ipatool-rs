@@ -18,6 +18,7 @@ pub mod sap_machine;
 pub mod sap_protocol;
 pub mod sap_remote;
 pub mod sap_signer;
+pub mod sap_system_os;
 pub mod state;
 pub mod store_memory;
 pub mod store_profile;
