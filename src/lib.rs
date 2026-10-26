@@ -10,6 +10,7 @@ pub mod dyld_cache;
 pub mod dyld_export;
 pub mod fairplay;
 pub mod host;
+pub mod ipa_metadata;
 pub mod lzbitmap;
 pub mod machfixups;
 pub mod machimage;
