@@ -17,6 +17,7 @@ pub mod sap_aea;
 pub mod sap_archive;
 pub mod sap_assets;
 pub mod sap_machine;
+pub mod sap_prelinked;
 pub mod sap_protocol;
 pub mod sap_remote;
 pub mod sap_signer;
