@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
 use ipatool_rs::{App, CatalogClient, Platform, SearchOutput};
 
@@ -28,6 +29,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Inspect or remove the account stored by ipatool in the system keychain.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Search the public App Store catalog.
     Search {
         term: String,
@@ -73,6 +79,14 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Show the stored account's name and email address.
+    Info,
+    /// Remove the stored account and KBSync cache.
+    Revoke,
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err:#}");
@@ -82,14 +96,37 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let client = CatalogClient::new()?;
     match cli.command {
+        Command::Auth { command } => {
+            let account_store = AccountStore::new(open_system_keychain()?);
+            match command {
+                AuthCommand::Info => {
+                    let summary = account_store.info()?;
+                    match cli.format {
+                        Format::Json => println!("{}", serde_json::to_string(&summary)?),
+                        Format::Text => {
+                            println!("name: {}", summary.name);
+                            println!("email: {}", summary.email);
+                            println!("success: true");
+                        }
+                    }
+                }
+                AuthCommand::Revoke => {
+                    account_store.revoke()?;
+                    match cli.format {
+                        Format::Json => println!("{{\"success\":true}}"),
+                        Format::Text => println!("success: true"),
+                    }
+                }
+            }
+        }
         Command::Search {
             term,
             limit,
             platform,
             country,
         } => {
+            let client = CatalogClient::new()?;
             let platform = parse_platform(platform.as_deref())?;
             let output = client.search(&term, &country, limit, platform)?;
             print_search(&output, cli.format)?;
@@ -100,6 +137,7 @@ fn run() -> Result<()> {
             platform,
             country,
         } => {
+            let client = CatalogClient::new()?;
             if app_id.is_none() && bundle_identifier.is_none() {
                 bail!("an app ID or bundle identifier is required");
             }
@@ -113,6 +151,7 @@ fn run() -> Result<()> {
             platform,
             country,
         } => {
+            let client = CatalogClient::new()?;
             let platform = Platform::parse(&platform)?.context("platform is required")?;
             let app = App {
                 id: app_id,

@@ -8,7 +8,8 @@ This checklist records behavior in that source tree; the Go README and source ar
 | Go command | Rust state | Main dependencies |
 | --- | --- | --- |
 | `search` | Implemented for public catalog; `--country` replaces account storefront for now | Catalog HTTP, platform mapping, visionOS storefront |
-| `auth login`, `auth info`, `auth revoke` | Pending | Store emulator, KBSync, keychain, cookies, 2FA |
+| `auth login` | Pending | Store emulator, KBSync, keychain, cookies, 2FA |
+| `auth info`, `auth revoke` | Implemented for macOS Keychain with Go service/key names; in-memory tests pass, real credentials not tested | Keychain account JSON and KBSync cache |
 | `list-purchases` | Pending | Authenticated purchase DAAP, pagination |
 | `purchase` | Pending | Authenticated purchase flow, action signing |
 | `download` | Pending | License, version selection, download, resume, IPA/PKG packaging, SINF, optional FairPlay actions |
@@ -25,7 +26,7 @@ This checklist records behavior in that source tree; the Go README and source ar
 
 ## Internal subsystems
 
-1. Finish `pkg/http` (cookie persistence and Store executor), then port `pkg/keychain` and account data. Shared HTTP response decoding and state directory migration are implemented. Verify format compatibility with a throwaway Go session before using any existing credentials.
+1. Finish `pkg/http` (cookie persistence and Store executor), then complete `pkg/keychain` on Linux, Windows, and iOS. Shared HTTP response decoding, state directory migration, and macOS Keychain account inspection/revocation are implemented. Verify real credential interoperability with a throwaway Go session before relying on an existing account.
 2. Port `internal/store` and its generated profile data, then `internal/sap` signing and runtime support. URL bag parsing, endpoint validation, machine GUID creation, 2FA normalization, and phone account routing are implemented. Login, authenticated search country selection, purchase, and owned-app listing still depend on the Store/SAP runtime.
 3. Port iOS/tvOS/watchOS/visionOS download flows, resume and range logic, ZIP framing, SINF replication, and all package tests. The latest public external version ID lookup for these platforms is implemented.
 4. Port macOS preflight, version metadata, package download, encrypted payload processing, and publish behavior.
