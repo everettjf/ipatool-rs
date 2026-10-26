@@ -109,6 +109,15 @@ struct NotificationObserver {
     object: u64,
 }
 
+struct PurchaseEncodeState {
+    receiver: u64,
+    request: u64,
+    parameters: u64,
+    selector: u64,
+    properties: u64,
+    step: u8,
+}
+
 struct SwiftTask {
     context: u64,
     entry: u64,
@@ -134,6 +143,7 @@ enum HostBlockAction {
 
 enum CallbackAction {
     ReturnZero,
+    ReturnCurrentValue,
     ReturnValue {
         value: u64,
     },
@@ -208,6 +218,7 @@ enum CallbackAction {
         index: usize,
         notification: u64,
     },
+    PurchaseEncode(PurchaseEncodeState),
 }
 
 pub struct StoreObject {
@@ -416,7 +427,10 @@ impl StoreRuntime {
                     .any(|&(start, end)| address >= start && address < end)
             {
                 *error_slot.borrow_mut() = Some(format!(
-                    "Store guest executed outside pinned image at {address:#x}"
+                    "Store guest executed outside pinned image at {address:#x}; lr={:#x} x0={:#x} x1={:#x}",
+                    context.reg_read(REG_LR).unwrap_or(0),
+                    context.reg_read(REG_X0).unwrap_or(0),
+                    context.reg_read(REG_X0 + 1).unwrap_or(0)
                 ));
                 context.stop().expect("stop Store guest outside image");
             }
@@ -1011,6 +1025,82 @@ impl StoreRuntime {
         self.resolve_promise(promise)
     }
 
+    /// Ask Apple's purchase encoder for a free-app request and verify the
+    /// encoded product and price before the request can leave the host. This
+    /// path is still under development: its pinned integration test currently
+    /// returns a Store promise timeout.
+    pub fn encode_purchase_request(
+        &mut self,
+        account: u64,
+        bag: u64,
+        parameters: &Value,
+    ) -> Result<u64> {
+        if bag == 0 {
+            bail!("purchase requires a Store bag");
+        }
+        let parameters = parameters
+            .as_object()
+            .context("purchase parameters must be an object")?;
+        if parameters.get("price").map(json_scalar) != Some("0".into())
+            || parameters.get("productType").map(json_scalar) != Some("C".into())
+        {
+            bail!("purchasing paid apps is not supported");
+        }
+        let buy_params = self.new_object("AMSBuyParams", StoreValue::Empty)?;
+        self.invoke(buy_params, "init", &[])?;
+        for (key, value) in parameters {
+            let key = self.new_object("NSString", StoreValue::String(key.clone()))?;
+            let value = self.import_json(value)?;
+            self.invoke(buy_params, "setParameter:forKey:", &[value, key])?;
+        }
+        let purchase = self.new_object("AMSPurchase", StoreValue::Empty)?;
+        let purchase = self.invoke(
+            purchase,
+            "initWithPurchaseType:buyParams:",
+            &[0, buy_params],
+        )?;
+        self.invoke(purchase, "setAccount:", &[account])?;
+        let info = self.new_object("AMSPurchaseInfo", StoreValue::Empty)?;
+        let info = self.invoke(info, "initWithPurchase:", &[purchase])?;
+        self.invoke(info, "setAddKBSync:", &[0])?;
+        self.invoke(info, "setHasBeenAuthedForBuy:", &[1])?;
+        let encoder = self.new_object("AMSPurchaseRequestEncoder", StoreValue::Empty)?;
+        let encoder = self.invoke(encoder, "initWithPurchaseInfo:bag:", &[info, bag])?;
+        for (selector, value) in [
+            ("setAnisetteType:", 0),
+            ("setMescalType:", 0),
+            ("setUrlKnownToBeTrusted:", 1),
+            ("setEnableRemoteSecuritySigning:", 0),
+            ("setDisableLoadURLMetrics:", 1),
+            ("setCompressRequestBody:", 0),
+            ("setShouldSetStorefrontHeader:", 0),
+            ("setShouldSetCookieHeader:", 0),
+        ] {
+            self.invoke(encoder, selector, &[value])?;
+        }
+        let promise = self.invoke(encoder, "encodeRequest", &[])?;
+        let request = self.resolve_promise(promise)?;
+        let body = self.invoke(request, "HTTPBody", &[])?;
+        let body = match &self
+            .state
+            .borrow()
+            .objects
+            .get(&body)
+            .context("purchase encoder returned no body")?
+            .value
+        {
+            StoreValue::Bytes(body) => body.clone(),
+            _ => bail!("purchase encoder returned an invalid body"),
+        };
+        let encoded: Value = plist::from_bytes(&body).context("invalid encoded purchase")?;
+        for key in ["price", "salableAdamId", "pricingParameters", "productType"] {
+            if encoded.get(key).map(json_scalar) != parameters.get(key).map(json_scalar) {
+                bail!("purchase encoder changed product or price");
+            }
+        }
+        Ok(request)
+    }
+
     /// Execute a pinned guest entry. Bridge calls not yet ported fail explicitly.
     pub fn call(&mut self, entry: u64, arguments: &[u64]) -> Result<u64> {
         if entry == 0 {
@@ -1051,6 +1141,13 @@ impl StoreRuntime {
         }
         self.engine.reg_read(REG_X0)
     }
+}
+
+fn json_scalar(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
 }
 
 impl StoreState {
@@ -1237,6 +1334,86 @@ fn dispatch_call(
             context.reg_write(REG_X0, 0)?;
         }
         "swift_task_localValueGet" => context.reg_write(REG_X0, 0)?,
+        "swift_dynamicCast" => {
+            let destination = context.reg_read(REG_X0)?;
+            let source = context.reg_read(REG_X0 + 1)?;
+            let mut source_type = context.reg_read(REG_X0 + 2)?;
+            let target_type = context.reg_read(REG_X0 + 3)?;
+            let flags = context.reg_read(REG_X0 + 4)?;
+            let string = profile.index.symbols["$sSSN"];
+            if source_type == profile.index.symbols["$ss11AnyHashableVN"] && target_type == string {
+                if read_guest_u64(context, source + 24)?
+                    != profile.index.bridges["anyHashableStringMetadata"]
+                {
+                    bail!("unsupported Swift AnyHashable cast box");
+                }
+                source_type = target_type;
+            } else if source_type == profile.index.symbols["$sypN"] + 8 {
+                source_type = read_guest_u64(context, source + 24)?;
+            }
+            if source_type == target_type {
+                let witnesses = read_guest_u64(context, source_type - 8)?;
+                let size = read_guest_u64(context, witnesses + 64)?;
+                if size > 24 {
+                    bail!("unsupported Swift cast value size");
+                }
+                context.mem_write(destination, &context.mem_read(source, size as usize)?)?;
+                context.reg_write(REG_X0, 1)?;
+            } else if target_type == string
+                && ["$sSiN", "$sSbN", "$sSdN"]
+                    .iter()
+                    .any(|name| source_type == profile.index.symbols[*name])
+                && flags & 1 == 0
+            {
+                context.reg_write(REG_X0, 0)?;
+            } else {
+                bail!(
+                    "unsupported Swift cast metadata {source_type:#x} -> {target_type:#x} flags={flags}"
+                );
+            }
+        }
+        "swift_allocError" => {
+            let metadata = context.reg_read(REG_X0)?;
+            let witness = context.reg_read(REG_X0 + 1)?;
+            let source = context.reg_read(REG_X0 + 2)?;
+            let witnesses = read_guest_u64(context, metadata - 8)?;
+            let size = read_guest_u64(context, witnesses + 64)?;
+            if size > 1 << 20 {
+                bail!("Swift error exceeds budget");
+            }
+            let value = state.allocate(size)?;
+            let box_address =
+                new_guest_object(context, profile, state, "HostSwiftError", StoreValue::Empty)?;
+            state
+                .objects
+                .get_mut(&box_address)
+                .expect("new Swift error box")
+                .properties = HashMap::from([
+                ("metadata".into(), metadata),
+                ("witness".into(), witness),
+                ("value".into(), value),
+            ]);
+            if source != 0 {
+                context.mem_write(value, &context.mem_read(source, size as usize)?)?;
+            }
+            context.reg_write(REG_X0, box_address)?;
+            context.reg_write(REG_X0 + 1, value)?;
+        }
+        "swift_getErrorValue" => {
+            let address = context.reg_read(REG_X0)?;
+            let object = state
+                .objects
+                .get(&address)
+                .context("unknown Swift error box")?;
+            if object.class != "HostSwiftError" {
+                bail!("unsupported unboxed Swift error");
+            }
+            let out = context.reg_read(REG_X0 + 2)?;
+            for (offset, name) in [(0, "value"), (8, "metadata"), (16, "witness")] {
+                write_guest_u64(context, out + offset, object.properties[name])?;
+            }
+        }
+        "swift_errorRetain" | "swift_errorRelease" => {}
         "swift_task_create" => {
             let flags = context.reg_read(REG_X0)?;
             let options = context.reg_read(REG_X0 + 1)?;
@@ -1536,16 +1713,6 @@ fn dispatch_call(
             context.reg_write(REG_X0, transaction)?;
         }
         "chkstk_darwin" | "free" | "swift_willThrow" => {}
-        "swift_memcpy8_8" | "swift_memcpy16_8" | "swift_memcpy32_8" => {
-            let destination = context.reg_read(REG_X0)?;
-            let source = context.reg_read(REG_X0 + 1)?;
-            let size = match symbol {
-                "swift_memcpy8_8" => 8,
-                "swift_memcpy16_8" => 16,
-                _ => 32,
-            };
-            context.mem_write(destination, &context.mem_read(source, size)?)?;
-        }
         "platform_memmove" | "platform_memcpy" | "memcpy" | "memmove" | "memcpy_chk"
         | "memmove_chk" => {
             let destination = context.reg_read(REG_X0)?;
@@ -2123,6 +2290,76 @@ fn dispatch_call(
                 destination,
                 value.get(start..end).context("CFData range exceeds data")?,
             )?;
+            context.reg_write(REG_X0, 0)?;
+        }
+        "CFUUIDCreate" => {
+            let mut bytes = [0u8; 16];
+            getrandom::fill(&mut bytes).context("generate Store UUID")?;
+            bytes[6] = (bytes[6] & 15) | 64;
+            bytes[8] = (bytes[8] & 63) | 128;
+            let uuid = new_guest_object(
+                context,
+                profile,
+                state,
+                "HostUUID",
+                StoreValue::Bytes(bytes.to_vec()),
+            )?;
+            context.reg_write(REG_X0, uuid)?;
+        }
+        "CFUUIDGetUUIDBytes" => {
+            let address = context.reg_read(REG_X0)?;
+            let StoreValue::Bytes(bytes) = &state
+                .objects
+                .get(&address)
+                .context("unknown Store UUID")?
+                .value
+            else {
+                bail!("Store UUID has invalid data");
+            };
+            let bytes: [u8; 16] = bytes
+                .as_slice()
+                .try_into()
+                .context("Store UUID must be 16 bytes")?;
+            context.reg_write(REG_X0, u64::from_le_bytes(bytes[..8].try_into()?))?;
+            context.reg_write(REG_X0 + 1, u64::from_le_bytes(bytes[8..].try_into()?))?;
+        }
+        "dispatch_time" => {
+            let base = context.reg_read(REG_X0)?;
+            let offset = context.reg_read(REG_X0 + 1)?;
+            let base = if base == 0 {
+                time::OffsetDateTime::now_utc().unix_timestamp_nanos() as u64
+            } else {
+                base
+            };
+            context.reg_write(REG_X0, base.wrapping_add(offset))?;
+        }
+        "dispatch_after" => {
+            // The Go guest retains deadline blocks without firing them. The
+            // request promise supplies its own completion path.
+            let block = context.reg_read(REG_X0 + 2)?;
+            if block == 0 {
+                bail!("cannot schedule a null Store block");
+            }
+            let flags = read_guest_u64(context, block + 8)? as u32;
+            if flags & (1 << 28) == 0 {
+                let descriptor = read_guest_u64(context, block + 24)?;
+                let size = read_guest_u64(context, descriptor + 8)?;
+                if !(32..=1_048_576).contains(&size) {
+                    bail!("invalid scheduled block size {size}");
+                }
+                let copied = state.allocate(size)?;
+                context.mem_write(copied, &context.mem_read(block, size as usize)?)?;
+                if flags & (1 << 25) != 0 {
+                    begin_callback(
+                        context,
+                        state,
+                        read_guest_u64(context, descriptor + 16)?,
+                        &[copied, block],
+                        CallbackAction::ReturnZero,
+                    )?;
+                    return Ok(());
+                }
+            }
             context.reg_write(REG_X0, 0)?;
         }
         "CFPreferencesAppSynchronize" | "CFPreferencesSynchronize" => {
@@ -3037,6 +3274,107 @@ fn dispatch_call(
             let metadata = context.reg_read(REG_X0 + 2)?;
             ensure_unique_dictionary(context, profile, state, slot, unique, capacity, metadata)?;
         }
+        "$ss18_DictionaryStorageC6resize8original8capacity4moveAByxq_Gs05__RawaB0C_SiSbtFZ" => {
+            let capacity = context.reg_read(REG_X0 + 1)?;
+            let storage_type = context.reg_read(REG_X0 + 3)?;
+            let metadata = profile
+                .index
+                .swift_dictionaries
+                .iter()
+                .find(|(_, layout)| layout.metadata == storage_type)
+                .and_then(|(key, _)| key.parse::<u64>().ok())
+                .with_context(|| {
+                    format!("unprepared Swift dictionary storage {storage_type:#x}")
+                })?;
+            let slot = state.allocate(8)?;
+            write_guest_u64(
+                context,
+                slot,
+                profile.index.symbols["_swiftEmptyDictionarySingleton"],
+            )?;
+            ensure_unique_dictionary(context, profile, state, slot, false, capacity, metadata)?;
+            context.reg_write(REG_X0, read_guest_u64(context, slot)?)?;
+        }
+        "$ss11AnyHashableVwxx" | "$sSSwxx" => {}
+        "$ss11AnyHashableVwcp" | "$ss11AnyHashableVwca" => {
+            let destination = context.reg_read(REG_X0)?;
+            let source = context.reg_read(REG_X0 + 1)?;
+            let metadata = read_guest_u64(context, source + 24)?;
+            if metadata != profile.index.bridges["anyHashableStringMetadata"] {
+                bail!("unsupported Swift AnyHashable copy layout");
+            }
+            context.mem_write(destination, &context.mem_read(source, 40)?)?;
+            context.reg_write(REG_X0, destination)?;
+        }
+        "$sSD10FoundationE36_unconditionallyBridgeFromObjectiveCySDyxq_GSo12NSDictionaryCSgFZ" => {
+            let object = context.reg_read(REG_X0)?;
+            let key_type = context.reg_read(REG_X0 + 1)?;
+            let value_type = context.reg_read(REG_X0 + 2)?;
+            let string = profile.index.symbols["$sSSN"];
+            let any_hashable = profile.index.symbols["$ss11AnyHashableVN"];
+            let any = profile.index.symbols["$sypN"] + 8;
+            if !matches!(key_type, value if value == string || value == any_hashable)
+                || !matches!(value_type, value if value == any || value == string)
+            {
+                bail!("unsupported Swift dictionary bridge metadata {key_type:#x}/{value_type:#x}");
+            }
+            bridge_dictionary_to_swift(context, profile, state, object, key_type, value_type)?;
+        }
+        "$sSD10FoundationE19_bridgeToObjectiveCSo12NSDictionaryCyF" => {
+            let storage = context.reg_read(REG_X0)?;
+            let key_type = context.reg_read(REG_X0 + 1)?;
+            let value_type = context.reg_read(REG_X0 + 2)?;
+            bridge_dictionary_to_objc(context, profile, state, storage, key_type, value_type)?;
+        }
+        "$ss38_bridgeAnythingNonVerbatimToObjectiveCyyXlxnlF" => {
+            let source = context.reg_read(REG_X0)?;
+            let metadata = context.reg_read(REG_X0 + 1)?;
+            let (class, value) = if metadata == profile.index.symbols["$sSSN"] {
+                let text = swift_string(
+                    context,
+                    state,
+                    read_guest_u64(context, source)?,
+                    read_guest_u64(context, source + 8)?,
+                )?;
+                ("NSString", StoreValue::String(text))
+            } else if metadata == profile.index.symbols["$sSiN"] {
+                (
+                    "NSNumber",
+                    StoreValue::Number(read_guest_u64(context, source)? as i64),
+                )
+            } else {
+                bail!("unsupported nonverbatim Swift bridge metadata {metadata:#x}");
+            };
+            let object = new_guest_object(context, profile, state, class, value)?;
+            context.reg_write(REG_X0, object)?;
+        }
+        "$s10Foundation22_convertErrorToNSErrorySo0E0Cs0C0_pF" => {
+            let mut value = context.reg_read(REG_X0)?;
+            let wrapper_metadata = profile
+                .index
+                .swift_types
+                .get(&0x1a2e1c7fau64.to_string())
+                .copied()
+                .context("missing Swift NSError wrapper metadata")?;
+            let mut result = None;
+            for _ in 0..16 {
+                let object = state
+                    .objects
+                    .get(&value)
+                    .context("unknown Swift error value")?;
+                if class_is_kind_of(profile, &object.class, "NSError") {
+                    result = Some(value);
+                    break;
+                }
+                if object.class != "HostSwiftError"
+                    || object.properties.get("metadata") != Some(&wrapper_metadata)
+                {
+                    bail!("unsupported Swift error bridge {}", object.class);
+                }
+                value = read_guest_u64(context, object.properties["value"])?;
+            }
+            context.reg_write(REG_X0, result.context("recursive Swift error box")?)?;
+        }
         "$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF" => {
             let value = swift_string(
                 context,
@@ -3220,6 +3558,28 @@ fn dispatch_call(
                 }
                 let value = context.reg_read(REG_X0 + 1)? as u8;
                 context.mem_write(context.reg_read(REG_X0)?, &[value])?;
+            } else if let Some((size, alignment)) = symbol
+                .strip_prefix("swift_memcpy")
+                .and_then(|suffix| suffix.split_once('_'))
+            {
+                let size = size.parse::<usize>().context("invalid Swift copy size")?;
+                let alignment = alignment
+                    .parse::<usize>()
+                    .context("invalid Swift copy alignment")?;
+                if size > 1024 || alignment == 0 || !alignment.is_power_of_two() {
+                    bail!("unsupported Swift copy layout");
+                }
+                let destination = context.reg_read(REG_X0)?;
+                let source = context.reg_read(REG_X0 + 1)?;
+                context.mem_write(destination, &context.mem_read(source, size)?)?;
+            } else if symbol.contains("BridgeObjectBox")
+                && (symbol.contains("initializeWithCopy") || symbol.contains("assignWithCopy"))
+            {
+                let destination = context.reg_read(REG_X0)?;
+                let source = context.reg_read(REG_X0 + 1)?;
+                write_guest_u64(context, destination, read_guest_u64(context, source)?)?;
+                context.reg_write(REG_X0, destination)?;
+            } else if symbol.contains("BridgeObjectBox") && symbol.contains("destroy") {
             } else if (symbol.contains("SwiftRetainableBox")
                 || symbol.contains("ObjCRetainableBox"))
                 && symbol.contains("initializeBufferWithCopyOfBuffer")
@@ -3413,6 +3773,65 @@ fn call_delegate(
             action: Box::new(action),
             depth: 0,
         },
+    )
+}
+
+fn purchase_encode_step(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    encode: PurchaseEncodeState,
+) -> Result<()> {
+    let PurchaseEncodeState {
+        receiver,
+        request,
+        parameters,
+        selector,
+        properties,
+        step,
+    } = encode;
+    const ENCODE: &str = "requestByEncodingRequestAndReturnSigningErrors:parameters:";
+    if step == 7 {
+        let implementation = method_address(profile, "AMSURLRequestEncoder", ENCODE, false)
+            .context("Store profile lacks the base purchase encoder")?;
+        return begin_callback(
+            context,
+            state,
+            implementation,
+            &[receiver, selector, request, parameters],
+            CallbackAction::ReturnCurrentValue,
+        );
+    }
+    let (target, method, arguments): (u64, &str, &[u64]) = match step {
+        0 => (receiver, "setAnisetteType:", &[0]),
+        1 => (receiver, "setMescalType:", &[0]),
+        2 => (request, "properties", &[]),
+        3 => (properties, "setAnisetteType:", &[0]),
+        4 => (properties, "setMescalType:", &[0]),
+        5 => (properties, "setDisableLoadURLMetrics:", &[1]),
+        6 => (receiver, "setDisableLoadURLMetrics:", &[1]),
+        _ => bail!("invalid purchase encoder step"),
+    };
+    if target == 0 {
+        bail!(
+            "purchase encoder has no request properties at step {step}: request={request:#x} receiver={receiver:#x}"
+        );
+    }
+    call_delegate(
+        context,
+        profile,
+        state,
+        target,
+        method,
+        arguments,
+        CallbackAction::PurchaseEncode(PurchaseEncodeState {
+            receiver,
+            request,
+            parameters,
+            selector,
+            properties,
+            step: step + 1,
+        }),
     )
 }
 
@@ -3969,7 +4388,46 @@ fn resume_callback(
 ) -> Result<()> {
     match resume.action {
         CallbackAction::ReturnZero => context.reg_write(REG_X0, 0)?,
+        CallbackAction::ReturnCurrentValue => {}
         CallbackAction::ReturnValue { value } => context.reg_write(REG_X0, value)?,
+        CallbackAction::PurchaseEncode(PurchaseEncodeState {
+            receiver,
+            request,
+            parameters,
+            selector,
+            properties,
+            step,
+        }) => {
+            let properties = if step == 3 {
+                let value = context.reg_read(REG_X0)?;
+                if value == 0 {
+                    let object = state.objects.get(&request);
+                    bail!(
+                        "purchase request properties getter returned nil: class={:?} properties={:?}",
+                        object.map(|object| &object.class),
+                        object.map(|object| &object.properties)
+                    );
+                }
+                value
+            } else {
+                properties
+            };
+            context.reg_write(REG_LR, resume.link)?;
+            purchase_encode_step(
+                context,
+                profile,
+                state,
+                PurchaseEncodeState {
+                    receiver,
+                    request,
+                    parameters,
+                    selector,
+                    properties,
+                    step,
+                },
+            )?;
+            return Ok(());
+        }
         CallbackAction::QueueBlock { block, queue } => {
             state.pending.push(PendingWork::Guest { block, queue });
             context.reg_write(REG_X0, 0)?;
@@ -4477,6 +4935,252 @@ fn ensure_unique_dictionary(
     Ok(())
 }
 
+fn bridge_dictionary_to_swift(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    object: u64,
+    key_type: u64,
+    value_type: u64,
+) -> Result<()> {
+    let empty = profile.index.symbols["_swiftEmptyDictionarySingleton"];
+    let entries = if object == 0 {
+        HashMap::new()
+    } else {
+        let StoreValue::Entries(entries) = &state
+            .objects
+            .get(&object)
+            .context("unknown Objective-C dictionary")?
+            .value
+        else {
+            bail!("Swift dictionary bridge source is not a dictionary");
+        };
+        entries.clone()
+    };
+    if entries.is_empty() {
+        context.reg_write(REG_X0, empty)?;
+        return Ok(());
+    }
+    let string = profile.index.symbols["$sSSN"];
+    let any_hashable = profile.index.symbols["$ss11AnyHashableVN"];
+    let (type_ref, key_stride, value_stride) = if key_type == any_hashable {
+        (0x1a2e1db1au64, 40u64, 32u64)
+    } else if value_type == string {
+        if key_type != string {
+            bail!("unsupported typed Swift dictionary bridge");
+        }
+        (0x1a2e1d7c6u64, 16, 16)
+    } else {
+        (0x1a2e1d5d6u64, 16, 32)
+    };
+    let metadata = profile
+        .index
+        .swift_types
+        .get(&type_ref.to_string())
+        .copied()
+        .context("Swift dictionary metadata is not prepared")?;
+    let slot = state.allocate(8)?;
+    write_guest_u64(context, slot, empty)?;
+    ensure_unique_dictionary(
+        context,
+        profile,
+        state,
+        slot,
+        false,
+        entries.len() as u64,
+        metadata,
+    )?;
+    let storage = read_guest_u64(context, slot)?;
+    let keys = read_guest_u64(context, storage + 48)?;
+    let values = read_guest_u64(context, storage + 56)?;
+    let seed = read_guest_u64(context, storage + 40)?;
+    let buckets = 1u64 << (read_guest_u64(context, storage + 32)? as u8);
+    let mut names = entries.keys().collect::<Vec<_>>();
+    names.sort();
+    for name in names {
+        let hasher = state.allocate(72)?;
+        init_hasher(context, profile, hasher, seed)?;
+        let mut bytes = name.nfc().collect::<String>().into_bytes();
+        bytes.push(255);
+        hash_bytes(context, hasher, &bytes)?;
+        let hash = hash_compress(context, hasher, read_guest_u64(context, hasher)?, true)?;
+        let mut index = hash & (buckets - 1);
+        while read_guest_u64(context, storage + 64 + (index / 64) * 8)? & (1 << (index % 64)) != 0 {
+            index = (index + 1) & (buckets - 1);
+        }
+        let bitmap = storage + 64 + (index / 64) * 8;
+        write_guest_u64(
+            context,
+            bitmap,
+            read_guest_u64(context, bitmap)? | (1 << (index % 64)),
+        )?;
+        return_swift_string(context, state, name)?;
+        write_guest_u64(
+            context,
+            keys + index * key_stride,
+            context.reg_read(REG_X0)?,
+        )?;
+        write_guest_u64(
+            context,
+            keys + index * key_stride + 8,
+            context.reg_read(REG_X0 + 1)?,
+        )?;
+        if key_stride == 40 {
+            write_guest_u64(
+                context,
+                keys + index * key_stride + 24,
+                profile.index.bridges["anyHashableStringMetadata"],
+            )?;
+            write_guest_u64(
+                context,
+                keys + index * key_stride + 32,
+                profile.index.bridges["anyHashableStringWitness"],
+            )?;
+        }
+        let destination = values + index * value_stride;
+        let value = entries[name];
+        if value_stride == 16 {
+            let StoreValue::String(text) = &state
+                .objects
+                .get(&value)
+                .context("missing typed Swift dictionary value")?
+                .value
+            else {
+                bail!("non-string value in typed Swift dictionary");
+            };
+            let text = text.clone();
+            return_swift_string(context, state, &text)?;
+            write_guest_u64(context, destination, context.reg_read(REG_X0)?)?;
+            write_guest_u64(context, destination + 8, context.reg_read(REG_X0 + 1)?)?;
+        } else {
+            store_swift_any(context, profile, state, destination, value)?;
+        }
+    }
+    write_guest_u64(context, storage + 16, entries.len() as u64)?;
+    context.reg_write(REG_X0, storage)?;
+    Ok(())
+}
+
+fn store_swift_any(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    destination: u64,
+    address: u64,
+) -> Result<()> {
+    let object = state
+        .objects
+        .get(&address)
+        .context("unknown object bridged to Swift Any")?;
+    let class = object.class.clone();
+    let value = object.value.clone();
+    let metadata = match value {
+        StoreValue::String(text) => {
+            return_swift_string(context, state, &text)?;
+            write_guest_u64(context, destination, context.reg_read(REG_X0)?)?;
+            write_guest_u64(context, destination + 8, context.reg_read(REG_X0 + 1)?)?;
+            profile.index.symbols["$sSSN"]
+        }
+        StoreValue::Number(number) => {
+            write_guest_u64(context, destination, number as u64)?;
+            profile.index.symbols["$sSiN"]
+        }
+        StoreValue::Boolean(boolean) => {
+            write_guest_u64(context, destination, u64::from(boolean))?;
+            profile.index.symbols["$sSbN"]
+        }
+        StoreValue::Float(float) => {
+            write_guest_u64(context, destination, float.to_bits())?;
+            profile.index.symbols["$sSdN"]
+        }
+        _ => {
+            let metadata_class = if class.contains("Dictionary") {
+                "NSDictionary"
+            } else if class.contains("Array") {
+                "NSArray"
+            } else if class.contains("Data") {
+                "NSData"
+            } else {
+                &class
+            };
+            write_guest_u64(context, destination, address)?;
+            *profile
+                .index
+                .objc_metadata
+                .get(metadata_class)
+                .with_context(|| format!("unprepared Swift Any metadata for {metadata_class}"))?
+        }
+    };
+    if metadata == 0 {
+        bail!("unprepared Swift Any metadata");
+    }
+    write_guest_u64(context, destination + 24, metadata)
+}
+
+fn bridge_dictionary_to_objc(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    storage: u64,
+    key_type: u64,
+    value_type: u64,
+) -> Result<()> {
+    let count = read_guest_u64(context, storage + 16)?;
+    let mut entries = HashMap::new();
+    if count != 0 {
+        let string = profile.index.symbols["$sSSN"];
+        if key_type != string || value_type != string {
+            bail!(
+                "unsupported Swift dictionary Objective-C bridge types {key_type:#x}/{value_type:#x}"
+            );
+        }
+        let exponent = read_guest_u64(context, storage + 32)? & 255;
+        if count > 768 || exponent > 10 {
+            bail!("Swift dictionary bridge exceeds budget");
+        }
+        let keys = read_guest_u64(context, storage + 48)?;
+        let values = read_guest_u64(context, storage + 56)?;
+        let buckets = 1u64 << exponent;
+        for index in 0..buckets {
+            if read_guest_u64(context, storage + 64 + (index / 64) * 8)? & (1 << (index % 64)) == 0
+            {
+                continue;
+            }
+            let key = swift_string(
+                context,
+                state,
+                read_guest_u64(context, keys + index * 16)?,
+                read_guest_u64(context, keys + index * 16 + 8)?,
+            )?;
+            let value = swift_string(
+                context,
+                state,
+                read_guest_u64(context, values + index * 16)?,
+                read_guest_u64(context, values + index * 16 + 8)?,
+            )?;
+            let value = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(value),
+            )?;
+            entries.insert(key, value);
+        }
+        if entries.len() != count as usize {
+            bail!("Swift dictionary count mismatch");
+        }
+    }
+    let dictionary = new_guest_object(
+        context,
+        profile,
+        state,
+        "NSDictionary",
+        StoreValue::Entries(entries),
+    )?;
+    context.reg_write(REG_X0, dictionary)
+}
+
 fn guest_cstring(
     context: &HookContext,
     profile: &ProfileData,
@@ -4681,6 +5385,26 @@ fn dispatch_message(
             .class
             .clone()
     };
+    if !class_method
+        && class_name == "AMSPurchaseRequestEncoder"
+        && selector == "requestByEncodingRequestAndReturnSigningErrors:parameters:"
+    {
+        let request = context.reg_read(REG_X0 + 2)?;
+        let parameters = context.reg_read(REG_X0 + 3)?;
+        return purchase_encode_step(
+            context,
+            profile,
+            state,
+            PurchaseEncodeState {
+                receiver,
+                request,
+                parameters,
+                selector: selector_address,
+                properties: 0,
+                step: 0,
+            },
+        );
+    }
     if class_name == "HostUnavailableProxy" {
         let error_block = state.objects[&receiver]
             .properties
@@ -5459,6 +6183,18 @@ fn dispatch_message(
                 ("HTTPMethod".into(), method),
                 ("allHTTPHeaderFields".into(), headers),
             ]);
+            if class_name == "AMSURLRequest" {
+                let request_properties = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "AMSURLRequestProperties",
+                    StoreValue::Empty,
+                )?;
+                let index = profile.runtime.classes_by_name["AMSURLRequest"];
+                let offset = profile.index.classes[index].ivars["_properties"];
+                write_guest_u64(context, receiver + offset, request_properties)?;
+            }
             context.reg_write(REG_X0, receiver)?;
             return Ok(());
         }
@@ -6190,6 +6926,25 @@ fn dispatch_message(
             )?;
             context.reg_write(REG_X0, date)?;
         }
+        (true, "dateWithTimeIntervalSinceNow:" | "dateWithTimeIntervalSince1970:")
+            if class_name == "NSDate" =>
+        {
+            let mut seconds = f64::from_bits(context.reg_read(40)?);
+            if selector == "dateWithTimeIntervalSinceNow:" {
+                seconds += time::OffsetDateTime::now_utc().unix_timestamp_nanos() as f64 / 1e9;
+            }
+            if !seconds.is_finite() || seconds <= i64::MIN as f64 || seconds >= i64::MAX as f64 {
+                bail!("unsupported Store date interval");
+            }
+            let date = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSDate",
+                StoreValue::Float(seconds),
+            )?;
+            context.reg_write(REG_X0, date)?;
+        }
         (true, "requestWithURL:")
             if matches!(class_name.as_str(), "NSURLRequest" | "NSMutableURLRequest") =>
         {
@@ -6808,6 +7563,28 @@ fn dispatch_message(
                 bail!("addObject: on {class_name}");
             };
             values.push(value);
+            context.reg_write(REG_X0, 0)?;
+        }
+        (false, "addObjectsFromArray:") if class_name == "NSMutableArray" => {
+            let source = context.reg_read(REG_X0 + 2)?;
+            let StoreValue::Addresses(items) = &state
+                .objects
+                .get(&source)
+                .context("unknown source array")?
+                .value
+            else {
+                bail!("addObjectsFromArray: source is not an array");
+            };
+            let items = items.clone();
+            let StoreValue::Addresses(values) = &mut state
+                .objects
+                .get_mut(&receiver)
+                .expect("known mutable array")
+                .value
+            else {
+                bail!("addObjectsFromArray: receiver is not an array");
+            };
+            values.extend(items);
             context.reg_write(REG_X0, 0)?;
         }
         (false, "removeObjectAtIndex:") if class_name == "NSMutableArray" => {
@@ -8046,5 +8823,45 @@ mod tests {
                 .eq_ignore_ascii_case("010203040506")
         );
         assert!(parameters["createSession"].is_boolean());
+    }
+
+    #[test]
+    #[ignore = "purchase encoding promise still times out in the Store guest"]
+    fn encodes_free_purchase_with_pinned_apple_code() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        runtime.set_hardware_id(&[1, 2, 3, 4, 5, 6]).unwrap();
+        let mut saved = Account::default();
+        saved.email = "saved@example.com".into();
+        saved.password_token = "saved-token".into();
+        saved.directory_services_id = "12345".into();
+        saved.store_front = "143441-1,29".into();
+        let account = runtime.ephemeral_account(Some(&saved)).unwrap();
+        let bag = runtime
+            .frozen_bag_from_values(&serde_json::json!({
+                "buyProduct": "https://buy.itunes.apple.com/request",
+                "redirect-cookie-removal-exclusion-list": [],
+                "clientIDDomains": [],
+                "storefront-header-suffix": "29",
+                "absinthe-requests": false
+            }))
+            .unwrap();
+        let request = runtime
+            .encode_purchase_request(
+                account,
+                bag,
+                &serde_json::json!({
+                    "salableAdamId": "1234",
+                    "pricingParameters": "STDQ",
+                    "price": "0",
+                    "productType": "C"
+                }),
+            )
+            .unwrap();
+        let url = runtime.invoke(request, "URL", &[]).unwrap();
+        assert_eq!(
+            runtime.object_string(url).unwrap(),
+            "https://buy.itunes.apple.com/request"
+        );
     }
 }
