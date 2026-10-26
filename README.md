@@ -28,7 +28,7 @@ On macOS, `auth info` reads the existing Go-compatible account from the system K
 | Public search, including visionOS discovery | Implemented, with offline unit tests |
 | Public app lookup by ID or bundle identifier | Implemented, with offline unit tests |
 | Latest public external version ID for non-macOS platforms | Implemented, with offline unit tests; iPhone live lookup checked |
-| Shared HTTP request/response decoding, state migration and Go cookie-file reading | Implemented as library modules; cookie writes and authenticated transport pending |
+| Shared HTTP decoding, state migration and Go-compatible cookie persistence | Implemented as library modules; local redirect/cookie transport tested, Store executor pending |
 | Authentication URL bag, endpoint validation, 2FA and phone routing helpers | Implemented as library modules; SAP signing and login execution pending |
 | FairPlay SINF, IPA SINF and enrollment model inspection | Implemented as library modules; decryption pending |
 | `fairplay-doctor` host, capture, IPA and model checks | Implemented; current macOS host output compared with Go |

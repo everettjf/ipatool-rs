@@ -26,7 +26,7 @@ This checklist records behavior in that source tree; the Go README and source ar
 
 ## Internal subsystems
 
-1. Finish `pkg/http` (cookie saving, concurrent file merging, and Store executor), then complete `pkg/keychain` on Linux, Windows, and iOS. Shared HTTP response decoding, state directory migration, read-only Go cookie-file loading and matching, and macOS Keychain account inspection/revocation are implemented. Verify real credential interoperability with a throwaway Go session before relying on an existing account.
+1. Finish `pkg/http` Store executor and signed authentication redirect behavior, then complete `pkg/keychain` on Linux, Windows, and iOS. Shared HTTP response decoding, state directory migration, Go-compatible cookie reading/writing with file locking and merge, and macOS Keychain account inspection/revocation are implemented. Cookie files were exchanged with the Go library using disposable values; real account interoperability still needs controlled verification.
 2. Port `internal/store` and its generated profile data, then `internal/sap` signing and runtime support. URL bag parsing, endpoint validation, machine GUID creation, 2FA normalization, and phone account routing are implemented. Login, authenticated search country selection, purchase, and owned-app listing still depend on the Store/SAP runtime.
 3. Port iOS/tvOS/watchOS/visionOS download flows, resume and range logic, ZIP framing, SINF replication, and all package tests. The latest public external version ID lookup for these platforms is implemented.
 4. Port macOS preflight, version metadata, package download, encrypted payload processing, and publish behavior.

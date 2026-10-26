@@ -1,12 +1,28 @@
 //! Shared Store HTTP transport and typed response decoding.
 
-use std::{collections::HashMap, sync::LazyLock, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{LazyLock, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
-use reqwest::{Method, blocking::Client, header::HeaderMap, redirect::Policy};
+use reqwest::{
+    Method,
+    blocking::{Client, Response as HttpResponse},
+    header::{
+        AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HOST, HeaderMap, HeaderValue,
+        LOCATION, PROXY_AUTHORIZATION, SET_COOKIE,
+    },
+    redirect::Policy,
+};
 use serde::de::DeserializeOwned;
+use time::OffsetDateTime;
 use url::Url;
+
+use crate::cookies::SavedCookies;
 
 static DOCUMENT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?is)<Document\b[^>]*>(.*?)</Document>").unwrap());
@@ -126,6 +142,7 @@ impl Response {
 pub struct Transport {
     follow_redirects: Client,
     no_redirects: Client,
+    cookies: Option<Mutex<SavedCookies>>,
 }
 
 impl Transport {
@@ -138,10 +155,20 @@ impl Transport {
                 .redirect(Policy::none())
                 .build()
                 .context("failed to create non-redirecting HTTP client")?,
+            cookies: None,
         })
     }
 
+    pub fn with_cookies(state_directory: &Path) -> Result<Self> {
+        let mut transport = Self::new()?;
+        transport.cookies = Some(Mutex::new(SavedCookies::open(state_directory)?));
+        Ok(transport)
+    }
+
     pub fn send(&self, request: Request) -> Result<Response> {
+        if let Some(cookies) = &self.cookies {
+            return self.send_with_cookies(request, cookies);
+        }
         let client = if request.no_redirects {
             &self.no_redirects
         } else {
@@ -157,6 +184,92 @@ impl Transport {
             builder = builder.timeout(timeout);
         }
         let response = builder.send().context("request failed")?;
+        Self::response_from_http(response)
+    }
+
+    fn send_with_cookies(
+        &self,
+        request: Request,
+        cookies: &Mutex<SavedCookies>,
+    ) -> Result<Response> {
+        let mut method = request.method;
+        let mut url = request.url;
+        let mut headers = request.headers;
+        let mut body = request.body;
+        for redirects in 0..=10 {
+            let mut send_headers = headers.clone();
+            if !send_headers.contains_key(COOKIE) {
+                let cookie_header = cookies
+                    .lock()
+                    .map_err(|_| anyhow!("cookie jar lock is poisoned"))?
+                    .header_for(&url, OffsetDateTime::now_utc());
+                if let Some(cookie_header) = cookie_header {
+                    send_headers.insert(
+                        COOKIE,
+                        HeaderValue::from_str(&cookie_header)
+                            .context("invalid saved cookie header")?,
+                    );
+                }
+            }
+            let mut builder = self
+                .no_redirects
+                .request(method.clone(), url.clone())
+                .headers(send_headers);
+            if let Some(data) = &body {
+                builder = builder.body(data.clone());
+            }
+            if let Some(timeout) = request.timeout {
+                builder = builder.timeout(timeout);
+            }
+            let response = builder.send().context("request failed")?;
+            {
+                let mut jar = cookies
+                    .lock()
+                    .map_err(|_| anyhow!("cookie jar lock is poisoned"))?;
+                let now = OffsetDateTime::now_utc();
+                for value in response.headers().get_all(SET_COOKIE).iter() {
+                    if let Ok(raw) = value.to_str() {
+                        jar.set_cookie(&url, raw, now);
+                    }
+                }
+                jar.save(now).context("failed to save cookies")?;
+            }
+            let status = response.status().as_u16();
+            let Some(location) = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|value| value.to_str().ok())
+            else {
+                return Self::response_from_http(response);
+            };
+            if request.no_redirects || !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                return Self::response_from_http(response);
+            }
+            if redirects == 10 {
+                bail!("too many HTTP redirects");
+            }
+            let next = url.join(location).context("invalid redirect Location")?;
+            if !matches!(next.scheme(), "http" | "https") {
+                bail!("unsupported redirect scheme");
+            }
+            if next.origin() != url.origin() {
+                headers.remove(AUTHORIZATION);
+                headers.remove(PROXY_AUTHORIZATION);
+                headers.remove(COOKIE);
+                headers.remove(HOST);
+            }
+            if status == 303 || (matches!(status, 301 | 302) && method == Method::POST) {
+                method = Method::GET;
+                body = None;
+                headers.remove(CONTENT_TYPE);
+                headers.remove(CONTENT_LENGTH);
+            }
+            url = next;
+        }
+        unreachable!("redirect limit returns before loop exhaustion")
+    }
+
+    fn response_from_http(response: HttpResponse) -> Result<Response> {
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -243,6 +356,11 @@ fn body_snippet(body: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+        thread,
+    };
 
     fn response(status: u16, body: &str) -> Response {
         Response {
@@ -296,5 +414,91 @@ mod tests {
             .insert("content-range".into(), "bytes 0-3/8".into());
         assert_eq!(res.header("Content-Range"), Some("bytes 0-3/8"));
         assert_eq!(res.body, b"part");
+    }
+
+    #[test]
+    fn cookie_transport_saves_and_replays_cookie_across_redirect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut lines = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    lines.push(line);
+                }
+                if index == 0 {
+                    assert!(lines[0].starts_with("GET /start "));
+                    stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /next\r\nSet-Cookie: sid=dummy-value; Max-Age=3600; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    assert!(lines[0].starts_with("GET /next "));
+                    assert!(lines.iter().any(|line| {
+                        line.to_ascii_lowercase()
+                            .starts_with("cookie: sid=dummy-value")
+                    }));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .unwrap();
+                }
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let transport = Transport::with_cookies(directory.path()).unwrap();
+        let response = transport
+            .send(Request::get(
+                Url::parse(&format!("http://{address}/start")).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+        server.join().unwrap();
+        let saved = SavedCookies::open(directory.path()).unwrap();
+        assert_eq!(
+            saved
+                .header_for(
+                    &Url::parse(&format!("http://{address}/next")).unwrap(),
+                    OffsetDateTime::now_utc()
+                )
+                .as_deref(),
+            Some("sid=dummy-value")
+        );
+    }
+
+    #[test]
+    fn authentication_style_no_redirects_still_saves_cookie() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /login-next\r\nSet-Cookie: auth=dummy; Max-Age=3600; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let transport = Transport::with_cookies(directory.path()).unwrap();
+        let url = Url::parse(&format!("http://{address}/login")).unwrap();
+        let mut request = Request::get(url.clone());
+        request.no_redirects = true;
+        assert_eq!(transport.send(request).unwrap().status, 302);
+        server.join().unwrap();
+        let saved = SavedCookies::open(directory.path()).unwrap();
+        assert_eq!(
+            saved.header_for(&url, OffsetDateTime::now_utc()).as_deref(),
+            Some("auth=dummy")
+        );
     }
 }
