@@ -1,4 +1,4 @@
-//! Authentication protocol preparation. SAP signing and login execution remain to be ported.
+//! Authentication protocol preparation and Apple URL bag handling.
 
 use anyhow::{Context, Result, bail};
 use reqwest::{
@@ -11,6 +11,10 @@ use url::Url;
 use crate::transport::{DEFAULT_AUTHENTICATION_TIMEOUT, Request, Transport};
 
 const AUTH_PATH: &str = "/WebObjects/MZFinance.woa/wa/authenticate";
+const FALLBACK_AUTH_ENDPOINT: &str =
+    "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate";
+const FALLBACK_SAP_SETUP: &str = "https://fpinit.itunes.apple.com/v1/signSapSetup/legacy";
+const FALLBACK_SAP_CERTIFICATE: &str = "https://s.mzstatic.com/sap/setupCert.plist";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SapConfig {
@@ -29,13 +33,13 @@ struct BagResponse {
 #[derive(Debug, Deserialize)]
 struct UrlBag {
     #[serde(rename = "authenticateAccount")]
-    auth_endpoint: String,
+    auth_endpoint: Option<String>,
     #[serde(rename = "sign-sap-setup")]
-    setup_url: String,
+    setup_url: Option<String>,
     #[serde(rename = "sign-sap-setup-cert")]
-    certificate_url: String,
+    certificate_url: Option<String>,
     #[serde(rename = "sign-sap-version")]
-    version: String,
+    version: Option<String>,
 }
 
 pub fn normalize_auth_code(code: &str) -> Result<String> {
@@ -175,16 +179,42 @@ pub fn fetch_bag(transport: &Transport, mac_address: &str) -> Result<SapConfig> 
         .context("failed to request Apple URL bag")?;
     response.ensure_success()?;
     let parsed: BagResponse = response.plist(false)?;
+    config_from_bag(parsed)
+}
+
+fn config_from_bag(parsed: BagResponse) -> Result<SapConfig> {
+    // Apple may omit the legacy Store and SAP keys from an otherwise valid
+    // bag. Use the independently validated endpoints only for absent keys.
     let mut config = SapConfig {
-        auth_endpoint: Url::parse(&parsed.bag.auth_endpoint)
-            .context("invalid authentication endpoint in bag")?,
-        setup_url: Url::parse(&parsed.bag.setup_url)
-            .context("invalid SAP setup endpoint in bag")?,
-        certificate_url: Url::parse(&parsed.bag.certificate_url)
-            .context("invalid SAP setup certificate endpoint in bag")?,
+        auth_endpoint: Url::parse(
+            parsed
+                .bag
+                .auth_endpoint
+                .as_deref()
+                .unwrap_or(FALLBACK_AUTH_ENDPOINT),
+        )
+        .context("invalid authentication endpoint in bag")?,
+        setup_url: Url::parse(
+            parsed
+                .bag
+                .setup_url
+                .as_deref()
+                .unwrap_or(FALLBACK_SAP_SETUP),
+        )
+        .context("invalid SAP setup endpoint in bag")?,
+        certificate_url: Url::parse(
+            parsed
+                .bag
+                .certificate_url
+                .as_deref()
+                .unwrap_or(FALLBACK_SAP_CERTIFICATE),
+        )
+        .context("invalid SAP setup certificate endpoint in bag")?,
         version: parsed
             .bag
             .version
+            .as_deref()
+            .unwrap_or("200")
             .parse()
             .context("invalid SAP version in bag")?,
     };
@@ -196,6 +226,30 @@ pub fn fetch_bag(transport: &Transport, mac_address: &str) -> Result<SapConfig> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_legacy_bag_keys_use_validated_endpoints() {
+        let parsed: BagResponse = plist::from_bytes(
+            b"<plist version=\"1.0\"><dict><key>urlBag</key><dict/></dict></plist>",
+        )
+        .unwrap();
+        let config = config_from_bag(parsed).unwrap();
+        assert_eq!(config.setup_url.as_str(), FALLBACK_SAP_SETUP);
+        assert_eq!(config.certificate_url.as_str(), FALLBACK_SAP_CERTIFICATE);
+        assert_eq!(config.version, 200);
+        assert_eq!(config.auth_endpoint.path(), format!("{AUTH_PATH}/"));
+        let parsed: BagResponse = plist::from_bytes(b"<plist version=\"1.0\"><dict><key>urlBag</key><dict><key>sign-sap-setup</key><string>http://invalid.test</string></dict></dict></plist>").unwrap();
+        assert!(config_from_bag(parsed).is_err());
+    }
+
+    #[test]
+    #[ignore = "contacts the live Apple URL bag"]
+    fn fetches_current_apple_bag_with_legacy_endpoint_fallbacks() {
+        let transport = Transport::new().unwrap();
+        let config = fetch_bag(&transport, "02:00:00:00:00:01").unwrap();
+        assert_eq!(config.version, 200);
+        assert_eq!(config.setup_url.scheme(), "https");
+    }
 
     #[test]
     fn normalizes_pasted_codes_and_rejects_non_ascii_digits() {
@@ -268,10 +322,10 @@ mod tests {
     fn bag_fields_decode_from_plist_names() {
         let xml = r#"<plist version="1.0"><dict><key>urlBag</key><dict><key>authenticateAccount</key><string>https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate</string><key>sign-sap-setup</key><string>https://example.test/setup</string><key>sign-sap-setup-cert</key><string>https://example.test/cert</string><key>sign-sap-version</key><string>200</string></dict></dict></plist>"#;
         let parsed: BagResponse = plist::from_bytes(xml.as_bytes()).unwrap();
-        assert_eq!(parsed.bag.version, "200");
+        assert_eq!(parsed.bag.version.as_deref(), Some("200"));
         assert_eq!(
-            parsed.bag.auth_endpoint,
-            "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"
+            parsed.bag.auth_endpoint.as_deref(),
+            Some("https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate")
         );
     }
 }

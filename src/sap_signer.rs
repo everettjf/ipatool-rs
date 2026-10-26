@@ -5,7 +5,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     auth::{SapConfig, validate_sap_config},
-    sap_protocol::{SapHttpClient, SapProtocol},
+    sap_assets::SapAssetBundle,
+    sap_machine::SapRuntimeGuest,
+    sap_protocol::{ReqwestSapClient, SapHttpClient, SapProtocol},
 };
 
 pub trait SapGuest {
@@ -26,6 +28,16 @@ pub struct Signer<G: SapGuest> {
     guest: Option<G>,
     context: u64,
     hardware_id: Zeroizing<Vec<u8>>,
+}
+
+impl Signer<SapRuntimeGuest> {
+    pub fn open(config: &SapConfig, hardware_id: &[u8]) -> Result<Self> {
+        validate_sap_config(config)?;
+        let bundle = SapAssetBundle::load_or_download().context("load Apple SAP assets")?;
+        let guest = SapRuntimeGuest::open(&bundle).context("start Apple SAP runtime")?;
+        let protocol = SapProtocol::new(ReqwestSapClient::new()?);
+        Self::new(guest, &protocol, config, hardware_id)
+    }
 }
 
 impl<G: SapGuest> Signer<G> {
@@ -137,6 +149,17 @@ mod tests {
     use url::Url;
 
     use super::*;
+
+    #[test]
+    #[ignore = "downloads pinned Apple assets and contacts live SAP setup endpoints"]
+    fn signs_with_pinned_runtime_and_live_sap_setup() {
+        let transport = crate::transport::Transport::new().unwrap();
+        let config = crate::auth::fetch_bag(&transport, "02:00:00:00:00:01").unwrap();
+        let hardware_id = [0x02, 0, 0, 0, 0, 1];
+        let mut signer = Signer::<SapRuntimeGuest>::open(&config, &hardware_id).unwrap();
+        assert!(!signer.sign(b"test").unwrap().is_empty());
+        signer.close().unwrap();
+    }
     use crate::sap_protocol::{SapRequest, SapResponse};
 
     #[derive(Default)]

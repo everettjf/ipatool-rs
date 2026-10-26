@@ -81,6 +81,8 @@ enum Handler {
     ErrorPointer,
     Abort,
     Gettimeofday,
+    Sysctlbyname,
+    Sysconf,
     Unsupported,
 }
 
@@ -282,6 +284,8 @@ impl SapShims {
         state.function("_arc4random", Handler::Arc4random)?;
         state.function("___error", Handler::ErrorPointer)?;
         state.function("_gettimeofday", Handler::Gettimeofday)?;
+        state.function("_sysctlbyname", Handler::Sysctlbyname)?;
+        state.function("_sysconf", Handler::Sysconf)?;
         for name in ["_abort", "___stack_chk_fail", "dyld_stub_binder"] {
             state.function(name, Handler::Abort)?;
         }
@@ -490,6 +494,22 @@ fn dispatch(context: &HookContext, state: &Rc<RefCell<State>>, address: u64) -> 
                 context.mem_write(zone_address, &[0; 8])?;
             }
             context.reg_write(REG_X0, 0)
+        }
+        Handler::Sysctlbyname => {
+            let length_address = context.reg_read(REG_X0 + 2)?;
+            if length_address != 0 {
+                context.mem_write(length_address, &0u64.to_le_bytes())?;
+            }
+            context.reg_write(REG_X0, 0)
+        }
+        Handler::Sysconf => {
+            let value = match context.reg_read(REG_X0)? {
+                29 => 4096,
+                57 | 58 => 1,
+                200 => HEAP_SIZE / 4096,
+                _ => u64::MAX,
+            };
+            context.reg_write(REG_X0, value)
         }
         Handler::Unsupported => bail!("guest called unsupported import {name}"),
     }
