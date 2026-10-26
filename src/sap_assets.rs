@@ -281,6 +281,29 @@ mod tests {
     fn downloads_complete_pinned_bundle() {
         let bundle = SapAssetBundle::download_pinned().unwrap();
         bundle.validate().unwrap();
+        let core = crate::machimage::Image::open("CoreFP", &bundle.core_fp).unwrap();
+        for name in [
+            "_WIn9UJ86JKdV4dM",
+            "_X46O5IeS",
+            "_YlCJ3lg",
+            "_dku592fbFAj",
+            "_fdjkDSAFjklaf2s",
+            "_lxpgvVMLd0S7uRl",
+        ] {
+            assert_ne!(core.export(name, 0x0000_1000_0000_0000).unwrap(), 0);
+        }
+        let services =
+            crate::machimage::Image::open("AppleMediaServices", &bundle.apple_media_services)
+                .unwrap();
+        for name in [
+            "_cp2g1b9ro",
+            "_Mib5yocT",
+            "_Fc3vhtJDvr",
+            "_IPaI1oem5iL",
+            "_jEHf8Xzsv8K",
+        ] {
+            assert_ne!(services.export(name, services.base()).unwrap(), 0);
+        }
         let directory = tempfile::tempdir().unwrap();
         bundle.save_to(directory.path()).unwrap();
         let restored = SapAssetBundle::load_from(directory.path()).unwrap();

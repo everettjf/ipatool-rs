@@ -137,6 +137,83 @@ impl Image {
         self.base
     }
 
+    /// Resolve a Mach-O symbol and translate it to the image's load address.
+    pub fn export(&self, name: &str, load_base: u64) -> Result<u64> {
+        let commands_size = read_le_u32(&self.data, 20)? as usize;
+        let count = read_le_u32(&self.data, 16)? as usize;
+        let commands_end = 32usize
+            .checked_add(commands_size)
+            .context("Mach-O commands overflow")?;
+        let mut cursor = 32usize;
+        let mut symtab = None;
+        for _ in 0..count {
+            let kind = read_le_u32(&self.data, cursor)?;
+            let size = read_le_u32(&self.data, cursor + 4)? as usize;
+            if size < 8
+                || cursor
+                    .checked_add(size)
+                    .is_none_or(|end| end > commands_end)
+            {
+                bail!("{} has invalid Mach-O load commands", self.name);
+            }
+            if kind == 2 {
+                if size < 24 {
+                    bail!("{} has truncated symbol table command", self.name);
+                }
+                symtab = Some((
+                    read_le_u32(&self.data, cursor + 8)? as usize,
+                    read_le_u32(&self.data, cursor + 12)? as usize,
+                    read_le_u32(&self.data, cursor + 16)? as usize,
+                    read_le_u32(&self.data, cursor + 20)? as usize,
+                ));
+            }
+            cursor += size;
+        }
+        let (symbol_offset, symbol_count, string_offset, string_size) =
+            symtab.with_context(|| format!("{} has no Mach-O symbol table", self.name))?;
+        if symbol_count > 4 << 20 {
+            bail!("{} has too many symbols", self.name);
+        }
+        let symbols_end = symbol_offset
+            .checked_add(
+                symbol_count
+                    .checked_mul(16)
+                    .context("symbol count overflow")?,
+            )
+            .context("symbol table overflow")?;
+        let strings_end = string_offset
+            .checked_add(string_size)
+            .context("symbol strings overflow")?;
+        let symbols = self
+            .data
+            .get(symbol_offset..symbols_end)
+            .context("symbol table exceeds image")?;
+        let strings = self
+            .data
+            .get(string_offset..strings_end)
+            .context("symbol strings exceed image")?;
+        for symbol in symbols.as_chunks::<16>().0 {
+            let name_offset =
+                u32::from_le_bytes(symbol[..4].try_into().expect("four bytes")) as usize;
+            let Some(tail) = strings.get(name_offset..) else {
+                continue;
+            };
+            let Some(end) = tail.iter().position(|&byte| byte == 0) else {
+                continue;
+            };
+            if tail[..end].eq_ignore_ascii_case(name.as_bytes()) {
+                let address = u64::from_le_bytes(symbol[8..16].try_into().expect("eight bytes"));
+                let relative = address
+                    .checked_sub(self.base)
+                    .with_context(|| format!("symbol {name} precedes {} base", self.name))?;
+                return load_base
+                    .checked_add(relative)
+                    .context("export address overflow");
+            }
+        }
+        bail!("symbol {name} was not found in {}", self.name)
+    }
+
     pub fn code_ranges(&self) -> &[(u64, u64)] {
         &self.code_ranges
     }
