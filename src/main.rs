@@ -14,6 +14,7 @@ use ipatool_rs::fairplay_download_capture::write_download_capture;
 use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2};
 use ipatool_rs::fairplay_enrollment_v3::{V3Material, build_fpsenr3};
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
+use ipatool_rs::fairplay_key::CurrentSinfModel;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
 use ipatool_rs::fairplay_recovery;
@@ -279,6 +280,25 @@ enum FairplayEnrollCommand {
         selector: String,
         #[arg(long)]
         fairplayd_sha256: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Build an FPSENR2 decoder directly from private schema-2 checkpoints.
+    BuildModelV2Checkpoints {
+        #[arg(long)]
+        recovered_model: PathBuf,
+        #[arg(long)]
+        source_checkpoint: PathBuf,
+        #[arg(long)]
+        transformed_checkpoint: PathBuf,
+        #[arg(long, help = "Source address; defaults to source checkpoint x23")]
+        source_address: Option<String>,
+        #[arg(long, help = "Address of the 432-byte transformed output")]
+        output_address: String,
+        #[arg(long)]
+        selector: String,
+        #[arg(long, help = "Optional private SINF for end-to-end validation")]
+        sinf: Option<PathBuf>,
         #[arg(long)]
         output: PathBuf,
     },
@@ -1150,6 +1170,62 @@ fn run() -> Result<()> {
                     ),
                 }
             }
+            FairplayEnrollCommand::BuildModelV2Checkpoints {
+                recovered_model,
+                source_checkpoint,
+                transformed_checkpoint,
+                source_address,
+                output_address,
+                selector,
+                sinf,
+                output,
+            } => {
+                let recovered = read_private_model(&recovered_model)?;
+                let source_checkpoint = FairplayCheckpoint::load_private(&source_checkpoint)?;
+                let transformed_checkpoint =
+                    FairplayCheckpoint::load_private(&transformed_checkpoint)?;
+                if source_checkpoint.binary_hash != transformed_checkpoint.binary_hash {
+                    bail!("version-2 checkpoints have different fairplayd builds");
+                }
+                let source_address = match source_address {
+                    Some(address) => parse_address(&address)?,
+                    None => source_checkpoint.register_u64("x23")?,
+                };
+                let source =
+                    source_checkpoint.read_block::<FIRST_TRANSFORM_BYTES>(source_address)?;
+                let encoded = transformed_checkpoint
+                    .read_block::<FIRST_TRANSFORM_BYTES>(parse_address(&output_address)?)?;
+                let selector = parse_enrollment_selector(&selector)?;
+                let model = build_fpsenr2(
+                    &recovered,
+                    selector,
+                    source_checkpoint.binary_hash,
+                    &source,
+                    &encoded,
+                    &[],
+                )?;
+                if let Some(sinf) = sinf {
+                    let sinf = read_private_bytes(&sinf, 1024 * 1024)?;
+                    let _logical =
+                        Zeroizing::new(CurrentSinfModel::parse(&model)?.logical_key(&sinf)?);
+                }
+                write_private_binary(&output, &model)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "fairplay.enrollment-model.v2",
+                            "output": output,
+                            "selector": selector.identifier(),
+                            "bytes": model.len(),
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Built private FairPlay v2 enrollment model from checkpoints in {}",
+                        output.display()
+                    ),
+                }
+            }
             FairplayEnrollCommand::BuildModelV3 {
                 recovered_model,
                 whitebox_entry,
@@ -1629,6 +1705,38 @@ mod tests {
             }
         ));
         assert_eq!(parse_address("0x710000014ee0").unwrap(), 0x7100_0001_4ee0);
+    }
+
+    #[test]
+    fn build_model_v2_checkpoints_uses_source_register_by_default() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "build-model-v2-checkpoints",
+            "--recovered-model",
+            "/private/recovered.json",
+            "--source-checkpoint",
+            "/private/source.pkl.gz",
+            "--transformed-checkpoint",
+            "/private/transformed.pkl.gz",
+            "--output-address",
+            "0x710000014ee8",
+            "--selector",
+            "12345678:00000009",
+            "--output",
+            "/private/enrollment.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::BuildModelV2Checkpoints {
+                    source_address: None,
+                    sinf: None,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]
