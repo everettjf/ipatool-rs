@@ -599,8 +599,18 @@ impl StoreRuntime {
         } else {
             self.ephemeral_account(None)?
         };
-        let bag = input
-            .bag
+        let mut bag_values = input.bag.cloned();
+        if operation == StoreOperation::Purchase
+            && let Some(values) = bag_values.as_mut().and_then(Value::as_object_mut)
+        {
+            let endpoint = Value::String(input.url.into());
+            values.insert("buyProduct".into(), endpoint.clone());
+            if let Some(nested) = values.get_mut("urlBag").and_then(Value::as_object_mut) {
+                nested.insert("buyProduct".into(), endpoint);
+            }
+        }
+        let bag = bag_values
+            .as_ref()
             .map(|value| self.frozen_bag_from_values(value))
             .transpose()?
             .unwrap_or(0);
@@ -9155,7 +9165,7 @@ mod tests {
             "appleId": "test@example.com",
             "password": "test"
         });
-        let bag = serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/request"});
+        let bag = serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/stale"});
         let response = runtime
             .execute_purchase(StoreStandardRequest {
                 method: "POST",
