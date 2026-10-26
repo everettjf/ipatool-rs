@@ -160,6 +160,55 @@ impl Image {
 
     /// Resolve a Mach-O symbol and translate it to the image's load address.
     pub fn export(&self, name: &str, load_base: u64) -> Result<u64> {
+        let (symbols, strings) = self.symbol_table()?;
+        for symbol in symbols.as_chunks::<16>().0 {
+            let name_offset =
+                u32::from_le_bytes(symbol[..4].try_into().expect("four bytes")) as usize;
+            let Some(tail) = strings.get(name_offset..) else {
+                continue;
+            };
+            let Some(end) = tail.iter().position(|&byte| byte == 0) else {
+                continue;
+            };
+            if tail[..end].eq_ignore_ascii_case(name.as_bytes()) {
+                let address = u64::from_le_bytes(symbol[8..16].try_into().expect("eight bytes"));
+                let relative = address
+                    .checked_sub(self.base)
+                    .with_context(|| format!("symbol {name} precedes {} base", self.name))?;
+                return load_base
+                    .checked_add(relative)
+                    .context("export address overflow");
+            }
+        }
+        bail!("symbol {name} was not found in {}", self.name)
+    }
+
+    /// Find non-fragile Objective-C ivar offset slots in the image symbol table.
+    pub fn objc_ivar_symbols(&self) -> Result<Vec<(String, u64)>> {
+        let (symbols, strings) = self.symbol_table()?;
+        let mut ivars = Vec::new();
+        for symbol in symbols.as_chunks::<16>().0 {
+            let name_offset =
+                u32::from_le_bytes(symbol[..4].try_into().expect("four bytes")) as usize;
+            let Some(tail) = strings.get(name_offset..) else {
+                continue;
+            };
+            let Some(end) = tail.iter().position(|&byte| byte == 0) else {
+                continue;
+            };
+            let Some(name) = std::str::from_utf8(&tail[..end])
+                .ok()
+                .and_then(|name| name.strip_prefix("_OBJC_IVAR_$_"))
+            else {
+                continue;
+            };
+            let address = u64::from_le_bytes(symbol[8..16].try_into().expect("eight bytes"));
+            ivars.push((name.to_owned(), address));
+        }
+        Ok(ivars)
+    }
+
+    fn symbol_table(&self) -> Result<(&[u8], &[u8])> {
         let commands_size = read_le_u32(&self.data, 20)? as usize;
         let count = read_le_u32(&self.data, 16)? as usize;
         let commands_end = 32usize
@@ -213,26 +262,7 @@ impl Image {
             .data
             .get(string_offset..strings_end)
             .context("symbol strings exceed image")?;
-        for symbol in symbols.as_chunks::<16>().0 {
-            let name_offset =
-                u32::from_le_bytes(symbol[..4].try_into().expect("four bytes")) as usize;
-            let Some(tail) = strings.get(name_offset..) else {
-                continue;
-            };
-            let Some(end) = tail.iter().position(|&byte| byte == 0) else {
-                continue;
-            };
-            if tail[..end].eq_ignore_ascii_case(name.as_bytes()) {
-                let address = u64::from_le_bytes(symbol[8..16].try_into().expect("eight bytes"));
-                let relative = address
-                    .checked_sub(self.base)
-                    .with_context(|| format!("symbol {name} precedes {} base", self.name))?;
-                return load_base
-                    .checked_add(relative)
-                    .context("export address overflow");
-            }
-        }
-        bail!("symbol {name} was not found in {}", self.name)
+        Ok((symbols, strings))
     }
 
     pub fn code_ranges(&self) -> &[(u64, u64)] {

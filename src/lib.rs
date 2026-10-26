@@ -28,6 +28,7 @@ pub mod state;
 pub mod store_agent;
 pub mod store_memory;
 pub mod store_profile;
+pub mod store_runtime;
 pub mod transport;
 pub mod unicorn_runtime;
 pub mod version;
