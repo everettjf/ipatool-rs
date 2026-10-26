@@ -23,7 +23,7 @@ use crate::{
     sap_assets::SapAssetBundle,
     store_memory::{MemoryRegion, exclude_mapped_regions},
     store_profile::{self, Call, ProfileData},
-    transport::Request as HostRequest,
+    transport::{Request as HostRequest, Response as HostResponse},
     unicorn_runtime::{Engine, HookContext, REG_PC, REG_X0},
 };
 
@@ -55,7 +55,14 @@ struct StoreState {
     hardware_id: Option<[u8; 6]>,
     preferences: HashMap<String, u64>,
     current_queue: u64,
-    pending: Vec<(u64, u64)>,
+    pending: Vec<PendingWork>,
+    transport: Option<Rc<dyn Fn(HostRequest) -> Result<HostResponse>>>,
+    transport_authenticated: bool,
+    transport_no_redirects: bool,
+    transport_timeout: Option<Duration>,
+    http_responses: HashMap<u64, HostResponse>,
+    last_http_task: Option<u64>,
+    host_blocks: HashMap<u64, HostBlockAction>,
     allocations: HashMap<u64, u64>,
     main_queue: Option<u64>,
     associations: HashMap<(u64, u64), u64>,
@@ -64,6 +71,24 @@ struct StoreState {
 struct CallbackResume {
     link: u64,
     action: CallbackAction,
+}
+
+struct DelegateCall {
+    selector: String,
+    arguments: Vec<u64>,
+    action: Box<CallbackAction>,
+    depth: u8,
+}
+
+enum PendingWork {
+    Guest { block: u64, queue: u64 },
+    Http { task: u64 },
+    DeliverData { task: u64 },
+    Complete { task: u64 },
+}
+
+enum HostBlockAction {
+    AcceptResponse { task: u64 },
 }
 
 enum CallbackAction {
@@ -109,6 +134,13 @@ enum CallbackAction {
     RestoreQueueWithValue {
         previous: u64,
         value: u64,
+    },
+    ScheduleComplete {
+        task: u64,
+    },
+    ForwardDelegate {
+        source: u64,
+        call: DelegateCall,
     },
     CopyProperty {
         destination: u64,
@@ -257,6 +289,13 @@ impl StoreRuntime {
             preferences: HashMap::new(),
             current_queue: 0,
             pending: Vec::new(),
+            transport: None,
+            transport_authenticated: true,
+            transport_no_redirects: false,
+            transport_timeout: None,
+            http_responses: HashMap::new(),
+            last_http_task: None,
+            host_blocks: HashMap::new(),
             allocations: HashMap::new(),
             main_queue: None,
             associations: HashMap::new(),
@@ -267,6 +306,19 @@ impl StoreRuntime {
         let hook_code_ranges = code_ranges.clone();
         let hook_state = Rc::clone(&state);
         engine.add_code_hook(0, u64::MAX, move |context, address, _| {
+            let host_block = hook_state.borrow_mut().host_blocks.remove(&address);
+            if let Some(action) = host_block {
+                if let Err(error) =
+                    dispatch_host_block(context, &mut hook_state.borrow_mut(), action)
+                {
+                    *error_slot.borrow_mut() =
+                        Some(format!("Store host block at {address:#x}: {error:#}"));
+                    context
+                        .stop()
+                        .expect("stop Store guest after host block error");
+                }
+                return;
+            }
             let resume = hook_state.borrow_mut().callbacks.remove(&address);
             if let Some(resume) = resume {
                 if let Err(error) =
@@ -313,6 +365,45 @@ impl StoreRuntime {
 
     pub fn heap_cursor(&self) -> u64 {
         self.state.borrow().heap_cursor
+    }
+
+    pub fn set_transport(
+        &mut self,
+        transport: impl Fn(HostRequest) -> Result<HostResponse> + 'static,
+    ) {
+        self.state.borrow_mut().transport = Some(Rc::new(transport));
+    }
+
+    pub fn set_transport_policy(
+        &mut self,
+        authenticated: bool,
+        no_redirects: bool,
+        timeout: Option<Duration>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        state.transport_authenticated = authenticated;
+        state.transport_no_redirects = no_redirects;
+        state.transport_timeout = timeout;
+    }
+
+    pub fn take_http_response(&mut self, task: u64) -> Option<HostResponse> {
+        self.state.borrow_mut().http_responses.remove(&task)
+    }
+
+    pub fn send_request(&mut self, session: u64, request: u64) -> Result<(u64, HostResponse)> {
+        self.state.borrow_mut().last_http_task = None;
+        let promise = self.invoke(session, "dataTaskPromiseWithRequest:", &[request])?;
+        let result = self.resolve_promise(promise)?;
+        let mut state = self.state.borrow_mut();
+        let task = state
+            .last_http_task
+            .take()
+            .context("Store session did not issue an HTTP task")?;
+        let response = state
+            .http_responses
+            .remove(&task)
+            .context("Store HTTP task has no response")?;
+        Ok((result, response))
     }
 
     pub fn set_hardware_id(&mut self, hardware_id: &[u8]) -> Result<()> {
@@ -630,60 +721,14 @@ impl StoreRuntime {
         timeout: Option<Duration>,
     ) -> Result<HostRequest> {
         let state = self.state.borrow();
-        let object = state
-            .objects
-            .get(&request)
-            .context("unknown Store request")?;
-        if !class_is_kind_of(&self.profile, &object.class, "NSURLRequest") {
-            bail!("Store object is not a URL request");
-        }
-        let property = |name: &str| object.properties.get(name).copied().unwrap_or(0);
-        let endpoint = object_string_value(&state, property("URL"))?;
-        let url = url::Url::parse(endpoint).context("invalid Store request URL")?;
-        if !allowed_store_url(&url, authenticated) {
-            bail!("unsupported Store request URL");
-        }
-        let method =
-            Method::from_bytes(object_string_value(&state, property("HTTPMethod"))?.as_bytes())
-                .context("invalid Store request method")?;
-        let body = match property("HTTPBody") {
-            0 => None,
-            address => match &state
-                .objects
-                .get(&address)
-                .context("missing Store request body")?
-                .value
-            {
-                StoreValue::Bytes(bytes) => Some(bytes.clone()),
-                _ => bail!("Store request body is not NSData"),
-            },
-        };
-        let mut headers = HeaderMap::new();
-        if let Some(address) = object.properties.get("allHTTPHeaderFields") {
-            let StoreValue::Entries(entries) = &state
-                .objects
-                .get(address)
-                .context("missing Store request headers")?
-                .value
-            else {
-                bail!("Store request headers are not a dictionary");
-            };
-            for (name, &value) in entries {
-                headers.insert(
-                    HeaderName::from_bytes(name.as_bytes()).context("invalid Store header name")?,
-                    HeaderValue::from_str(object_string_value(&state, value)?)
-                        .context("invalid Store header value")?,
-                );
-            }
-        }
-        Ok(HostRequest {
-            method,
-            url,
-            headers,
-            body,
+        host_request_from_state(
+            &self.profile,
+            &state,
+            request,
+            authenticated,
             no_redirects,
             timeout,
-        })
+        )
     }
 
     pub fn encode_request(
@@ -1716,6 +1761,32 @@ fn dispatch_call(
                 .properties
                 .insert("targetQueue".into(), target);
         }
+        "dispatch_assert_queue" => {
+            let expected = context.reg_read(REG_X0)?;
+            let mut queue = state.current_queue;
+            let mut matched = false;
+            for _ in 0..32 {
+                if queue == expected {
+                    matched = true;
+                    break;
+                }
+                queue = state
+                    .objects
+                    .get(&queue)
+                    .and_then(|object| object.properties.get("targetQueue"))
+                    .copied()
+                    .unwrap_or(0);
+                if queue == 0 {
+                    break;
+                }
+            }
+            if !matched {
+                bail!(
+                    "dispatch queue mismatch: running {:#x} expected {expected:#x}",
+                    state.current_queue
+                );
+            }
+        }
         "dispatch_suspend" => {
             let queue = context.reg_read(REG_X0)?;
             let object = state
@@ -2277,9 +2348,318 @@ fn copy_and_queue_block(
         }
         copied
     };
-    state.pending.push((copied, queue));
+    state.pending.push(PendingWork::Guest {
+        block: copied,
+        queue,
+    });
     context.reg_write(REG_X0, 0)?;
     Ok(())
+}
+
+fn new_host_block(
+    context: &HookContext,
+    state: &mut StoreState,
+    action: HostBlockAction,
+) -> Result<u64> {
+    let function = state.allocate(16)?;
+    context.mem_write(function, &[0xc0, 0x03, 0x5f, 0xd6])?;
+    state.host_blocks.insert(function, action);
+    let descriptor = state.allocate(16)?;
+    write_guest_u64(context, descriptor + 8, 32)?;
+    let block = state.allocate(32)?;
+    write_guest_u64(context, block + 8, 1 << 28)?;
+    write_guest_u64(context, block + 16, function)?;
+    write_guest_u64(context, block + 24, descriptor)?;
+    Ok(block)
+}
+
+fn dispatch_host_block(
+    context: &HookContext,
+    state: &mut StoreState,
+    action: HostBlockAction,
+) -> Result<()> {
+    match action {
+        HostBlockAction::AcceptResponse { task } => {
+            if context.reg_read(REG_X0 + 1)? != 1 {
+                bail!("Store framework rejected HTTP response");
+            }
+            state.pending.push(PendingWork::DeliverData { task });
+            context.reg_write(REG_X0, 0)?;
+        }
+    }
+    Ok(())
+}
+
+fn selector_address_for_hook(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    selector: &str,
+) -> Result<u64> {
+    if let Some(&address) = profile.runtime.selector_addresses.get(selector) {
+        return Ok(address);
+    }
+    if let Some(&address) = state.dynamic_selectors.get(selector) {
+        return Ok(address);
+    }
+    let address = state.allocate((selector.len() + 1) as u64)?;
+    context.mem_write(address, selector.as_bytes())?;
+    context.mem_write(address + selector.len() as u64, &[0])?;
+    state.dynamic_selectors.insert(selector.into(), address);
+    state
+        .dynamic_selector_addresses
+        .insert(address, selector.into());
+    Ok(address)
+}
+
+fn call_delegate(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    delegate: u64,
+    selector: &str,
+    arguments: &[u64],
+    action: CallbackAction,
+) -> Result<()> {
+    call_delegate_inner(
+        context,
+        profile,
+        state,
+        delegate,
+        DelegateCall {
+            selector: selector.into(),
+            arguments: arguments.to_vec(),
+            action: Box::new(action),
+            depth: 0,
+        },
+    )
+}
+
+fn call_delegate_inner(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    delegate: u64,
+    call: DelegateCall,
+) -> Result<()> {
+    let DelegateCall {
+        selector,
+        arguments,
+        action,
+        depth,
+    } = call;
+    let class_name = state
+        .objects
+        .get(&delegate)
+        .context("missing Store transport delegate")?
+        .class
+        .clone();
+    let selector_address = selector_address_for_hook(context, profile, state, &selector)?;
+    let Some(entry) = method_address(profile, &class_name, &selector, false) else {
+        if depth >= 8 {
+            bail!("Store transport delegate forwarding loop");
+        }
+        let forward = method_address(profile, &class_name, "forwardingTargetForSelector:", false)
+            .with_context(|| {
+            format!("missing Store transport delegate method {class_name} {selector}")
+        })?;
+        let forward_selector =
+            selector_address_for_hook(context, profile, state, "forwardingTargetForSelector:")?;
+        return begin_callback(
+            context,
+            state,
+            forward,
+            &[delegate, forward_selector, selector_address],
+            CallbackAction::ForwardDelegate {
+                source: delegate,
+                call: DelegateCall {
+                    selector,
+                    arguments,
+                    action,
+                    depth: depth + 1,
+                },
+            },
+        );
+    };
+    let mut call_arguments = Vec::with_capacity(arguments.len() + 2);
+    call_arguments.extend_from_slice(&[delegate, selector_address]);
+    call_arguments.extend_from_slice(&arguments);
+    begin_callback(context, state, entry, &call_arguments, *action)
+}
+
+fn perform_http(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    task: u64,
+) -> Result<()> {
+    let task_object = state
+        .objects
+        .get(&task)
+        .context("unknown Store data task")?;
+    let request = *task_object
+        .properties
+        .get("currentRequest")
+        .context("Store data task has no request")?;
+    let session = *task_object
+        .properties
+        .get("session")
+        .context("Store data task has no session")?;
+    let delegate = *state
+        .objects
+        .get(&session)
+        .context("unknown Store URL session")?
+        .properties
+        .get("delegate")
+        .context("Store URL session has no delegate")?;
+    let host_request = host_request_from_state(
+        profile,
+        state,
+        request,
+        state.transport_authenticated,
+        state.transport_no_redirects,
+        state.transport_timeout,
+    )?;
+    let transport = Rc::clone(
+        state
+            .transport
+            .as_ref()
+            .context("Store HTTP transport is not configured")?,
+    );
+    let response = transport(host_request).context("send Store HTTP request")?;
+    if response.body.len() > 32 << 20 {
+        bail!("Store API response exceeds size limit");
+    }
+    let mut header_values = HashMap::new();
+    for (name, value) in &response.headers {
+        header_values.insert(
+            name.clone(),
+            new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(value.clone()),
+            )?,
+        );
+    }
+    let headers = new_guest_object(
+        context,
+        profile,
+        state,
+        "NSDictionary",
+        StoreValue::Entries(header_values),
+    )?;
+    let mime = response
+        .header("content-type")
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .to_owned();
+    let mime = new_guest_object(
+        context,
+        profile,
+        state,
+        "NSString",
+        StoreValue::String(mime),
+    )?;
+    let response_object = new_guest_object(
+        context,
+        profile,
+        state,
+        "NSHTTPURLResponse",
+        StoreValue::Empty,
+    )?;
+    let request_url = state.objects[&request]
+        .properties
+        .get("URL")
+        .copied()
+        .unwrap_or(0);
+    state
+        .objects
+        .get_mut(&response_object)
+        .expect("new HTTP response")
+        .properties
+        .extend([
+            ("statusCode".into(), u64::from(response.status)),
+            ("allHeaderFields".into(), headers),
+            ("URL".into(), request_url),
+            ("MIMEType".into(), mime),
+            ("expectedContentLength".into(), response.body.len() as u64),
+        ]);
+    state
+        .objects
+        .get_mut(&task)
+        .expect("known data task")
+        .properties
+        .insert("response".into(), response_object);
+    state.http_responses.insert(task, response);
+    state.last_http_task = Some(task);
+    let completion = new_host_block(context, state, HostBlockAction::AcceptResponse { task })?;
+    call_delegate(
+        context,
+        profile,
+        state,
+        delegate,
+        "URLSession:dataTask:didReceiveResponse:completionHandler:",
+        &[session, task, response_object, completion],
+        CallbackAction::ReturnValue { value: 1 },
+    )
+}
+
+fn deliver_http_data(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    task: u64,
+) -> Result<()> {
+    let object = state
+        .objects
+        .get(&task)
+        .context("unknown Store data task")?;
+    let session = object.properties["session"];
+    let delegate = state.objects[&session].properties["delegate"];
+    let bytes = state
+        .http_responses
+        .get(&task)
+        .context("missing Store HTTP response")?
+        .body
+        .clone();
+    let data = new_guest_object(context, profile, state, "NSData", StoreValue::Bytes(bytes))?;
+    call_delegate(
+        context,
+        profile,
+        state,
+        delegate,
+        "URLSession:dataTask:didReceiveData:",
+        &[session, task, data],
+        CallbackAction::ScheduleComplete { task },
+    )
+}
+
+fn complete_http_task(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    task: u64,
+) -> Result<()> {
+    let object = state
+        .objects
+        .get_mut(&task)
+        .context("unknown Store data task")?;
+    object.properties.insert("state".into(), 3);
+    let session = object.properties["session"];
+    let delegate = state.objects[&session].properties["delegate"];
+    call_delegate(
+        context,
+        profile,
+        state,
+        delegate,
+        "URLSession:task:didCompleteWithError:",
+        &[session, task, 0],
+        CallbackAction::ReturnValue { value: 1 },
+    )
 }
 
 fn begin_callback(
@@ -2316,8 +2696,21 @@ fn resume_callback(
         CallbackAction::ReturnZero => context.reg_write(REG_X0, 0)?,
         CallbackAction::ReturnValue { value } => context.reg_write(REG_X0, value)?,
         CallbackAction::QueueBlock { block, queue } => {
-            state.pending.push((block, queue));
+            state.pending.push(PendingWork::Guest { block, queue });
             context.reg_write(REG_X0, 0)?;
+        }
+        CallbackAction::ScheduleComplete { task } => {
+            state.pending.push(PendingWork::Complete { task });
+            context.reg_write(REG_X0, 1)?;
+        }
+        CallbackAction::ForwardDelegate { source, call } => {
+            let target = context.reg_read(REG_X0)?;
+            if target == 0 || target == source {
+                bail!("Store transport delegate cannot forward {}", call.selector);
+            }
+            context.reg_write(REG_LR, resume.link)?;
+            call_delegate_inner(context, profile, state, target, call)?;
+            return Ok(());
         }
         CallbackAction::StoreAt { destination, value } => {
             write_guest_u64(context, destination, value)?;
@@ -3391,15 +3784,25 @@ fn dispatch_message(
                 if state.pending.is_empty() {
                     bail!("guest condition has no runnable callback");
                 }
-                let (block, queue) = state.pending.remove(0);
-                let previous = std::mem::replace(&mut state.current_queue, queue);
-                begin_callback(
-                    context,
-                    state,
-                    read_guest_u64(context, block + 16)?,
-                    &[block],
-                    CallbackAction::RestoreQueueWithValue { previous, value: 1 },
-                )?;
+                match state.pending.remove(0) {
+                    PendingWork::Guest { block, queue } => {
+                        let previous = std::mem::replace(&mut state.current_queue, queue);
+                        begin_callback(
+                            context,
+                            state,
+                            read_guest_u64(context, block + 16)?,
+                            &[block],
+                            CallbackAction::RestoreQueueWithValue { previous, value: 1 },
+                        )?;
+                    }
+                    PendingWork::Http { task } => perform_http(context, profile, state, task)?,
+                    PendingWork::DeliverData { task } => {
+                        deliver_http_data(context, profile, state, task)?
+                    }
+                    PendingWork::Complete { task } => {
+                        complete_http_task(context, profile, state, task)?
+                    }
+                }
                 return Ok(());
             }
             _ => {}
@@ -3541,6 +3944,108 @@ fn dispatch_message(
         context.reg_write(REG_X0, task)?;
         return Ok(());
     }
+    if !class_method && class_name == "NSURLSessionDataTask" && selector == "resume" {
+        let task = state.objects.get_mut(&receiver).expect("known data task");
+        let task_state = task.properties.get("state").copied().unwrap_or(0);
+        if task_state != 1 {
+            bail!("Store data task resumed twice");
+        }
+        task.properties.insert("state".into(), 0);
+        state.pending.push(PendingWork::Http { task: receiver });
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if !class_method && class_name == "NSOperationQueue" && selector == "addOperationWithBlock:" {
+        let block = context.reg_read(REG_X0 + 2)?;
+        copy_and_queue_block(context, state, receiver, block)?;
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "AKAppleIDSession"
+        && selector == "handleResponse:forRequest:shouldRetry:"
+    {
+        let response = context.reg_read(REG_X0 + 2)?;
+        let status = state
+            .objects
+            .get(&response)
+            .and_then(|object| object.properties.get("statusCode"))
+            .copied()
+            .unwrap_or(0);
+        if matches!(status, 431 | 433 | 434 | 441 | 442 | 443 | 444) {
+            bail!("AuthKit anisette challenge is not supported");
+        }
+        let retry = context.reg_read(REG_X0 + 4)?;
+        if retry != 0 {
+            context.mem_write(retry, &[0])?;
+        }
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if !class_method && class_name == "NSHTTPURLResponse" && selector == "valueForHTTPHeaderField:"
+    {
+        let key = object_string_value(state, context.reg_read(REG_X0 + 2)?)?;
+        let headers = state.objects[&receiver]
+            .properties
+            .get("allHeaderFields")
+            .copied()
+            .unwrap_or(0);
+        let value = state
+            .objects
+            .get(&headers)
+            .and_then(|object| match &object.value {
+                StoreValue::Entries(entries) => entries
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                    .map(|(_, &value)| value),
+                _ => None,
+            })
+            .unwrap_or(0);
+        context.reg_write(REG_X0, value)?;
+        return Ok(());
+    }
+    if !class_method && matches!(class_name.as_str(), "NSData" | "NSMutableData") {
+        match selector {
+            "bytes" => {
+                let StoreValue::Bytes(bytes) = &state.objects[&receiver].value else {
+                    bail!("invalid Store data object");
+                };
+                let bytes = bytes.clone();
+                let address = state.allocate(bytes.len() as u64)?;
+                context.mem_write(address, &bytes)?;
+                context.reg_write(REG_X0, address)?;
+                return Ok(());
+            }
+            "appendData:" | "appendBytes:length:" => {
+                let source = context.reg_read(REG_X0 + 2)?;
+                let other = if selector == "appendData:" {
+                    let StoreValue::Bytes(bytes) = &state.objects[&source].value else {
+                        bail!("invalid appended Store data");
+                    };
+                    bytes.clone()
+                } else {
+                    let size = context.reg_read(REG_X0 + 3)?;
+                    if size > 32 << 20 {
+                        bail!("data append exceeds budget");
+                    }
+                    context.mem_read(source, size as usize)?
+                };
+                let data = &mut state.objects.get_mut(&receiver).expect("known data").value;
+                if matches!(data, StoreValue::Empty) {
+                    *data = StoreValue::Bytes(Vec::new());
+                }
+                let StoreValue::Bytes(bytes) = data else {
+                    bail!("invalid mutable Store data");
+                };
+                if bytes.len().saturating_add(other.len()) > 32 << 20 {
+                    bail!("data append exceeds budget");
+                }
+                bytes.extend_from_slice(&other);
+                context.reg_write(REG_X0, 0)?;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     if !class_method
         && (matches!(
             class_name.as_str(),
@@ -3634,6 +4139,17 @@ fn dispatch_message(
                 })
                 .is_ok();
             context.reg_write(REG_X0, u64::from(valid))?;
+        }
+        (true, "propertyListWithData:options:format:error:")
+            if class_name == "NSPropertyListSerialization" =>
+        {
+            let data = context.reg_read(REG_X0 + 2)?;
+            let StoreValue::Bytes(bytes) = &state.objects[&data].value else {
+                bail!("property list input is not NSData");
+            };
+            let parsed: Value = plist::from_bytes(bytes).context("parse Store property list")?;
+            let value = import_guest_json(context, profile, state, &parsed, 0)?;
+            context.reg_write(REG_X0, value)?;
         }
         (true, "dataWithPropertyList:format:options:error:")
             if class_name == "NSPropertyListSerialization" =>
@@ -3914,6 +4430,92 @@ fn dispatch_message(
                 StoreValue::Entries(HashMap::new()),
             )?;
             context.reg_write(REG_X0, address)?;
+        }
+        (true, "cookiesWithResponseHeaderFields:forURL:") if class_name == "NSHTTPCookie" => {
+            let headers = context.reg_read(REG_X0 + 2)?;
+            let origin = context.reg_read(REG_X0 + 3)?;
+            let origin = url::Url::parse(object_string_value(state, origin)?)?;
+            let StoreValue::Entries(entries) = &state.objects[&headers].value else {
+                bail!("cookie response headers are not a dictionary");
+            };
+            let raw = entries
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+                .map(|(_, &value)| object_string_value(state, value))
+                .transpose()?
+                .map(str::to_owned);
+            let mut items = Vec::new();
+            if let Some(raw) = raw
+                && let Ok(cookie) = cookie::Cookie::parse(raw)
+            {
+                let name = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String(cookie.name().into()),
+                )?;
+                let value = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String(cookie.value().into()),
+                )?;
+                let domain = cookie
+                    .domain()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| origin.host_str().unwrap_or("").into());
+                let domain = if cookie.domain().is_some() && !domain.starts_with('.') {
+                    format!(".{domain}")
+                } else {
+                    domain
+                };
+                let domain = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String(domain),
+                )?;
+                let path = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String(cookie.path().unwrap_or("/").into()),
+                )?;
+                let object =
+                    new_guest_object(context, profile, state, "NSHTTPCookie", StoreValue::Empty)?;
+                state
+                    .objects
+                    .get_mut(&object)
+                    .expect("new cookie")
+                    .properties
+                    .extend([
+                        ("name".into(), name),
+                        ("value".into(), value),
+                        ("domain".into(), domain),
+                        ("path".into(), path),
+                        (
+                            "isSecure".into(),
+                            u64::from(cookie.secure().unwrap_or(false)),
+                        ),
+                        (
+                            "isHTTPOnly".into(),
+                            u64::from(cookie.http_only().unwrap_or(false)),
+                        ),
+                    ]);
+                items.push(object);
+            }
+            let array = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSArray",
+                StoreValue::Addresses(items),
+            )?;
+            context.reg_write(REG_X0, array)?;
         }
         (true, "setWithObject:" | "arrayWithObject:") => {
             let value = context.reg_read(REG_X0 + 2)?;
@@ -4638,15 +5240,54 @@ fn dispatch_message(
             )?;
             context.reg_write(REG_X0, result)?;
         }
-        (false, "hasSuffix:" | "containsString:") => {
+        (false, "hasPrefix:" | "hasSuffix:" | "containsString:") => {
             let value = object_string_value(state, receiver)?;
             let needle = object_string_value(state, context.reg_read(REG_X0 + 2)?)?;
-            let found = if selector == "hasSuffix:" {
-                value.ends_with(needle)
-            } else {
-                value.contains(needle)
+            let found = match selector {
+                "hasPrefix:" => value.starts_with(needle),
+                "hasSuffix:" => value.ends_with(needle),
+                _ => value.contains(needle),
             };
             context.reg_write(REG_X0, u64::from(found))?;
+        }
+        (false, "caseInsensitiveCompare:") => {
+            let value = object_string_value(state, receiver)?.to_lowercase();
+            let other = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_lowercase();
+            let order = match value.cmp(&other) {
+                std::cmp::Ordering::Less => -1i64,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            context.reg_write(REG_X0, order as u64)?;
+        }
+        (false, "rangeOfString:" | "rangeOfString:options:") => {
+            let value = object_string_value(state, receiver)?.to_owned();
+            let needle = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
+            let options = if selector.ends_with("options:") {
+                context.reg_read(REG_X0 + 3)?
+            } else {
+                0
+            };
+            let (search, target) = if options & 1 != 0 {
+                (value.to_lowercase(), needle.to_lowercase())
+            } else {
+                (value, needle)
+            };
+            let index = if options & 4 != 0 {
+                search.rfind(&target)
+            } else {
+                search.find(&target)
+            };
+            let (start, length) = if let Some(index) = index {
+                (
+                    search[..index].encode_utf16().count() as u64,
+                    target.encode_utf16().count() as u64,
+                )
+            } else {
+                (i64::MAX as u64, 0)
+            };
+            context.reg_write(REG_X0, start)?;
+            context.reg_write(REG_X0 + 1, length)?;
         }
         (false, "copy" | "mutableCopy" | "mutableCopyWithZone:") => {
             let object = &state.objects[&receiver];
@@ -4719,6 +5360,86 @@ fn collection_key(state: &StoreState, address: u64) -> String {
         }
     }
     format!("#object:{address:x}")
+}
+
+fn import_guest_json(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    value: &Value,
+    depth: usize,
+) -> Result<u64> {
+    if depth > 32 {
+        bail!("Store Foundation import exceeds nesting limit");
+    }
+    match value {
+        Value::Null => Ok(0),
+        Value::String(value) => new_guest_object(
+            context,
+            profile,
+            state,
+            "NSString",
+            StoreValue::String(value.clone()),
+        ),
+        Value::Bool(value) => new_guest_object(
+            context,
+            profile,
+            state,
+            "NSNumber",
+            StoreValue::Boolean(*value),
+        ),
+        Value::Number(value) => {
+            let number = if let Some(integer) = value.as_i64() {
+                StoreValue::Number(integer)
+            } else if let Some(integer) = value.as_u64().filter(|value| *value <= i64::MAX as u64) {
+                StoreValue::Number(integer as i64)
+            } else {
+                StoreValue::Float(value.as_f64().context("invalid Store number")?)
+            };
+            new_guest_object(context, profile, state, "NSNumber", number)
+        }
+        Value::Array(values) => {
+            if values.len() > 65_536 {
+                bail!("Store Foundation array exceeds size limit");
+            }
+            let mut items = Vec::with_capacity(values.len());
+            for value in values {
+                items.push(import_guest_json(
+                    context,
+                    profile,
+                    state,
+                    value,
+                    depth + 1,
+                )?);
+            }
+            new_guest_object(
+                context,
+                profile,
+                state,
+                "NSArray",
+                StoreValue::Addresses(items),
+            )
+        }
+        Value::Object(values) => {
+            if values.len() > 65_536 {
+                bail!("Store Foundation dictionary exceeds size limit");
+            }
+            let mut entries = HashMap::with_capacity(values.len());
+            for (key, value) in values {
+                entries.insert(
+                    key.clone(),
+                    import_guest_json(context, profile, state, value, depth + 1)?,
+                );
+            }
+            new_guest_object(
+                context,
+                profile,
+                state,
+                "NSDictionary",
+                StoreValue::Entries(entries),
+            )
+        }
+    }
 }
 
 fn export_object(
@@ -4881,6 +5602,69 @@ fn random_uuid_string() -> Result<String> {
     })
     .collect::<Vec<_>>()
     .join("-"))
+}
+
+fn host_request_from_state(
+    profile: &ProfileData,
+    state: &StoreState,
+    request: u64,
+    authenticated: bool,
+    no_redirects: bool,
+    timeout: Option<Duration>,
+) -> Result<HostRequest> {
+    let object = state
+        .objects
+        .get(&request)
+        .context("unknown Store request")?;
+    if !class_is_kind_of(profile, &object.class, "NSURLRequest") {
+        bail!("Store object is not a URL request");
+    }
+    let property = |name: &str| object.properties.get(name).copied().unwrap_or(0);
+    let endpoint = object_string_value(state, property("URL"))?;
+    let url = url::Url::parse(endpoint).context("invalid Store request URL")?;
+    if !allowed_store_url(&url, authenticated) {
+        bail!("unsupported Store request URL");
+    }
+    let method = Method::from_bytes(object_string_value(state, property("HTTPMethod"))?.as_bytes())
+        .context("invalid Store request method")?;
+    let body = match property("HTTPBody") {
+        0 => None,
+        address => match &state
+            .objects
+            .get(&address)
+            .context("missing Store request body")?
+            .value
+        {
+            StoreValue::Bytes(bytes) => Some(bytes.clone()),
+            _ => bail!("Store request body is not NSData"),
+        },
+    };
+    let mut headers = HeaderMap::new();
+    if let Some(address) = object.properties.get("allHTTPHeaderFields") {
+        let StoreValue::Entries(entries) = &state
+            .objects
+            .get(address)
+            .context("missing Store request headers")?
+            .value
+        else {
+            bail!("Store request headers are not a dictionary");
+        };
+        for (name, &value) in entries {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).context("invalid Store header name")?,
+                HeaderValue::from_str(object_string_value(state, value)?)
+                    .context("invalid Store header value")?,
+            );
+        }
+    }
+    Ok(HostRequest {
+        method,
+        url,
+        headers,
+        body,
+        no_redirects,
+        timeout,
+    })
 }
 
 fn allowed_store_url(url: &url::Url, authenticated: bool) -> bool {
@@ -5056,7 +5840,13 @@ mod tests {
             "AMSURLRequestEncoder"
         );
         let request = runtime
-            .encode_request(0, 0, "POST", "https://example.com/test", &nested)
+            .encode_request(
+                ephemeral,
+                0,
+                "POST",
+                "https://buy.itunes.apple.com/request",
+                &nested,
+            )
             .unwrap();
         assert_eq!(
             runtime.state.borrow().objects[&request].class,
@@ -5065,17 +5855,26 @@ mod tests {
         let url = runtime.invoke(request, "URL", &[]).unwrap();
         assert_eq!(
             runtime.object_string(url).unwrap(),
-            "https://example.com/test"
+            "https://buy.itunes.apple.com/request"
         );
-        let host_request = runtime.host_request(request, false, true, None).unwrap();
+        let host_request = runtime.host_request(request, true, true, None).unwrap();
         assert_eq!(host_request.method, Method::POST);
-        assert_eq!(host_request.url.as_str(), "https://example.com/test");
-        runtime.configure_request(request, 0, 0, false).unwrap();
+        assert_eq!(
+            host_request.url.as_str(),
+            "https://buy.itunes.apple.com/request"
+        );
+        runtime
+            .configure_request(request, ephemeral, 0, false)
+            .unwrap();
         let session = runtime.new_session().unwrap();
         assert_eq!(
             runtime.state.borrow().objects[&session].class,
             "AMSURLSession"
         );
+        let client_delegate = runtime.new_object("NSObject", StoreValue::Empty).unwrap();
+        runtime
+            .invoke(session, "setDelegate:", &[client_delegate])
+            .unwrap();
         let task = runtime
             .invoke(session, "dataTaskWithRequest:", &[request])
             .unwrap();
@@ -5087,6 +5886,22 @@ mod tests {
             runtime.invoke(task, "currentRequest", &[]).unwrap(),
             request
         );
+        runtime.set_transport(|request| {
+            assert_eq!(request.url.as_str(), "https://buy.itunes.apple.com/request");
+            Ok(HostResponse {
+                status: 200,
+                headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
+                body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
+            })
+        });
+        let (result, response) = runtime.send_request(session, request).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.header("content-type"),
+            Some("application/x-apple-plist")
+        );
+        let object = runtime.invoke(result, "object", &[]).unwrap();
+        assert_eq!(runtime.export(object).unwrap()["status"], 0);
         let joined_call = runtime
             .profile
             .index
