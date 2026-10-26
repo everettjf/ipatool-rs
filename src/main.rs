@@ -8,7 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
-use ipatool_rs::store_download_product::DownloadProductClient;
+use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
 use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
 use ipatool_rs::store_purchase::{
@@ -79,6 +79,21 @@ enum Command {
         bundle_identifier: Option<String>,
         #[arg(long)]
         platform: Option<String>,
+    },
+    /// Download an owned mobile app package from the App Store.
+    Download {
+        #[arg(short = 'i', long)]
+        app_id: Option<i64>,
+        #[arg(short = 'b', long)]
+        bundle_identifier: Option<String>,
+        #[arg(short = 'o', long)]
+        output: Option<PathBuf>,
+        #[arg(long, default_value = "")]
+        external_version_id: String,
+        #[arg(long, default_value = "iphone")]
+        platform: String,
+        #[arg(long)]
+        purchase: bool,
     },
     /// List apps owned by the authenticated App Store account.
     ListPurchases {
@@ -310,6 +325,98 @@ fn run() -> Result<()> {
                     Err(error) if error.downcast_ref::<LicenseAlreadyExists>().is_some() => {
                         print_purchase_success(true, cli.format)?;
                         break;
+                    }
+                    Err(error)
+                        if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
+                    {
+                        let authentication_backend = NativeAuthenticationBackend::open()?;
+                        account = store_login::login(
+                            &authentication_backend,
+                            &account_store,
+                            LoginInput {
+                                email: account.email.clone(),
+                                password: account.password.clone(),
+                                auth_code: String::new(),
+                            },
+                        )?;
+                        refreshed = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Command::Download {
+            app_id,
+            bundle_identifier,
+            output,
+            external_version_id,
+            platform,
+            purchase,
+        } => {
+            if app_id.is_none_or(|id| id <= 0)
+                && bundle_identifier.as_deref().is_none_or(str::is_empty)
+            {
+                bail!("either the app ID or the bundle identifier must be specified");
+            }
+            let platform = Platform::parse(&platform)?.context("platform is required")?;
+            let account_store = AccountStore::new(open_system_keychain()?);
+            let mut account = account_store.load()?;
+            let backend = DownloadProductClient::open()?;
+            let catalog = CatalogClient::new()?;
+            let mut refreshed = false;
+            let mut purchased = false;
+            loop {
+                let mut app = App {
+                    id: app_id.unwrap_or_default(),
+                    bundle_id: bundle_identifier.clone().unwrap_or_default(),
+                    ..App::default()
+                };
+                if let Some(bundle_id) = bundle_identifier.as_deref().filter(|id| !id.is_empty()) {
+                    let country = country_code_from_storefront(&account.store_front)?;
+                    match catalog.lookup(None, Some(bundle_id), country, Some(platform)) {
+                        Ok(found) => app = found,
+                        Err(error) if app.id <= 0 => return Err(error),
+                        Err(_) => {}
+                    }
+                }
+                match backend.download_ipa(
+                    &catalog,
+                    &account,
+                    &app,
+                    &external_version_id,
+                    platform,
+                    output.as_deref(),
+                ) {
+                    Ok(path) => {
+                        match cli.format {
+                            Format::Json => println!(
+                                "{}",
+                                serde_json::json!({
+                                    "output": path, "purchased": purchased, "success": true
+                                })
+                            ),
+                            Format::Text => println!("{}", path.display()),
+                        }
+                        break;
+                    }
+                    Err(error)
+                        if purchase
+                            && !purchased
+                            && error.downcast_ref::<LicenseRequired>().is_some() =>
+                    {
+                        let purchase_backend = NativePurchaseBackend::open()?;
+                        match store_purchase::purchase(
+                            &purchase_backend,
+                            &account,
+                            &app,
+                            Some(platform),
+                        ) {
+                            Ok(()) => {}
+                            Err(error)
+                                if error.downcast_ref::<LicenseAlreadyExists>().is_some() => {}
+                            Err(error) => return Err(error),
+                        }
+                        purchased = true;
                     }
                     Err(error)
                         if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>

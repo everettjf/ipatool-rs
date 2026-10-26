@@ -1,6 +1,12 @@
 //! Native Store download-product requests and version-history metadata.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    error::Error,
+    fmt, fs,
+    io::Read,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -16,8 +22,11 @@ use zeroize::Zeroize;
 use crate::{
     App, CatalogClient, Platform,
     credentials::{Account, CredentialStore, KBSYNC_CACHE_KEY, open_system_keychain},
+    download_file::download_file,
+    download_package::validate_ipa_platform,
     host::hardware_mac_address,
     ipa_metadata::{self, VersionMetadata},
+    ipa_patch::patch_ipa,
     mac_preflight,
     sap_assets::SapAssetBundle,
     state::prepare_state_directory_from_environment,
@@ -35,6 +44,17 @@ const ENT_DOWNLOAD_URL: &str =
     "https://downloaddispatch.itunes.apple.com/WebObjects/DownloadDispatch.woa/wa/ent/download";
 type Sender = dyn Fn(Request) -> Result<Response> + Send + Sync;
 type KbsyncGenerator = dyn Fn([u8; 6], u64) -> Result<Vec<u8>> + Send + Sync;
+
+#[derive(Debug)]
+pub struct LicenseRequired;
+
+impl fmt::Display for LicenseRequired {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a license is required for this app")
+    }
+}
+
+impl Error for LicenseRequired {}
 
 pub struct DownloadProductClient {
     hardware_id: [u8; 6],
@@ -73,6 +93,8 @@ pub struct DownloadItem {
     pub url: String,
     #[serde(default, rename = "preflightPackageURL")]
     pub preflight_package_url: String,
+    #[serde(default, rename = "artworkURL")]
+    pub artwork_url: String,
     #[serde(default)]
     pub sinfs: Vec<plist::Value>,
     #[serde(default)]
@@ -138,6 +160,55 @@ impl DownloadProductClient {
     ) -> Self {
         self.kbsync_generator = Some(Arc::new(generator));
         self
+    }
+
+    /// Download an owned mobile app, validate its platform, and publish a patched IPA.
+    pub fn download_ipa(
+        &self,
+        catalog: &CatalogClient,
+        account: &Account,
+        app: &App,
+        version: &str,
+        platform: Platform,
+        output: Option<&Path>,
+    ) -> Result<PathBuf> {
+        if matches!(platform, Platform::Macos | Platform::Unknown) {
+            bail!(
+                "mobile IPA download requires an iOS, iPadOS, tvOS, watchOS, or visionOS platform"
+            );
+        }
+        let country = country_code_from_storefront(&account.store_front)?;
+        let response = self.send_product(account, app, version, || {
+            catalog.latest_external_version_id(app, country, platform)
+        })?;
+        let item = checked_item(&response)?;
+        if item.url.is_empty() {
+            bail!("App Store download response has no IPA URL");
+        }
+        let display_version = item
+            .metadata
+            .get("bundleShortVersionString")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown");
+        let destination = ipa_destination(app, display_version, output)?;
+        let mut temporary = destination.as_os_str().to_os_string();
+        temporary.push(".tmp");
+        let temporary = PathBuf::from(temporary);
+        download_file(&item.url, &temporary).context("download IPA package")?;
+        validate_ipa_platform(&temporary, platform).context("validate downloaded IPA platform")?;
+        let artwork = fetch_artwork(&item.artwork_url)?;
+        patch_ipa(
+            &temporary,
+            &destination,
+            &item.metadata,
+            &account.email,
+            &artwork,
+            &item.sinfs,
+        )
+        .context("patch downloaded IPA")?;
+        fs::remove_file(&temporary).context("remove temporary IPA")?;
+        Ok(destination)
     }
 
     /// Select a version and read its history from the authenticated Store response.
@@ -685,6 +756,73 @@ fn volume_url(account: &Account) -> Result<Url> {
     Url::parse(&format!("https://{host}{VOLUME_PATH}")).context("invalid Store volume URL")
 }
 
+fn ipa_destination(app: &App, version: &str, output: Option<&Path>) -> Result<PathBuf> {
+    let parts = [
+        (!app.bundle_id.is_empty()).then(|| safe_filename_part(&app.bundle_id)),
+        (app.id > 0).then(|| app.id.to_string()),
+        (!version.is_empty()).then(|| safe_filename_part(version)),
+    ];
+    let name = format!(
+        "{}.ipa",
+        parts.into_iter().flatten().collect::<Vec<_>>().join("_")
+    );
+    let destination = match output {
+        Some(path) if path.is_dir() => path.join(name),
+        Some(path) => path.to_owned(),
+        None => std::env::current_dir()
+            .context("read current directory")?
+            .join(name),
+    };
+    if destination.file_name().is_none() {
+        bail!("IPA output path has no file name");
+    }
+    Ok(destination)
+}
+
+fn safe_filename_part(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn fetch_artwork(url: &str) -> Result<Vec<u8>> {
+    if url.is_empty() {
+        return Ok(Vec::new());
+    }
+    let url = Url::parse(url).context("invalid Store artwork URL")?;
+    if !matches!(url.scheme(), "https" | "http") {
+        bail!("Store artwork URL must use HTTP or HTTPS");
+    }
+    let mut response = reqwest::blocking::Client::builder()
+        .timeout(DEFAULT_AUTHENTICATION_TIMEOUT)
+        .build()
+        .context("create artwork HTTP client")?
+        .get(url)
+        .send()
+        .context("download Store artwork")?;
+    if response.status().as_u16() != 200 {
+        bail!("unexpected Store artwork status: {}", response.status());
+    }
+    const MAX_ARTWORK: u64 = 32 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    response
+        .by_ref()
+        .take(MAX_ARTWORK + 1)
+        .read_to_end(&mut bytes)
+        .context("read Store artwork")?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_ARTWORK {
+        bail!("Store artwork is empty or too large");
+    }
+    Ok(bytes)
+}
+
 fn version_string(value: &Value) -> Result<String> {
     match value {
         Value::String(value) if !value.is_empty() => Ok(value.clone()),
@@ -699,7 +837,7 @@ fn checked_item(response: &DownloadProductResponse) -> Result<&DownloadItem> {
         return Err(PasswordTokenExpired.into());
     }
     if result.failure_type == "9610" {
-        bail!("a license is required for this app");
+        return Err(LicenseRequired.into());
     }
     if !result.failure_type.is_empty() {
         bail!(
@@ -765,7 +903,10 @@ mod tests {
     use super::*;
     use std::{
         collections::HashMap,
+        io::{Cursor, Write},
+        net::TcpListener,
         sync::atomic::{AtomicUsize, Ordering},
+        thread,
     };
 
     use crate::{
@@ -1309,5 +1450,79 @@ mod tests {
                 .unwrap();
             assert!(client.cached_kbsync(123456, "000102030405").is_none());
         }
+    }
+
+    #[test]
+    fn downloads_validates_and_patches_mobile_ipa() {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "Payload/App.app/Info.plist",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .write_all(br#"<plist version="1.0"><dict><key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array></dict></plist>"#)
+            .unwrap();
+        let ipa = archive.finish().unwrap().into_inner();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/app.ipa", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0u8; 1];
+            let mut request = Vec::new();
+            while std::io::Read::read_exact(&mut stream, &mut byte).is_ok() {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                ipa.len()
+            )
+            .unwrap();
+            stream.write_all(&ipa).unwrap();
+        });
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |_| {
+            Ok(response(serde_json::json!({"songList": [{
+                "URL": url,
+                "metadata": {
+                    "itemId": 42,
+                    "softwareVersionBundleId": "com.example.app",
+                    "softwareVersionExternalIdentifier": "101",
+                    "bundleShortVersionString": "1.2.3"
+                }
+            }]})))
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let mut account = account();
+        account.email = "person@example.test".into();
+        let path = client
+            .download_ipa(
+                &CatalogClient::new().unwrap(),
+                &account,
+                &app(),
+                "101",
+                Platform::Iphone,
+                Some(directory.path()),
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(path.file_name().unwrap(), "com.example.app_42_1.2.3.ipa");
+        assert!(!PathBuf::from(format!("{}.tmp", path.display())).exists());
+        let mut archive = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
+        let mut metadata = Vec::new();
+        std::io::Read::read_to_end(
+            &mut archive.by_name("iTunesMetadata.plist").unwrap(),
+            &mut metadata,
+        )
+        .unwrap();
+        let metadata: plist::Value = plist::from_bytes(&metadata).unwrap();
+        assert_eq!(
+            metadata.as_dictionary().unwrap()["apple-id"].as_string(),
+            Some("person@example.test")
+        );
     }
 }

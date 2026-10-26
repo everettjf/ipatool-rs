@@ -132,6 +132,7 @@ mod tests {
         DownloadItem {
             url: String::new(),
             preflight_package_url: String::new(),
+            artwork_url: String::new(),
             sinfs,
             metadata,
         }
