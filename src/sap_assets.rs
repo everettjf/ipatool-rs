@@ -8,7 +8,15 @@ use std::{
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
+use crate::{sap_aea::AeaReader, sap_archive::PinnedRestore};
+
 const CACHE_DIRECTORY: &str = "apple-assets-macos-27-26A434-arm64-v1";
+const FILE_SYSTEM_IMAGE_SIZE: u64 = 14_189_330_432;
+const FRAMEWORK_PATHS: [&str; 3] = [
+    "/System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Resources/commerce",
+    "/System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP",
+    "/System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/Resources/CoreFP.icxs",
+];
 
 #[derive(Clone, Copy)]
 struct AssetSpec {
@@ -45,6 +53,53 @@ pub struct SapAssetBundle {
     pub commerce: Vec<u8>,
     pub core_fp: Vec<u8>,
     pub core_fp_icxs: Vec<u8>,
+}
+
+pub struct SapFrameworkAssets {
+    pub commerce: Vec<u8>,
+    pub core_fp: Vec<u8>,
+    pub core_fp_icxs: Vec<u8>,
+}
+
+impl SapFrameworkAssets {
+    pub fn download_pinned() -> Result<Self> {
+        let restore = PinnedRestore::open().context("open pinned macOS restore archive")?;
+        let image = AeaReader::open(&restore.remote, restore.file_system)
+            .context("open encrypted macOS filesystem")?;
+        if image.size() != FILE_SYSTEM_IMAGE_SIZE {
+            bail!(
+                "macOS filesystem has size {}, expected {FILE_SYSTEM_IMAGE_SIZE}",
+                image.size()
+            );
+        }
+        let mut volume = apfs::ApfsVolume::open(image).context("open macOS APFS volume")?;
+        let mut files = Vec::with_capacity(FRAMEWORK_PATHS.len());
+        for (path, spec) in FRAMEWORK_PATHS.into_iter().zip(&SPECS[1..]) {
+            let stat = volume
+                .stat(path)
+                .with_context(|| format!("inspect Apple SAP asset {}", spec.name))?;
+            if stat.size != spec.size as u64 {
+                bail!(
+                    "apple SAP asset {} has size {}, expected {}",
+                    spec.name,
+                    stat.size,
+                    spec.size
+                );
+            }
+            let mut data = Vec::with_capacity(spec.size);
+            volume
+                .read_file_to(path, &mut data)
+                .with_context(|| format!("extract Apple SAP asset {}", spec.name))?;
+            validate_file(*spec, &data)?;
+            files.push(data);
+        }
+        let mut files = files.into_iter();
+        Ok(Self {
+            commerce: files.next().unwrap(),
+            core_fp: files.next().unwrap(),
+            core_fp_icxs: files.next().unwrap(),
+        })
+    }
 }
 
 impl SapAssetBundle {
@@ -150,5 +205,14 @@ mod tests {
         };
         assert!(validate_file(spec, b"four").is_err());
         assert!(validate_file(spec, b"bad").is_err());
+    }
+
+    #[test]
+    #[ignore = "downloads and verifies framework assets from the pinned Apple restore image"]
+    fn downloads_pinned_frameworks() {
+        let assets = SapFrameworkAssets::download_pinned().unwrap();
+        assert_eq!(assets.commerce.len(), SPECS[1].size);
+        assert_eq!(assets.core_fp.len(), SPECS[2].size);
+        assert_eq!(assets.core_fp_icxs.len(), SPECS[3].size);
     }
 }
