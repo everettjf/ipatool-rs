@@ -11,6 +11,7 @@ pub mod platform;
 pub mod sap_assets;
 pub mod sap_machine;
 pub mod sap_protocol;
+pub mod sap_remote;
 pub mod sap_signer;
 pub mod state;
 pub mod store_memory;
