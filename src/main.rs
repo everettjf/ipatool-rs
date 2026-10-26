@@ -9,6 +9,7 @@ use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
 use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
+use ipatool_rs::fairplay_download_capture::write_download_capture;
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
@@ -110,6 +111,8 @@ enum Command {
         fairplay_report: Option<PathBuf>,
         #[arg(long, requires = "fairplay_decrypt")]
         fairplay_force: bool,
+        #[arg(long)]
+        fairplay_capture_dir: Option<PathBuf>,
     },
     /// List apps owned by the authenticated App Store account.
     ListPurchases {
@@ -421,6 +424,7 @@ fn run() -> Result<()> {
             fairplay_output,
             fairplay_report,
             fairplay_force,
+            fairplay_capture_dir,
         } => {
             if app_id.is_none_or(|id| id <= 0)
                 && bundle_identifier.as_deref().is_none_or(str::is_empty)
@@ -451,7 +455,23 @@ fn run() -> Result<()> {
                         Err(_) => {}
                     }
                 }
-                let result = if platform == Platform::Macos {
+                let mut captured_download = None;
+                let result = if platform == Platform::Macos && fairplay_capture_dir.is_some() {
+                    match backend.download_macos_ipa_with_capture(
+                        &catalog,
+                        &account,
+                        &app,
+                        &external_version_id,
+                        output.as_deref(),
+                    ) {
+                        Ok(download) => {
+                            let path = download.path.clone();
+                            captured_download = Some(download);
+                            Ok(path)
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else if platform == Platform::Macos {
                     backend.download_macos(
                         &catalog,
                         &account,
@@ -459,6 +479,22 @@ fn run() -> Result<()> {
                         &external_version_id,
                         output.as_deref(),
                     )
+                } else if fairplay_capture_dir.is_some() {
+                    match backend.download_ipa_with_capture(
+                        &catalog,
+                        &account,
+                        &app,
+                        &external_version_id,
+                        platform,
+                        output.as_deref(),
+                    ) {
+                        Ok(download) => {
+                            let path = download.path.clone();
+                            captured_download = Some(download);
+                            Ok(path)
+                        }
+                        Err(error) => Err(error),
+                    }
                 } else {
                     backend.download_ipa(
                         &catalog,
@@ -471,6 +507,21 @@ fn run() -> Result<()> {
                 };
                 match result {
                     Ok(path) => {
+                        let capture_output =
+                            if let Some(directory) = fairplay_capture_dir.as_deref() {
+                                let download = captured_download
+                                    .as_ref()
+                                    .context("missing paired FairPlay download capture")?;
+                                Some(write_download_capture(
+                                    directory,
+                                    download,
+                                    &app,
+                                    &external_version_id,
+                                    platform,
+                                )?)
+                            } else {
+                                None
+                            };
                         let decrypted = if fairplay_decrypt {
                             let (decrypted_path, report_path) = fairplay_download_paths(
                                 &path,
@@ -497,6 +548,9 @@ fn run() -> Result<()> {
                                     output["decryptedOutput"] = serde_json::json!(decrypted_path);
                                     output["report"] = serde_json::json!(report_path);
                                 }
+                                if let Some(capture_output) = &capture_output {
+                                    output["fairplayCapture"] = serde_json::json!(capture_output);
+                                }
                                 println!("{output}");
                             }
                             Format::Text => {
@@ -504,6 +558,9 @@ fn run() -> Result<()> {
                                 if let Some((decrypted_path, report_path)) = decrypted {
                                     println!("decrypted: {}", decrypted_path.display());
                                     println!("report: {}", report_path.display());
+                                }
+                                if let Some(capture_output) = capture_output {
+                                    println!("fairplay capture: {}", capture_output.display());
                                 }
                             }
                         }
@@ -972,6 +1029,8 @@ mod tests {
             "--fairplay-model",
             "/private/model.bin",
             "--fairplay-force",
+            "--fairplay-capture-dir",
+            "/private/capture",
         ])
         .unwrap();
         match cli.command {
@@ -979,11 +1038,16 @@ mod tests {
                 fairplay_decrypt,
                 fairplay_model,
                 fairplay_force,
+                fairplay_capture_dir,
                 ..
             } => {
                 assert!(fairplay_decrypt);
                 assert_eq!(fairplay_model, Some(PathBuf::from("/private/model.bin")));
                 assert!(fairplay_force);
+                assert_eq!(
+                    fairplay_capture_dir,
+                    Some(PathBuf::from("/private/capture"))
+                );
             }
             _ => panic!("unexpected command"),
         }

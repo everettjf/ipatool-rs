@@ -88,6 +88,55 @@ pub struct DownloadProductResult {
     pub items: Vec<DownloadItem>,
 }
 
+/// Private request/response material from one successful ent/download call.
+#[derive(Clone)]
+pub struct FairPlayDownloadCapture {
+    pub kbsync: Vec<u8>,
+    pub keybag: Vec<u8>,
+}
+
+impl fmt::Debug for FairPlayDownloadCapture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FairPlayDownloadCapture")
+            .field("kbsync_bytes", &self.kbsync.len())
+            .field("keybag_bytes", &self.keybag.len())
+            .finish()
+    }
+}
+
+impl Drop for FairPlayDownloadCapture {
+    fn drop(&mut self) {
+        self.kbsync.zeroize();
+        self.keybag.zeroize();
+    }
+}
+
+pub struct CapturedIpaDownload {
+    pub path: PathBuf,
+    pub sinfs: Vec<Vec<u8>>,
+    pub capture: FairPlayDownloadCapture,
+}
+
+impl fmt::Debug for CapturedIpaDownload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedIpaDownload")
+            .field("path", &self.path)
+            .field("sinf_count", &self.sinfs.len())
+            .field("capture", &self.capture)
+            .finish()
+    }
+}
+
+impl Drop for CapturedIpaDownload {
+    fn drop(&mut self) {
+        for sinf in &mut self.sinfs {
+            sinf.zeroize();
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct DownloadItem {
     #[serde(default, rename = "URL")]
@@ -184,6 +233,89 @@ impl DownloadProductClient {
         })?;
         let item = checked_item(&response)?;
         self.download_mobile_item(account, app, item, platform, output)
+    }
+
+    /// Download a mobile IPA while retaining the paired ent/download KBSync,
+    /// keybag, and SINF values for a private diagnostic capture.
+    pub fn download_ipa_with_capture(
+        &self,
+        catalog: &CatalogClient,
+        account: &Account,
+        app: &App,
+        version: &str,
+        platform: Platform,
+        output: Option<&Path>,
+    ) -> Result<CapturedIpaDownload> {
+        if matches!(platform, Platform::Macos | Platform::Unknown) {
+            bail!("FairPlay capture requires a mobile IPA platform");
+        }
+        let country = country_code_from_storefront(&account.store_front)?;
+        let response = self.send_product(account, app, version, || {
+            catalog.latest_external_version_id(app, country, platform)
+        })?;
+        let item = checked_item(&response)?;
+        self.captured_mobile_item(account, app, item, &response, platform, output)
+    }
+
+    /// Capture a macOS Store offer only when it resolves to a universal IPA.
+    pub fn download_macos_ipa_with_capture(
+        &self,
+        catalog: &CatalogClient,
+        account: &Account,
+        app: &App,
+        version: &str,
+        output: Option<&Path>,
+    ) -> Result<CapturedIpaDownload> {
+        let country = country_code_from_storefront(&account.store_front)?;
+        let selected = if version.is_empty() {
+            catalog.latest_external_version_id(app, country, Platform::Macos)?
+        } else {
+            version.to_owned()
+        };
+        let response = self.send_product(account, app, &selected, || Ok(selected.clone()))?;
+        let item = checked_item(&response)?;
+        if package_platform(Platform::Macos, item)? != Platform::Iphone {
+            bail!("FairPlay download capture requires an IPA package; the macOS offer is a PKG");
+        }
+        self.captured_mobile_item(account, app, item, &response, Platform::Iphone, output)
+    }
+
+    fn captured_mobile_item(
+        &self,
+        account: &Account,
+        app: &App,
+        item: &DownloadItem,
+        response: &DownloadProductResponse,
+        platform: Platform,
+        output: Option<&Path>,
+    ) -> Result<CapturedIpaDownload> {
+        let capture = response.capture.clone().context(
+            "FairPlay capture requires a successful ent/download response containing a keybag",
+        )?;
+        let sinfs = item
+            .sinfs
+            .iter()
+            .map(|sinf| {
+                let bytes = sinf
+                    .as_dictionary()
+                    .and_then(|fields| fields.get("sinf"))
+                    .and_then(plist::Value::as_data)
+                    .context("Store SINF entry has no data")?;
+                if bytes.is_empty() {
+                    bail!("Store SINF entry is empty");
+                }
+                Ok(bytes.to_vec())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if sinfs.is_empty() {
+            bail!("download returned no SINF for the FairPlay capture");
+        }
+        let path = self.download_mobile_item(account, app, item, platform, output)?;
+        Ok(CapturedIpaDownload {
+            path,
+            sinfs,
+            capture,
+        })
     }
 
     /// Download the selected macOS offer, including universal apps supplied as IPAs.
@@ -580,9 +712,20 @@ impl DownloadProductClient {
         })
         .context("send ent/download request")?;
         let data: DownloadProductResult = response.plist(false)?;
+        let keybag = response
+            .plist::<plist::Value>(false)
+            .ok()
+            .and_then(|value| response_keybag(&value));
+        let capture = keybag.and_then(|keybag| {
+            STANDARD
+                .decode(kbsync)
+                .ok()
+                .map(|kbsync| FairPlayDownloadCapture { kbsync, keybag })
+        });
         let result = DownloadProductResponse {
             status: response.status,
             data,
+            capture,
         };
         validate_fallback(&result, app, version)?;
         if result.data.failure_type.is_empty()
@@ -731,6 +874,7 @@ impl DownloadProductClient {
                     customer_message: String::new(),
                     items: Vec::new(),
                 },
+                capture: None,
             });
         }
         let data = response
@@ -739,6 +883,7 @@ impl DownloadProductClient {
         Ok(DownloadProductResponse {
             status: response.status,
             data,
+            capture: None,
         })
     }
 
@@ -754,6 +899,49 @@ impl DownloadProductClient {
 pub struct DownloadProductResponse {
     pub status: u16,
     pub data: DownloadProductResult,
+    capture: Option<FairPlayDownloadCapture>,
+}
+
+fn response_keybag(value: &plist::Value) -> Option<Vec<u8>> {
+    const NAMES: [&str; 3] = ["keybag", "subKeyBag", "sbKeyBag"];
+    let dictionary = value.as_dictionary()?;
+    for name in NAMES {
+        if let Some(bytes) = dictionary.get(name).and_then(decode_keybag) {
+            return Some(bytes);
+        }
+    }
+    for item in dictionary
+        .get("songList")
+        .and_then(plist::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(fields) = item.as_dictionary() else {
+            continue;
+        };
+        for name in NAMES {
+            if let Some(bytes) = fields.get(name).and_then(decode_keybag) {
+                return Some(bytes);
+            }
+        }
+        if let Some(metadata) = fields.get("metadata").and_then(plist::Value::as_dictionary) {
+            for name in NAMES {
+                if let Some(bytes) = metadata.get(name).and_then(decode_keybag) {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn decode_keybag(value: &plist::Value) -> Option<Vec<u8>> {
+    let bytes = match value {
+        plist::Value::Data(bytes) => bytes.clone(),
+        plist::Value::String(text) => STANDARD.decode(text).ok()?,
+        _ => return None,
+    };
+    (!bytes.is_empty()).then_some(bytes)
 }
 
 impl DownloadProductResponse {
@@ -1301,6 +1489,60 @@ mod tests {
             .unwrap();
         assert_eq!(result.data.items.len(), 1);
         assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn captures_matching_ent_download_kbsync_and_keybag() {
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |request| {
+            if request.url.path().ends_with("bag.xml") {
+                return Ok(response(
+                    serde_json::json!({"urlBag": {"volumeStoreDownloadProduct": ENT_DOWNLOAD_URL}}),
+                ));
+            }
+            Ok(response(serde_json::json!({
+                "keybag": STANDARD.encode(b"response-keybag"),
+                "songList": [{"URL": "https://example.test/app.ipa", "metadata": {
+                    "itemId": 42, "softwareVersionBundleId": "com.example.app",
+                    "softwareVersionExternalIdentifier": "101"
+                }}]
+            })))
+        })
+        .with_kbsync_generator(|_, _| Ok(b"request-kbsync".to_vec()));
+        let result = client
+            .send_product(&account(), &app(), "101", || unreachable!())
+            .unwrap();
+        let capture = result.capture.unwrap();
+        assert_eq!(capture.kbsync, b"request-kbsync");
+        assert_eq!(capture.keybag, b"response-keybag");
+        let debug = format!("{capture:?}");
+        assert!(!debug.contains("request-kbsync"));
+        assert!(!debug.contains("response-keybag"));
+    }
+
+    #[test]
+    fn decodes_binary_and_metadata_keybags() {
+        let mut top = plist::Dictionary::new();
+        top.insert("keybag".into(), plist::Value::Data(b"binary".to_vec()));
+        assert_eq!(
+            response_keybag(&plist::Value::Dictionary(top)),
+            Some(b"binary".to_vec())
+        );
+        let mut metadata = plist::Dictionary::new();
+        metadata.insert(
+            "subKeyBag".into(),
+            plist::Value::String(STANDARD.encode(b"metadata")),
+        );
+        let mut item = plist::Dictionary::new();
+        item.insert("metadata".into(), plist::Value::Dictionary(metadata));
+        let mut root = plist::Dictionary::new();
+        root.insert(
+            "songList".into(),
+            plist::Value::Array(vec![plist::Value::Dictionary(item)]),
+        );
+        assert_eq!(
+            response_keybag(&plist::Value::Dictionary(root)),
+            Some(b"metadata".to_vec())
+        );
     }
 
     #[test]
