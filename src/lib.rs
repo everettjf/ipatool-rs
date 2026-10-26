@@ -8,6 +8,7 @@ pub mod fairplay;
 pub mod host;
 pub mod machimage;
 pub mod platform;
+pub mod sap_machine;
 pub mod sap_protocol;
 pub mod sap_signer;
 pub mod state;
