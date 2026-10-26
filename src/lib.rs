@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod capture;
 pub mod catalog;
+pub mod cookies;
 pub mod credentials;
 pub mod fairplay;
 pub mod host;
