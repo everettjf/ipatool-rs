@@ -8,6 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
+use ipatool_rs::store_download_product::DownloadProductClient;
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
 use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
 use ipatool_rs::store_purchase::{
@@ -87,6 +88,15 @@ enum Command {
         max_results: usize,
         #[arg(long)]
         platform: Option<String>,
+    },
+    /// List version IDs available in the account's Store download metadata.
+    ListVersions {
+        #[arg(short = 'i', long)]
+        app_id: Option<i64>,
+        #[arg(short = 'b', long)]
+        bundle_identifier: Option<String>,
+        #[arg(long, default_value = "iphone")]
+        platform: String,
     },
     /// Resolve the latest external version ID from the public platform catalog.
     LatestVersionId {
@@ -374,6 +384,69 @@ fn run() -> Result<()> {
             match cli.format {
                 Format::Text => println!("{id}"),
                 Format::Json => println!("{}", serde_json::json!({ "externalVersionID": id })),
+            }
+        }
+        Command::ListVersions {
+            app_id,
+            bundle_identifier,
+            platform,
+        } => {
+            if app_id.is_none_or(|id| id <= 0)
+                && bundle_identifier.as_deref().is_none_or(str::is_empty)
+            {
+                bail!("either the app ID or the bundle identifier must be specified");
+            }
+            let platform = Platform::parse(&platform)?.context("platform is required")?;
+            let account_store = AccountStore::new(open_system_keychain()?);
+            let mut account = account_store.load()?;
+            let backend = DownloadProductClient::open()?;
+            let catalog = CatalogClient::new()?;
+            let mut refreshed = false;
+            loop {
+                let app = if let Some(bundle_id) =
+                    bundle_identifier.as_deref().filter(|id| !id.is_empty())
+                {
+                    let country = country_code_from_storefront(&account.store_front)?;
+                    catalog.lookup(None, Some(bundle_id), country, Some(platform))?
+                } else {
+                    App {
+                        id: app_id.context("app ID is required")?,
+                        ..App::default()
+                    }
+                };
+                match backend.list_versions(&catalog, &account, &app, platform) {
+                    Ok(output) => {
+                        match cli.format {
+                            Format::Json => println!("{}", serde_json::to_string(&output)?),
+                            Format::Text => {
+                                println!(
+                                    "latestExternalVersionID: {}",
+                                    output.latest_external_version_id
+                                );
+                                for id in output.external_version_identifiers {
+                                    println!("{id}");
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    Err(error)
+                        if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
+                    {
+                        let authentication_backend = NativeAuthenticationBackend::open()?;
+                        account = store_login::login(
+                            &authentication_backend,
+                            &account_store,
+                            LoginInput {
+                                email: account.email.clone(),
+                                password: account.password.clone(),
+                                auth_code: String::new(),
+                            },
+                        )?;
+                        refreshed = true;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
         Command::FairplayDoctor {
