@@ -106,9 +106,18 @@ pub fn evaluate(
         bail!("SIDB oracle model does not match the checked 26A428 build");
     }
     let mut state = model.state();
+    evaluate_in_state(&mut state, frame, input, fault)
+}
+
+pub(crate) fn evaluate_in_state(
+    state: &mut OracleState<'_>,
+    frame: &[u8; 16],
+    input: &[u8; 16],
+    fault: OracleFault,
+) -> Result<[u8; 16]> {
     state.begin(input)?;
     state.store(ENROLLMENT_FRAME_ADDRESS, frame)?;
-    run_generated(&mut state, fault)?;
+    run_generated(state, fault)?;
     state.output()
 }
 

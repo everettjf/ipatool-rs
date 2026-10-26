@@ -3,14 +3,15 @@
 //! Adapted from the Go DarkPhoenix subset in `ipatool-fairplay` and changed
 //! for this Rust port. Attribution is in `licenses/LICENSE-DARKPHOENIX.txt`.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
-    fairplay_oracle_model::OracleModel,
+    fairplay_frame::BUILD_HASH,
+    fairplay_oracle_model::{OracleModel, OracleState},
     fairplay_recovery_math::{Encoding, mix_columns, shift_rows},
-    fairplay_sidb::{evaluate, fault_for_metadata},
+    fairplay_sidb::{evaluate_in_state, fault_for_metadata},
 };
 
 #[derive(Clone, Copy)]
@@ -21,6 +22,7 @@ pub struct OracleJob {
 
 pub struct SidbTarget<'a> {
     model: &'a OracleModel,
+    state: OracleState<'a>,
     frame: Zeroizing<[u8; 16]>,
 }
 
@@ -28,20 +30,24 @@ impl<'a> SidbTarget<'a> {
     pub fn new(model: &'a OracleModel, frame: [u8; 16]) -> Self {
         Self {
             model,
+            state: model.state(),
             frame: Zeroizing::new(frame),
         }
     }
 
-    pub fn evaluate_jobs(&self, jobs: &[OracleJob]) -> Result<Vec<[u8; 16]>> {
+    pub fn evaluate_jobs(&mut self, jobs: &[OracleJob]) -> Result<Vec<[u8; 16]>> {
+        if self.model.binary_hash != BUILD_HASH {
+            bail!("SIDB oracle model does not match the checked 26A428 build");
+        }
         jobs.iter()
             .map(|job| {
                 let fault = fault_for_metadata(job.metadata)?;
-                evaluate(self.model, &self.frame, &job.block, fault)
+                evaluate_in_state(&mut self.state, &self.frame, &job.block, fault)
             })
             .collect()
     }
 
-    pub fn apply(&self, block: [u8; 16]) -> Result<[u8; 16]> {
+    pub fn apply(&mut self, block: [u8; 16]) -> Result<[u8; 16]> {
         Ok(self.evaluate_jobs(&[OracleJob {
             block,
             metadata: 0xffff,
@@ -49,7 +55,7 @@ impl<'a> SidbTarget<'a> {
     }
 
     pub fn apply_fault(
-        &self,
+        &mut self,
         block: [u8; 16],
         round: u16,
         position: u8,
@@ -95,7 +101,7 @@ mod tests {
             "../tests/fixtures/fairplay-oracle-sidb-public.model.gz"
         ))
         .unwrap();
-        let target = SidbTarget::new(&model, [0; 16]);
+        let mut target = SidbTarget::new(&model, [0; 16]);
         let jobs = [
             OracleJob {
                 block: [0; 16],
