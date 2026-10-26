@@ -62,6 +62,19 @@ pub fn read_private_frame(path: &Path) -> Result<Zeroizing<[u8; 16]>> {
     read_private_block(path)
 }
 
+/// Read a bounded private input whose exact size is selected by the caller.
+pub fn read_private_bytes(path: &Path, max_size: usize) -> Result<Zeroizing<Vec<u8>>> {
+    let file = open_private_file(path, None, max_size as u64)?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.take(max_size as u64 + 1)
+        .read_to_end(&mut bytes)
+        .context("read private recovery input")?;
+    if bytes.len() > max_size {
+        bail!("private recovery input grew beyond its size limit");
+    }
+    Ok(bytes)
+}
+
 impl Serialize for EncodingRows<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         let mut rows = serializer.serialize_seq(Some(16))?;
@@ -312,6 +325,8 @@ mod tests {
             fs::set_permissions(&input, fs::Permissions::from_mode(0o600)).unwrap();
         }
         assert_eq!(*read_private_block::<432>(&input).unwrap(), block);
+        assert_eq!(&*read_private_bytes(&input, 432).unwrap(), &block);
+        assert!(read_private_bytes(&input, 431).is_err());
         let output = private.join("enrollment.bin");
         write_private_binary(&output, &block).unwrap();
         assert_eq!(fs::read(&output).unwrap(), block);

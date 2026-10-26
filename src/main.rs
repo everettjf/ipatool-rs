@@ -13,10 +13,11 @@ use ipatool_rs::fairplay_download_capture::write_download_capture;
 use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2};
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
+use ipatool_rs::fairplay_portable;
 use ipatool_rs::fairplay_recovery;
 use ipatool_rs::fairplay_recovery_output::{
-    read_private_block, read_private_frame, read_private_model, write_private_binary,
-    write_private_model,
+    read_private_block, read_private_bytes, read_private_frame, read_private_model,
+    write_private_binary, write_private_model,
 };
 use ipatool_rs::fairplay_recovery_target::SidbTarget;
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
@@ -220,10 +221,26 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         build_version: Option<String>,
     },
-    /// Recover a private AES model from an exported SIDB oracle model and frame.
+    /// Transform a private 192/224-byte source with the embedded 26A428 state model.
+    EvaluateState {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Evaluate one private 16-byte slot with the embedded 26A428 frame model.
+    EvaluateFrame {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        slot: Option<usize>,
+    },
+    /// Recover a private AES model from a frame and embedded or supplied SIDB oracle.
     RecoverOracle {
         #[arg(long)]
-        model: PathBuf,
+        model: Option<PathBuf>,
         #[arg(long)]
         enrollment_frame: PathBuf,
         #[arg(long)]
@@ -907,15 +924,64 @@ fn run() -> Result<()> {
                     ),
                 }
             }
+            FairplayEnrollCommand::EvaluateState { input, output } => {
+                let source = read_private_bytes(&input, 224)?;
+                let transformed = fairplay_portable::evaluate_state(&source)?;
+                write_private_binary(&output, &transformed)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({ "output": output, "bytes": transformed.len() })
+                    ),
+                    Format::Text => println!(
+                        "Evaluated {} private FairPlay state bytes in {}",
+                        source.len(),
+                        output.display()
+                    ),
+                }
+            }
+            FairplayEnrollCommand::EvaluateFrame {
+                input,
+                output,
+                slot,
+            } => {
+                let source = read_private_bytes(&input, 224)?;
+                let block: [u8; 16] = if let Some(index) = slot {
+                    if !matches!(source.len(), 192 | 224) || index >= source.len() / 16 {
+                        bail!("slot index requires a 192/224-byte input and an in-range slot");
+                    }
+                    source[index * 16..(index + 1) * 16].try_into().unwrap()
+                } else {
+                    source
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("frame input must be exactly 16 bytes"))?
+                };
+                let frame = fairplay_portable::evaluate_frame(&block)?;
+                write_private_binary(&output, &*frame)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({ "output": output, "bytes": frame.len(), "slot": slot })
+                    ),
+                    Format::Text => {
+                        println!("Evaluated private FairPlay frame in {}", output.display())
+                    }
+                }
+            }
             FairplayEnrollCommand::RecoverOracle {
                 model,
                 enrollment_frame,
                 output,
             } => {
-                let oracle = OracleModel::load_private(&model)?;
                 let frame = read_private_frame(&enrollment_frame)?;
-                let mut target = SidbTarget::new(&oracle, *frame);
-                let recovered = fairplay_recovery::recover(&mut target)?;
+                let recovered = if let Some(model) = model {
+                    let oracle = OracleModel::load_private(&model)?;
+                    let mut target = SidbTarget::new(&oracle, *frame);
+                    fairplay_recovery::recover(&mut target)?
+                } else {
+                    fairplay_portable::recover_sidb(*frame)?
+                };
                 write_private_model(&output, &recovered)?;
                 match cli.format {
                     Format::Json => println!(
@@ -1156,12 +1222,66 @@ mod tests {
                         output,
                     },
             } => {
-                assert_eq!(model, PathBuf::from("/private/model.gz"));
+                assert_eq!(model, Some(PathBuf::from("/private/model.gz")));
                 assert_eq!(enrollment_frame, PathBuf::from("/private/frame.bin"));
                 assert_eq!(output, PathBuf::from("/private/recovered.json"));
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn portable_fairplay_pipeline_accepts_embedded_models() {
+        let state = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "evaluate-state",
+            "--input",
+            "/private/source.bin",
+            "--output",
+            "/private/slots.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            state.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::EvaluateState { .. }
+            }
+        ));
+        let frame = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "evaluate-frame",
+            "--input",
+            "/private/slots.bin",
+            "--slot",
+            "8",
+            "--output",
+            "/private/frame.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            frame.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::EvaluateFrame { slot: Some(8), .. }
+            }
+        ));
+        let recover = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "recover-oracle",
+            "--enrollment-frame",
+            "/private/frame.bin",
+            "--output",
+            "/private/recovered.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            recover.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::RecoverOracle { model: None, .. }
+            }
+        ));
     }
 
     #[test]

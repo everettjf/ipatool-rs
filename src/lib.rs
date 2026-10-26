@@ -23,6 +23,7 @@ pub mod fairplay_key;
 pub mod fairplay_macho;
 pub mod fairplay_oracle_model;
 pub mod fairplay_page;
+pub mod fairplay_portable;
 pub mod fairplay_recovery;
 pub mod fairplay_recovery_linear;
 pub mod fairplay_recovery_math;
