@@ -363,7 +363,7 @@ pub(crate) fn read_u32(machine: &mut GuestMachine, address: u64) -> Result<u32> 
     Ok(u32::from_le_bytes(bytes.as_slice().try_into()?))
 }
 
-fn consume_output(
+pub(crate) fn consume_output(
     machine: &mut GuestMachine,
     dispose: u64,
     pointer_field: u64,
