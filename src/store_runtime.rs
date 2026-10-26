@@ -3732,6 +3732,12 @@ fn dispatch_call(
                 let destination = context.reg_read(REG_X0)?;
                 let source = context.reg_read(REG_X0 + 1)?;
                 context.mem_write(destination, &context.mem_read(source, size)?)?;
+            } else if symbol.contains("NativeBoxIyLm8ELm8ELm8E")
+                && symbol.contains("initializeBufferWithCopyOfBuffer")
+            {
+                let destination = context.reg_read(REG_X0)?;
+                let source = context.reg_read(REG_X0 + 1)?;
+                write_guest_u64(context, destination, read_guest_u64(context, source)?)?;
             } else if symbol.contains("BridgeObjectBox")
                 && (symbol.contains("initializeWithCopy") || symbol.contains("assignWithCopy"))
             {

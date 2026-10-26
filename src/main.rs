@@ -10,6 +10,8 @@ use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
 use ipatool_rs::store_backend::StoreBackend;
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput};
+use ipatool_rs::store_purchase::{self, LicenseAlreadyExists, PasswordTokenExpired};
+use ipatool_rs::storefront::country_code_from_storefront;
 use ipatool_rs::{App, CatalogClient, Platform, SearchOutput};
 use zeroize::Zeroizing;
 
@@ -65,6 +67,15 @@ enum Command {
         platform: Option<String>,
         #[arg(long, default_value = "US")]
         country: String,
+    },
+    /// Obtain a license for a free app from the App Store.
+    Purchase {
+        #[arg(short = 'i', long)]
+        app_id: Option<i64>,
+        #[arg(short = 'b', long)]
+        bundle_identifier: Option<String>,
+        #[arg(long)]
+        platform: Option<String>,
     },
     /// Resolve the latest external version ID from the public platform catalog.
     LatestVersionId {
@@ -232,6 +243,60 @@ fn run() -> Result<()> {
             let app = client.lookup(app_id, bundle_identifier.as_deref(), &country, platform)?;
             print_app(&app, cli.format)?;
         }
+        Command::Purchase {
+            app_id,
+            bundle_identifier,
+            platform,
+        } => {
+            if app_id.is_none_or(|id| id <= 0)
+                && bundle_identifier.as_deref().is_none_or(str::is_empty)
+            {
+                bail!("either the app ID or the bundle identifier must be specified");
+            }
+            let platform = parse_platform(platform.as_deref())?;
+            let account_store = AccountStore::new(open_system_keychain()?);
+            let mut account = account_store.load()?;
+            let backend = StoreBackend::open()?;
+            let mut refreshed = false;
+            loop {
+                let app = if let Some(bundle_id) =
+                    bundle_identifier.as_deref().filter(|id| !id.is_empty())
+                {
+                    let country = country_code_from_storefront(&account.store_front)?;
+                    CatalogClient::new()?.lookup(None, Some(bundle_id), country, platform)?
+                } else {
+                    App {
+                        id: app_id.context("app ID is required")?,
+                        ..App::default()
+                    }
+                };
+                match store_purchase::purchase(&backend, &account, &app, platform) {
+                    Ok(()) => {
+                        print_purchase_success(false, cli.format)?;
+                        break;
+                    }
+                    Err(error) if error.downcast_ref::<LicenseAlreadyExists>().is_some() => {
+                        print_purchase_success(true, cli.format)?;
+                        break;
+                    }
+                    Err(error)
+                        if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
+                    {
+                        account = store_login::login(
+                            &backend,
+                            &account_store,
+                            LoginInput {
+                                email: account.email.clone(),
+                                password: account.password.clone(),
+                                auth_code: String::new(),
+                            },
+                        )?;
+                        refreshed = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
         Command::LatestVersionId {
             app_id,
             bundle_identifier,
@@ -356,6 +421,20 @@ fn print_app(app: &App, format: Format) -> Result<()> {
             "{}\t{}\t{}\t{}",
             app.id, app.name, app.bundle_id, app.version
         ),
+    }
+    Ok(())
+}
+
+fn print_purchase_success(already_owned: bool, format: Format) -> Result<()> {
+    match format {
+        Format::Json => println!(
+            "{}",
+            serde_json::json!({ "alreadyOwned": already_owned, "success": true })
+        ),
+        Format::Text => {
+            println!("alreadyOwned: {already_owned}");
+            println!("success: true");
+        }
     }
     Ok(())
 }
