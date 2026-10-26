@@ -49,8 +49,6 @@ yaxpeax-arch = { version = "0.3.2", default-features = false, features = ["std"]
 rmcp = { version = "3.7.0", default-features = false, features = ["server", "macros", "transport-io"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
 schemars = "1"
-
-[dev-dependencies]
 flate2 = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
