@@ -12,6 +12,7 @@ pub mod fairplay;
 pub mod host;
 pub mod ipa_metadata;
 pub mod lzbitmap;
+pub mod mac_preflight;
 pub mod machfixups;
 pub mod machimage;
 pub mod macos;

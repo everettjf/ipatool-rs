@@ -16,6 +16,7 @@ use crate::{
     credentials::Account,
     host::hardware_mac_address,
     ipa_metadata::{self, VersionMetadata},
+    mac_preflight,
     state::prepare_state_directory_from_environment,
     store_backend::DEFAULT_USER_AGENT,
     store_purchase::PasswordTokenExpired,
@@ -47,6 +48,10 @@ pub struct DownloadProductResult {
 pub struct DownloadItem {
     #[serde(default, rename = "URL")]
     pub url: String,
+    #[serde(default, rename = "preflightPackageURL")]
+    pub preflight_package_url: String,
+    #[serde(default)]
+    pub sinfs: Vec<plist::Value>,
     #[serde(default)]
     pub metadata: Value,
 }
@@ -134,7 +139,7 @@ impl DownloadProductClient {
         account: &Account,
         app: &App,
         version: &str,
-        platform: Platform,
+        platform: Option<Platform>,
     ) -> Result<VersionMetadata> {
         self.get_version_metadata_with(
             account,
@@ -142,6 +147,7 @@ impl DownloadProductClient {
             version,
             platform,
             ipa_metadata::read_version_metadata_from_ipa,
+            mac_preflight::read_preflight_version_metadata,
         )
     }
 
@@ -150,11 +156,12 @@ impl DownloadProductClient {
         account: &Account,
         app: &App,
         version: &str,
-        platform: Platform,
+        platform: Option<Platform>,
         read_ipa: impl FnOnce(&str) -> Result<VersionMetadata>,
+        read_mac: impl FnOnce(&str, &str) -> Result<VersionMetadata>,
     ) -> Result<VersionMetadata> {
-        if version.is_empty() || platform == Platform::Unknown {
-            bail!("a version ID and platform are required");
+        if version.is_empty() || platform == Some(Platform::Unknown) {
+            bail!("a version ID and valid platform are required");
         }
         let response = self.send_product(account, app, version, || Ok(version.to_owned()))?;
         let item = checked_item(&response)?;
@@ -168,11 +175,36 @@ impl DownloadProductClient {
             .get("product-type")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if platform == Platform::Macos
+        let response_is_mac = software_platform.eq_ignore_ascii_case("macos")
+            || (software_platform.is_empty() && product_type.eq_ignore_ascii_case("mac-os-app"));
+        let selected_platform = platform.unwrap_or(if response_is_mac {
+            Platform::Macos
+        } else {
+            Platform::Iphone
+        });
+        if selected_platform == Platform::Macos
             && !software_platform.eq_ignore_ascii_case("ios")
             && !(software_platform.is_empty() && product_type.eq_ignore_ascii_case("ios-app"))
         {
-            bail!("macOS package version metadata requires the XAR package reader");
+            let has_dp_info = item.sinfs.iter().any(|sinf| {
+                sinf.as_dictionary()
+                    .and_then(|fields| fields.get("dpInfo"))
+                    .and_then(plist::Value::as_data)
+                    .is_some_and(|data| !data.is_empty())
+            });
+            if !has_dp_info && !item.preflight_package_url.is_empty() {
+                let bundle_id = if app.bundle_id.is_empty() {
+                    item.metadata
+                        .get("softwareVersionBundleId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                } else {
+                    &app.bundle_id
+                };
+                return read_mac(&item.preflight_package_url, bundle_id)
+                    .context("read version metadata from Mac preflight package");
+            }
+            bail!("macOS package version metadata requires StoreAgent decryption");
         }
         if item.url.is_empty() {
             bail!("App Store download response has no IPA URL");
@@ -651,17 +683,24 @@ mod tests {
     }
 
     #[test]
-    fn version_metadata_reads_selected_ipa_url_and_rejects_mac_package() {
+    fn version_metadata_reads_selected_ipa_url_and_rejects_mac_without_preflight() {
         let client =
             DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| Ok(item_response("101")));
         let metadata = client
-            .get_version_metadata_with(&account(), &app(), "101", Platform::Iphone, |url| {
-                assert_eq!(url, "https://example.test/app.ipa");
-                Ok(VersionMetadata {
-                    display_version: "1.0".into(),
-                    release_date: "2025-01-01T00:00:00Z".into(),
-                })
-            })
+            .get_version_metadata_with(
+                &account(),
+                &app(),
+                "101",
+                Some(Platform::Iphone),
+                |url| {
+                    assert_eq!(url, "https://example.test/app.ipa");
+                    Ok(VersionMetadata {
+                        display_version: "1.0".into(),
+                        release_date: "2025-01-01T00:00:00Z".into(),
+                    })
+                },
+                |_, _| unreachable!(),
+            )
             .unwrap();
         assert_eq!(metadata.display_version, "1.0");
         assert!(
@@ -670,10 +709,65 @@ mod tests {
                     &account(),
                     &app(),
                     "101",
-                    Platform::Macos,
-                    |_| unreachable!()
+                    Some(Platform::Macos),
+                    |_| unreachable!(),
+                    |_, _| unreachable!()
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn version_metadata_uses_mac_preflight_for_native_package() {
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| {
+            Ok(response(serde_json::json!({"songList": [{
+                "URL": "https://example.test/encrypted.pkg",
+                "preflightPackageURL": "https://example.test/preflight.pkg",
+                "metadata": {"software-platform": "macos", "softwareVersionBundleId": "com.example.mac"}
+            }]})))
+        });
+        let result = client
+            .get_version_metadata_with(
+                &account(),
+                &App {
+                    id: 42,
+                    ..App::default()
+                },
+                "101",
+                None,
+                |_| unreachable!(),
+                |url, bundle| {
+                    assert_eq!(url, "https://example.test/preflight.pkg");
+                    assert_eq!(bundle, "com.example.mac");
+                    Ok(VersionMetadata {
+                        display_version: "4.2".into(),
+                        release_date: "2012-07-06T09:54:33Z".into(),
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(result.display_version, "4.2");
+    }
+
+    #[test]
+    fn mac_dp_info_does_not_use_unrelated_preflight_package() {
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| {
+            Ok(Response {
+                status: 200,
+                headers: Default::default(),
+                body: br#"<plist version="1.0"><dict><key>songList</key><array><dict><key>URL</key><string>https://example.test/encrypted.pkg</string><key>preflightPackageURL</key><string>https://example.test/preflight.pkg</string><key>metadata</key><dict><key>software-platform</key><string>macos</string></dict><key>sinfs</key><array><dict><key>dpInfo</key><data>AQID</data></dict></array></dict></array></dict></plist>"#.to_vec(),
+            })
+        });
+        let error = client
+            .get_version_metadata_with(
+                &account(),
+                &app(),
+                "101",
+                Some(Platform::Macos),
+                |_| unreachable!(),
+                |_, _| unreachable!(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("StoreAgent decryption"));
     }
 }

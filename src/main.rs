@@ -98,7 +98,7 @@ enum Command {
         #[arg(long, default_value = "iphone")]
         platform: String,
     },
-    /// Read one IPA version's display version and release date.
+    /// Read one app version's display version and release date.
     GetVersionMetadata {
         #[arg(short = 'i', long)]
         app_id: Option<i64>,
@@ -106,8 +106,8 @@ enum Command {
         bundle_identifier: Option<String>,
         #[arg(long)]
         external_version_id: String,
-        #[arg(long, default_value = "iphone")]
-        platform: String,
+        #[arg(long)]
+        platform: Option<String>,
     },
     /// Resolve the latest external version ID from the public platform catalog.
     LatestVersionId {
@@ -474,7 +474,7 @@ fn run() -> Result<()> {
             if external_version_id.is_empty() {
                 bail!("an external version ID is required");
             }
-            let platform = Platform::parse(&platform)?.context("platform is required")?;
+            let platform = parse_platform(platform.as_deref())?;
             let account_store = AccountStore::new(open_system_keychain()?);
             let mut account = account_store.load()?;
             let backend = DownloadProductClient::open()?;
@@ -485,7 +485,7 @@ fn run() -> Result<()> {
                     bundle_identifier.as_deref().filter(|id| !id.is_empty())
                 {
                     let country = country_code_from_storefront(&account.store_front)?;
-                    catalog.lookup(None, Some(bundle_id), country, Some(platform))?
+                    catalog.lookup(None, Some(bundle_id), country, platform)?
                 } else {
                     App {
                         id: app_id.context("app ID is required")?,
