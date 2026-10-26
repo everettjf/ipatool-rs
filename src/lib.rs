@@ -7,6 +7,7 @@ pub mod credentials;
 pub mod decmpfs;
 pub mod dmap;
 pub mod download_file;
+pub mod download_package;
 pub mod dyld_cache;
 pub mod dyld_export;
 pub mod fairplay;
