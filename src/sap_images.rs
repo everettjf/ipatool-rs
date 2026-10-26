@@ -12,6 +12,7 @@ use crate::{
 };
 
 pub const CORE_FP_BASE: u64 = 0x0000_1000_0000_0000;
+pub const STORE_AGENT_BASE: u64 = 0x0000_1000_c000_0000;
 
 const CORE_EXPORTS: [&str; 6] = [
     "_WIn9UJ86JKdV4dM",
@@ -32,6 +33,7 @@ const AMS_EXPORTS: [&str; 5] = [
 pub struct SapImages {
     core_fp: Image,
     apple_media_services: Image,
+    commerce: Option<Image>,
     exports: HashMap<String, u64>,
 }
 
@@ -53,8 +55,15 @@ impl SapImages {
         Ok(Self {
             core_fp,
             apple_media_services,
+            commerce: None,
             exports,
         })
+    }
+
+    pub fn open_store_agent(bundle: &SapAssetBundle) -> Result<Self> {
+        let mut images = Self::open(bundle)?;
+        images.commerce = Some(Image::open("commerce", &bundle.commerce).context("open commerce")?);
+        Ok(images)
     }
 
     pub fn core_exports(&self) -> impl Iterator<Item = (&str, u64)> {
@@ -103,6 +112,12 @@ impl SapImages {
         self.apple_media_services
             .load(memory)
             .context("load AppleMediaServices")?;
+        if let Some(commerce) = self.commerce.as_mut() {
+            commerce
+                .relocate(STORE_AGENT_BASE, &mut resolve)
+                .context("relocate commerce")?;
+            commerce.load(memory).context("load commerce")?;
+        }
         Ok(())
     }
 }
@@ -155,9 +170,17 @@ mod tests {
             return;
         }
         let profile = crate::store_profile::load().unwrap();
+        let commerce_path =
+            "/System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Resources/commerce";
+        let commerce = std::fs::read(commerce_path).ok().and_then(|bytes| {
+            (format!("{:x}", Sha256::digest(&bytes))
+                == "76de40a4a32f691947cb926ce3b128d2fc446f7cac9755f831c406cf5a316ac9")
+                .then(|| Image::open("commerce", &bytes).unwrap())
+        });
         let mut images = SapImages {
             core_fp: Image::open("CoreFP", &bytes).unwrap(),
             apple_media_services: Image::open("plugin fixture", &profile.plugin).unwrap(),
+            commerce,
             exports: HashMap::new(),
         };
         let mut memory = RecordedMemory::default();

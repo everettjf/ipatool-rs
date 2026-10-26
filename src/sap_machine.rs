@@ -25,6 +25,13 @@ const REG_LR: i32 = 2;
 const REG_SP: i32 = 4;
 const GUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_OUTPUT_SIZE: u64 = 16 << 20;
+const STORE_AGENT_ZERO_ALIASES: &[&str] = &[
+    "_pthread_rwlock_rdlock",
+    "_pthread_rwlock_rdlock$UNIX2003",
+    "_pthread_mutex_init",
+    "_pthread_mutex_destroy",
+    "_pthread_rwlock_destroy",
+];
 
 pub struct GuestMachine {
     engine: Engine,
@@ -170,10 +177,25 @@ pub struct SapRuntimeGuest {
 
 impl SapRuntimeGuest {
     pub fn open(bundle: &SapAssetBundle) -> Result<Self> {
-        let mut images = SapImages::open(bundle)?;
+        Self::open_images(SapImages::open(bundle)?, false)
+    }
+
+    pub fn open_store_agent_runtime(bundle: &SapAssetBundle) -> Result<Self> {
+        Self::open_images(SapImages::open_store_agent(bundle)?, true)
+    }
+
+    fn open_images(mut images: SapImages, store_agent: bool) -> Result<Self> {
         let entries = images.entrypoints();
         let mut machine = GuestMachine::new()?;
         let mut shims = SapShims::new()?;
+        shims.set_core_exports(
+            images
+                .core_exports()
+                .map(|(name, address)| (name.to_owned(), address)),
+        );
+        if store_agent {
+            shims.add_zero_aliases(STORE_AGENT_ZERO_ALIASES)?;
+        }
         shims.install(machine.engine())?;
         images.load(machine.engine(), |name| shims.resolve(name))?;
         Ok(Self {
@@ -191,7 +213,7 @@ impl SapRuntimeGuest {
         }
     }
 
-    fn with_scratch<T>(
+    pub(crate) fn with_scratch<T>(
         &mut self,
         call: impl FnOnce(&mut GuestMachine, SapEntrypoints) -> Result<T>,
     ) -> Result<T> {
@@ -315,7 +337,7 @@ impl SapGuest for SapRuntimeGuest {
     }
 }
 
-fn hardware_block(hardware_id: &[u8]) -> Result<[u8; 24]> {
+pub(crate) fn hardware_block(hardware_id: &[u8]) -> Result<[u8; 24]> {
     if hardware_id.is_empty() || hardware_id.len() > 20 {
         bail!("hardware ID must contain between 1 and 20 bytes");
     }
@@ -333,7 +355,7 @@ fn read_u64(machine: &mut GuestMachine, address: u64) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes.as_slice().try_into()?))
 }
 
-fn read_u32(machine: &mut GuestMachine, address: u64) -> Result<u32> {
+pub(crate) fn read_u32(machine: &mut GuestMachine, address: u64) -> Result<u32> {
     let bytes = machine
         .engine
         .mem_read(address, 4)
@@ -388,6 +410,15 @@ mod tests {
         let context = guest.initialize(&[1; 20]).unwrap();
         assert_ne!(context, 0);
         guest.teardown(context).unwrap();
+        guest.close().unwrap();
+    }
+
+    #[test]
+    #[ignore = "downloads pinned macOS restore assets when the cache is empty"]
+    fn opens_pinned_store_agent_runtime() {
+        let bundle = SapAssetBundle::load_or_download().unwrap();
+        let mut guest = SapRuntimeGuest::open_store_agent_runtime(&bundle).unwrap();
+        assert!(guest.entries.initialize != 0);
         guest.close().unwrap();
     }
     use std::{cell::Cell, rc::Rc};

@@ -20,6 +20,7 @@ const REG_LR: i32 = 2;
 const HEAP_BASE: u64 = 0x0000_4000_0000_0000;
 const HEAP_SIZE: u64 = 64 << 20;
 const MAX_TRANSFER: u64 = 64 << 20;
+const CORE_FP_PATH: &str = "/System/Library/PrivateFrameworks/CoreFP.framework/CoreFP";
 
 const ZERO_ALIASES: &[&str] = &[
     "_CFBundleGetMainBundle",
@@ -83,6 +84,14 @@ enum Handler {
     Gettimeofday,
     Sysctlbyname,
     Sysconf,
+    Dlopen,
+    Dlsym,
+    Mmap,
+    Munmap,
+    VmAllocate,
+    VmDeallocate,
+    Basename,
+    BootstrapLookUp,
     Unsupported,
 }
 
@@ -114,6 +123,7 @@ struct State {
     heap_cursor: u64,
     allocations: HashMap<u64, Allocation>,
     free_blocks: Vec<FreeBlock>,
+    core_exports: HashMap<String, u64>,
 }
 
 impl State {
@@ -129,6 +139,7 @@ impl State {
             heap_cursor: 0,
             allocations: HashMap::new(),
             free_blocks: Vec::new(),
+            core_exports: HashMap::new(),
         }
     }
 
@@ -203,6 +214,30 @@ impl State {
         }
         let address = HEAP_BASE + self.heap_cursor;
         self.heap_cursor += reserved;
+        self.allocations
+            .insert(address, Allocation { size, reserved });
+        Ok(address)
+    }
+
+    fn allocate_aligned(&mut self, size: u64, alignment: u64) -> Result<u64> {
+        if size > MAX_TRANSFER {
+            bail!("guest allocation exceeds transfer limit");
+        }
+        let reserved = size
+            .max(1)
+            .checked_add(alignment - 1)
+            .context("aligned allocation size overflows")?
+            & !(alignment - 1);
+        let cursor = self
+            .heap_cursor
+            .checked_add(alignment - 1)
+            .context("aligned heap cursor overflows")?
+            & !(alignment - 1);
+        if cursor > HEAP_SIZE || reserved > HEAP_SIZE - cursor {
+            bail!("guest heap exhausted");
+        }
+        let address = HEAP_BASE + cursor;
+        self.heap_cursor = cursor + reserved;
         self.allocations
             .insert(address, Allocation { size, reserved });
         Ok(address)
@@ -286,6 +321,14 @@ impl SapShims {
         state.function("_gettimeofday", Handler::Gettimeofday)?;
         state.function("_sysctlbyname", Handler::Sysctlbyname)?;
         state.function("_sysconf", Handler::Sysconf)?;
+        state.function("_dlopen", Handler::Dlopen)?;
+        state.function("_dlsym", Handler::Dlsym)?;
+        state.function("_mmap", Handler::Mmap)?;
+        state.function("_munmap", Handler::Munmap)?;
+        state.function("_vm_allocate", Handler::VmAllocate)?;
+        state.function("_vm_deallocate", Handler::VmDeallocate)?;
+        state.function("_basename", Handler::Basename)?;
+        state.function("_bootstrap_look_up", Handler::BootstrapLookUp)?;
         for name in ["_abort", "___stack_chk_fail", "dyld_stub_binder"] {
             state.function(name, Handler::Abort)?;
         }
@@ -352,6 +395,18 @@ impl SapShims {
 
     pub fn resolve(&mut self, name: &str) -> Result<u64> {
         self.state.borrow_mut().function(name, Handler::Unsupported)
+    }
+
+    pub fn add_zero_aliases(&mut self, names: &[&str]) -> Result<()> {
+        let mut state = self.state.borrow_mut();
+        for &name in names {
+            state.function(name, Handler::Return(0))?;
+        }
+        Ok(())
+    }
+
+    pub fn set_core_exports(&mut self, exports: impl IntoIterator<Item = (String, u64)>) {
+        self.state.borrow_mut().core_exports.extend(exports);
     }
 
     pub fn take_fault(&mut self) -> Option<String> {
@@ -511,6 +566,74 @@ fn dispatch(context: &HookContext, state: &Rc<RefCell<State>>, address: u64) -> 
             };
             context.reg_write(REG_X0, value)
         }
+        Handler::Dlopen => {
+            let path = read_c_string(context, context.reg_read(REG_X0)?)?;
+            context.reg_write(REG_X0, if path == CORE_FP_PATH { FAKE_HANDLE } else { 0 })
+        }
+        Handler::Dlsym => {
+            let name = read_c_string(context, context.reg_read(REG_X1)?)?;
+            let address = state
+                .core_exports
+                .get(&format!("_{name}"))
+                .copied()
+                .unwrap_or(0);
+            context.reg_write(REG_X0, address)
+        }
+        Handler::Mmap => {
+            let size = context.reg_read(REG_X1)?;
+            let Ok(address) = state.allocate_aligned(size, 4096) else {
+                return context.reg_write(REG_X0, u64::MAX);
+            };
+            if let Err(error) = context.mem_write(address, &vec![0; size as usize]) {
+                let _ = state.release(context, address);
+                return Err(error);
+            }
+            context.reg_write(REG_X0, address)
+        }
+        Handler::Munmap => {
+            let address = context.reg_read(REG_X0)?;
+            let result = if state.release(context, address).is_ok() {
+                0
+            } else {
+                u64::MAX
+            };
+            context.reg_write(REG_X0, result)
+        }
+        Handler::VmAllocate => {
+            let field = context.reg_read(REG_X1)?;
+            let size = context.reg_read(REG_X0 + 2)?;
+            let Ok(address) = state.allocate_aligned(size, 4096) else {
+                return context.reg_write(REG_X0, 3);
+            };
+            context.mem_write(address, &vec![0; size as usize])?;
+            context.mem_write(field, &address.to_le_bytes())?;
+            context.reg_write(REG_X0, 0)
+        }
+        Handler::VmDeallocate => {
+            let address = context.reg_read(REG_X1)?;
+            let result = if state.release(context, address).is_ok() {
+                0
+            } else {
+                1
+            };
+            context.reg_write(REG_X0, result)
+        }
+        Handler::Basename => {
+            let address = context.reg_read(REG_X0)?;
+            let path = read_c_string(context, address)?;
+            let path = path.trim_end_matches('/');
+            let result = path
+                .rfind('/')
+                .map_or(address, |index| address + index as u64 + 1);
+            context.reg_write(REG_X0, result)
+        }
+        Handler::BootstrapLookUp => {
+            let service = context.reg_read(REG_X0 + 2)?;
+            if service != 0 {
+                context.mem_write(service, &0u32.to_le_bytes())?;
+            }
+            context.reg_write(REG_X0, 5)
+        }
         Handler::Unsupported => bail!("guest called unsupported import {name}"),
     }
 }
@@ -520,6 +643,21 @@ fn read_u64(context: &HookContext, address: u64) -> Result<u64> {
     Ok(u64::from_le_bytes(
         bytes.as_slice().try_into().expect("eight bytes"),
     ))
+}
+
+fn read_c_string(context: &HookContext, address: u64) -> Result<String> {
+    let mut bytes = Vec::new();
+    for offset in 0..4096u64 {
+        let address = address
+            .checked_add(offset)
+            .context("guest string address overflows")?;
+        let byte = context.mem_read(address, 1)?[0];
+        if byte == 0 {
+            return String::from_utf8(bytes).context("guest string is invalid UTF-8");
+        }
+        bytes.push(byte);
+    }
+    bail!("guest string exceeds 4096 bytes")
 }
 
 fn invoke_callback(context: &HookContext, state: &mut State, initializer: u64) -> Result<()> {
