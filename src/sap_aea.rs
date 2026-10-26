@@ -1,6 +1,6 @@
 //! Bounded parsing of AEA cryptex headers and FCS metadata.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::time::Duration;
 
@@ -16,7 +16,7 @@ use hpke::{
 };
 use p256::{SecretKey, pkcs8::DecodePrivateKey};
 use serde::Deserialize;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -27,6 +27,7 @@ const MAX_AUTH_DATA: usize = 1 << 20;
 const MAX_FCS_KEY_SIZE: u64 = 64 << 10;
 const MAIN_SALT_SIZE: usize = 32;
 const ENCRYPTED_ROOT_SIZE: usize = 112;
+const DECODED_SEGMENT_CACHE_COUNT: usize = 64;
 
 type Aes256Ctr = ctr::Ctr128BE<Aes256>;
 
@@ -53,6 +54,137 @@ pub struct AeaSegment {
 
 pub struct AeaIndex {
     pub segments: Vec<Option<AeaSegment>>,
+}
+
+pub struct AeaReader<'a> {
+    remote: &'a RemoteFile,
+    root: AeaRoot,
+    index: AeaIndex,
+    cache: HashMap<usize, Vec<u8>>,
+    cache_order: VecDeque<usize>,
+}
+
+impl<'a> AeaReader<'a> {
+    pub fn open(remote: &'a RemoteFile, entry: ArchiveEntry) -> Result<Self> {
+        let header = read_remote_header(remote, entry)?;
+        let symmetric_key = header.resolve_symmetric_key()?;
+        let root = read_remote_root(remote, entry, &header, &symmetric_key)?;
+        let index = index_remote_clusters(remote, entry, &root)?;
+        Ok(Self::from_parts(remote, root, index))
+    }
+
+    fn from_parts(remote: &'a RemoteFile, root: AeaRoot, index: AeaIndex) -> Self {
+        Self {
+            remote,
+            root,
+            index,
+            cache: HashMap::new(),
+            cache_order: VecDeque::new(),
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        self.root.file_size
+    }
+
+    pub fn read_at(&mut self, buffer: &mut [u8], offset: u64) -> Result<usize> {
+        if buffer.is_empty() || offset >= self.root.file_size {
+            return Ok(0);
+        }
+        let wanted = buffer
+            .len()
+            .min(usize::try_from(self.root.file_size - offset).unwrap_or(usize::MAX));
+        let mut written = 0usize;
+        while written < wanted {
+            let position = offset + written as u64;
+            let segment_index = usize::try_from(position / u64::from(self.root.segment_size))?;
+            let segment = self
+                .index
+                .segments
+                .get(segment_index)
+                .and_then(Option::as_ref)
+                .with_context(|| format!("AEA segment {segment_index} is missing"))?
+                .clone();
+            if !self.cache.contains_key(&segment_index) {
+                let mut encrypted = vec![0u8; segment.compressed_size as usize];
+                read_exact_at(self.remote, &mut encrypted, segment.input_offset)?;
+                let decoded = decode_segment(&self.root.main_key, &segment, &encrypted)?;
+                if self.cache_order.len() == DECODED_SEGMENT_CACHE_COUNT
+                    && let Some(oldest) = self.cache_order.pop_front()
+                {
+                    self.cache.remove(&oldest);
+                }
+                self.cache.insert(segment_index, decoded);
+                self.cache_order.push_back(segment_index);
+            }
+            let decoded = &self.cache[&segment_index];
+            let inside = usize::try_from(
+                position
+                    .checked_sub(segment.output_offset)
+                    .context("AEA segment has an invalid output offset")?,
+            )?;
+            if inside >= decoded.len() {
+                bail!("AEA segment {segment_index} has an invalid output offset");
+            }
+            let count = (wanted - written).min(decoded.len() - inside);
+            buffer[written..written + count].copy_from_slice(&decoded[inside..inside + count]);
+            written += count;
+        }
+        Ok(written)
+    }
+}
+
+fn decode_segment(main_key: &[u8], segment: &AeaSegment, encrypted: &[u8]) -> Result<Vec<u8>> {
+    if encrypted.len() != segment.compressed_size as usize {
+        bail!("AEA segment size mismatch");
+    }
+    let cluster_key = derive_cluster_key(main_key, segment.cluster)?;
+    let mut info = b"AEA_SK".to_vec();
+    info.extend_from_slice(&segment.index.to_le_bytes());
+    let segment_key = derive_header_key(&cluster_key, &info)?;
+    verify_aea_mac(&segment_key[..32], encrypted, &[], &segment.mac).with_context(|| {
+        format!(
+            "AEA cluster {} segment {} failed authentication",
+            segment.cluster, segment.index
+        )
+    })?;
+    let mut compressed = encrypted.to_vec();
+    Aes256Ctr::new_from_slices(&segment_key[32..64], &segment_key[64..80])?
+        .apply_keystream(&mut compressed);
+    let decoded = if segment.compressed_size == segment.decompressed_size {
+        compressed
+    } else {
+        let mut decoder = lzfse_rust::LzfseRingDecoder::default();
+        let reader = decoder.reader_bytes(&compressed);
+        let mut decoded = Vec::new();
+        reader
+            .take(u64::from(segment.decompressed_size) + 1)
+            .read_to_end(&mut decoded)
+            .with_context(|| {
+                format!(
+                    "decompress AEA cluster {} segment {}",
+                    segment.cluster, segment.index
+                )
+            })?;
+        decoded
+    };
+    if decoded.len() != segment.decompressed_size as usize {
+        bail!(
+            "AEA cluster {} segment {} decoded to {} bytes, expected {}",
+            segment.cluster,
+            segment.index,
+            decoded.len(),
+            segment.decompressed_size
+        );
+    }
+    if Sha256::digest(&decoded).as_slice() != segment.checksum {
+        bail!(
+            "AEA cluster {} segment {} failed checksum verification",
+            segment.cluster,
+            segment.index
+        );
+    }
+    Ok(decoded)
 }
 
 #[derive(Deserialize)]
@@ -641,12 +773,21 @@ mod tests {
         let mut image = [0u8; 108];
         image[..4].copy_from_slice(&4u32.to_le_bytes());
         image[4..8].copy_from_slice(&4u32.to_le_bytes());
-        image[8..40].copy_from_slice(&[0xaa; 32]);
+        image[8..40].copy_from_slice(&Sha256::digest(b"data"));
         image[104..].copy_from_slice(b"data");
+        let mut segment_info = b"AEA_SK".to_vec();
+        segment_info.extend_from_slice(&0u32.to_le_bytes());
+        let segment_key = derive_header_key(&cluster_key, &segment_info).unwrap();
+        Aes256Ctr::new_from_slices(&segment_key[32..64], &segment_key[64..80])
+            .unwrap()
+            .apply_keystream(&mut image[104..]);
+        let mut segment_mac = Hmac::<Sha256>::new_from_slice(&segment_key[..32]).unwrap();
+        segment_mac.update(&image[104..]);
+        segment_mac.update(&0u64.to_le_bytes());
+        image[72..104].copy_from_slice(&segment_mac.finalize().into_bytes());
         Aes256Ctr::new_from_slices(&header_key[32..64], &header_key[64..80])
             .unwrap()
             .apply_keystream(&mut image[..40]);
-        image[72..104].fill(0x55);
         let mut mac = Hmac::<Sha256>::new_from_slice(&header_key[..32]).unwrap();
         mac.update(&image[40..104]);
         mac.update(&image[..40]);
@@ -658,7 +799,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            for (start, end) in [(0usize, 0usize), (0, 103)] {
+            for (start, end) in [(0usize, 0usize), (0, 103), (104, 107)] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 1024];
@@ -692,7 +833,53 @@ mod tests {
         assert_eq!(segment.output_offset, 0);
         assert_eq!(segment.compressed_size, 4);
         assert_eq!(segment.decompressed_size, 4);
-        assert_eq!(segment.mac, [0x55; 32]);
+        let mut reader = AeaReader::from_parts(&remote, root, index);
+        let mut decoded = [0u8; 4];
+        assert_eq!(reader.read_at(&mut decoded, 0).unwrap(), 4);
+        assert_eq!(&decoded, b"data");
+        assert_eq!(reader.read_at(&mut decoded, 1).unwrap(), 3);
+        assert_eq!(&decoded[..3], b"ata");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn decodes_authenticated_plain_and_lzfse_segments() {
+        let main_key = [7u8; 32];
+        for original in [b"data".to_vec(), vec![b'A'; 4096]] {
+            let mut compressed = if original.len() == 4 {
+                original.clone()
+            } else {
+                let mut encoded = Vec::new();
+                lzfse_rust::encode_bytes(&original, &mut encoded).unwrap();
+                assert!(encoded.len() < original.len());
+                encoded
+            };
+            let cluster_key = derive_cluster_key(&main_key, 0).unwrap();
+            let mut info = b"AEA_SK".to_vec();
+            info.extend_from_slice(&0u32.to_le_bytes());
+            let segment_key = derive_header_key(&cluster_key, &info).unwrap();
+            Aes256Ctr::new_from_slices(&segment_key[32..64], &segment_key[64..80])
+                .unwrap()
+                .apply_keystream(&mut compressed);
+            let mut mac = Hmac::<Sha256>::new_from_slice(&segment_key[..32]).unwrap();
+            mac.update(&compressed);
+            mac.update(&0u64.to_le_bytes());
+            let segment = AeaSegment {
+                input_offset: 0,
+                output_offset: 0,
+                compressed_size: compressed.len() as u32,
+                decompressed_size: original.len() as u32,
+                checksum: Sha256::digest(&original).into(),
+                mac: mac.finalize().into_bytes().into(),
+                cluster: 0,
+                index: 0,
+            };
+            assert_eq!(
+                decode_segment(&main_key, &segment, &compressed).unwrap(),
+                original
+            );
+            compressed[0] ^= 1;
+            assert!(decode_segment(&main_key, &segment, &compressed).is_err());
+        }
     }
 }

@@ -36,6 +36,7 @@ aes = "0.8"
 ctr = "0.9"
 hkdf = "0.12"
 hmac = "0.12"
+lzfse_rust = "0.2.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
