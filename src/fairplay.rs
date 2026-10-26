@@ -5,6 +5,7 @@ use std::{fs, io::Read, path::Path};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 use zip::ZipArchive;
 
 const MODEL_V1_BYTES: usize = 8 + 4 + 4 + 32 + 16 + 16 + 16 * 256;
@@ -260,11 +261,11 @@ pub fn inspect_enrollment_model(path: &Path) -> Result<EnrollmentModelDiagnostic
         bail!("FairPlay enrollment model is not a regular file");
     }
     check_private_permissions(&metadata, "file")?;
-    let bytes = fs::read(path).context("read FairPlay enrollment model")?;
-    let (version, fairplayd_sha256, selector) = model_details(&bytes)?;
+    let bytes = Zeroizing::new(fs::read(path).context("read FairPlay enrollment model")?);
+    let (version, fairplayd_sha256, selector) = model_details(bytes.as_slice())?;
     Ok(EnrollmentModelDiagnostic {
         path: path.to_string_lossy().into_owned(),
-        sha256: format!("{:x}", Sha256::digest(&bytes)),
+        sha256: format!("{:x}", Sha256::digest(bytes.as_slice())),
         bytes: bytes.len(),
         version,
         fairplayd_sha256,

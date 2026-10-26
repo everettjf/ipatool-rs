@@ -658,6 +658,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "url",
+ "zeroize",
  "zip",
 ]
 
