@@ -2,9 +2,13 @@
 
 use std::{
     cell::RefCell,
+    error::Error as StdError,
     ffi::{CStr, c_char, c_void},
+    fmt,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
+    rc::Rc,
+    sync::Arc,
     time::Duration,
 };
 
@@ -23,6 +27,7 @@ const CONTROL_CPU_MODEL: u32 = 7 | 1 << 26 | 1 << 30;
 const ARM64_CPU_MODEL_MAX: u32 = 3;
 const HOOK_CODE: i32 = 1 << 2;
 const HOOK_UNMAPPED_MEMORY: i32 = 1 << 4 | 1 << 5 | 1 << 6;
+const HOOK_MEMORY_ACCESS: i32 = 1 << 10 | 1 << 11;
 
 type Handle = *mut c_void;
 
@@ -145,9 +150,16 @@ struct MemoryFaultData {
     operations: HookOperations,
 }
 
+struct MemoryAccessData {
+    callback: RefCell<Box<CodeCallback>>,
+    failure: RefCell<Option<String>>,
+    operations: HookOperations,
+}
+
 enum HookOwner {
     Code(Box<HookData>),
     Fault(Box<MemoryFaultData>),
+    Access(Box<MemoryAccessData>),
 }
 
 impl HookOwner {
@@ -155,6 +167,51 @@ impl HookOwner {
         match self {
             Self::Code(data) => data.failure.borrow().clone(),
             Self::Fault(data) => data.failure.borrow().clone(),
+            Self::Access(data) => data.failure.borrow().clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GuardError(Arc<anyhow::Error>);
+
+impl fmt::Display for GuardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:#}", self.0)
+    }
+}
+
+impl fmt::Debug for GuardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, formatter)
+    }
+}
+
+impl StdError for GuardError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.0.as_ref().as_ref())
+    }
+}
+
+struct MemoryGuard {
+    check: Rc<dyn Fn(u64, u64) -> Result<()>>,
+    failure: Rc<RefCell<Option<GuardError>>>,
+    access_hook_id: u64,
+    code_hook_id: u64,
+}
+
+fn guard_callback(
+    check: Rc<dyn Fn(u64, u64) -> Result<()>>,
+    failure: Rc<RefCell<Option<GuardError>>>,
+) -> impl FnMut(&HookContext, u64, u32) {
+    move |context, address, size| {
+        if failure.borrow().is_some() {
+            let _ = context.stop();
+            return;
+        }
+        if let Err(error) = check(address, u64::from(size)) {
+            *failure.borrow_mut() = Some(GuardError(Arc::new(error)));
+            let _ = context.stop();
         }
     }
 }
@@ -218,12 +275,41 @@ extern "C" fn fault_trampoline(
     }
 }
 
+extern "C" fn access_trampoline(
+    handle: Handle,
+    _kind: i32,
+    address: u64,
+    size: i32,
+    _value: i64,
+    user_data: *mut c_void,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    let data = unsafe { &*user_data.cast::<MemoryAccessData>() };
+    let context = HookContext {
+        handle,
+        operations: data.operations,
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(mut callback) = data.callback.try_borrow_mut() else {
+            panic!("reentrant Unicorn memory access hook");
+        };
+        callback(&context, address, size.max(0) as u32);
+    }));
+    if result.is_err() {
+        *data.failure.borrow_mut() = Some("Unicorn memory access hook panicked".to_owned());
+        unsafe { (data.operations.stop)(handle) };
+    }
+}
+
 pub struct Engine {
     api: Api,
     handle: Handle,
     _library: UnicornLibrary,
     hooks: Vec<HookRegistration>,
     next_hook_id: u64,
+    memory_guard: Option<MemoryGuard>,
 }
 
 impl Engine {
@@ -241,6 +327,7 @@ impl Engine {
             _library: library,
             hooks: Vec::new(),
             next_hook_id: 1,
+            memory_guard: None,
         };
         let code = unsafe { (engine.api.control)(handle, CONTROL_CPU_MODEL, ARM64_CPU_MODEL_MAX) };
         if let Err(error) = engine.check(code) {
@@ -259,6 +346,7 @@ impl Engine {
     }
 
     pub fn mem_read(&self, address: u64, size: usize) -> Result<Vec<u8>> {
+        self.check_memory(address, size)?;
         let mut data = vec![0; size];
         if size != 0 {
             self.check(unsafe {
@@ -272,6 +360,7 @@ impl Engine {
         if data.is_empty() {
             return Ok(());
         }
+        self.check_memory(address, data.len())?;
         self.check(unsafe {
             (self.api.mem_write)(self.handle, address, data.as_ptr().cast(), data.len())
         })
@@ -313,6 +402,9 @@ impl Engine {
         if timeout.is_zero() {
             bail!("Unicorn timeout must be positive");
         }
+        if let Some(failure) = self.guard_failure() {
+            return Err(anyhow::Error::new(failure));
+        }
         let micros = u64::try_from(timeout.as_micros())
             .unwrap_or(u64::MAX)
             .max(1);
@@ -321,6 +413,9 @@ impl Engine {
         });
         if let Some(failure) = self.hooks.iter().find_map(|hook| hook.data.failure()) {
             bail!("{failure}");
+        }
+        if let Some(failure) = self.guard_failure() {
+            return Err(anyhow::Error::new(failure));
         }
         result?;
         let mut timed_out = 0u64;
@@ -405,7 +500,81 @@ impl Engine {
         Ok(id)
     }
 
+    fn add_memory_access_hook<F>(&mut self, callback: F) -> Result<u64>
+    where
+        F: FnMut(&HookContext, u64, u32) + 'static,
+    {
+        let id = self.next_hook_id;
+        let next_id = id.checked_add(1).context("Unicorn hook ID overflow")?;
+        let data = Box::new(MemoryAccessData {
+            callback: RefCell::new(Box::new(callback)),
+            failure: RefCell::new(None),
+            operations: self.hook_operations(),
+        });
+        let mut hook_handle = 0usize;
+        let user_data = (&*data as *const MemoryAccessData)
+            .cast_mut()
+            .cast::<c_void>();
+        let trampoline = access_trampoline as *const () as *mut c_void;
+        self.check(unsafe {
+            (self.api.hook_add)(
+                self.handle,
+                &mut hook_handle,
+                HOOK_MEMORY_ACCESS,
+                trampoline,
+                user_data,
+                1,
+                0,
+            )
+        })?;
+        self.next_hook_id = next_id;
+        self.hooks.push(HookRegistration {
+            id,
+            handle: hook_handle,
+            data: HookOwner::Access(data),
+        });
+        Ok(id)
+    }
+
+    pub fn guard_memory<F>(&mut self, check: F) -> Result<()>
+    where
+        F: Fn(u64, u64) -> Result<()> + 'static,
+    {
+        if self.memory_guard.is_some() {
+            bail!("Unicorn memory validator is already installed");
+        }
+        let check: Rc<dyn Fn(u64, u64) -> Result<()>> = Rc::new(check);
+        let failure = Rc::new(RefCell::new(None));
+        let access_id =
+            self.add_memory_access_hook(guard_callback(Rc::clone(&check), Rc::clone(&failure)))?;
+        let code_id = match self.add_code_hook(
+            1,
+            0,
+            guard_callback(Rc::clone(&check), Rc::clone(&failure)),
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = self.remove_hook(access_id);
+                return Err(error);
+            }
+        };
+        self.memory_guard = Some(MemoryGuard {
+            check,
+            failure,
+            access_hook_id: access_id,
+            code_hook_id: code_id,
+        });
+        Ok(())
+    }
+
     pub fn remove_hook(&mut self, id: u64) -> Result<()> {
+        if self
+            .memory_guard
+            .as_ref()
+            .is_some_and(|guard| id == guard.access_hook_id || id == guard.code_hook_id)
+        {
+            bail!("cannot remove an active Unicorn memory guard hook");
+        }
         let position = self
             .hooks
             .iter()
@@ -431,6 +600,19 @@ impl Engine {
         } else {
             Err(api_error(&self.api, code))
         }
+    }
+
+    fn check_memory(&self, address: u64, size: usize) -> Result<()> {
+        if size != 0
+            && let Some(guard) = &self.memory_guard
+        {
+            (guard.check)(address, size as u64)?;
+        }
+        Ok(())
+    }
+
+    fn guard_failure(&self) -> Option<GuardError> {
+        self.memory_guard.as_ref()?.failure.borrow().clone()
     }
 
     fn hook_operations(&self) -> HookOperations {
@@ -532,5 +714,85 @@ mod tests {
             .unwrap();
         assert_eq!(calls.get(), 1);
         assert_eq!(engine.reg_read(REG_X0).unwrap(), 42);
+    }
+
+    #[derive(Debug)]
+    struct MissingPage;
+
+    impl fmt::Display for MissingPage {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(formatter, "missing dependency")
+        }
+    }
+
+    impl StdError for MissingPage {}
+
+    fn is_missing_page(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<MissingPage>())
+    }
+
+    #[test]
+    #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
+    fn memory_guard_checks_host_guest_and_sticky_failures() {
+        let mut engine = Engine::new().unwrap();
+        let base = 0x6000000u64;
+        engine.mem_map(base, 3 * 4096).unwrap();
+        engine.mem_write(base, &[0x20, 0x00, 0x40, 0xf9]).unwrap();
+        engine.reg_write(REG_X1, base + 4096).unwrap();
+        engine
+            .guard_memory(move |address, size| {
+                if size > 0 && address < base + 8192 && address + size > base + 4096 {
+                    return Err(MissingPage.into());
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert!(is_missing_page(
+            &engine.mem_read(base + 4092, 8).unwrap_err()
+        ));
+        assert!(is_missing_page(
+            &engine.mem_write(base + 4092, &[0; 8]).unwrap_err()
+        ));
+        assert!(is_missing_page(
+            &engine
+                .start_bounded(base, base + 4, Duration::from_secs(1), 10)
+                .unwrap_err()
+        ));
+        assert!(is_missing_page(
+            &engine
+                .start_bounded(base, base + 4, Duration::from_secs(1), 10)
+                .unwrap_err()
+        ));
+        assert!(engine.guard_memory(|_, _| Ok(())).is_err());
+    }
+
+    #[test]
+    #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
+    fn memory_guard_checks_cached_instruction_fetch() {
+        let mut engine = Engine::new().unwrap();
+        engine.mem_map(0x1000, 4096).unwrap();
+        engine.mem_write(0x1000, &[0xe0, 0x00, 0x80, 0xd2]).unwrap();
+        let allowed = Rc::new(Cell::new(true));
+        let observed = Rc::clone(&allowed);
+        engine
+            .guard_memory(move |_, _| {
+                if observed.get() {
+                    Ok(())
+                } else {
+                    Err(MissingPage.into())
+                }
+            })
+            .unwrap();
+        engine
+            .start_bounded(0x1000, 0x1004, Duration::from_secs(1), 10)
+            .unwrap();
+        allowed.set(false);
+        engine.reg_write(REG_X0, 0).unwrap();
+        assert!(is_missing_page(
+            &engine
+                .start_bounded(0x1000, 0x1004, Duration::from_secs(1), 10)
+                .unwrap_err()
+        ));
+        assert_eq!(engine.reg_read(REG_X0).unwrap(), 0);
     }
 }
