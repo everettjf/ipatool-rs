@@ -1,6 +1,6 @@
 //! StoreAgent guest memory prepared from the pinned AMS images and profile.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -10,7 +10,7 @@ use crate::{
     sap_assets::SapAssetBundle,
     store_memory::{MemoryRegion, exclude_mapped_regions},
     store_profile::{self, ProfileData},
-    unicorn_runtime::Engine,
+    unicorn_runtime::{Engine, REG_PC, REG_X0},
 };
 
 const AMS_SHA256: &str = "95f4558aa2c0ccd9f96ed479e336b630b46bf4b4e0baabc1c1ac8c7d55e21ab4";
@@ -19,6 +19,10 @@ const HEAP_SIZE: usize = 64 << 20;
 const STACK_BASE: u64 = 0x5000_0000_0000;
 const STACK_SIZE: usize = 8 << 20;
 const RETURN_PC: u64 = 0x1_0000_0000;
+const REG_LR: i32 = 2;
+const REG_SP: i32 = 4;
+const GUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const GUEST_INSTRUCTION_LIMIT: usize = 20_000_000;
 
 pub struct StoreRuntime {
     pub engine: Engine,
@@ -28,6 +32,7 @@ pub struct StoreRuntime {
     dynamic_selectors: HashMap<String, u64>,
     dynamic_selector_addresses: HashMap<u64, String>,
     pub objects: HashMap<u64, StoreObject>,
+    hook_error: Rc<RefCell<Option<String>>>,
 }
 
 pub struct StoreObject {
@@ -159,6 +164,53 @@ impl StoreRuntime {
                 },
             );
         }
+        let hook_error = Rc::new(RefCell::new(None));
+        let error_slot = Rc::clone(&hook_error);
+        let hook_profile = Arc::clone(&profile);
+        let hook_code_ranges = code_ranges.clone();
+        engine.add_code_hook(0, u64::MAX, move |context, address, _| {
+            if let Some(&index) = hook_profile.runtime.calls_by_address.get(&address) {
+                let call = &hook_profile.index.calls[index];
+                match call.symbol.trim_start_matches('_') {
+                    "CRIsAutoSubmitEnabled" | "CFURLResponseCopyPeerAddress" => {
+                        context
+                            .reg_write(REG_X0, 0)
+                            .expect("write Store guest return");
+                    }
+                    "getuid" | "geteuid" => {
+                        context
+                            .reg_write(REG_X0, 501)
+                            .expect("write Store guest return");
+                    }
+                    "getgid" | "getegid" => {
+                        context
+                            .reg_write(REG_X0, 20)
+                            .expect("write Store guest return");
+                    }
+                    "getpid" => {
+                        context
+                            .reg_write(REG_X0, 123)
+                            .expect("write Store guest return");
+                    }
+                    _ => {
+                        *error_slot.borrow_mut() = Some(format!(
+                            "unsupported Store bridge call at {address:#x}: {} {}",
+                            call.symbol, call.selector
+                        ));
+                        context.stop().expect("stop Store guest after bridge error");
+                    }
+                }
+            } else if address != RETURN_PC
+                && !hook_code_ranges
+                    .iter()
+                    .any(|&(start, end)| address >= start && address < end)
+            {
+                *error_slot.borrow_mut() = Some(format!(
+                    "Store guest executed outside pinned image at {address:#x}"
+                ));
+                context.stop().expect("stop Store guest outside image");
+            }
+        })?;
         Ok(Self {
             engine,
             profile,
@@ -167,6 +219,7 @@ impl StoreRuntime {
             dynamic_selectors: HashMap::new(),
             dynamic_selector_addresses: HashMap::new(),
             objects,
+            hook_error,
         })
     }
 
@@ -313,6 +366,42 @@ impl StoreRuntime {
             _ => bail!("Store object is not a string"),
         }
     }
+
+    /// Execute a pinned guest entry. Bridge calls not yet ported fail explicitly.
+    pub fn call(&mut self, entry: u64, arguments: &[u64]) -> Result<u64> {
+        if entry == 0 {
+            bail!("Store guest entry point is unavailable");
+        }
+        *self.hook_error.borrow_mut() = None;
+        for index in 0..8 {
+            self.engine.reg_write(
+                REG_X0 + index,
+                arguments.get(index as usize).copied().unwrap_or(0),
+            )?;
+        }
+        let extras = arguments.len().saturating_sub(8);
+        if extras > 512 {
+            bail!("Store guest stack argument limit exceeded");
+        }
+        let stack_pointer = STACK_BASE + STACK_SIZE as u64 - 4096;
+        for (index, value) in arguments.iter().skip(8).enumerate() {
+            self.write_u64(stack_pointer + (index as u64) * 8, *value)?;
+        }
+        self.engine.reg_write(REG_SP, stack_pointer)?;
+        self.engine.reg_write(REG_LR, RETURN_PC)?;
+        let result =
+            self.engine
+                .start_bounded(entry, RETURN_PC, GUEST_TIMEOUT, GUEST_INSTRUCTION_LIMIT);
+        if let Some(error) = self.hook_error.borrow_mut().take() {
+            bail!("{error}");
+        }
+        result.context("execute Store guest")?;
+        let pc = self.engine.reg_read(REG_PC)?;
+        if pc != RETURN_PC {
+            bail!("Store guest stopped before return at {pc:#x}");
+        }
+        self.engine.reg_read(REG_X0)
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +452,22 @@ mod tests {
         assert_eq!(
             runtime.object_string(profile_string_address).unwrap(),
             profile_string_value
+        );
+        assert_eq!(runtime.call(0x1a2d_0fb94, &[]).unwrap(), 0);
+        let unsupported = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| !call.selector.is_empty())
+            .unwrap()
+            .address;
+        assert!(
+            runtime
+                .call(unsupported, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported Store bridge call")
         );
         let patch = &runtime.profile.index.metadata_patches[0];
         assert_eq!(
