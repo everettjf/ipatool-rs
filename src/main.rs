@@ -7,13 +7,17 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
-use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
+use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
 use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
 use ipatool_rs::fairplay_download_capture::write_download_capture;
+use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2};
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_recovery;
-use ipatool_rs::fairplay_recovery_output::{read_private_frame, write_private_model};
+use ipatool_rs::fairplay_recovery_output::{
+    read_private_block, read_private_frame, read_private_model, write_private_binary,
+    write_private_model,
+};
 use ipatool_rs::fairplay_recovery_target::SidbTarget;
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
@@ -222,6 +226,21 @@ enum FairplayEnrollCommand {
         model: PathBuf,
         #[arg(long)]
         enrollment_frame: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Build a private FPSENR2 decoder from a recovered AES model and raw transform blocks.
+    BuildModel {
+        #[arg(long)]
+        recovered_model: PathBuf,
+        #[arg(long)]
+        source_block: PathBuf,
+        #[arg(long)]
+        encoded_block: PathBuf,
+        #[arg(long)]
+        selector: String,
+        #[arg(long)]
+        fairplayd_sha256: String,
         #[arg(long)]
         output: PathBuf,
     },
@@ -914,12 +933,78 @@ fn run() -> Result<()> {
                     ),
                 }
             }
+            FairplayEnrollCommand::BuildModel {
+                recovered_model,
+                source_block,
+                encoded_block,
+                selector,
+                fairplayd_sha256,
+                output,
+            } => {
+                let recovered = read_private_model(&recovered_model)?;
+                let source = read_private_block::<FIRST_TRANSFORM_BYTES>(&source_block)?;
+                let encoded = read_private_block::<FIRST_TRANSFORM_BYTES>(&encoded_block)?;
+                let selector = parse_enrollment_selector(&selector)?;
+                let fairplayd_sha256 = parse_sha256(&fairplayd_sha256)?;
+                let model = build_fpsenr2(
+                    &recovered,
+                    selector,
+                    fairplayd_sha256,
+                    &source,
+                    &encoded,
+                    &[],
+                )?;
+                write_private_binary(&output, &model)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "fairplay.enrollment-model.v2",
+                            "output": output,
+                            "selector": selector.identifier(),
+                            "bytes": model.len(),
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Built private FairPlay enrollment model for {} in {}",
+                        selector.identifier(),
+                        output.display()
+                    ),
+                }
+            }
         },
     }
     if cli.verbose {
         // Accepted for CLI compatibility. HTTP diagnostics will be added with the transport port.
     }
     Ok(())
+}
+
+fn parse_enrollment_selector(value: &str) -> Result<SinfSelector> {
+    let (user, key) = value
+        .split_once(':')
+        .context("selector must be eight hex digits:eight hex digits")?;
+    if user.len() != 8 || key.len() != 8 {
+        bail!("selector must be eight hex digits:eight hex digits");
+    }
+    Ok(SinfSelector {
+        user: u32::from_str_radix(user, 16).context("invalid selector user")?,
+        key: u32::from_str_radix(key, 16).context("invalid selector key")?,
+    })
+}
+
+fn parse_sha256(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 {
+        bail!("fairplayd SHA-256 must be 64 hex digits");
+    }
+    let mut hash = [0u8; 32];
+    for (index, byte) in hash.iter_mut().enumerate() {
+        let digits = value
+            .get(index * 2..index * 2 + 2)
+            .context("invalid fairplayd SHA-256")?;
+        *byte = u8::from_str_radix(digits, 16).context("invalid fairplayd SHA-256")?;
+    }
+    Ok(hash)
 }
 
 fn prompt(label: &str, secret: bool) -> Result<String> {
@@ -1077,6 +1162,54 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn fairplay_build_model_accepts_private_recovery_inputs() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "build-model",
+            "--recovered-model",
+            "/private/recovered.json",
+            "--source-block",
+            "/private/source.bin",
+            "--encoded-block",
+            "/private/encoded.bin",
+            "--selector",
+            "12345678:00000009",
+            "--fairplayd-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--output",
+            "/private/enrollment.bin",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::FairplayEnroll {
+                command:
+                    FairplayEnrollCommand::BuildModel {
+                        recovered_model,
+                        source_block,
+                        encoded_block,
+                        selector,
+                        fairplayd_sha256,
+                        output,
+                    },
+            } => {
+                assert_eq!(recovered_model, PathBuf::from("/private/recovered.json"));
+                assert_eq!(source_block, PathBuf::from("/private/source.bin"));
+                assert_eq!(encoded_block, PathBuf::from("/private/encoded.bin"));
+                assert_eq!(output, PathBuf::from("/private/enrollment.bin"));
+                assert_eq!(
+                    parse_enrollment_selector(&selector).unwrap().identifier(),
+                    selector
+                );
+                assert_eq!(parse_sha256(&fairplayd_sha256).unwrap(), [0xaa; 32]);
+            }
+            _ => panic!("unexpected command"),
+        }
+        assert!(parse_enrollment_selector("1234:00000009").is_err());
+        assert!(parse_sha256(&"é".repeat(32)).is_err());
     }
 
     #[test]
