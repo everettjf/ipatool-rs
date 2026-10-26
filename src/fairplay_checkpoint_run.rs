@@ -28,11 +28,21 @@ use crate::{
 const EXTERNAL_BASE: u64 = 0xf100_0000_0000_0000;
 const EXTERNAL_STRIDE: u64 = 0x1000;
 const MAX_EXTERNALS: usize = 1 << 20;
+const MAX_ONCE_TOKENS: usize = 65_536;
 const PAGE_BYTES: u64 = 4096;
 const MAX_SNAPSHOT_PAGES: usize = 30_000;
 const MAX_EXTERNAL_BYTES: u64 = 0x1000_0000;
 const EXTERNAL_CHUNK_BYTES: usize = 64 * 1024;
 const RET_X30: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
+const SYNTHETIC_NOOP_CALLBACK: u64 = 0x7200_0000_0000;
+const PTHREAD_ONCE_STUB: [u32; 6] = [
+    0xa9bf_7bfd, // stp x29, x30, [sp, #-16]!
+    0x9100_03fd, // mov x29, sp
+    0xd63f_0020, // blr x1
+    0xa8c1_7bfd, // ldp x29, x30, [sp], #16
+    0x5280_0000, // mov w0, #0
+    0xd65f_03c0, // ret x30
+];
 const SYNTHETIC_ALLOCATION_BASE: u64 = 0x7101_0000_0000;
 const STATIC_ALLOCATION_START: u64 = 0x7000_1000_0000;
 const STATIC_ALLOCATION_END: u64 = 0x7000_2000_0000;
@@ -186,6 +196,7 @@ pub struct CheckpointRunner {
     pub modeled_imports: usize,
     external_failure: Rc<RefCell<Option<String>>>,
     allocation_state: Rc<RefCell<AllocationState>>,
+    once_tokens: Rc<RefCell<BTreeSet<u64>>>,
 }
 
 fn guest_register(context: &HookContext, index: i32) -> Result<u64> {
@@ -246,6 +257,7 @@ fn run_modeled_external(
     context: &HookContext,
     symbol: &str,
     allocations: &Rc<RefCell<AllocationState>>,
+    once_tokens: &Rc<RefCell<BTreeSet<u64>>>,
 ) -> Result<()> {
     match symbol {
         "malloc" | "malloc_type_malloc" | "calloc" | "malloc_type_calloc" => {
@@ -295,6 +307,18 @@ fn run_modeled_external(
             context.reg_write(199, length)?;
         }
         "free" => {}
+        "pthread_once" => {
+            let token = guest_register(context, 0)?;
+            let mut tokens = once_tokens.borrow_mut();
+            if tokens.contains(&token) {
+                context.reg_write(200, SYNTHETIC_NOOP_CALLBACK)?;
+            } else {
+                if tokens.len() >= MAX_ONCE_TOKENS {
+                    bail!("FairPlay once token count exceeds limit");
+                }
+                tokens.insert(token);
+            }
+        }
         _ => bail!("unmodeled external function {symbol}"),
     }
     Ok(())
@@ -306,6 +330,7 @@ fn install_modeled_external(
     symbol: &str,
     failure: &Rc<RefCell<Option<String>>>,
     allocations: &Rc<RefCell<AllocationState>>,
+    once_tokens: &Rc<RefCell<BTreeSet<u64>>>,
 ) -> Result<bool> {
     let symbol = symbol.trim_start_matches('_');
     if !matches!(
@@ -321,18 +346,29 @@ fn install_modeled_external(
             | "calloc"
             | "malloc_type_calloc"
             | "free"
+            | "pthread_once"
     ) {
         return Ok(false);
     }
     engine
         .mem_map(address, PAGE_BYTES as usize)
         .with_context(|| format!("map external {symbol} stub"))?;
-    engine.mem_write(address, &RET_X30)?;
+    if symbol == "pthread_once" {
+        let instructions = PTHREAD_ONCE_STUB
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        engine.mem_write(address, &instructions)?;
+    } else {
+        engine.mem_write(address, &RET_X30)?;
+    }
     let symbol_name = symbol.to_owned();
     let failure = Rc::clone(failure);
     let allocations = Rc::clone(allocations);
+    let once_tokens = Rc::clone(once_tokens);
     engine.add_code_hook(address, address, move |context, _, _| {
-        if let Err(error) = run_modeled_external(context, &symbol_name, &allocations) {
+        if let Err(error) = run_modeled_external(context, &symbol_name, &allocations, &once_tokens)
+        {
             *failure.borrow_mut() = Some(format!("FairPlay external {symbol_name}: {error:#}"));
             let _ = context.stop();
         }
@@ -363,6 +399,17 @@ impl CheckpointRunner {
         }
         let external_failure = Rc::new(RefCell::new(None));
         let allocation_state = Rc::new(RefCell::new(AllocationState::from_checkpoint(checkpoint)?));
+        let once_tokens = Rc::new(RefCell::new(
+            checkpoint.once_tokens()?.into_iter().collect(),
+        ));
+        if image
+            .externals
+            .values()
+            .any(|symbol| symbol.trim_start_matches('_') == "pthread_once")
+        {
+            engine.mem_map(SYNTHETIC_NOOP_CALLBACK, PAGE_BYTES as usize)?;
+            engine.mem_write(SYNTHETIC_NOOP_CALLBACK, &RET_X30)?;
+        }
         let mut modeled_imports = 0;
         for (&address, symbol) in &image.externals {
             if install_modeled_external(
@@ -371,6 +418,7 @@ impl CheckpointRunner {
                 symbol,
                 &external_failure,
                 &allocation_state,
+                &once_tokens,
             )? {
                 modeled_imports += 1;
             }
@@ -383,6 +431,7 @@ impl CheckpointRunner {
             modeled_imports,
             external_failure,
             allocation_state,
+            once_tokens,
         })
     }
 
@@ -504,6 +553,16 @@ impl CheckpointRunner {
                 "next_allocation",
                 Value::Int(self.allocation_state.borrow().next.into()),
             ),
+            (
+                "once_tokens",
+                Value::List(
+                    self.once_tokens
+                        .borrow()
+                        .iter()
+                        .map(|&token| Value::Int(token.into()))
+                        .collect(),
+                ),
+            ),
         ];
         for (name, value) in updates {
             if let Some(mut old) = fields.insert(HashableValue::String(name.into()), value) {
@@ -546,10 +605,19 @@ mod tests {
         let allocations = Rc::new(RefCell::new(
             AllocationState::from_checkpoint(&source).unwrap(),
         ));
+        let once_tokens = Rc::new(RefCell::new(BTreeSet::new()));
         let call = |engine: &mut Engine, index: u64, symbol: &str, args: [u64; 3]| {
             let address = EXTERNAL_BASE + index * EXTERNAL_STRIDE;
             assert!(
-                install_modeled_external(engine, address, symbol, &failure, &allocations).unwrap()
+                install_modeled_external(
+                    engine,
+                    address,
+                    symbol,
+                    &failure,
+                    &allocations,
+                    &once_tokens,
+                )
+                .unwrap()
             );
             for (index, value) in args.into_iter().enumerate() {
                 engine.reg_write(199 + index as i32, value).unwrap();
@@ -583,6 +651,7 @@ mod tests {
                 "_unmodeled",
                 &failure,
                 &allocations,
+                &once_tokens,
             )
             .unwrap()
         );
@@ -606,12 +675,14 @@ mod tests {
         let allocations = Rc::new(RefCell::new(
             AllocationState::from_checkpoint(&source).unwrap(),
         ));
+        let once_tokens = Rc::new(RefCell::new(BTreeSet::new()));
         install_modeled_external(
             &mut engine,
             EXTERNAL_BASE,
             "_memset",
             &failure,
             &allocations,
+            &once_tokens,
         )
         .unwrap();
         engine.reg_write(199, 0x9000).unwrap();
@@ -647,6 +718,7 @@ mod tests {
             "_malloc",
             &runner.external_failure,
             &runner.allocation_state,
+            &runner.once_tokens,
         )
         .unwrap();
         runner.engine.reg_write(199, 5000).unwrap();
@@ -670,6 +742,7 @@ mod tests {
             "_calloc",
             &runner.external_failure,
             &runner.allocation_state,
+            &runner.once_tokens,
         )
         .unwrap();
         runner.engine.reg_write(199, 2).unwrap();
@@ -724,6 +797,90 @@ mod tests {
                 .unwrap(),
             b"Rust"
         );
+    }
+
+    #[test]
+    fn pthread_once_runs_callback_once_and_persists_token() {
+        const STACK: u64 = 0x7300_0000_0000;
+        const CALLBACK: u64 = STACK + PAGE_BYTES;
+        const RETURN: u64 = STACK + 2 * PAGE_BYTES;
+        const TOKEN: u64 = 0x1234;
+
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let binary_path = directory.path().join("fairplayd.arm64e");
+        let output_path = directory.path().join("resumed.pkl.gz");
+        std::fs::write(&binary_path, SYNTHETIC_BINARY).unwrap();
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let setup = |runner: &mut CheckpointRunner| {
+            runner.engine.mem_map(STACK, PAGE_BYTES as usize).unwrap();
+            runner
+                .engine
+                .mem_map(CALLBACK, PAGE_BYTES as usize)
+                .unwrap();
+            runner
+                .engine
+                .mem_map(SYNTHETIC_NOOP_CALLBACK, PAGE_BYTES as usize)
+                .unwrap();
+            runner
+                .engine
+                .mem_write(SYNTHETIC_NOOP_CALLBACK, &RET_X30)
+                .unwrap();
+            let callback = [0x9100_0484u32, 0xd65f_03c0]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>();
+            runner.engine.mem_write(CALLBACK, &callback).unwrap();
+            install_modeled_external(
+                &mut runner.engine,
+                EXTERNAL_BASE,
+                "_pthread_once",
+                &runner.external_failure,
+                &runner.allocation_state,
+                &runner.once_tokens,
+            )
+            .unwrap();
+        };
+        let call = |runner: &mut CheckpointRunner| {
+            runner.engine.reg_write(199, TOKEN).unwrap();
+            runner.engine.reg_write(200, CALLBACK).unwrap();
+            runner.engine.reg_write(2, RETURN).unwrap();
+            runner.engine.reg_write(4, CALLBACK).unwrap();
+            runner
+                .engine
+                .start_bounded(EXTERNAL_BASE, RETURN, Duration::from_secs(2), 20)
+                .unwrap();
+            assert!(runner.external_failure.borrow().is_none());
+            assert_eq!(runner.engine.reg_read(199).unwrap(), 0);
+        };
+
+        let mut runner = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        setup(&mut runner);
+        runner.engine.reg_write(203, 0).unwrap();
+        call(&mut runner);
+        assert_eq!(runner.engine.reg_read(203).unwrap(), 1);
+        call(&mut runner);
+        assert_eq!(runner.engine.reg_read(203).unwrap(), 1);
+        runner
+            .engine
+            .reg_write(REG_PC, source.pc().unwrap())
+            .unwrap();
+        runner
+            .write_checkpoint(&source, &binary_path, &output_path)
+            .unwrap();
+
+        let resumed = FairplayCheckpoint::load_private(&output_path).unwrap();
+        assert_eq!(resumed.once_tokens().unwrap(), vec![TOKEN]);
+        let mut replay = CheckpointRunner::new(&resumed, SYNTHETIC_BINARY).unwrap();
+        setup(&mut replay);
+        replay.engine.reg_write(203, 0).unwrap();
+        call(&mut replay);
+        assert_eq!(replay.engine.reg_read(203).unwrap(), 0);
     }
 
     #[test]

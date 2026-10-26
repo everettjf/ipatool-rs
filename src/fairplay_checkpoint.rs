@@ -372,6 +372,25 @@ impl FairplayCheckpoint {
             .transpose()
     }
 
+    pub fn once_tokens(&self) -> Result<Vec<u64>> {
+        if let Some(metadata) = &self.sparse_metadata {
+            return Ok(metadata.once_tokens.clone());
+        }
+        let Some(Value::Dict(root)) = &self.root else {
+            return Ok(Vec::new());
+        };
+        let Some(value) = root.get(&HashableValue::String("once_tokens".into())) else {
+            return Ok(Vec::new());
+        };
+        let Value::List(tokens) = value else {
+            bail!("checkpoint once_tokens is not a list");
+        };
+        if tokens.len() > 65_536 {
+            bail!("checkpoint has too many once tokens");
+        }
+        tokens.iter().map(value_u64).collect()
+    }
+
     /// Preserve original metadata when writing a resumed schema-2 snapshot.
     pub(crate) fn clone_root(&self) -> Result<Value> {
         if let Some(root) = &self.root {
