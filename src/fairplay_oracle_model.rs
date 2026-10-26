@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{File, OpenOptions},
     io::Read,
     path::Path,
 };
@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAGIC: &[u8; 8] = b"FPGOOR1\0";
 const VERSION: u32 = 2;
@@ -26,8 +26,8 @@ pub struct OracleModel {
     pub registers: [u64; 31],
     pub sp: u64,
     pub flags: [bool; 4],
-    pages: BTreeMap<u64, Vec<u8>>,
-    domains: BTreeMap<(u64, u8), [u64; 256]>,
+    pages: BTreeMap<u64, Zeroizing<Vec<u8>>>,
+    domains: BTreeMap<(u64, u8), Zeroizing<[u64; 256]>>,
 }
 
 impl Drop for OracleModel {
@@ -35,12 +35,6 @@ impl Drop for OracleModel {
         self.binary_hash.zeroize();
         self.registers.zeroize();
         self.sp = 0;
-        for page in self.pages.values_mut() {
-            page.zeroize();
-        }
-        for domain in self.domains.values_mut() {
-            domain.zeroize();
-        }
     }
 }
 
@@ -48,8 +42,19 @@ impl OracleModel {
     /// Load private enrollment state. Public sanitized models can be parsed
     /// from bytes without relaxing the private-file rule.
     pub fn load_private(path: &Path) -> Result<Self> {
-        let metadata = fs::symlink_metadata(path)
-            .with_context(|| format!("inspect oracle model {}", path.display()))?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file: File = options
+            .open(path)
+            .with_context(|| format!("open oracle model {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .context("inspect opened FairPlay oracle model")?;
         if !metadata.file_type().is_file() || metadata.len() > MAX_COMPRESSED_BYTES {
             bail!("FairPlay oracle model must be a bounded regular file");
         }
@@ -60,7 +65,12 @@ impl OracleModel {
                 bail!("FairPlay oracle model must be mode 0600 or stricter");
             }
         }
-        Self::parse_gzip(&fs::read(path).context("read private FairPlay oracle model")?)
+        let mut compressed = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+        file.by_ref()
+            .take(MAX_COMPRESSED_BYTES + 1)
+            .read_to_end(&mut compressed)
+            .context("read private FairPlay oracle model")?;
+        Self::parse_gzip(&compressed)
     }
 
     pub fn parse_gzip(compressed: &[u8]) -> Result<Self> {
@@ -118,7 +128,7 @@ impl OracleModel {
             if address % PAGE_SIZE as u64 != 0 {
                 bail!("unaligned FairPlay oracle page");
             }
-            let page = cursor.read(PAGE_SIZE)?.to_vec();
+            let page = Zeroizing::new(cursor.read(PAGE_SIZE)?.to_vec());
             if pages.insert(address, page).is_some() {
                 bail!("duplicate FairPlay oracle page");
             }
@@ -141,7 +151,10 @@ impl OracleModel {
                     bail!("FairPlay oracle domain is not ordered");
                 }
             }
-            if domains.insert((pc, register), values).is_some() {
+            if domains
+                .insert((pc, register), Zeroizing::new(values))
+                .is_some()
+            {
                 bail!("duplicate FairPlay oracle domain");
             }
         }
@@ -166,7 +179,7 @@ impl OracleModel {
         self.domains.len()
     }
     pub fn domain(&self, pc: u64, register: u8) -> Option<&[u64; 256]> {
-        self.domains.get(&(pc, register))
+        self.domains.get(&(pc, register)).map(|values| &**values)
     }
     pub fn state(&self) -> OracleState<'_> {
         OracleState::new(self)
@@ -204,7 +217,7 @@ pub struct OracleState<'a> {
     pub registers: [u64; 31],
     pub sp: u64,
     pub flags: [bool; 4],
-    writable: BTreeMap<u64, Vec<u8>>,
+    writable: BTreeMap<u64, Zeroizing<Vec<u8>>>,
     touched: BTreeSet<u64>,
 }
 
@@ -212,9 +225,6 @@ impl Drop for OracleState<'_> {
     fn drop(&mut self) {
         self.registers.zeroize();
         self.sp = 0;
-        for page in self.writable.values_mut() {
-            page.zeroize();
-        }
     }
 }
 
@@ -290,6 +300,66 @@ impl<'a> OracleState<'a> {
         Ok(())
     }
 
+    pub fn store_value(&mut self, address: u64, value: u64, size: usize) -> Result<()> {
+        if !matches!(size, 1 | 4 | 8) {
+            bail!("unsupported oracle store size {size}");
+        }
+        self.store(address, &value.to_le_bytes()[..size])
+    }
+
+    pub fn output(&self) -> Result<[u8; 16]> {
+        let mut result = [0u8; 16];
+        for (index, byte) in result.iter_mut().enumerate() {
+            let address = self
+                .model
+                .block_address
+                .checked_add(index as u64)
+                .context("oracle output address overflow")?;
+            *byte = self.load(address, 1)? as u8;
+        }
+        Ok(result)
+    }
+
+    pub fn output_bytes(&self, size: usize) -> Result<Vec<u8>> {
+        if size > 4096 {
+            bail!("oracle output exceeds one page");
+        }
+        let mut result = vec![0u8; size];
+        for (index, byte) in result.iter_mut().enumerate() {
+            let address = self
+                .model
+                .block_address
+                .checked_add(index as u64)
+                .context("oracle output address overflow")?;
+            *byte = self.load(address, 1)? as u8;
+        }
+        Ok(result)
+    }
+
+    pub fn test32(&mut self, value: u32) {
+        self.flags = [value & 0x8000_0000 != 0, value == 0, false, false];
+    }
+
+    pub fn compare32(&mut self, left: u32, right: u32) {
+        let result = left.wrapping_sub(right);
+        self.flags = [
+            result & 0x8000_0000 != 0,
+            result == 0,
+            left >= right,
+            ((left ^ right) & (left ^ result) & 0x8000_0000) != 0,
+        ];
+    }
+
+    pub fn condition(&self, name: &str) -> bool {
+        match name {
+            "eq" => self.flags[1],
+            "ne" => !self.flags[1],
+            "lo" => !self.flags[2],
+            "hi" => self.flags[2] && !self.flags[1],
+            _ => panic!("unsupported generated condition {name}"),
+        }
+    }
+
     pub fn digest(&self) -> String {
         let mut hash = Sha256::new();
         for register in self.registers {
@@ -309,7 +379,7 @@ impl<'a> OracleState<'a> {
 mod tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
-    use std::io::Write;
+    use std::{fs, io::Write};
 
     fn fixture() -> Vec<u8> {
         let mut bytes = MAGIC.to_vec();
@@ -376,6 +446,9 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
             assert!(OracleModel::load_private(&path).is_err());
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let link = root.path().join("model-link.gz");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(OracleModel::load_private(&link).is_err());
         }
         assert!(OracleModel::load_private(&path).is_ok());
     }
