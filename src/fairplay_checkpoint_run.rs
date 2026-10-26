@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use flate2::{Compression, write::GzEncoder};
 use serde_pickle::{HashableValue, SerOptions, Value};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     fairplay_checkpoint::{FairplayCheckpoint, clear_value},
@@ -36,6 +36,7 @@ const EXTERNAL_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_VIRTUAL_FILE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_VIRTUAL_FILES: usize = 1024;
 const DARWIN_STAT_BYTES: usize = 144;
+const MAX_DARWIN_OBJECTS: usize = 4096;
 const RET_X30: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
 const SYNTHETIC_ERRNO_ADDRESS: u64 = 0x7100_fff0_0000;
 const SYNTHETIC_NOOP_CALLBACK: u64 = 0x7200_0000_0000;
@@ -210,6 +211,182 @@ impl VirtualFileState {
     }
 }
 
+enum CfValue {
+    Boolean(bool),
+    Data(Zeroizing<Vec<u8>>),
+}
+
+struct DarwinState {
+    next_iterator: u64,
+    next_service: u64,
+    next_connection: u64,
+    next_bootstrap_port: u64,
+    next_cf_object: u64,
+    next_xpc_connection: u64,
+    iterator_services: BTreeMap<u64, u64>,
+    cf_values: BTreeMap<u64, CfValue>,
+    mac_address: [u8; 6],
+    iokit15_output: Option<Zeroizing<Vec<u8>>>,
+}
+
+type ServiceRefs<'a> = (
+    &'a Rc<RefCell<HostState>>,
+    &'a Rc<RefCell<VirtualFileState>>,
+    &'a Rc<RefCell<DarwinState>>,
+);
+
+impl Drop for DarwinState {
+    fn drop(&mut self) {
+        self.mac_address.zeroize();
+    }
+}
+
+impl DarwinState {
+    fn from_checkpoint(checkpoint: &FairplayCheckpoint) -> Result<Self> {
+        let mut state = Self {
+            next_iterator: 0x100,
+            next_service: 0x200,
+            next_connection: 0x300,
+            next_bootstrap_port: 0x500,
+            next_cf_object: 0x7000_7000_0000,
+            next_xpc_connection: 0x7000_9000_0000,
+            iterator_services: BTreeMap::new(),
+            cf_values: BTreeMap::new(),
+            mac_address: [2, 0, 0, 0, 0, 1],
+            iokit15_output: None,
+        };
+        let Some(value) = checkpoint.optional_metadata("darwin_services") else {
+            return Ok(state);
+        };
+        let Value::Dict(fields) = value else {
+            bail!("FairPlay darwin_services is not a dictionary");
+        };
+        for (name, destination) in [
+            ("next_iterator", &mut state.next_iterator),
+            ("next_service", &mut state.next_service),
+            ("next_connection", &mut state.next_connection),
+            ("next_bootstrap_port", &mut state.next_bootstrap_port),
+            ("next_cf_object", &mut state.next_cf_object),
+            ("next_xpc_connection", &mut state.next_xpc_connection),
+        ] {
+            *destination = pickle_u64(pickle_field(fields, name)?)?;
+        }
+        let Value::Bytes(mac) = pickle_field(fields, "mac_address")? else {
+            bail!("FairPlay MAC address is not bytes");
+        };
+        state.mac_address = mac
+            .as_slice()
+            .try_into()
+            .context("invalid FairPlay MAC length")?;
+        let Value::Dict(iterators) = pickle_field(fields, "iterator_services")? else {
+            bail!("FairPlay iterator services are not a dictionary");
+        };
+        if iterators.len() > MAX_DARWIN_OBJECTS {
+            bail!("too many FairPlay iterator services");
+        }
+        for (key, service) in iterators {
+            let iterator = pickle_hash_u64(key)?;
+            state
+                .iterator_services
+                .insert(iterator, pickle_u64(service)?);
+        }
+        let Value::Dict(values) = pickle_field(fields, "cf_values")? else {
+            bail!("FairPlay CF values are not a dictionary");
+        };
+        if values.len() > MAX_DARWIN_OBJECTS {
+            bail!("too many FairPlay CF values");
+        }
+        for (key, value) in values {
+            let handle = pickle_hash_u64(key)?;
+            let value = match value {
+                Value::Bool(value) => CfValue::Boolean(*value),
+                Value::Bytes(bytes) if bytes.len() <= 4096 => {
+                    CfValue::Data(Zeroizing::new(bytes.clone()))
+                }
+                _ => bail!("invalid FairPlay CF value"),
+            };
+            state.cf_values.insert(handle, value);
+        }
+        if let Some(value) = fields.get(&HashableValue::String("iokit15_output".into())) {
+            let Value::Bytes(bytes) = value else {
+                bail!("FairPlay IOKit output is not bytes");
+            };
+            if bytes.len() > 1024 * 1024 {
+                bail!("FairPlay IOKit output exceeds limit");
+            }
+            state.iokit15_output = Some(Zeroizing::new(bytes.clone()));
+        }
+        Ok(state)
+    }
+
+    fn next_handle(value: &mut u64, increment: u64) -> Result<u64> {
+        let handle = *value;
+        *value = value
+            .checked_add(increment)
+            .context("FairPlay handle overflow")?;
+        Ok(handle)
+    }
+
+    fn snapshot(&self) -> Value {
+        let mut fields = BTreeMap::new();
+        let mut insert = |name: &str, value: Value| {
+            fields.insert(HashableValue::String(name.into()), value);
+        };
+        for (name, value) in [
+            ("next_iterator", self.next_iterator),
+            ("next_service", self.next_service),
+            ("next_connection", self.next_connection),
+            ("next_bootstrap_port", self.next_bootstrap_port),
+            ("next_cf_object", self.next_cf_object),
+            ("next_xpc_connection", self.next_xpc_connection),
+        ] {
+            insert(name, Value::Int(value.into()));
+        }
+        insert("mac_address", Value::Bytes(self.mac_address.to_vec()));
+        insert(
+            "iterator_services",
+            Value::Dict(
+                self.iterator_services
+                    .iter()
+                    .map(|(&iterator, &service)| {
+                        (
+                            HashableValue::Int(iterator.into()),
+                            Value::Int(service.into()),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+        insert(
+            "cf_values",
+            Value::Dict(
+                self.cf_values
+                    .iter()
+                    .map(|(&handle, value)| {
+                        let value = match value {
+                            CfValue::Boolean(value) => Value::Bool(*value),
+                            CfValue::Data(bytes) => Value::Bytes(bytes.to_vec()),
+                        };
+                        (HashableValue::Int(handle.into()), value)
+                    })
+                    .collect(),
+            ),
+        );
+        if let Some(output) = &self.iokit15_output {
+            insert("iokit15_output", Value::Bytes(output.to_vec()));
+        }
+        Value::Dict(fields)
+    }
+}
+
+fn pickle_hash_u64(value: &HashableValue) -> Result<u64> {
+    match value {
+        HashableValue::I64(value) => Ok(u64::try_from(*value)?),
+        HashableValue::Int(value) => Ok(value.to_string().parse()?),
+        _ => bail!("FairPlay state key is not numeric"),
+    }
+}
+
 struct AllocationState {
     next: u64,
     stride: Option<u64>,
@@ -361,6 +538,7 @@ pub struct CheckpointRunner {
     once_tokens: Rc<RefCell<BTreeSet<u64>>>,
     host_state: Rc<RefCell<HostState>>,
     virtual_files: Rc<RefCell<VirtualFileState>>,
+    darwin: Rc<RefCell<DarwinState>>,
     errno_mapped: bool,
 }
 
@@ -428,6 +606,13 @@ fn guest_path(context: &HookContext, address: u64) -> Result<Vec<u8>> {
 
 fn set_guest_errno(context: &HookContext, errno: u32) -> Result<()> {
     context.mem_write(SYNTHETIC_ERRNO_ADDRESS, &errno.to_le_bytes())
+}
+
+fn read_guest_u64(context: &HookContext, address: u64) -> Result<u64> {
+    let bytes = context.mem_read(address, 8)?;
+    let mut value = [0u8; 8];
+    value.copy_from_slice(&bytes);
+    Ok(u64::from_le_bytes(value))
 }
 
 fn write_guest_stat(
@@ -556,6 +741,174 @@ fn run_virtual_file_external(
     Ok(())
 }
 
+fn run_darwin_external(
+    context: &HookContext,
+    symbol: &str,
+    allocations: &Rc<RefCell<AllocationState>>,
+    darwin: &Rc<RefCell<DarwinState>>,
+) -> Result<()> {
+    let mut state = darwin.borrow_mut();
+    match symbol {
+        "IOMainPort" => {
+            let destination = guest_register(context, 1)?;
+            if destination != 0 {
+                context.mem_write(destination, &1u32.to_le_bytes())?;
+            }
+            context.reg_write(199, 0)?;
+        }
+        "IOBSDNameMatching" | "IOServiceMatching" => {
+            context.reg_write(199, 0x7102_0000_0000)?;
+        }
+        "IOServiceGetMatchingServices" => {
+            if state.iterator_services.len() >= MAX_DARWIN_OBJECTS {
+                bail!("too many FairPlay IO iterators");
+            }
+            let iterator = DarwinState::next_handle(&mut state.next_iterator, 1)?;
+            let service = DarwinState::next_handle(&mut state.next_service, 1)?;
+            context.mem_write(
+                guest_register(context, 2)?,
+                &u32::try_from(iterator)?.to_le_bytes(),
+            )?;
+            state.iterator_services.insert(iterator, service);
+            context.reg_write(199, 0)?;
+        }
+        "IOIteratorNext" => {
+            let iterator = guest_register(context, 0)? & 0xffff_ffff;
+            context.reg_write(199, state.iterator_services.remove(&iterator).unwrap_or(0))?;
+        }
+        "IOServiceOpen" => {
+            let connection = DarwinState::next_handle(&mut state.next_connection, 1)?;
+            context.mem_write(
+                guest_register(context, 3)?,
+                &u32::try_from(connection)?.to_le_bytes(),
+            )?;
+            context.reg_write(199, 0)?;
+        }
+        "IORegistryEntryGetParentEntry" => {
+            let parent = DarwinState::next_handle(&mut state.next_service, 1)?;
+            context.mem_write(
+                guest_register(context, 2)?,
+                &u32::try_from(parent)?.to_le_bytes(),
+            )?;
+            context.reg_write(199, 0)?;
+        }
+        "IORegistryEntryCreateCFProperty" => {
+            let key_object = guest_register(context, 1)?;
+            let pointer = read_guest_u64(
+                context,
+                key_object
+                    .checked_add(16)
+                    .context("CFString address overflow")?,
+            )?;
+            let length = read_guest_u64(
+                context,
+                key_object
+                    .checked_add(24)
+                    .context("CFString address overflow")?,
+            )?;
+            if length > 0x1000 {
+                bail!("FairPlay IORegistry property key exceeds limit");
+            }
+            let key = context.mem_read(pointer, length as usize)?;
+            let value = match key.as_slice() {
+                b"IOBuiltin" => CfValue::Boolean(true),
+                b"IOMACAddress" => CfValue::Data(Zeroizing::new(state.mac_address.to_vec())),
+                _ => bail!("unmodeled FairPlay IORegistry property"),
+            };
+            if state.cf_values.len() >= MAX_DARWIN_OBJECTS {
+                bail!("too many FairPlay CF values");
+            }
+            let handle = allocations.borrow_mut().allocate(context, 1)?;
+            state.cf_values.insert(handle, value);
+            context.reg_write(199, handle)?;
+        }
+        "CFBooleanGetValue" => {
+            let handle = guest_register(context, 0)?;
+            let Some(CfValue::Boolean(value)) = state.cf_values.get(&handle) else {
+                bail!("FairPlay CF value is not a boolean");
+            };
+            context.reg_write(199, u64::from(*value))?;
+        }
+        "CFDataGetBytes" => {
+            let handle = guest_register(context, 0)?;
+            let Some(CfValue::Data(data)) = state.cf_values.get(&handle) else {
+                bail!("FairPlay CF value is not data");
+            };
+            let offset = usize::try_from(guest_register(context, 1)?)?;
+            let length = usize::try_from(guest_register(context, 2)?)?;
+            let start = offset.min(data.len());
+            let end = start.saturating_add(length).min(data.len());
+            context.mem_write(guest_register(context, 3)?, &data[start..end])?;
+        }
+        "CFRelease" => {
+            state.cf_values.remove(&guest_register(context, 0)?);
+        }
+        "IOConnectCallStructMethod" => {
+            let selector = guest_register(context, 1)? & 0xffff_ffff;
+            let output = match selector {
+                0x16 => 0x4b13_0000u32.to_le_bytes().to_vec(),
+                0x17 => 0x1f8u32.to_le_bytes().to_vec(),
+                0x15 => state
+                    .iokit15_output
+                    .as_ref()
+                    .context("FairPlay IOKit selector 0x15 needs private output")?
+                    .to_vec(),
+                _ => bail!("unmodeled FairPlay IOKit selector {selector:#x}"),
+            };
+            let size_pointer = guest_register(context, 5)?;
+            let capacity = if size_pointer == 0 {
+                0
+            } else {
+                read_guest_u64(context, size_pointer)?
+            };
+            if output.len() as u64 > capacity {
+                bail!("FairPlay IOKit output exceeds caller capacity");
+            }
+            context.mem_write(guest_register(context, 4)?, &output)?;
+            context.mem_write(size_pointer, &(output.len() as u64).to_le_bytes())?;
+            context.reg_write(199, 0)?;
+        }
+        "bootstrap_check_in" => {
+            let port = DarwinState::next_handle(&mut state.next_bootstrap_port, 1)?;
+            context.mem_write(
+                guest_register(context, 2)?,
+                &u32::try_from(port)?.to_le_bytes(),
+            )?;
+            context.reg_write(199, 0)?;
+        }
+        "CFMachPortCreateWithPort" => {
+            let context_pointer = guest_register(context, 4)?;
+            if context_pointer != 0 {
+                context.mem_write(context_pointer, &[0])?;
+            }
+            let handle = DarwinState::next_handle(&mut state.next_cf_object, PAGE_BYTES)?;
+            context.reg_write(199, handle)?;
+        }
+        "CFMachPortCreateRunLoopSource"
+        | "CFFileDescriptorCreate"
+        | "CFFileDescriptorCreateRunLoopSource" => {
+            let handle = DarwinState::next_handle(&mut state.next_cf_object, PAGE_BYTES)?;
+            context.reg_write(199, handle)?;
+        }
+        "CFRunLoopGetMain" => context.reg_write(199, 0x7000_7000_f000)?,
+        "xpc_connection_create_mach_service" => {
+            let handle = DarwinState::next_handle(&mut state.next_xpc_connection, PAGE_BYTES)?;
+            context.reg_write(199, handle)?;
+        }
+        "IOObjectRelease" => context.reg_write(199, 0)?,
+        "CFFileDescriptorEnableCallBacks"
+        | "CFRunLoopAddSource"
+        | "xpc_connection_activate"
+        | "xpc_connection_cancel"
+        | "xpc_connection_resume"
+        | "xpc_connection_send_message"
+        | "xpc_connection_set_event_handler"
+        | "xpc_connection_set_target_queue" => {}
+        _ => bail!("unmodeled Darwin external function {symbol}"),
+    }
+    Ok(())
+}
+
 fn run_modeled_external(
     context: &HookContext,
     symbol: &str,
@@ -563,8 +916,39 @@ fn run_modeled_external(
     once_tokens: &Rc<RefCell<BTreeSet<u64>>>,
     host_state: &Rc<RefCell<HostState>>,
     virtual_files: &Rc<RefCell<VirtualFileState>>,
+    darwin: &Rc<RefCell<DarwinState>>,
 ) -> Result<()> {
     match symbol {
+        "IOMainPort"
+        | "IOBSDNameMatching"
+        | "IOServiceMatching"
+        | "IOServiceGetMatchingServices"
+        | "IOIteratorNext"
+        | "IOServiceOpen"
+        | "IORegistryEntryGetParentEntry"
+        | "IORegistryEntryCreateCFProperty"
+        | "CFBooleanGetValue"
+        | "CFDataGetBytes"
+        | "CFRelease"
+        | "IOConnectCallStructMethod"
+        | "bootstrap_check_in"
+        | "CFMachPortCreateWithPort"
+        | "CFMachPortCreateRunLoopSource"
+        | "CFFileDescriptorCreate"
+        | "CFFileDescriptorCreateRunLoopSource"
+        | "CFRunLoopGetMain"
+        | "xpc_connection_create_mach_service"
+        | "IOObjectRelease"
+        | "CFFileDescriptorEnableCallBacks"
+        | "CFRunLoopAddSource"
+        | "xpc_connection_activate"
+        | "xpc_connection_cancel"
+        | "xpc_connection_resume"
+        | "xpc_connection_send_message"
+        | "xpc_connection_set_event_handler"
+        | "xpc_connection_set_target_queue" => {
+            run_darwin_external(context, symbol, allocations, darwin)?;
+        }
         "open" | "open_dprotected_np" | "stat" | "lstat" | "fstat" | "read" | "close"
         | "unlink" => run_virtual_file_external(context, symbol, virtual_files)?,
         "malloc" | "malloc_type_malloc" | "calloc" | "malloc_type_calloc" => {
@@ -645,6 +1029,27 @@ fn run_modeled_external(
         }
         "getpid" => context.reg_write(199, 1234)?,
         "kqueue" => context.reg_write(199, 0x900)?,
+        "kevent"
+        | "signal"
+        | "sched_yield"
+        | "umask"
+        | "notify_cancel"
+        | "notify_post"
+        | "vm_deallocate"
+        | "pthread_set_qos_class_self_np"
+        | "pthread_mutex_destroy"
+        | "pthread_mutex_init"
+        | "pthread_mutex_lock"
+        | "pthread_mutex_unlock"
+        | "pthread_rwlock_destroy"
+        | "pthread_rwlock_init"
+        | "pthread_rwlock_rdlock"
+        | "pthread_rwlock_unlock"
+        | "pthread_rwlock_wrlock"
+        | "CSBackupSetItemExcluded" => {
+            context.reg_write(199, 0)?;
+        }
+        "chkstk_darwin" => {}
         "error" => context.reg_write(199, SYNTHETIC_ERRNO_ADDRESS)?,
         "mmap" => {
             let length = guest_register(context, 1)?;
@@ -690,7 +1095,7 @@ fn install_modeled_external(
     failure: &Rc<RefCell<Option<String>>>,
     allocations: &Rc<RefCell<AllocationState>>,
     once_tokens: &Rc<RefCell<BTreeSet<u64>>>,
-    services: (&Rc<RefCell<HostState>>, &Rc<RefCell<VirtualFileState>>),
+    services: ServiceRefs<'_>,
 ) -> Result<bool> {
     let symbol = symbol.trim_start_matches('_');
     if !matches!(
@@ -711,6 +1116,25 @@ fn install_modeled_external(
             | "gettimeofday"
             | "getpid"
             | "kqueue"
+            | "kevent"
+            | "signal"
+            | "sched_yield"
+            | "umask"
+            | "notify_cancel"
+            | "notify_post"
+            | "vm_deallocate"
+            | "pthread_set_qos_class_self_np"
+            | "pthread_mutex_destroy"
+            | "pthread_mutex_init"
+            | "pthread_mutex_lock"
+            | "pthread_mutex_unlock"
+            | "pthread_rwlock_destroy"
+            | "pthread_rwlock_init"
+            | "pthread_rwlock_rdlock"
+            | "pthread_rwlock_unlock"
+            | "pthread_rwlock_wrlock"
+            | "CSBackupSetItemExcluded"
+            | "chkstk_darwin"
             | "error"
             | "mmap"
             | "munmap"
@@ -722,6 +1146,34 @@ fn install_modeled_external(
             | "read"
             | "close"
             | "unlink"
+            | "IOMainPort"
+            | "IOBSDNameMatching"
+            | "IOServiceMatching"
+            | "IOServiceGetMatchingServices"
+            | "IOIteratorNext"
+            | "IOServiceOpen"
+            | "IORegistryEntryGetParentEntry"
+            | "IORegistryEntryCreateCFProperty"
+            | "CFBooleanGetValue"
+            | "CFDataGetBytes"
+            | "CFRelease"
+            | "IOConnectCallStructMethod"
+            | "bootstrap_check_in"
+            | "CFMachPortCreateWithPort"
+            | "CFMachPortCreateRunLoopSource"
+            | "CFFileDescriptorCreate"
+            | "CFFileDescriptorCreateRunLoopSource"
+            | "CFRunLoopGetMain"
+            | "xpc_connection_create_mach_service"
+            | "IOObjectRelease"
+            | "CFFileDescriptorEnableCallBacks"
+            | "CFRunLoopAddSource"
+            | "xpc_connection_activate"
+            | "xpc_connection_cancel"
+            | "xpc_connection_resume"
+            | "xpc_connection_send_message"
+            | "xpc_connection_set_event_handler"
+            | "xpc_connection_set_target_queue"
     ) {
         return Ok(false);
     }
@@ -743,6 +1195,7 @@ fn install_modeled_external(
     let once_tokens = Rc::clone(once_tokens);
     let host_state = Rc::clone(services.0);
     let virtual_files = Rc::clone(services.1);
+    let darwin = Rc::clone(services.2);
     engine.add_code_hook(address, address, move |context, _, _| {
         if let Err(error) = run_modeled_external(
             context,
@@ -751,6 +1204,7 @@ fn install_modeled_external(
             &once_tokens,
             &host_state,
             &virtual_files,
+            &darwin,
         ) {
             *failure.borrow_mut() = Some(format!("FairPlay external {symbol_name}: {error:#}"));
             let _ = context.stop();
@@ -789,6 +1243,7 @@ impl CheckpointRunner {
             random_state: checkpoint.random_state()?,
         }));
         let virtual_files = Rc::new(RefCell::new(VirtualFileState::from_checkpoint(checkpoint)?));
+        let darwin = Rc::new(RefCell::new(DarwinState::from_checkpoint(checkpoint)?));
         let source_pages = checkpoint.page_addresses()?;
         let errno_mapped = image.externals.values().any(|symbol| {
             matches!(
@@ -826,7 +1281,7 @@ impl CheckpointRunner {
                 &external_failure,
                 &allocation_state,
                 &once_tokens,
-                (&host_state, &virtual_files),
+                (&host_state, &virtual_files, &darwin),
             )? {
                 modeled_imports += 1;
             }
@@ -842,6 +1297,7 @@ impl CheckpointRunner {
             once_tokens,
             host_state,
             virtual_files,
+            darwin,
             errno_mapped,
         })
     }
@@ -887,6 +1343,18 @@ impl CheckpointRunner {
 
     pub fn set_missing_files_are_enoent(&mut self, enabled: bool) {
         self.virtual_files.borrow_mut().missing_are_enoent = enabled;
+    }
+
+    pub fn set_mac_address(&mut self, address: [u8; 6]) {
+        self.darwin.borrow_mut().mac_address = address;
+    }
+
+    pub fn set_iokit15_output(&mut self, output: Zeroizing<Vec<u8>>) -> Result<()> {
+        if output.len() > 1024 * 1024 {
+            bail!("FairPlay IOKit selector 0x15 output exceeds limit");
+        }
+        self.darwin.borrow_mut().iokit15_output = Some(output);
+        Ok(())
     }
 
     pub fn run_until(
@@ -996,6 +1464,7 @@ impl CheckpointRunner {
             .to_owned();
         let pc = self.engine.reg_read(REG_PC)?;
         let (open_files, next_fd, removed_file_suffixes) = self.virtual_files.borrow().snapshot();
+        let mut darwin_services = SensitiveValue(self.darwin.borrow().snapshot());
         let mut root = SensitiveValue(source.clone_root()?);
         let Value::Dict(ref mut fields) = root.0 else {
             bail!("checkpoint root is not a dictionary");
@@ -1028,6 +1497,10 @@ impl CheckpointRunner {
             ("open_files", open_files),
             ("next_fd", next_fd),
             ("removed_file_suffixes", removed_file_suffixes),
+            (
+                "darwin_services",
+                std::mem::replace(&mut darwin_services.0, Value::None),
+            ),
         ];
         for (name, value) in updates {
             if let Some(mut old) = fields.insert(HashableValue::String(name.into()), value) {
@@ -1077,6 +1550,7 @@ mod tests {
         let virtual_files = Rc::new(RefCell::new(
             VirtualFileState::from_checkpoint(&source).unwrap(),
         ));
+        let darwin = Rc::new(RefCell::new(DarwinState::from_checkpoint(&source).unwrap()));
         let call = |engine: &mut Engine, index: u64, symbol: &str, args: [u64; 3]| {
             let address = EXTERNAL_BASE + index * EXTERNAL_STRIDE;
             assert!(
@@ -1087,7 +1561,7 @@ mod tests {
                     &failure,
                     &allocations,
                     &once_tokens,
-                    (&host_state, &virtual_files),
+                    (&host_state, &virtual_files, &darwin),
                 )
                 .unwrap()
             );
@@ -1116,22 +1590,26 @@ mod tests {
         assert_eq!(engine.reg_read(199).unwrap(), 3);
         call(&mut engine, 6, "_free", [0x2000, 0, 0]);
         assert_eq!(engine.reg_read(199).unwrap(), 0x2000);
+        call(&mut engine, 7, "_pthread_mutex_lock", [0x2000, 0, 0]);
+        assert_eq!(engine.reg_read(199).unwrap(), 0);
+        call(&mut engine, 8, "_chkstk_darwin", [0x1234, 0, 0]);
+        assert_eq!(engine.reg_read(199).unwrap(), 0x1234);
         assert!(
             !install_modeled_external(
                 &mut engine,
-                EXTERNAL_BASE + 7 * EXTERNAL_STRIDE,
+                EXTERNAL_BASE + 9 * EXTERNAL_STRIDE,
                 "_unmodeled",
                 &failure,
                 &allocations,
                 &once_tokens,
-                (&host_state, &virtual_files),
+                (&host_state, &virtual_files, &darwin),
             )
             .unwrap()
         );
         assert!(
             engine
                 .start_bounded(
-                    EXTERNAL_BASE + 7 * EXTERNAL_STRIDE,
+                    EXTERNAL_BASE + 9 * EXTERNAL_STRIDE,
                     0x5000,
                     Duration::from_secs(2),
                     4
@@ -1155,6 +1633,7 @@ mod tests {
         let virtual_files = Rc::new(RefCell::new(
             VirtualFileState::from_checkpoint(&source).unwrap(),
         ));
+        let darwin = Rc::new(RefCell::new(DarwinState::from_checkpoint(&source).unwrap()));
         install_modeled_external(
             &mut engine,
             EXTERNAL_BASE,
@@ -1162,7 +1641,7 @@ mod tests {
             &failure,
             &allocations,
             &once_tokens,
-            (&host_state, &virtual_files),
+            (&host_state, &virtual_files, &darwin),
         )
         .unwrap();
         engine.reg_write(199, 0x9000).unwrap();
@@ -1199,7 +1678,7 @@ mod tests {
             &runner.external_failure,
             &runner.allocation_state,
             &runner.once_tokens,
-            (&runner.host_state, &runner.virtual_files),
+            (&runner.host_state, &runner.virtual_files, &runner.darwin),
         )
         .unwrap();
         runner.engine.reg_write(199, 5000).unwrap();
@@ -1224,7 +1703,7 @@ mod tests {
             &runner.external_failure,
             &runner.allocation_state,
             &runner.once_tokens,
-            (&runner.host_state, &runner.virtual_files),
+            (&runner.host_state, &runner.virtual_files, &runner.darwin),
         )
         .unwrap();
         runner.engine.reg_write(199, 2).unwrap();
@@ -1325,7 +1804,7 @@ mod tests {
                 &runner.external_failure,
                 &runner.allocation_state,
                 &runner.once_tokens,
-                (&runner.host_state, &runner.virtual_files),
+                (&runner.host_state, &runner.virtual_files, &runner.darwin),
             )
             .unwrap();
         };
@@ -1390,7 +1869,7 @@ mod tests {
                 &runner.external_failure,
                 &runner.allocation_state,
                 &runner.once_tokens,
-                (&runner.host_state, &runner.virtual_files),
+                (&runner.host_state, &runner.virtual_files, &runner.darwin),
             )
             .unwrap();
             runner.engine.reg_write(199, x0).unwrap();
@@ -1429,7 +1908,7 @@ mod tests {
             &runner.external_failure,
             &runner.allocation_state,
             &runner.once_tokens,
-            (&runner.host_state, &runner.virtual_files),
+            (&runner.host_state, &runner.virtual_files, &runner.darwin),
         )
         .unwrap();
         runner.engine.reg_write(200, 8192).unwrap();
@@ -1537,7 +2016,7 @@ mod tests {
                 &runner.external_failure,
                 &runner.allocation_state,
                 &runner.once_tokens,
-                (&runner.host_state, &runner.virtual_files),
+                (&runner.host_state, &runner.virtual_files, &runner.darwin),
             )
             .unwrap();
             for (index, value) in args.into_iter().enumerate() {
@@ -1619,6 +2098,208 @@ mod tests {
             replay.engine.mem_read(SYNTHETIC_ERRNO_ADDRESS, 4).unwrap(),
             9u32.to_le_bytes()
         );
+    }
+
+    #[test]
+    fn darwin_iokit_and_cf_objects_survive_checkpoint_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let binary_path = directory.path().join("fairplayd.arm64e");
+        let output_path = directory.path().join("resumed.pkl.gz");
+        std::fs::write(&binary_path, SYNTHETIC_BINARY).unwrap();
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        let prepare = |runner: &mut CheckpointRunner| {
+            runner.engine.mem_map(0x8000, PAGE_BYTES as usize).unwrap();
+            runner.engine.mem_map(0x9000, PAGE_BYTES as usize).unwrap();
+            runner.engine.mem_map(0xa000, PAGE_BYTES as usize).unwrap();
+            runner.engine.mem_write(0x9000, b"IOBuiltin").unwrap();
+            runner.engine.mem_write(0x9010, b"IOMACAddress").unwrap();
+            runner
+                .engine
+                .mem_write(0x8010, &0x9000u64.to_le_bytes())
+                .unwrap();
+            runner
+                .engine
+                .mem_write(0x8018, &9u64.to_le_bytes())
+                .unwrap();
+            runner
+                .engine
+                .mem_write(0x8050, &0x9010u64.to_le_bytes())
+                .unwrap();
+            runner
+                .engine
+                .mem_write(0x8058, &12u64.to_le_bytes())
+                .unwrap();
+        };
+        let call = |runner: &mut CheckpointRunner, index: u64, symbol: &str, args: [u64; 6]| {
+            let address = EXTERNAL_BASE + index * EXTERNAL_STRIDE;
+            install_modeled_external(
+                &mut runner.engine,
+                address,
+                symbol,
+                &runner.external_failure,
+                &runner.allocation_state,
+                &runner.once_tokens,
+                (&runner.host_state, &runner.virtual_files, &runner.darwin),
+            )
+            .unwrap();
+            for (index, value) in args.into_iter().enumerate() {
+                runner.engine.reg_write(199 + index as i32, value).unwrap();
+            }
+            runner.engine.reg_write(2, 0x5000).unwrap();
+            runner
+                .engine
+                .start_bounded(address, 0x5000, Duration::from_secs(2), 4)
+                .unwrap();
+            assert!(runner.external_failure.borrow().is_none());
+            runner.engine.reg_read(199).unwrap()
+        };
+        prepare(&mut runner);
+        runner.set_mac_address([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        runner
+            .set_iokit15_output(Zeroizing::new(b"test".to_vec()))
+            .unwrap();
+        assert_eq!(
+            call(&mut runner, 0, "_IOMainPort", [0, 0xa000, 0, 0, 0, 0]),
+            0
+        );
+        assert_eq!(
+            runner.engine.mem_read(0xa000, 4).unwrap(),
+            1u32.to_le_bytes()
+        );
+        assert_eq!(
+            call(&mut runner, 1, "_IOServiceMatching", [0, 0, 0, 0, 0, 0]),
+            0x7102_0000_0000
+        );
+        assert_eq!(
+            call(
+                &mut runner,
+                2,
+                "_IOServiceGetMatchingServices",
+                [0, 0, 0xa000, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            runner.engine.mem_read(0xa000, 4).unwrap(),
+            0x100u32.to_le_bytes()
+        );
+        assert_eq!(
+            call(&mut runner, 3, "_IOIteratorNext", [0x100, 0, 0, 0, 0, 0]),
+            0x200
+        );
+        assert_eq!(
+            call(&mut runner, 4, "_IOIteratorNext", [0x100, 0, 0, 0, 0, 0]),
+            0
+        );
+        let boolean = call(
+            &mut runner,
+            5,
+            "_IORegistryEntryCreateCFProperty",
+            [0x200, 0x8000, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            call(
+                &mut runner,
+                6,
+                "_CFBooleanGetValue",
+                [boolean, 0, 0, 0, 0, 0]
+            ),
+            1
+        );
+        let data = call(
+            &mut runner,
+            7,
+            "_IORegistryEntryCreateCFProperty",
+            [0x200, 0x8040, 0, 0, 0, 0],
+        );
+        call(
+            &mut runner,
+            8,
+            "_CFDataGetBytes",
+            [data, 0, 6, 0xa010, 0, 0],
+        );
+        assert_eq!(
+            runner.engine.mem_read(0xa010, 6).unwrap(),
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+        );
+        runner
+            .engine
+            .mem_write(0xa100, &8u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            call(
+                &mut runner,
+                9,
+                "_IOConnectCallStructMethod",
+                [0, 0x16, 0, 0, 0xa200, 0xa100]
+            ),
+            0
+        );
+        assert_eq!(
+            runner.engine.mem_read(0xa200, 4).unwrap(),
+            0x4b13_0000u32.to_le_bytes()
+        );
+        runner
+            .engine
+            .mem_write(0xa100, &8u64.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            call(
+                &mut runner,
+                10,
+                "_IOConnectCallStructMethod",
+                [0, 0x15, 0, 0, 0xa200, 0xa100]
+            ),
+            0
+        );
+        assert_eq!(runner.engine.mem_read(0xa200, 4).unwrap(), b"test");
+        assert_eq!(
+            call(
+                &mut runner,
+                11,
+                "_IOServiceGetMatchingServices",
+                [0, 0, 0xa000, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            runner.engine.mem_read(0xa000, 4).unwrap(),
+            0x101u32.to_le_bytes()
+        );
+        runner
+            .engine
+            .reg_write(REG_PC, source.pc().unwrap())
+            .unwrap();
+        runner
+            .write_checkpoint(&source, &binary_path, &output_path)
+            .unwrap();
+
+        let resumed = FairplayCheckpoint::load_private(&output_path).unwrap();
+        let mut replay = CheckpointRunner::new(&resumed, SYNTHETIC_BINARY).unwrap();
+        prepare(&mut replay);
+        assert_eq!(
+            call(&mut replay, 0, "_IOIteratorNext", [0x101, 0, 0, 0, 0, 0]),
+            0x201
+        );
+        call(
+            &mut replay,
+            1,
+            "_CFDataGetBytes",
+            [data, 1, 3, 0xa010, 0, 0],
+        );
+        assert_eq!(
+            replay.engine.mem_read(0xa010, 3).unwrap(),
+            [0xbb, 0xcc, 0xdd]
+        );
+        call(&mut replay, 2, "_CFRelease", [data, 0, 0, 0, 0, 0]);
+        assert!(!replay.darwin.borrow().cf_values.contains_key(&data));
     }
 
     #[test]

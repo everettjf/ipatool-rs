@@ -250,6 +250,10 @@ enum FairplayEnrollCommand {
         file_stats: Vec<String>,
         #[arg(long)]
         missing_files_are_enoent: bool,
+        #[arg(long)]
+        mac_address_file: Option<PathBuf>,
+        #[arg(long)]
+        iokit15_output: Option<PathBuf>,
     },
     /// Transform a private 192/224-byte source with the embedded 26A428 state model.
     EvaluateState {
@@ -1048,6 +1052,8 @@ fn run() -> Result<()> {
                 file_payloads,
                 file_stats,
                 missing_files_are_enoent,
+                mac_address_file,
+                iokit15_output,
             } => {
                 if timeout_seconds == 0 || timeout_seconds > 300 {
                     bail!("FairPlay timeout must be between 1 and 300 seconds");
@@ -1069,6 +1075,13 @@ fn run() -> Result<()> {
                 let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
                 let stop = parse_address(&stop_address)?;
                 let mut runner = CheckpointRunner::new(&snapshot, &binary)?;
+                if let Some(path) = mac_address_file {
+                    let input = read_private_bytes(&path, 64)?;
+                    runner.set_mac_address(parse_private_mac(&input)?);
+                }
+                if let Some(path) = iokit15_output {
+                    runner.set_iokit15_output(read_private_bytes(&path, 1024 * 1024)?)?;
+                }
                 runner.set_missing_files_are_enoent(missing_files_are_enoent);
                 for specification in file_payloads {
                     let (suffix, path) = specification
@@ -1508,6 +1521,28 @@ fn parse_address(value: &str) -> Result<u64> {
     }
 }
 
+fn parse_private_mac(input: &[u8]) -> Result<[u8; 6]> {
+    if input.len() == 6 {
+        return Ok(input.try_into()?);
+    }
+    let text = std::str::from_utf8(input)
+        .context("MAC address file must contain six raw bytes or hexadecimal text")?;
+    let digits = text
+        .trim()
+        .bytes()
+        .filter(|byte| !matches!(byte, b':' | b'-'))
+        .collect::<Vec<_>>();
+    if digits.len() != 12 || !digits.iter().all(u8::is_ascii_hexdigit) {
+        bail!("MAC address file must contain six raw bytes or twelve hexadecimal digits");
+    }
+    let mut address = [0u8; 6];
+    for (index, byte) in address.iter_mut().enumerate() {
+        let pair = std::str::from_utf8(&digits[index * 2..index * 2 + 2])?;
+        *byte = u8::from_str_radix(pair, 16)?;
+    }
+    Ok(address)
+}
+
 fn parse_byte(value: &str) -> Result<u8> {
     if let Some(hex) = value.strip_prefix("0x") {
         Ok(u8::from_str_radix(hex, 16)?)
@@ -1936,6 +1971,10 @@ mod tests {
             "--file-stat",
             "SC Info.demo=0o666,265,265",
             "--missing-files-are-enoent",
+            "--mac-address-file",
+            "/private/iomac.bin",
+            "--iokit15-output",
+            "/private/iokit15.bin",
         ])
         .unwrap();
         match cli.command {
@@ -1945,16 +1984,29 @@ mod tests {
                         file_payloads,
                         file_stats,
                         missing_files_are_enoent,
+                        mac_address_file,
+                        iokit15_output,
                         ..
                     },
             } => {
                 assert_eq!(file_payloads, ["SC Info.demo=/private/state"]);
                 assert_eq!(file_stats, ["SC Info.demo=0o666,265,265"]);
                 assert!(missing_files_are_enoent);
+                assert_eq!(mac_address_file, Some(PathBuf::from("/private/iomac.bin")));
+                assert_eq!(iokit15_output, Some(PathBuf::from("/private/iokit15.bin")));
             }
             _ => panic!("unexpected command"),
         }
         assert_eq!(parse_address("0o666").unwrap(), 0o666);
+        assert_eq!(
+            parse_private_mac(&[1, 2, 3, 4, 5, 6]).unwrap(),
+            [1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            parse_private_mac(b"aa:bb:cc:dd:ee:ff\n").unwrap(),
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+        );
+        assert!(parse_private_mac(b"aa:bb:cc:dd:ee:xx").is_err());
     }
 
     #[test]
