@@ -9,6 +9,8 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::store_memory::group_pages;
+
 const MANIFEST: &str = include_str!("../assets/store/manifest.json");
 const METADATA: &[u8] = include_bytes!("../assets/store/metadata.zst");
 const PAGES: &[u8] = include_bytes!("../assets/store/pages.zst");
@@ -100,6 +102,12 @@ fn decode_profile() -> Result<ProfileData> {
             bail!("invalid Store page index");
         }
     }
+    let addresses = index
+        .pages
+        .iter()
+        .map(|page| page.address)
+        .collect::<Vec<_>>();
+    group_pages(&addresses).context("invalid Store page mapping")?;
     Ok(ProfileData {
         metadata,
         pages,
