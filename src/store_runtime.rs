@@ -1,6 +1,6 @@
 //! StoreAgent guest memory prepared from the pinned AMS images and profile.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -25,6 +25,8 @@ pub struct StoreRuntime {
     pub profile: Arc<ProfileData>,
     pub code_ranges: Vec<(u64, u64)>,
     pub heap_cursor: u64,
+    dynamic_selectors: HashMap<String, u64>,
+    dynamic_selector_addresses: HashMap<u64, String>,
 }
 
 struct ImageMemory<'a> {
@@ -116,7 +118,104 @@ impl StoreRuntime {
             profile,
             code_ranges,
             heap_cursor: HEAP_BASE,
+            dynamic_selectors: HashMap::new(),
+            dynamic_selector_addresses: HashMap::new(),
         })
+    }
+
+    pub fn allocate(&mut self, size: u64) -> Result<u64> {
+        let size = size
+            .max(1)
+            .checked_add(15)
+            .context("Store allocation size overflow")?
+            & !15;
+        let next = self
+            .heap_cursor
+            .checked_add(size)
+            .context("Store heap address overflow")?;
+        if next > HEAP_BASE + HEAP_SIZE as u64 {
+            bail!("Store guest heap exhausted");
+        }
+        let address = self.heap_cursor;
+        self.heap_cursor = next;
+        Ok(address)
+    }
+
+    pub fn read_u64(&self, address: u64) -> Result<u64> {
+        let bytes = self.engine.mem_read(address, 8)?;
+        Ok(u64::from_le_bytes(bytes.try_into().expect("eight bytes")))
+    }
+
+    pub fn write_u64(&mut self, address: u64, value: u64) -> Result<()> {
+        self.engine.mem_write(address, &value.to_le_bytes())
+    }
+
+    pub fn class_address(&self, name: &str) -> Option<u64> {
+        self.profile
+            .runtime
+            .classes_by_name
+            .get(name)
+            .map(|&index| self.profile.index.classes[index].address)
+    }
+
+    pub fn method_address(
+        &self,
+        class_name: &str,
+        selector: &str,
+        class_method: bool,
+    ) -> Option<u64> {
+        let mut name = class_name;
+        let prefix = if class_method { '+' } else { '-' };
+        loop {
+            let key = format!("{prefix}[{name} {selector}]");
+            if let Some(&address) = self.profile.runtime.methods.get(&key) {
+                return Some(address);
+            }
+            let &index = self.profile.runtime.classes_by_name.get(name)?;
+            let superclass = &self.profile.index.classes[index].superclass;
+            if superclass.is_empty() {
+                return None;
+            }
+            name = superclass;
+        }
+    }
+
+    pub fn selector_address(&mut self, selector: &str) -> Result<u64> {
+        if let Some(&address) = self.profile.runtime.selector_addresses.get(selector) {
+            return Ok(address);
+        }
+        if let Some(&address) = self.dynamic_selectors.get(selector) {
+            return Ok(address);
+        }
+        let address = self.allocate((selector.len() + 1) as u64)?;
+        self.engine.mem_write(address, selector.as_bytes())?;
+        self.engine
+            .mem_write(address + selector.len() as u64, &[0])?;
+        self.dynamic_selectors.insert(selector.to_owned(), address);
+        self.dynamic_selector_addresses
+            .insert(address, selector.to_owned());
+        Ok(address)
+    }
+
+    pub fn cstring(&self, address: u64) -> Result<String> {
+        if address == 0 {
+            return Ok(String::new());
+        }
+        if let Some(value) = self.profile.runtime.selectors_by_address.get(&address) {
+            return Ok(value.clone());
+        }
+        if let Some(value) = self.dynamic_selector_addresses.get(&address) {
+            return Ok(value.clone());
+        }
+        let mut bytes = Vec::new();
+        for offset in 0..16_384u64 {
+            let byte = self.engine.mem_read(address + offset, 1)?[0];
+            if byte == 0 {
+                return String::from_utf8(bytes).context("Store guest C string is not UTF-8");
+            }
+            bytes.push(byte);
+        }
+        bail!("unterminated Store guest C string")
     }
 }
 
@@ -133,8 +232,26 @@ mod tests {
     #[ignore = "requires cached pinned Apple image and Unicorn library"]
     fn boots_pinned_store_profile() {
         let assets = SapAssetBundle::load_cached().unwrap();
-        let runtime = StoreRuntime::open(&assets).unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
         assert!(!runtime.code_ranges.is_empty());
+        let allocated = runtime.allocate(17).unwrap();
+        assert_eq!(runtime.heap_cursor, allocated + 32);
+        runtime.write_u64(allocated, 0x1234_5678_90ab_cdef).unwrap();
+        assert_eq!(runtime.read_u64(allocated).unwrap(), 0x1234_5678_90ab_cdef);
+        let selector = runtime.selector_address("codexStoreProbe:").unwrap();
+        assert_eq!(
+            runtime.selector_address("codexStoreProbe:").unwrap(),
+            selector
+        );
+        assert_eq!(runtime.cstring(selector).unwrap(), "codexStoreProbe:");
+        let account =
+            &runtime.profile.index.classes[runtime.profile.runtime.classes_by_name["ACAccount"]];
+        assert_eq!(runtime.class_address("ACAccount"), Some(account.address));
+        let method = &account.methods[0];
+        assert_eq!(
+            runtime.method_address("ACAccount", &method.selector, method.class_method),
+            Some(method.address)
+        );
         let patch = &runtime.profile.index.metadata_patches[0];
         assert_eq!(
             runtime
