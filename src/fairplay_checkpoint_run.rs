@@ -3,7 +3,7 @@
 //! other imports remain named stubs until their host services are modeled.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Write,
     path::Path,
@@ -1419,16 +1419,49 @@ impl CheckpointRunner {
         timeout: Duration,
         instruction_limit: usize,
     ) -> Result<()> {
+        self.run_until_hit(stop_pc, 1, timeout, instruction_limit)
+    }
+
+    pub fn run_until_hit(
+        &mut self,
+        stop_pc: u64,
+        stop_hit: usize,
+        timeout: Duration,
+        instruction_limit: usize,
+    ) -> Result<()> {
         if instruction_limit == 0 || instruction_limit > 100_000_000 {
             bail!("FairPlay instruction limit is outside the bounded range");
         }
+        if stop_hit == 0 || stop_hit > 1_000_000 {
+            bail!("FairPlay stop hit count is outside the bounded range");
+        }
         let start = self.engine.reg_read(REG_PC)?;
-        if start == stop_pc {
+        if stop_hit == 1 && start == stop_pc {
             return Ok(());
         }
-        let execution = self
-            .engine
-            .start_bounded(start, stop_pc, timeout, instruction_limit);
+        let mut hits = None;
+        let execution = if stop_hit == 1 {
+            self.engine
+                .start_bounded(start, stop_pc, timeout, instruction_limit)
+        } else {
+            let observed = Rc::new(Cell::new(0usize));
+            let hook_observed = Rc::clone(&observed);
+            let hook = self
+                .engine
+                .add_code_hook(stop_pc, stop_pc, move |context, _, _| {
+                    let next = hook_observed.get() + 1;
+                    hook_observed.set(next);
+                    if next == stop_hit {
+                        let _ = context.stop();
+                    }
+                })?;
+            let result = self
+                .engine
+                .start_bounded(start, 0, timeout, instruction_limit);
+            self.engine.remove_hook(hook)?;
+            hits = Some(observed.get());
+            result
+        };
         if let Some(failure) = self.external_failure.borrow().as_deref() {
             bail!("{failure}");
         }
@@ -1440,7 +1473,7 @@ impl CheckpointRunner {
             return Err(error).with_context(|| format!("resume FairPlay checkpoint at {start:#x}"));
         }
         let actual = self.engine.reg_read(REG_PC)?;
-        if actual != stop_pc {
+        if actual != stop_pc || hits.is_some_and(|count| count != stop_hit) {
             if let Some(name) = self.image.externals.get(&actual) {
                 bail!("FairPlay reached unmodeled external {name} at {actual:#x}");
             }
@@ -2420,6 +2453,50 @@ mod tests {
         let mut runner = CheckpointRunner::new(&checkpoint, SYNTHETIC_BINARY).unwrap();
         runner.run_until(stop, Duration::from_secs(2), 8).unwrap();
         assert_eq!(runner.engine.reg_read(199).unwrap(), 43);
+    }
+
+    #[test]
+    fn stops_on_requested_address_visit_with_one_instruction_budget() {
+        let checkpoint = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&checkpoint, SYNTHETIC_BINARY).unwrap();
+        runner.engine.mem_map(0x3000, PAGE_BYTES as usize).unwrap();
+        runner
+            .engine
+            .mem_write(0x3000, &0x9100_0400u32.to_le_bytes())
+            .unwrap(); // add x0, x0, #1
+        runner
+            .engine
+            .mem_write(0x3004, &0x17ff_ffffu32.to_le_bytes())
+            .unwrap(); // b #-4
+        runner.engine.reg_write(REG_PC, 0x3000).unwrap();
+        runner.engine.reg_write(199, 0).unwrap();
+        runner
+            .run_until_hit(0x3000, 3, Duration::from_secs(2), 10)
+            .unwrap();
+        assert_eq!(runner.engine.reg_read(REG_PC).unwrap(), 0x3000);
+        assert_eq!(runner.engine.reg_read(199).unwrap(), 2);
+
+        let mut bounded = CheckpointRunner::new(&checkpoint, SYNTHETIC_BINARY).unwrap();
+        bounded.engine.mem_map(0x3000, PAGE_BYTES as usize).unwrap();
+        bounded
+            .engine
+            .mem_write(0x3000, &0x9100_0400u32.to_le_bytes())
+            .unwrap();
+        bounded
+            .engine
+            .mem_write(0x3004, &0x17ff_ffffu32.to_le_bytes())
+            .unwrap();
+        bounded.engine.reg_write(REG_PC, 0x3000).unwrap();
+        assert!(
+            bounded
+                .run_until_hit(0x3000, 3, Duration::from_secs(2), 2)
+                .is_err()
+        );
+        assert!(
+            bounded
+                .run_until_hit(0x3000, 0, Duration::from_secs(2), 10)
+                .is_err()
+        );
     }
 
     #[test]

@@ -240,6 +240,8 @@ enum FairplayEnrollCommand {
         output_checkpoint: Option<PathBuf>,
         #[arg(long, help = "Instruction address at which to stop")]
         stop_address: String,
+        #[arg(long, default_value_t = 1, help = "Stop on this visit to the address")]
+        stop_hit: usize,
         #[arg(long, default_value_t = 100_000)]
         instruction_limit: usize,
         #[arg(long, default_value_t = 30)]
@@ -1047,6 +1049,7 @@ fn run() -> Result<()> {
                 fairplayd,
                 output_checkpoint,
                 stop_address,
+                stop_hit,
                 instruction_limit,
                 timeout_seconds,
                 file_payloads,
@@ -1110,8 +1113,9 @@ fn run() -> Result<()> {
                         },
                     )?;
                 }
-                runner.run_until(
+                runner.run_until_hit(
                     stop,
+                    stop_hit,
                     Duration::from_secs(timeout_seconds),
                     instruction_limit,
                 )?;
@@ -1126,6 +1130,7 @@ fn run() -> Result<()> {
                             "schema": "fairplay.checkpoint-run.v1",
                             "start_pc": format!("{:#x}", runner.start_pc),
                             "stop_pc": format!("{stop:#x}"),
+                            "stop_hit": stop_hit,
                             "checkpoint_pages": runner.checkpoint_pages,
                             "fairplayd_fixups": runner.image.fixups,
                             "external_imports": runner.image.externals.len(),
@@ -1967,6 +1972,8 @@ mod tests {
             "/private/fairplayd",
             "--stop-address",
             "0x1000",
+            "--stop-hit",
+            "432",
             "--file-payload",
             "SC Info.demo=/private/state",
             "--file-stat",
@@ -1985,6 +1992,7 @@ mod tests {
                         file_payloads,
                         file_stats,
                         missing_files_are_enoent,
+                        stop_hit,
                         mac_address_file,
                         iokit15_output,
                         ..
@@ -1993,6 +2001,7 @@ mod tests {
                 assert_eq!(file_payloads, ["SC Info.demo=/private/state"]);
                 assert_eq!(file_stats, ["SC Info.demo=0o666,265,265"]);
                 assert!(missing_files_are_enoent);
+                assert_eq!(stop_hit, 432);
                 assert_eq!(mac_address_file, Some(PathBuf::from("/private/iomac.bin")));
                 assert_eq!(iokit15_output, Some(PathBuf::from("/private/iokit15.bin")));
             }
