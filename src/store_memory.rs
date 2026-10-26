@@ -48,6 +48,59 @@ pub fn group_pages(addresses: &[u64]) -> Result<Vec<MemoryRegion>> {
     Ok(regions)
 }
 
+/// Remove already mapped image ranges from grouped profile mappings. The
+/// profile bytes can still be written into those existing ranges afterward.
+pub fn exclude_mapped_regions(
+    regions: &[MemoryRegion],
+    existing: &[MemoryRegion],
+) -> Result<Vec<MemoryRegion>> {
+    let mut occupied = Vec::with_capacity(existing.len());
+    for region in existing {
+        if region.size == 0
+            || region.address % PROFILE_PAGE_SIZE != 0
+            || region.size % PROFILE_PAGE_SIZE != 0
+        {
+            bail!("invalid existing Store image mapping");
+        }
+        let end = region
+            .address
+            .checked_add(region.size)
+            .ok_or_else(|| anyhow::anyhow!("existing Store image mapping overflows"))?;
+        occupied.push((region.address, end));
+    }
+    occupied.sort_unstable();
+    let mut result = Vec::new();
+    for region in regions {
+        let end = region
+            .address
+            .checked_add(region.size)
+            .ok_or_else(|| anyhow::anyhow!("Store profile region overflows"))?;
+        let mut cursor = region.address;
+        for &(taken_start, taken_end) in &occupied {
+            if taken_end <= cursor || taken_start >= end {
+                continue;
+            }
+            if taken_start > cursor {
+                result.push(MemoryRegion {
+                    address: cursor,
+                    size: taken_start - cursor,
+                });
+            }
+            cursor = cursor.max(taken_end).min(end);
+            if cursor == end {
+                break;
+            }
+        }
+        if cursor < end {
+            result.push(MemoryRegion {
+                address: cursor,
+                size: end - cursor,
+            });
+        }
+    }
+    Ok(result)
+}
+
 pub fn check_profile_access(allowed: &HashSet<u64>, address: u64, size: u64) -> Result<()> {
     if size == 0 {
         return Ok(());
@@ -133,5 +186,40 @@ mod tests {
                 .contains("overflows")
         );
         assert!(check_profile_access(&HashSet::from([u64::MAX - 4095]), u64::MAX, 1).is_ok());
+    }
+
+    #[test]
+    fn excludes_loaded_image_ranges_from_profile_mappings() {
+        let regions = [MemoryRegion {
+            address: 0x1000,
+            size: 0x6000,
+        }];
+        let existing = [MemoryRegion {
+            address: 0x3000,
+            size: 0x2000,
+        }];
+        assert_eq!(
+            exclude_mapped_regions(&regions, &existing).unwrap(),
+            [
+                MemoryRegion {
+                    address: 0x1000,
+                    size: 0x2000
+                },
+                MemoryRegion {
+                    address: 0x5000,
+                    size: 0x2000
+                }
+            ]
+        );
+        assert!(
+            exclude_mapped_regions(
+                &regions,
+                &[MemoryRegion {
+                    address: 1,
+                    size: 4096
+                }]
+            )
+            .is_err()
+        );
     }
 }

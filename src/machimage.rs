@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 
-use crate::unicorn_runtime::Engine;
+use crate::{store_memory::MemoryRegion, unicorn_runtime::Engine};
 
 const PAGE_SIZE: u64 = 4096;
 const MAX_IMAGE_SPAN: u64 = 1 << 30;
@@ -180,10 +180,7 @@ impl Image {
         Ok(())
     }
 
-    pub fn load(&self, memory: &mut impl Memory) -> Result<()> {
-        if !self.prelinked {
-            bail!("{} must be prepared before loading", self.name);
-        }
+    pub fn mapped_regions(&self) -> Result<Vec<MemoryRegion>> {
         let mut ranges = Vec::new();
         for segment in &self.segments {
             if segment.name == "__PAGEZERO" || segment.size == 0 {
@@ -217,6 +214,7 @@ impl Image {
             merged.push((start, end));
         }
         let mut mapped = 0u64;
+        let mut regions = Vec::with_capacity(merged.len());
         for (start, end) in merged {
             let size = end - start;
             mapped = mapped
@@ -225,8 +223,21 @@ impl Image {
             if mapped > MAX_IMAGE_SPAN {
                 bail!("mapped segments make {} too large", self.name);
             }
+            regions.push(MemoryRegion {
+                address: start,
+                size,
+            });
+        }
+        Ok(regions)
+    }
+
+    pub fn load(&self, memory: &mut impl Memory) -> Result<()> {
+        if !self.prelinked {
+            bail!("{} must be prepared before loading", self.name);
+        }
+        for region in self.mapped_regions()? {
             memory
-                .map(start, size)
+                .map(region.address, region.size)
                 .with_context(|| format!("map {}", self.name))?;
         }
         for segment in &self.segments {

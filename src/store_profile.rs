@@ -10,7 +10,10 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::{store_memory::group_pages, unicorn_runtime::Engine};
+use crate::{
+    store_memory::{MemoryRegion, exclude_mapped_regions, group_pages},
+    unicorn_runtime::Engine,
+};
 
 const MANIFEST: &str = include_str!("../assets/store/manifest.json");
 const METADATA: &[u8] = include_bytes!("../assets/store/metadata.zst");
@@ -81,9 +84,19 @@ pub struct Call {
 }
 
 impl ProfileData {
-    /// Map exported pages and install return stubs for all pinned call sites in
-    /// a fresh Unicorn engine. Mach-O image segments are loaded separately.
+    /// Map exported pages and install return stubs in a fresh Unicorn engine.
     pub fn map_pages_and_calls(&self, engine: &mut Engine) -> Result<()> {
+        self.map_pages_and_calls_after_images(engine, &[])
+    }
+
+    /// Install profile data after prelinked image segments have been loaded.
+    /// Already mapped image ranges are skipped during mapping but may receive
+    /// profile page data and call stubs.
+    pub fn map_pages_and_calls_after_images(
+        &self,
+        engine: &mut Engine,
+        image_regions: &[MemoryRegion],
+    ) -> Result<()> {
         let mut addresses = self
             .index
             .pages
@@ -93,7 +106,7 @@ impl ProfileData {
         addresses.extend(self.index.calls.iter().map(|call| call.address & !4095));
         addresses.sort_unstable();
         addresses.dedup();
-        for region in group_pages(&addresses)? {
+        for region in exclude_mapped_regions(&group_pages(&addresses)?, image_regions)? {
             engine
                 .mem_map(region.address, region.size as usize)
                 .with_context(|| format!("map Store region at {:#x}", region.address))?;
@@ -249,6 +262,42 @@ mod tests {
                 [0xc0, 0x03, 0x5f, 0xd6]
             );
         }
+    }
+
+    #[test]
+    #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
+    fn overlays_store_profile_on_prelinked_plugin_image() {
+        let profile = load().unwrap();
+        let mut image =
+            crate::machimage::Image::open("AMSAccountAuthenticationPlugin", &profile.plugin)
+                .unwrap();
+        image.prepare_prelinked(&[], |_| unreachable!()).unwrap();
+        let regions = image.mapped_regions().unwrap();
+        let overlapping = profile
+            .index
+            .pages
+            .iter()
+            .find(|page| {
+                regions.iter().any(|region| {
+                    page.address >= region.address && page.address < region.address + region.size
+                })
+            })
+            .unwrap();
+        let mut engine = Engine::new().unwrap();
+        image.load(&mut engine).unwrap();
+        profile
+            .map_pages_and_calls_after_images(&mut engine, &regions)
+            .unwrap();
+        let start = overlapping.offset as usize;
+        assert_eq!(
+            engine.mem_read(overlapping.address, 4096).unwrap(),
+            profile.pages[start..start + 4096]
+        );
+        let call = &profile.index.calls[0];
+        assert_eq!(
+            engine.mem_read(call.address, 4).unwrap(),
+            [0xc0, 0x03, 0x5f, 0xd6]
+        );
     }
 
     #[test]
