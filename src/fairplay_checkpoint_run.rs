@@ -3,9 +3,11 @@
 //! the corresponding FairPlay host services are modeled in Rust.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Write,
     path::Path,
+    rc::Rc,
     time::Duration,
 };
 
@@ -20,7 +22,7 @@ use crate::{
     fairplay_recovery_output::write_private_binary,
     machimage::Image,
     store_memory::MemoryRegion,
-    unicorn_runtime::{Engine, REG_PC},
+    unicorn_runtime::{Engine, HookContext, REG_PC},
 };
 
 const EXTERNAL_BASE: u64 = 0xf100_0000_0000_0000;
@@ -28,6 +30,9 @@ const EXTERNAL_STRIDE: u64 = 0x1000;
 const MAX_EXTERNALS: usize = 1 << 20;
 const PAGE_BYTES: u64 = 4096;
 const MAX_SNAPSHOT_PAGES: usize = 30_000;
+const MAX_EXTERNAL_BYTES: u64 = 0x1000_0000;
+const EXTERNAL_CHUNK_BYTES: usize = 64 * 1024;
+const RET_X30: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
 
 struct SensitiveValue(Value);
 
@@ -108,6 +113,130 @@ pub struct CheckpointRunner {
     pub image: LoadedFairplayd,
     pub checkpoint_pages: usize,
     pub start_pc: u64,
+    pub modeled_imports: usize,
+    external_failure: Rc<RefCell<Option<String>>>,
+}
+
+fn guest_register(context: &HookContext, index: i32) -> Result<u64> {
+    context.reg_read(199 + index)
+}
+
+fn copy_guest_memory(
+    context: &HookContext,
+    destination: u64,
+    source: u64,
+    count: u64,
+) -> Result<()> {
+    let backward = destination > source && destination < source.saturating_add(count);
+    let mut done = 0u64;
+    while done < count {
+        let chunk = (count - done).min(EXTERNAL_CHUNK_BYTES as u64);
+        let offset = if backward { count - done - chunk } else { done };
+        let read_address = source
+            .checked_add(offset)
+            .context("external memory source address overflow")?;
+        let write_address = destination
+            .checked_add(offset)
+            .context("external memory destination address overflow")?;
+        let bytes = Zeroizing::new(context.mem_read(read_address, chunk as usize)?);
+        context.mem_write(write_address, &bytes)?;
+        done += chunk;
+    }
+    Ok(())
+}
+
+fn fill_guest_memory(context: &HookContext, destination: u64, value: u8, count: u64) -> Result<()> {
+    let bytes = vec![value; EXTERNAL_CHUNK_BYTES];
+    let mut done = 0u64;
+    while done < count {
+        let chunk = (count - done).min(EXTERNAL_CHUNK_BYTES as u64) as usize;
+        let address = destination
+            .checked_add(done)
+            .context("external memory destination address overflow")?;
+        context.mem_write(address, &bytes[..chunk])?;
+        done += chunk as u64;
+    }
+    Ok(())
+}
+
+fn guest_string_length(context: &HookContext, address: u64, limit: u64) -> Result<u64> {
+    for offset in 0..limit {
+        let cursor = address
+            .checked_add(offset)
+            .context("external string address overflow")?;
+        if context.mem_read(cursor, 1)?[0] == 0 {
+            return Ok(offset);
+        }
+    }
+    Ok(limit)
+}
+
+fn run_modeled_external(context: &HookContext, symbol: &str) -> Result<()> {
+    match symbol {
+        "memcpy" | "memmove" => {
+            let destination = guest_register(context, 0)?;
+            let source = guest_register(context, 1)?;
+            let count = guest_register(context, 2)?.min(MAX_EXTERNAL_BYTES);
+            copy_guest_memory(context, destination, source, count)?;
+            context.reg_write(199, destination)?;
+        }
+        "memset" => {
+            let destination = guest_register(context, 0)?;
+            let value = guest_register(context, 1)? as u8;
+            let count = guest_register(context, 2)?.min(MAX_EXTERNAL_BYTES);
+            fill_guest_memory(context, destination, value, count)?;
+            context.reg_write(199, destination)?;
+        }
+        "bzero" => {
+            let destination = guest_register(context, 0)?;
+            let count = guest_register(context, 1)?.min(MAX_EXTERNAL_BYTES);
+            fill_guest_memory(context, destination, 0, count)?;
+        }
+        "strlen" | "strnlen" => {
+            let address = guest_register(context, 0)?;
+            let limit = if symbol == "strlen" {
+                0x10000
+            } else {
+                guest_register(context, 1)?.min(0x100000)
+            };
+            let length = guest_string_length(context, address, limit)?;
+            if symbol == "strlen" && length == limit {
+                bail!("unterminated guest string at {address:#x}");
+            }
+            context.reg_write(199, length)?;
+        }
+        "free" => {}
+        _ => bail!("unmodeled external function {symbol}"),
+    }
+    Ok(())
+}
+
+fn install_modeled_external(
+    engine: &mut Engine,
+    address: u64,
+    symbol: &str,
+    failure: &Rc<RefCell<Option<String>>>,
+) -> Result<bool> {
+    let symbol = symbol.trim_start_matches('_');
+    if !matches!(
+        symbol,
+        "memcpy" | "memmove" | "memset" | "bzero" | "strlen" | "strnlen" | "free"
+    ) {
+        return Ok(false);
+    }
+    engine
+        .mem_map(address, PAGE_BYTES as usize)
+        .with_context(|| format!("map external {symbol} stub"))?;
+    engine.mem_write(address, &RET_X30)?;
+    let symbol_name = symbol.to_owned();
+    let failure = Rc::clone(failure);
+    engine.add_code_hook(address, address, move |context, _, _| {
+        if let Err(error) = run_modeled_external(context, &symbol_name) {
+            *failure.borrow_mut() = Some(format!("FairPlay external {symbol_name}: {error:#}"));
+            let _ = context.stop();
+        }
+    })?;
+    Ok(true)
 }
 
 impl CheckpointRunner {
@@ -131,11 +260,20 @@ impl CheckpointRunner {
         }) {
             bail!("checkpoint PC is outside the fairplayd image");
         }
+        let external_failure = Rc::new(RefCell::new(None));
+        let mut modeled_imports = 0;
+        for (&address, symbol) in &image.externals {
+            if install_modeled_external(&mut engine, address, symbol, &external_failure)? {
+                modeled_imports += 1;
+            }
+        }
         Ok(Self {
             engine,
             image,
             checkpoint_pages,
             start_pc,
+            modeled_imports,
+            external_failure,
         })
     }
 
@@ -152,10 +290,13 @@ impl CheckpointRunner {
         if start == stop_pc {
             return Ok(());
         }
-        if let Err(error) = self
+        let execution = self
             .engine
-            .start_bounded(start, stop_pc, timeout, instruction_limit)
-        {
+            .start_bounded(start, stop_pc, timeout, instruction_limit);
+        if let Some(failure) = self.external_failure.borrow().as_deref() {
+            bail!("{failure}");
+        }
+        if let Err(error) = execution {
             let actual = self.engine.reg_read(REG_PC).unwrap_or(start);
             if let Some(name) = self.image.externals.get(&actual) {
                 bail!("FairPlay reached unmodeled external {name} at {actual:#x}: {error:#}");
@@ -281,6 +422,75 @@ mod tests {
         include_bytes!("../tests/fixtures/fairplay-checkpoint-run-schema1-synthetic.pkl.gz");
 
     #[test]
+    fn modeled_memory_externals_execute_in_guest_and_return_to_lr() {
+        let mut engine = Engine::new().unwrap();
+        engine.mem_map(0x1000, PAGE_BYTES as usize).unwrap();
+        engine.mem_map(0x2000, PAGE_BYTES as usize).unwrap();
+        engine.mem_write(0x1000, b"abcdef\0").unwrap();
+        let failure = Rc::new(RefCell::new(None));
+        let call = |engine: &mut Engine, index: u64, symbol: &str, args: [u64; 3]| {
+            let address = EXTERNAL_BASE + index * EXTERNAL_STRIDE;
+            assert!(install_modeled_external(engine, address, symbol, &failure).unwrap());
+            for (index, value) in args.into_iter().enumerate() {
+                engine.reg_write(199 + index as i32, value).unwrap();
+            }
+            engine.reg_write(2, 0x5000).unwrap();
+            engine
+                .start_bounded(address, 0x5000, Duration::from_secs(2), 4)
+                .unwrap();
+            assert!(failure.borrow().is_none());
+        };
+        call(&mut engine, 0, "_memcpy", [0x2000, 0x1000, 6]);
+        assert_eq!(engine.mem_read(0x2000, 6).unwrap(), b"abcdef");
+        assert_eq!(engine.reg_read(199).unwrap(), 0x2000);
+        call(&mut engine, 1, "_memmove", [0x1002, 0x1000, 6]);
+        assert_eq!(engine.mem_read(0x1000, 8).unwrap(), b"ababcdef");
+        call(&mut engine, 2, "_memset", [0x2000, 0x41, 4]);
+        assert_eq!(engine.mem_read(0x2000, 4).unwrap(), b"AAAA");
+        call(&mut engine, 3, "_bzero", [0x2000, 2, 0]);
+        assert_eq!(engine.mem_read(0x2000, 4).unwrap(), b"\0\0AA");
+        engine.mem_write(0x1000, b"hello\0").unwrap();
+        call(&mut engine, 4, "_strlen", [0x1000, 0, 0]);
+        assert_eq!(engine.reg_read(199).unwrap(), 5);
+        call(&mut engine, 5, "_strnlen", [0x1000, 3, 0]);
+        assert_eq!(engine.reg_read(199).unwrap(), 3);
+        call(&mut engine, 6, "_free", [0x2000, 0, 0]);
+        assert_eq!(engine.reg_read(199).unwrap(), 0x2000);
+        assert!(
+            !install_modeled_external(
+                &mut engine,
+                EXTERNAL_BASE + 7 * EXTERNAL_STRIDE,
+                "_unmodeled",
+                &failure
+            )
+            .unwrap()
+        );
+        assert!(
+            engine
+                .start_bounded(
+                    EXTERNAL_BASE + 7 * EXTERNAL_STRIDE,
+                    0x5000,
+                    Duration::from_secs(2),
+                    4
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn modeled_external_reports_invalid_guest_memory() {
+        let mut engine = Engine::new().unwrap();
+        let failure = Rc::new(RefCell::new(None));
+        install_modeled_external(&mut engine, EXTERNAL_BASE, "_memset", &failure).unwrap();
+        engine.reg_write(199, 0x9000).unwrap();
+        engine.reg_write(200, 0x41).unwrap();
+        engine.reg_write(201, 1).unwrap();
+        engine.reg_write(2, 0x5000).unwrap();
+        let _ = engine.start_bounded(EXTERNAL_BASE, 0x5000, Duration::from_secs(2), 4);
+        assert!(failure.borrow().as_ref().unwrap().contains("memset"));
+    }
+
+    #[test]
     fn resumes_checked_macho_and_checkpoint_to_target() {
         let checkpoint = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
         assert!(CheckpointRunner::new(&checkpoint, b"wrong fairplayd").is_err());
@@ -357,10 +567,7 @@ mod tests {
         };
         assert_eq!(
             fields.get(&HashableValue::String("once_tokens".into())),
-            Some(&Value::List(vec![
-                Value::I64(0x1234),
-                Value::I64(0x5678),
-            ]))
+            Some(&Value::List(vec![Value::I64(0x1234), Value::I64(0x5678),]))
         );
         let replay = CheckpointRunner::new(&resumed, SYNTHETIC_BINARY).unwrap();
         assert_eq!(replay.engine.reg_read(199).unwrap(), 43);
