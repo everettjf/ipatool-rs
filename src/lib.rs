@@ -13,6 +13,7 @@ pub mod dyld_export;
 pub mod fairplay;
 pub mod host;
 pub mod ipa_metadata;
+pub mod ipa_patch;
 pub mod lzbitmap;
 pub mod mac_preflight;
 pub mod machfixups;
