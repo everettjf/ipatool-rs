@@ -1,1 +1,5 @@
 /target/
+/vendor/apfs/target/
+/vendor/apfs/Cargo.lock
+/vendor/apfs/.cargo-ok
+/vendor/apfs/.cargo_vcs_info.json

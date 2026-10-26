@@ -1,7 +1,7 @@
 //! Bounded parsing of AEA cryptex headers and FCS metadata.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::Read;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::time::Duration;
 
 use aes::Aes256;
@@ -62,6 +62,7 @@ pub struct AeaReader<'a> {
     index: AeaIndex,
     cache: HashMap<usize, Vec<u8>>,
     cache_order: VecDeque<usize>,
+    cursor: u64,
 }
 
 impl<'a> AeaReader<'a> {
@@ -80,6 +81,7 @@ impl<'a> AeaReader<'a> {
             index,
             cache: HashMap::new(),
             cache_order: VecDeque::new(),
+            cursor: 0,
         }
     }
 
@@ -131,6 +133,27 @@ impl<'a> AeaReader<'a> {
             written += count;
         }
         Ok(written)
+    }
+}
+
+impl Read for AeaReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = AeaReader::read_at(self, buffer, self.cursor).map_err(io::Error::other)?;
+        self.cursor += count as u64;
+        Ok(count)
+    }
+}
+
+impl Seek for AeaReader<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let target = match position {
+            SeekFrom::Start(offset) => i128::from(offset),
+            SeekFrom::Current(delta) => i128::from(self.cursor) + i128::from(delta),
+            SeekFrom::End(delta) => i128::from(self.root.file_size) + i128::from(delta),
+        };
+        self.cursor = u64::try_from(target)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid AEA seek"))?;
+        Ok(self.cursor)
     }
 }
 
@@ -230,16 +253,22 @@ impl AeaHeader {
     pub fn resolve_symmetric_key(&self) -> Result<Zeroizing<Vec<u8>>> {
         let url = self.fcs_key_url()?;
         let client = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    attempt.error("too many Apple FCS redirects")
+                } else if attempt.url().scheme() != "https" {
+                    attempt.error("Apple FCS redirect is not HTTPS")
+                } else {
+                    attempt.follow()
+                }
+            }))
             .timeout(Duration::from_secs(30))
             .build()
             .context("create Apple FCS client")?;
-        let mut response = client
-            .get(url)
-            .send()
-            .context("download Apple FCS key")?
-            .error_for_status()
-            .context("Apple FCS key server returned an error")?;
+        let mut response = client.get(url).send().context("download Apple FCS key")?;
+        if response.status() != reqwest::StatusCode::OK {
+            bail!("Apple FCS key server returned HTTP {}", response.status());
+        }
         let mut pem = Zeroizing::new(Vec::new());
         response
             .by_ref()
@@ -258,7 +287,24 @@ impl AeaHeader {
             bail!("Apple FCS key response is too large");
         }
         let pem = std::str::from_utf8(pem).context("Apple FCS key is not PEM encoded")?;
-        let secret = SecretKey::from_pkcs8_pem(pem)
+        let begin = pem
+            .find("-----BEGIN ")
+            .context("Apple FCS key response is not PEM encoded")?;
+        let label_start = begin + "-----BEGIN ".len();
+        let label_end = pem[label_start..]
+            .find("-----")
+            .map(|offset| label_start + offset)
+            .context("Apple FCS key response has no PEM label")?;
+        let label = &pem[label_start..label_end];
+        if label != "PRIVATE KEY" {
+            bail!("unsupported Apple FCS PEM label {label:?}");
+        }
+        let end_marker = "-----END PRIVATE KEY-----";
+        let end = pem[begin..]
+            .find(end_marker)
+            .map(|offset| begin + offset + end_marker.len())
+            .context("Apple FCS key response has no PEM end marker")?;
+        let secret = SecretKey::from_pkcs8_pem(&pem[begin..end])
             .context("Apple FCS key is not a PKCS#8 P-256 private key")?;
         let wrapped: FcsResponse =
             serde_json::from_slice(self.fcs_response()?).context("parse AEA FCS response")?;
@@ -695,6 +741,12 @@ mod tests {
             &*header.unwrap_fcs_key(pem.as_bytes()).unwrap(),
             &[0x42; 32]
         );
+        assert_eq!(
+            &*header
+                .unwrap_fcs_key(format!("\0prefix\0{}\0suffix", pem.as_str()).as_bytes())
+                .unwrap(),
+            &[0x42; 32]
+        );
 
         let mut tampered = wrapped;
         tampered[0] ^= 1;
@@ -839,6 +891,10 @@ mod tests {
         assert_eq!(&decoded, b"data");
         assert_eq!(reader.read_at(&mut decoded, 1).unwrap(), 3);
         assert_eq!(&decoded[..3], b"ata");
+        assert_eq!(reader.seek(SeekFrom::End(-2)).unwrap(), 2);
+        assert_eq!(reader.read(&mut decoded).unwrap(), 2);
+        assert_eq!(&decoded[..2], b"ta");
+        assert_eq!(reader.read(&mut decoded).unwrap(), 0);
         server.join().unwrap();
     }
 
@@ -903,5 +959,37 @@ mod tests {
             .read_to_end(&mut decoded)
             .unwrap();
         assert_eq!(decoded, original);
+    }
+
+    #[test]
+    #[ignore = "downloads and decrypts the pinned Apple restore image"]
+    fn pinned_aea_image_exposes_filesystem_header() {
+        let restore = crate::sap_archive::PinnedRestore::open().unwrap();
+        let mut image = AeaReader::open(&restore.remote, restore.file_system).unwrap();
+        assert_eq!(image.size(), 14_189_330_432);
+        let mut header = [0u8; 36];
+        image.read_exact(&mut header).unwrap();
+        assert!(header.iter().any(|byte| *byte != 0));
+        eprintln!("pinned filesystem header: {header:02x?}");
+    }
+
+    #[test]
+    #[ignore = "downloads and mounts the pinned Apple restore image"]
+    fn pinned_aea_image_opens_apfs_volume() {
+        let restore = crate::sap_archive::PinnedRestore::open().unwrap();
+        let image = AeaReader::open(&restore.remote, restore.file_system).unwrap();
+        let mut volume = apfs::ApfsVolume::open(image).unwrap();
+        eprintln!("APFS volume: {}", volume.volume_info().name);
+        let entries = volume.list_directory("/").unwrap();
+        assert!(!entries.is_empty());
+        for path in [
+            "/System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Resources/commerce",
+            "/System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP",
+            "/System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/Resources/CoreFP.icxs",
+        ] {
+            let stat = volume.stat(path).unwrap();
+            eprintln!("APFS file {path}: {} bytes", stat.size);
+            assert!(stat.size > 0);
+        }
     }
 }
