@@ -7,6 +7,7 @@ pub mod fairplay;
 pub mod host;
 pub mod machimage;
 pub mod platform;
+pub mod sap_protocol;
 pub mod state;
 pub mod store_memory;
 pub mod store_profile;
