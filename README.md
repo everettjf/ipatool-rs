@@ -19,6 +19,7 @@ cargo run -- lookup --app-id 497799835
 | Public search, including visionOS discovery | Implemented, with offline unit tests |
 | Public app lookup by ID or bundle identifier | Implemented, with offline unit tests |
 | Shared HTTP request/response decoding and state directory migration | Implemented as library modules; account integration pending |
+| Authentication URL bag, endpoint validation, 2FA and phone routing helpers | Implemented as library modules; SAP signing and login execution pending |
 | Account authentication and secure credential storage | Pending |
 | Purchases, owned apps, version history and metadata | Pending |
 | iOS and macOS package downloads and SINF replication | Pending |

@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod catalog;
 pub mod platform;
 pub mod state;
