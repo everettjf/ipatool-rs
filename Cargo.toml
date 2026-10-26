@@ -32,6 +32,10 @@ tempfile = "3.27"
 base64 = "0.22"
 hpke = { version = "0.14.1", default-features = false, features = ["nistp", "aes", "alloc", "getrandom"] }
 p256 = { version = "0.13", features = ["pkcs8", "pem"] }
+aes = "0.8"
+ctr = "0.9"
+hkdf = "0.12"
+hmac = "0.12"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"

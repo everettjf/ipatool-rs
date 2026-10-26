@@ -4,14 +4,19 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::time::Duration;
 
+use aes::Aes256;
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use ctr::cipher::{KeyIvInit, StreamCipher};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use hpke::{
     Deserializable, Kem, OpModeR, aead::AesGcm256, kdf::HkdfSha256, kem::DhP256HkdfSha256,
     setup_receiver,
 };
 use p256::{SecretKey, pkcs8::DecodePrivateKey};
 use serde::Deserialize;
+use sha2::Sha256;
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -20,6 +25,19 @@ use crate::{sap_archive::ArchiveEntry, sap_remote::RemoteFile};
 const HEADER_SIZE: usize = 12;
 const MAX_AUTH_DATA: usize = 1 << 20;
 const MAX_FCS_KEY_SIZE: u64 = 64 << 10;
+const MAIN_SALT_SIZE: usize = 32;
+const ENCRYPTED_ROOT_SIZE: usize = 112;
+
+type Aes256Ctr = ctr::Ctr128BE<Aes256>;
+
+pub struct AeaRoot {
+    pub file_size: u64,
+    pub segment_size: u32,
+    pub segments_per_cluster: u32,
+    pub cluster_offset: u64,
+    pub cluster_mac: [u8; 32],
+    pub main_key: Zeroizing<Vec<u8>>,
+}
 
 #[derive(Deserialize)]
 struct FcsResponse {
@@ -32,6 +50,7 @@ struct FcsResponse {
 pub struct AeaHeader {
     pub profile_and_scrypt_strength: u32,
     pub metadata: HashMap<String, Vec<u8>>,
+    pub auth_data: Vec<u8>,
 }
 
 impl AeaHeader {
@@ -73,7 +92,7 @@ impl AeaHeader {
             .context("download Apple FCS key")?
             .error_for_status()
             .context("Apple FCS key server returned an error")?;
-        let mut pem = Vec::new();
+        let mut pem = Zeroizing::new(Vec::new());
         response
             .by_ref()
             .take(MAX_FCS_KEY_SIZE + 1)
@@ -140,6 +159,103 @@ pub fn read_remote_header(remote: &RemoteFile, entry: ArchiveEntry) -> Result<Ae
     Ok(AeaHeader {
         profile_and_scrypt_strength: u32::from_le_bytes(prefix[4..8].try_into()?),
         metadata: parse_metadata(&auth_data)?,
+        auth_data,
+    })
+}
+
+pub fn read_remote_root(
+    remote: &RemoteFile,
+    entry: ArchiveEntry,
+    header: &AeaHeader,
+    symmetric_key: &[u8],
+) -> Result<AeaRoot> {
+    if entry
+        .offset
+        .checked_add(entry.size)
+        .is_none_or(|end| end > remote.size())
+    {
+        bail!("AEA archive entry exceeds remote image");
+    }
+    let salt_offset = HEADER_SIZE as u64 + header.auth_data.len() as u64;
+    let cluster_offset = salt_offset
+        .checked_add((MAIN_SALT_SIZE + ENCRYPTED_ROOT_SIZE) as u64)
+        .context("AEA root offset overflow")?;
+    if cluster_offset > entry.size {
+        bail!("AEA root header exceeds archive entry");
+    }
+    let mut salt = [0u8; MAIN_SALT_SIZE];
+    let mut encrypted_root = [0u8; ENCRYPTED_ROOT_SIZE];
+    read_exact_at(remote, &mut salt, entry.offset + salt_offset)?;
+    read_exact_at(
+        remote,
+        &mut encrypted_root,
+        entry.offset + salt_offset + MAIN_SALT_SIZE as u64,
+    )?;
+    decrypt_root_header(header, entry.size, &salt, &encrypted_root, symmetric_key).map(
+        |mut root| {
+            root.cluster_offset = entry.offset + cluster_offset;
+            root
+        },
+    )
+}
+
+fn decrypt_root_header(
+    header: &AeaHeader,
+    encrypted_size: u64,
+    main_salt: &[u8; MAIN_SALT_SIZE],
+    encrypted_root: &[u8; ENCRYPTED_ROOT_SIZE],
+    symmetric_key: &[u8],
+) -> Result<AeaRoot> {
+    if symmetric_key.is_empty() {
+        bail!("empty AEA symmetric key");
+    }
+    let mut info = b"AEA_AMK".to_vec();
+    info.extend_from_slice(&header.profile_and_scrypt_strength.to_le_bytes());
+    let mut main_key = Zeroizing::new(vec![0u8; symmetric_key.len()]);
+    Hkdf::<Sha256>::new(Some(main_salt), symmetric_key)
+        .expand(&info, &mut main_key)
+        .map_err(|_| anyhow::anyhow!("derive AEA main key"))?;
+
+    let mut root_key = Zeroizing::new([0u8; 80]);
+    Hkdf::<Sha256>::new(None, &main_key)
+        .expand(b"AEA_RHEK", &mut *root_key)
+        .map_err(|_| anyhow::anyhow!("derive AEA root key"))?;
+    let (expected_mac, rest) = encrypted_root.split_at(32);
+    let (ciphertext, cluster_mac) = rest.split_at(48);
+    let mut mac = Hmac::<Sha256>::new_from_slice(&root_key[..32])?;
+    mac.update(cluster_mac);
+    mac.update(&header.auth_data);
+    mac.update(ciphertext);
+    mac.update(&(cluster_mac.len() as u64 + header.auth_data.len() as u64).to_le_bytes());
+    mac.verify_slice(expected_mac)
+        .map_err(|_| anyhow::anyhow!("AEA root header failed authentication"))?;
+
+    let mut plain = Zeroizing::new([0u8; 48]);
+    plain.copy_from_slice(ciphertext);
+    Aes256Ctr::new_from_slices(&root_key[32..64], &root_key[64..80])?.apply_keystream(&mut *plain);
+    let file_size = u64::from_le_bytes(plain[0..8].try_into()?);
+    let actual_encrypted_size = u64::from_le_bytes(plain[8..16].try_into()?);
+    let segment_size = u32::from_le_bytes(plain[16..20].try_into()?);
+    let segments_per_cluster = u32::from_le_bytes(plain[20..24].try_into()?);
+    if file_size == 0 || file_size > i64::MAX as u64 {
+        bail!("invalid AEA output size {file_size}");
+    }
+    if actual_encrypted_size != encrypted_size {
+        bail!("AEA encrypted size is {actual_encrypted_size}, expected {encrypted_size}");
+    }
+    if segment_size == 0 || segments_per_cluster == 0 {
+        bail!("AEA has an invalid segment layout");
+    }
+    if plain[24] != b'e' || plain[25] != 2 {
+        bail!("unsupported AEA encoding");
+    }
+    Ok(AeaRoot {
+        file_size,
+        segment_size,
+        segments_per_cluster,
+        cluster_offset: 0,
+        cluster_mac: cluster_mac.try_into()?,
+        main_key,
     })
 }
 
@@ -215,6 +331,7 @@ mod tests {
         let header = AeaHeader {
             profile_and_scrypt_strength: 1,
             metadata: parse_metadata(&bytes).unwrap(),
+            auth_data: bytes,
         };
         assert_eq!(
             header.fcs_key_url().unwrap().host_str(),
@@ -238,6 +355,7 @@ mod tests {
                 "com.apple.wkms.fcs-key-url".into(),
                 b"https://example.com/key".to_vec(),
             )]),
+            auth_data: Vec::new(),
         };
         assert!(header.fcs_key_url().is_err());
     }
@@ -264,6 +382,7 @@ mod tests {
                 .to_string()
                 .into_bytes(),
             )]),
+            auth_data: Vec::new(),
         };
         assert_eq!(
             &*header.unwrap_fcs_key(pem.as_bytes()).unwrap(),
@@ -282,5 +401,53 @@ mod tests {
             .into_bytes(),
         );
         assert!(header.unwrap_fcs_key(pem.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn authenticates_and_decrypts_root_header() {
+        let header = AeaHeader {
+            profile_and_scrypt_strength: 1,
+            metadata: HashMap::new(),
+            auth_data: b"fixture-auth-data".to_vec(),
+        };
+        let salt = [0x12; MAIN_SALT_SIZE];
+        let symmetric_key = [0x34; 32];
+        let mut info = b"AEA_AMK".to_vec();
+        info.extend_from_slice(&1u32.to_le_bytes());
+        let mut main_key = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(&salt), &symmetric_key)
+            .expand(&info, &mut main_key)
+            .unwrap();
+        let mut root_key = [0u8; 80];
+        Hkdf::<Sha256>::new(None, &main_key)
+            .expand(b"AEA_RHEK", &mut root_key)
+            .unwrap();
+        let mut encrypted = [0u8; ENCRYPTED_ROOT_SIZE];
+        encrypted[32..40].copy_from_slice(&8192u64.to_le_bytes());
+        encrypted[40..48].copy_from_slice(&4096u64.to_le_bytes());
+        encrypted[48..52].copy_from_slice(&4096u32.to_le_bytes());
+        encrypted[52..56].copy_from_slice(&2u32.to_le_bytes());
+        encrypted[56] = b'e';
+        encrypted[57] = 2;
+        encrypted[80..].fill(0x56);
+        Aes256Ctr::new_from_slices(&root_key[32..64], &root_key[64..80])
+            .unwrap()
+            .apply_keystream(&mut encrypted[32..80]);
+        let mut mac = Hmac::<Sha256>::new_from_slice(&root_key[..32]).unwrap();
+        mac.update(&encrypted[80..]);
+        mac.update(&header.auth_data);
+        mac.update(&encrypted[32..80]);
+        mac.update(&(32u64 + header.auth_data.len() as u64).to_le_bytes());
+        encrypted[..32].copy_from_slice(&mac.finalize().into_bytes());
+
+        let root = decrypt_root_header(&header, 4096, &salt, &encrypted, &symmetric_key).unwrap();
+        assert_eq!(root.file_size, 8192);
+        assert_eq!(root.segment_size, 4096);
+        assert_eq!(root.segments_per_cluster, 2);
+        assert_eq!(root.cluster_mac, [0x56; 32]);
+        assert_eq!(&*root.main_key, &main_key);
+
+        encrypted[32] ^= 1;
+        assert!(decrypt_root_header(&header, 4096, &salt, &encrypted, &symmetric_key).is_err());
     }
 }
