@@ -100,6 +100,16 @@ enum Command {
         platform: String,
         #[arg(long)]
         purchase: bool,
+        #[arg(long)]
+        fairplay_decrypt: bool,
+        #[arg(long, requires = "fairplay_decrypt")]
+        fairplay_model: Option<PathBuf>,
+        #[arg(long, requires = "fairplay_decrypt")]
+        fairplay_output: Option<PathBuf>,
+        #[arg(long, requires = "fairplay_decrypt")]
+        fairplay_report: Option<PathBuf>,
+        #[arg(long, requires = "fairplay_decrypt")]
+        fairplay_force: bool,
     },
     /// List apps owned by the authenticated App Store account.
     ListPurchases {
@@ -406,6 +416,11 @@ fn run() -> Result<()> {
             external_version_id,
             platform,
             purchase,
+            fairplay_decrypt,
+            fairplay_model,
+            fairplay_output,
+            fairplay_report,
+            fairplay_force,
         } => {
             if app_id.is_none_or(|id| id <= 0)
                 && bundle_identifier.as_deref().is_none_or(str::is_empty)
@@ -413,6 +428,9 @@ fn run() -> Result<()> {
                 bail!("either the app ID or the bundle identifier must be specified");
             }
             let platform = Platform::parse(&platform)?.context("platform is required")?;
+            if fairplay_decrypt && fairplay_model.is_none() {
+                bail!("--fairplay-model is required with --fairplay-decrypt");
+            }
             let account_store = AccountStore::new(open_system_keychain()?);
             let mut account = account_store.load()?;
             let backend = DownloadProductClient::open()?;
@@ -453,14 +471,41 @@ fn run() -> Result<()> {
                 };
                 match result {
                     Ok(path) => {
+                        let decrypted = if fairplay_decrypt {
+                            let (decrypted_path, report_path) = fairplay_download_paths(
+                                &path,
+                                fairplay_output.as_deref(),
+                                fairplay_report.as_deref(),
+                            )?;
+                            decrypt_ipa_with_options(
+                                &path,
+                                &decrypted_path,
+                                fairplay_model.as_deref().expect("validated model"),
+                                Some(&report_path),
+                                fairplay_force,
+                            )?;
+                            Some((decrypted_path, report_path))
+                        } else {
+                            None
+                        };
                         match cli.format {
-                            Format::Json => println!(
-                                "{}",
-                                serde_json::json!({
+                            Format::Json => {
+                                let mut output = serde_json::json!({
                                     "output": path, "purchased": purchased, "success": true
-                                })
-                            ),
-                            Format::Text => println!("{}", path.display()),
+                                });
+                                if let Some((decrypted_path, report_path)) = &decrypted {
+                                    output["decryptedOutput"] = serde_json::json!(decrypted_path);
+                                    output["report"] = serde_json::json!(report_path);
+                                }
+                                println!("{output}");
+                            }
+                            Format::Text => {
+                                println!("{}", path.display());
+                                if let Some((decrypted_path, report_path)) = decrypted {
+                                    println!("decrypted: {}", decrypted_path.display());
+                                    println!("report: {}", report_path.display());
+                                }
+                            }
                         }
                         break;
                     }
@@ -838,6 +883,27 @@ fn parse_platform(value: Option<&str>) -> Result<Option<Platform>> {
     Platform::parse(value.unwrap_or_default())
 }
 
+fn fairplay_download_paths(
+    package: &std::path::Path,
+    output: Option<&std::path::Path>,
+    report: Option<&std::path::Path>,
+) -> Result<(PathBuf, PathBuf)> {
+    if !package
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ipa"))
+    {
+        bail!("FairPlay post-processing requires an IPA download");
+    }
+    Ok((
+        output
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| package.with_extension("decrypted.ipa")),
+        report
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| package.with_extension("decrypted.json")),
+    ))
+}
+
 fn print_search(output: &SearchOutput, format: Format) -> Result<()> {
     match format {
         Format::Json => println!(
@@ -880,4 +946,46 @@ fn print_purchase_success(already_owned: bool, format: Format) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fairplay_download_paths_require_ipa_and_default_beside_it() {
+        let paths =
+            fairplay_download_paths(std::path::Path::new("/tmp/App.IPA"), None, None).unwrap();
+        assert_eq!(paths.0, PathBuf::from("/tmp/App.decrypted.ipa"));
+        assert_eq!(paths.1, PathBuf::from("/tmp/App.decrypted.json"));
+        assert!(fairplay_download_paths(std::path::Path::new("/tmp/App.pkg"), None, None).is_err());
+    }
+
+    #[test]
+    fn fairplay_download_flags_parse_without_signing_in() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "download",
+            "--app-id",
+            "123",
+            "--fairplay-decrypt",
+            "--fairplay-model",
+            "/private/model.bin",
+            "--fairplay-force",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Download {
+                fairplay_decrypt,
+                fairplay_model,
+                fairplay_force,
+                ..
+            } => {
+                assert!(fairplay_decrypt);
+                assert_eq!(fairplay_model, Some(PathBuf::from("/private/model.bin")));
+                assert!(fairplay_force);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
 }
