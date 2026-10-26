@@ -52,6 +52,7 @@ struct StoreState {
     current_queue: u64,
     pending: Vec<(u64, u64)>,
     allocations: HashMap<u64, u64>,
+    main_queue: Option<u64>,
 }
 
 struct CallbackResume {
@@ -237,6 +238,7 @@ impl StoreRuntime {
             current_queue: 0,
             pending: Vec::new(),
             allocations: HashMap::new(),
+            main_queue: None,
         }));
         let hook_error = Rc::new(RefCell::new(None));
         let error_slot = Rc::clone(&hook_error);
@@ -879,6 +881,7 @@ fn dispatch_call(
         | "swift_bridgeObjectRetain"
         | "swift_unknownObjectRetain"
         | "swift_destroy_strong"
+        | "$ss15CollectionOfOneV8IteratorVwxx"
         | "swift_pod_destroy"
         | "swift_arrayDestroy"
         | "swift_deallocPartialClassInstance"
@@ -1474,7 +1477,16 @@ fn dispatch_call(
         | "dispatch_get_global_queue"
         | "dispatch_get_main_queue"
         | "dispatch_queue_create_with_target" => {
+            if symbol == "dispatch_get_main_queue"
+                && let Some(queue) = state.main_queue
+            {
+                context.reg_write(REG_X0, queue)?;
+                return Ok(());
+            }
             let queue = new_guest_object(context, profile, state, "HostQueue", StoreValue::Empty)?;
+            if symbol == "dispatch_get_main_queue" {
+                state.main_queue = Some(queue);
+            }
             if symbol == "dispatch_queue_create_with_target" {
                 let target = context.reg_read(REG_X0 + 2)?;
                 state
@@ -1562,6 +1574,23 @@ fn dispatch_call(
             write_guest_u64(context, output, 5)?;
             write_guest_u64(context, output + 8, 0)?;
         }
+        "$sSo17OS_dispatch_queueC8DispatchE4mainABvgZ" => {
+            let queue = match state.main_queue {
+                Some(queue) => queue,
+                None => {
+                    let queue =
+                        new_guest_object(context, profile, state, "HostQueue", StoreValue::Empty)?;
+                    state.main_queue = Some(queue);
+                    queue
+                }
+            };
+            context.reg_write(REG_X0, queue)?;
+        }
+        "$sSo13os_log_type_ta0A0E5errorABvgZ" => context.reg_write(REG_X0, 16)?,
+        "$sSo13os_log_type_ta0A0E5faultABvgZ" => context.reg_write(REG_X0, 17)?,
+        "$sSo13os_log_type_ta0A0E4infoABvgZ" => context.reg_write(REG_X0, 1)?,
+        "$sSo13os_log_type_ta0A0E5debugABvgZ" => context.reg_write(REG_X0, 2)?,
+        "$sSo13os_log_type_ta0A0E7defaultABvgZ" => context.reg_write(REG_X0, 0)?,
         "$s2os12OSSignpostIDVwst" => {
             let destination = context.reg_read(REG_X0)?;
             let tag = context.reg_read(REG_X0 + 1)?;
@@ -1698,10 +1727,54 @@ fn dispatch_call(
             write_guest_u64(context, destination, context.reg_read(REG_X0)?)?;
             write_guest_u64(context, destination + 8, context.reg_read(REG_X0 + 1)?)?;
         }
+        "$sSKsSS7ElementRtzrlE6joined9separatorS2S_tF" => {
+            let separator = swift_string(
+                context,
+                state,
+                context.reg_read(REG_X0)?,
+                context.reg_read(REG_X0 + 1)?,
+            )?;
+            let sequence = context.reg_read(REG_X0 + 20)?;
+            let storage = read_guest_u64(context, sequence)?;
+            let count = read_guest_u64(context, storage + 16)?;
+            if count > 65_536 {
+                bail!("Swift joined sequence exceeds item limit");
+            }
+            let mut values = Vec::with_capacity(count as usize);
+            for index in 0..count {
+                let element = storage + 32 + index * 16;
+                values.push(swift_string(
+                    context,
+                    state,
+                    read_guest_u64(context, element)?,
+                    read_guest_u64(context, element + 8)?,
+                )?);
+            }
+            return_swift_string(context, state, &values.join(&separator))?;
+        }
         "$ss17CodingUserInfoKeyVwCP" | "$sSSwCP" | "$sSSwcp" | "$sSSwca" => {
             let destination = context.reg_read(REG_X0)?;
             let source = context.reg_read(REG_X0 + 1)?;
             context.mem_write(destination, &context.mem_read(source, 16)?)?;
+            context.reg_write(REG_X0, destination)?;
+        }
+        "$sSqwta"
+        | "$sSqwca"
+        | "$sSqwcp"
+        | "$sSqwtk"
+        | "swift_cvw_initWithCopy"
+        | "swift_cvw_assignWithCopy"
+        | "swift_cvw_initWithTake"
+        | "swift_cvw_assignWithTake" => {
+            let destination = context.reg_read(REG_X0)?;
+            let source = context.reg_read(REG_X0 + 1)?;
+            let metadata = context.reg_read(REG_X0 + 2)?;
+            let witnesses = read_guest_u64(context, metadata - 8)?;
+            let size = read_guest_u64(context, witnesses + 64)?;
+            if size > 1024 {
+                bail!("Swift value copy exceeds budget");
+            }
+            context.mem_write(destination, &context.mem_read(source, size as usize)?)?;
             context.reg_write(REG_X0, destination)?;
         }
         "$s10ObjectiveC8SelectorV4hash4intoys6HasherVz_tF" => {
@@ -3667,6 +3740,39 @@ mod tests {
             .unwrap();
         assert!(runtime.state.borrow().objects.contains_key(&promise));
         assert!(!runtime.state.borrow().pending.is_empty());
+        let joined_call = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| {
+                call.symbol.trim_start_matches('_')
+                    == "$sSKsSS7ElementRtzrlE6joined9separatorS2S_tF"
+            })
+            .unwrap()
+            .address;
+        let storage = runtime.allocate(64).unwrap();
+        runtime.write_u64(storage + 16, 2).unwrap();
+        for (index, character) in [(0, b'a'), (1, b'b')] {
+            let mut word = [0u8; 16];
+            word[0] = character;
+            word[15] = 0xe1;
+            runtime
+                .engine
+                .mem_write(storage + 32 + index * 16, &word)
+                .unwrap();
+        }
+        let sequence = runtime.allocate(8).unwrap();
+        runtime.write_u64(sequence, storage).unwrap();
+        runtime.engine.reg_write(REG_X0 + 20, sequence).unwrap();
+        let result = runtime
+            .call(joined_call, &[0x202c, 0xe200_0000_0000_0000])
+            .unwrap();
+        assert_eq!(
+            result,
+            u64::from_le_bytes([b'a', b',', b' ', b'b', 0, 0, 0, 0])
+        );
+        assert_eq!(runtime.engine.reg_read(REG_X0 + 1).unwrap() >> 56, 0xe4);
         assert!(
             runtime
                 .call(objc_msg_send, &[u64::MAX, selector])
