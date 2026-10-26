@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     fs::{self, File},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
-use zip::{ZipArchive, ZipWriter};
+use zip::{ZipArchive, ZipWriter, read::ZipFile, write::FullFileOptions};
 
 use crate::{
     fairplay::{inspect_model_path, parse_sinf_selector},
@@ -66,6 +66,100 @@ fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn local_extra(source: &mut File, member: &ZipFile<'_, File>) -> Result<Vec<u8>> {
+    source.seek(SeekFrom::Start(member.header_start()))?;
+    let mut header = [0u8; 30];
+    source.read_exact(&mut header)?;
+    if header[..4] != [0x50, 0x4b, 0x03, 0x04] {
+        bail!("IPA member has an invalid local ZIP header");
+    }
+    let name_len = u16::from_le_bytes(header[26..28].try_into().unwrap()) as u64;
+    let extra_len = u16::from_le_bytes(header[28..30].try_into().unwrap()) as usize;
+    source.seek(SeekFrom::Current(name_len as i64))?;
+    let mut extra = vec![0u8; extra_len];
+    source.read_exact(&mut extra)?;
+    Ok(extra)
+}
+
+fn add_extra_fields(options: &mut FullFileOptions<'_>, extra: &[u8], central: bool) -> Result<()> {
+    let mut cursor = 0;
+    while cursor < extra.len() {
+        if extra.len() - cursor < 4 {
+            bail!("IPA ZIP extra field is truncated");
+        }
+        let id = u16::from_le_bytes(extra[cursor..cursor + 2].try_into().unwrap());
+        let length = u16::from_le_bytes(extra[cursor + 2..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4;
+        if length > extra.len() - cursor {
+            bail!("IPA ZIP extra field has invalid length");
+        }
+        options.add_extra_data(id, extra[cursor..cursor + length].into(), central)?;
+        cursor += length;
+    }
+    Ok(())
+}
+
+fn without_zip64(extra: &[u8]) -> Result<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut cursor = 0;
+    while cursor < extra.len() {
+        if extra.len() - cursor < 4 {
+            bail!("IPA ZIP extra field is truncated");
+        }
+        let id = u16::from_le_bytes(extra[cursor..cursor + 2].try_into().unwrap());
+        let length = u16::from_le_bytes(extra[cursor + 2..cursor + 4].try_into().unwrap()) as usize;
+        let end = cursor + 4 + length;
+        if end > extra.len() {
+            bail!("IPA ZIP extra field has invalid length");
+        }
+        if id != 0x0001 {
+            result.extend_from_slice(&extra[cursor..end]);
+        }
+        cursor = end;
+    }
+    Ok(result)
+}
+
+fn full_options(
+    member: &ZipFile<'_, File>,
+    local: &[u8],
+    central: &[u8],
+) -> Result<FullFileOptions<'static>> {
+    let mut options = FullFileOptions::default()
+        .compression_method(member.compression())
+        .unix_permissions(member.unix_mode().unwrap_or(0o644))
+        .large_file(member.size().max(member.compressed_size()) >= u32::MAX as u64)
+        .last_modified_time(member.last_modified().unwrap_or_default());
+    let local = without_zip64(local)?;
+    let central = without_zip64(central)?;
+    let central_only = central
+        .strip_prefix(local.as_slice())
+        .context("IPA ZIP central extras do not contain the local extras as a prefix")?;
+    add_extra_fields(&mut options, &local, false)?;
+    add_extra_fields(&mut options, central_only, true)?;
+    Ok(options)
+}
+
+fn write_reencoded(
+    writer: &mut ZipWriter<File>,
+    member: &mut ZipFile<'_, File>,
+    local: &[u8],
+    central: &[u8],
+    prefix: &[u8],
+    rest: Option<&[u8]>,
+) -> Result<()> {
+    let name = member.name().to_owned();
+    let options = full_options(member, local, central)?;
+    writer.start_file(name, options)?;
+    writer.write_all(prefix)?;
+    if let Some(bytes) = rest {
+        writer.write_all(bytes)?;
+    } else {
+        std::io::copy(member, writer)?;
+    }
+    Ok(())
+}
+
 fn supf_for<'a>(member: &str, names: &'a HashSet<String>) -> Option<&'a str> {
     let (directory, base) = member.rsplit_once('/')?;
     for suffix in [".v5.supf", ".supf"] {
@@ -113,6 +207,7 @@ pub fn decrypt_ipa_with_options(
     validate_destinations(input, output, model_path, report, force)?;
     let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
     let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
+    let mut raw_source = File::open(input).context("open IPA ZIP headers")?;
     let mut names = HashSet::with_capacity(archive.len());
     let mut sinf_name = None;
     for index in 0..archive.len() {
@@ -141,15 +236,35 @@ pub fn decrypt_ipa_with_options(
     for index in 0..archive.len() {
         let mut member = archive.by_index(index).context("read IPA member")?;
         let name = member.name().to_owned();
-        if member.is_dir() || member.size() < 4 {
-            writer.raw_copy_file(member)?;
+        let local = local_extra(&mut raw_source, &member)?;
+        let central = member.extra_data().unwrap_or_default().to_vec();
+        let has_extra = !local.is_empty() || !central.is_empty();
+        if member.is_dir() {
+            if has_extra {
+                let options = full_options(&member, &local, &central)?;
+                writer.add_directory(name, options)?;
+            } else {
+                writer.raw_copy_file(member)?;
+            }
+            continue;
+        }
+        if member.size() < 4 {
+            if has_extra {
+                write_reencoded(&mut writer, &mut member, &local, &central, &[], None)?;
+            } else {
+                writer.raw_copy_file(member)?;
+            }
             continue;
         }
         let mut prefix = [0u8; 4];
         member.read_exact(&mut prefix)?;
         if !is_macho(&prefix) {
-            drop(member);
-            writer.raw_copy_file(archive.by_index_raw(index)?)?;
+            if has_extra {
+                write_reencoded(&mut writer, &mut member, &local, &central, &prefix, None)?;
+            } else {
+                drop(member);
+                writer.raw_copy_file(archive.by_index_raw(index)?)?;
+            }
             continue;
         }
         let mut blob = Vec::new();
@@ -160,11 +275,18 @@ pub fn decrypt_ipa_with_options(
         let slices = parse_macho_slices(&blob).with_context(|| format!("inspect {name}"))?;
         let encrypted = slices.iter().any(|slice| slice.layout.crypt_id != 0);
         if !encrypted {
-            drop(member);
-            writer.raw_copy_file(archive.by_index_raw(index)?)?;
+            if has_extra {
+                write_reencoded(&mut writer, &mut member, &local, &central, &blob, Some(&[]))?;
+            } else {
+                drop(member);
+                writer.raw_copy_file(archive.by_index_raw(index)?)?;
+            }
             continue;
         }
         let options = member.options();
+        let rich_options = has_extra
+            .then(|| full_options(&member, &local, &central))
+            .transpose()?;
         drop(member);
         let supf_name = supf_for(&name, &names)
             .with_context(|| format!("encrypted Mach-O {name} has no adjacent SUPF"))?;
@@ -172,9 +294,12 @@ pub fn decrypt_ipa_with_options(
             .with_context(|| format!("parse {supf_name}"))?;
         let (decrypted, reports) =
             decrypt_macho(&blob, &supf, *key).with_context(|| format!("decrypt {name}"))?;
-        writer
-            .start_file(&name, options)
-            .with_context(|| format!("create decrypted IPA member {name}"))?;
+        if let Some(rich_options) = rich_options {
+            writer.start_file(&name, rich_options)
+        } else {
+            writer.start_file(&name, options)
+        }
+        .with_context(|| format!("create decrypted IPA member {name}"))?;
         writer
             .write_all(&decrypted)
             .with_context(|| format!("write decrypted IPA member {name}"))?;
@@ -444,6 +569,13 @@ mod tests {
         bytes
     }
 
+    fn extras(path: &Path, name: &str) -> (Vec<u8>, Vec<u8>) {
+        let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let member = archive.by_name(name).unwrap();
+        let local = local_extra(&mut File::open(path).unwrap(), &member).unwrap();
+        (local, member.extra_data().unwrap_or_default().to_vec())
+    }
+
     #[test]
     fn decrypts_ipa_with_private_model_and_preserves_other_members() {
         let directory = tempfile::tempdir().unwrap();
@@ -469,10 +601,23 @@ mod tests {
             ("Payload/A.app/A", encrypted.as_slice()),
             ("Payload/A.app/Info.plist", b"unchanged".as_slice()),
         ] {
-            writer.start_file(name, options).unwrap();
+            if name == "Payload/A.app/A" || name == "Payload/A.app/Info.plist" {
+                let mut extra = FullFileOptions::default();
+                extra
+                    .add_extra_data(0xcafe, Box::new([1, 2, 3]), false)
+                    .unwrap();
+                extra
+                    .add_extra_data(0xbeef, Box::new([4, 5, 6]), true)
+                    .unwrap();
+                writer.start_file(name, extra).unwrap();
+            } else {
+                writer.start_file(name, options).unwrap();
+            }
             writer.write_all(data).unwrap();
         }
         writer.finish().unwrap();
+        let original_extras = extras(&input, "Payload/A.app/A");
+        assert_ne!(original_extras.0, original_extras.1);
         let input_before = fs::read(&input).unwrap();
         let result =
             decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), false).unwrap();
@@ -487,6 +632,11 @@ mod tests {
         );
         decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), true).unwrap();
         assert_eq!(fs::read(&input).unwrap(), input_before);
+        assert_eq!(extras(&output, "Payload/A.app/A"), original_extras);
+        assert_eq!(
+            extras(&output, "Payload/A.app/Info.plist"),
+            extras(&input, "Payload/A.app/Info.plist")
+        );
         let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
         let mut image = Vec::new();
         archive
