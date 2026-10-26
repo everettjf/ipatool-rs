@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
+    credentials::Account,
     machimage::{Image, Memory},
     sap_assets::SapAssetBundle,
     store_memory::{MemoryRegion, exclude_mapped_regions},
@@ -44,6 +45,22 @@ pub struct StoreRuntime {
     pub code_ranges: Vec<(u64, u64)>,
     state: Rc<RefCell<StoreState>>,
     hook_error: Rc<RefCell<Option<String>>>,
+}
+
+/// Inputs for the ordinary Store request path. Authentication and purchase use
+/// additional Apple guest objects and are handled separately.
+pub struct StoreStandardRequest<'a> {
+    pub method: &'a str,
+    pub url: &'a str,
+    pub headers: &'a HeaderMap,
+    pub parameters: Option<&'a Value>,
+    pub body: Option<&'a [u8]>,
+    pub bag: Option<&'a Value>,
+    pub hardware_id: &'a [u8],
+    pub raw: bool,
+    pub response_format: &'a str,
+    pub no_redirects: bool,
+    pub timeout: Option<Duration>,
 }
 
 struct StoreState {
@@ -466,12 +483,173 @@ impl StoreRuntime {
         Ok((result, response))
     }
 
+    /// Prepare, send, and decode one ordinary Store request through the pinned
+    /// Apple code. The host HTTP transport must be installed with set_transport.
+    pub fn execute_standard(&mut self, input: StoreStandardRequest<'_>) -> Result<HostResponse> {
+        self.set_hardware_id(input.hardware_id)?;
+        self.set_transport_policy(true, input.no_redirects, input.timeout);
+
+        let mut saved = Account::default();
+        let account = if let Some(dsid) = input.headers.get("X-Dsid") {
+            saved.directory_services_id = dsid
+                .to_str()
+                .context("invalid saved account identifier header")?
+                .into();
+            saved.password_token = input
+                .headers
+                .get("X-Token")
+                .map(|value| value.to_str())
+                .transpose()
+                .context("invalid saved account token header")?
+                .unwrap_or_default()
+                .into();
+            saved.store_front = input
+                .headers
+                .get("X-Apple-Store-Front")
+                .map(|value| value.to_str())
+                .transpose()
+                .context("invalid saved storefront header")?
+                .unwrap_or_default()
+                .into();
+            self.ephemeral_account(Some(&saved))?
+        } else {
+            self.ephemeral_account(None)?
+        };
+        let bag = input
+            .bag
+            .map(|value| self.frozen_bag_from_values(value))
+            .transpose()?
+            .unwrap_or(0);
+        let session = self.new_session()?;
+        let delegate = self.new_object("NSObject", StoreValue::Empty)?;
+        self.invoke(session, "setDelegate:", &[delegate])?;
+
+        let request = if let Some(parameters) = input.parameters {
+            self.encode_request(account, bag, input.method, input.url, parameters)?
+        } else {
+            let request = self.new_object("AMSURLRequest", StoreValue::Empty)?;
+            let url = self.new_object("NSURL", StoreValue::String(input.url.into()))?;
+            let request = self.invoke(
+                request,
+                "initWithURL:cachePolicy:timeoutInterval:",
+                &[url, 0, 0],
+            )?;
+            let method = self.new_object("NSString", StoreValue::String(input.method.into()))?;
+            self.invoke(request, "setHTTPMethod:", &[method])?;
+            if let Some(body) = input.body {
+                let body = self.new_object("NSData", StoreValue::Bytes(body.to_vec()))?;
+                self.invoke(request, "setHTTPBody:", &[body])?;
+            }
+            request
+        };
+        self.configure_request(request, account, bag, input.raw)?;
+        let mut headers: HashMap<String, Vec<&str>> = HashMap::new();
+        for (name, value) in input.headers {
+            if name.as_str().eq_ignore_ascii_case("content-length") {
+                continue;
+            }
+            headers.entry(name.to_string()).or_default().push(
+                value
+                    .to_str()
+                    .context("Store request header is not UTF-8")?,
+            );
+        }
+        for (name, values) in headers {
+            let name = self.new_object("NSString", StoreValue::String(name))?;
+            let value = self.new_object("NSString", StoreValue::String(values.join(", ")))?;
+            self.invoke(request, "setValue:forHTTPHeaderField:", &[value, name])?;
+        }
+
+        let (result, mut response) = self.send_request(session, request)?;
+        if input.raw {
+            return Ok(response);
+        }
+        let object = self.invoke(result, "object", &[])?;
+        if object != 0 {
+            let value = self.export(object)?;
+            let json = input.response_format == "json"
+                || response
+                    .header("content-type")
+                    .is_some_and(|content_type| content_type.to_ascii_lowercase().contains("json"));
+            let body = if json {
+                serde_json::to_vec(&value).context("encode decoded Store JSON")?
+            } else {
+                let mut bytes = Vec::new();
+                plist::to_writer_xml(&mut bytes, &value)
+                    .context("encode decoded Store property list")?;
+                bytes
+            };
+            response.body = body;
+            response.headers.retain(|name, _| {
+                !name.eq_ignore_ascii_case("content-encoding")
+                    && !name.eq_ignore_ascii_case("content-length")
+            });
+        }
+        Ok(response)
+    }
+
     pub fn set_hardware_id(&mut self, hardware_id: &[u8]) -> Result<()> {
         let hardware_id: [u8; 6] = hardware_id
             .try_into()
             .map_err(|_| anyhow::anyhow!("Store hardware identity must be six bytes"))?;
         self.state.borrow_mut().hardware_id = Some(hardware_id);
         Ok(())
+    }
+
+    /// Construct the ephemeral account used for a Store request. Saved account
+    /// fields come from the host credential store, not from guest memory.
+    pub fn ephemeral_account(&mut self, saved: Option<&Account>) -> Result<u64> {
+        let account_class = self
+            .class_address("ACAccount")
+            .context("Store profile is missing ACAccount")?;
+        let account = self.invoke(account_class, "ams_createEphemeralAccount", &[])?;
+        if let Some(saved) = saved {
+            let dsid = saved
+                .directory_services_id
+                .parse::<i64>()
+                .context("invalid saved account identifier")?;
+            let fields = [
+                ("setUsername:", &saved.email),
+                ("ams_setPassword:", &saved.password_token),
+                ("ams_setStorefront:", &saved.store_front),
+            ];
+            for (selector, text) in fields {
+                let value = self.new_object("NSString", StoreValue::String(text.clone()))?;
+                self.invoke(account, selector, &[value])?;
+            }
+            let dsid = self.new_object("NSNumber", StoreValue::Number(dsid))?;
+            self.invoke(account, "ams_setDSID:", &[dsid])?;
+        }
+        Ok(account)
+    }
+
+    /// Build the same short-lived frozen Store bag as the Go backend. A nested
+    /// `urlBag` overrides its parent entries, matching the input bag response.
+    pub fn frozen_bag_from_values(&mut self, values: &Value) -> Result<u64> {
+        let source = values
+            .as_object()
+            .context("Store bag must be a JSON object")?;
+        let mut flattened = source.clone();
+        if let Some(nested) = source.get("urlBag").and_then(Value::as_object) {
+            flattened.extend(nested.clone());
+        }
+        let data = self.import_json(&Value::Object(flattened))?;
+        let profile = self.new_object("NSString", StoreValue::String("AMSPurchase".into()))?;
+        let version = self.new_object("NSString", StoreValue::String("1".into()))?;
+        let expiration = self.new_object(
+            "NSDate",
+            StoreValue::Float(time::OffsetDateTime::now_utc().unix_timestamp() as f64 + 300.0),
+        )?;
+        let builder = self.new_object("AMSBagFrozenDataSourceBuilder", StoreValue::Empty)?;
+        for (selector, value) in [
+            ("setData:", data),
+            ("setProfile:", profile),
+            ("setProfileVersion:", version),
+            ("setExpirationDate:", expiration),
+        ] {
+            self.invoke(builder, selector, &[value])?;
+        }
+        self.invoke(builder, "createFrozenBag", &[])
     }
 
     pub fn read_u64(&self, address: u64) -> Result<u64> {
@@ -672,10 +850,7 @@ impl StoreRuntime {
         bag: u64,
     ) -> Result<Value> {
         self.set_hardware_id(hardware_id)?;
-        let account_class = self
-            .class_address("ACAccount")
-            .context("Store profile is missing ACAccount")?;
-        let account = self.invoke(account_class, "ams_createEphemeralAccount", &[])?;
+        let account = self.ephemeral_account(None)?;
         let username = self.new_object("NSString", StoreValue::String(email.into()))?;
         self.invoke(account, "setUsername:", &[username])?;
 
@@ -7621,6 +7796,18 @@ mod tests {
             runtime.state.borrow().objects[&ephemeral].class,
             "AMSEphemeralAccount"
         );
+        let mut saved = Account::default();
+        saved.email = "saved@example.com".into();
+        saved.password_token = "saved-token".into();
+        saved.directory_services_id = "12345".into();
+        saved.store_front = "143441-1,29".into();
+        let saved_ephemeral = runtime.ephemeral_account(Some(&saved)).unwrap();
+        assert_eq!(
+            runtime.state.borrow().objects[&saved_ephemeral].class,
+            "AMSEphemeralAccount"
+        );
+        let username = runtime.invoke(saved_ephemeral, "username", &[]).unwrap();
+        assert_eq!(runtime.object_string(username).unwrap(), saved.email);
         let username = runtime
             .new_object("NSString", StoreValue::String("test@example.com".into()))
             .unwrap();
@@ -7714,11 +7901,61 @@ mod tests {
         );
         let object = runtime.invoke(result, "object", &[]).unwrap();
         assert_eq!(runtime.export(object).unwrap()["status"], 0);
-        let builder = runtime
-            .new_object("AMSBagFrozenDataSourceBuilder", StoreValue::Empty)
+        let headers = HeaderMap::new();
+        let decoded = runtime
+            .execute_standard(StoreStandardRequest {
+                method: "POST",
+                url: "https://buy.itunes.apple.com/request",
+                headers: &headers,
+                parameters: Some(&nested),
+                body: None,
+                bag: None,
+                hardware_id: &[1, 2, 3, 4, 5, 6],
+                raw: false,
+                response_format: "plist",
+                no_redirects: true,
+                timeout: None,
+            })
             .unwrap();
-        let bag_values = runtime
-            .import_json(&serde_json::json!({
+        assert_eq!(decoded.status, 200);
+        assert_eq!(
+            plist::from_bytes::<Value>(&decoded.body).unwrap()["status"],
+            0
+        );
+        runtime.set_transport(|request| {
+            assert_eq!(request.method, Method::POST);
+            assert_eq!(request.body.as_deref(), Some(b"raw request".as_slice()));
+            assert_eq!(request.headers.get("x-test").unwrap(), "present, second");
+            Ok(HostResponse {
+                status: 200,
+                headers: HashMap::from([(
+                    "content-type".into(),
+                    "application/octet-stream".into(),
+                )]),
+                body: b"raw response".to_vec(),
+            })
+        });
+        let mut raw_headers = HeaderMap::new();
+        raw_headers.insert("x-test", HeaderValue::from_static("present"));
+        raw_headers.append("x-test", HeaderValue::from_static("second"));
+        let raw = runtime
+            .execute_standard(StoreStandardRequest {
+                method: "POST",
+                url: "https://buy.itunes.apple.com/request",
+                headers: &raw_headers,
+                parameters: None,
+                body: Some(b"raw request"),
+                bag: None,
+                hardware_id: &[1, 2, 3, 4, 5, 6],
+                raw: true,
+                response_format: "",
+                no_redirects: true,
+                timeout: None,
+            })
+            .unwrap();
+        assert_eq!(raw.body, b"raw response");
+        let bag = runtime
+            .frozen_bag_from_values(&serde_json::json!({
                 "buyProduct": "https://buy.itunes.apple.com/request",
                 "redirect-cookie-removal-exclusion-list": [],
                 "clientIDDomains": [],
@@ -7726,27 +7963,6 @@ mod tests {
                 "absinthe-requests": false
             }))
             .unwrap();
-        let bag_profile = runtime
-            .new_object("NSString", StoreValue::String("AMSPurchase".into()))
-            .unwrap();
-        let bag_version = runtime
-            .new_object("NSString", StoreValue::String("1".into()))
-            .unwrap();
-        let expiration = runtime
-            .new_object(
-                "NSDate",
-                StoreValue::Float(time::OffsetDateTime::now_utc().unix_timestamp() as f64 + 300.0),
-            )
-            .unwrap();
-        for (selector, value) in [
-            ("setData:", bag_values),
-            ("setProfile:", bag_profile),
-            ("setProfileVersion:", bag_version),
-            ("setExpirationDate:", expiration),
-        ] {
-            runtime.invoke(builder, selector, &[value]).unwrap();
-        }
-        let bag = runtime.invoke(builder, "createFrozenBag", &[]).unwrap();
         let storefront = runtime
             .new_object("NSString", StoreValue::String("143441-1,29".into()))
             .unwrap();
