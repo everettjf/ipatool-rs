@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::Path,
 };
 
@@ -28,13 +28,9 @@ pub fn patch_ipa(
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let output = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("create temporary IPA in {}", parent.display()))?;
-    let mut writer = ZipWriter::new(output.reopen().context("open temporary IPA")?);
-    for index in 0..archive.len() {
-        let entry = archive
-            .by_index_raw(index)
-            .context("read downloaded IPA entry")?;
-        writer.raw_copy_file(entry).context("copy IPA ZIP entry")?;
-    }
+    let mut copy = output.reopen().context("open temporary IPA")?;
+    io::copy(&mut File::open(source)?, &mut copy).context("copy original IPA")?;
+    let mut writer = ZipWriter::new_append(copy).context("open IPA ZIP for patching")?;
     if !artwork.is_empty() {
         writer
             .start_file("iTunesArtwork", SimpleFileOptions::default())
@@ -159,6 +155,7 @@ fn read_plist_entry(archive: &mut ZipArchive<File>, index: usize) -> Result<Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom};
 
     fn source(manifest: Option<&str>) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().unwrap();
@@ -192,6 +189,56 @@ mod tests {
         let mut fields = plist::Dictionary::new();
         fields.insert("sinf".into(), Value::Data(b"ticket".to_vec()));
         Value::Dictionary(fields)
+    }
+
+    fn zip_extras(path: &Path, entry_name: &str) -> (Vec<u8>, Vec<u8>) {
+        let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let entry = archive.by_name(entry_name).unwrap();
+        let header_start = entry.header_start();
+        let central = entry.extra_data().unwrap_or_default().to_vec();
+        let mut file = File::open(path).unwrap();
+        file.seek(SeekFrom::Start(header_start + 26)).unwrap();
+        let mut lengths = [0u8; 4];
+        file.read_exact(&mut lengths).unwrap();
+        let name_len = u16::from_le_bytes(lengths[..2].try_into().unwrap()) as u64;
+        let extra_len = u16::from_le_bytes(lengths[2..].try_into().unwrap()) as usize;
+        file.seek(SeekFrom::Start(header_start + 30 + name_len))
+            .unwrap();
+        let mut local = vec![0; extra_len];
+        file.read_exact(&mut local).unwrap();
+        (local, central)
+    }
+
+    #[test]
+    fn preserves_distinct_local_and_central_zip_extras() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.ipa");
+        let mut writer = ZipWriter::new(File::create(&source).unwrap());
+        let mut options = zip::write::FullFileOptions::default();
+        options
+            .add_extra_data(0xcafe, Box::new([1, 2, 3]), false)
+            .unwrap();
+        options
+            .add_extra_data(0xbeef, Box::new([4, 5, 6]), true)
+            .unwrap();
+        writer.start_file("Payload/App.app/App", options).unwrap();
+        writer.write_all(b"executable").unwrap();
+        writer.finish().unwrap();
+        let before = zip_extras(&source, "Payload/App.app/App");
+        assert_ne!(before.0, before.1);
+
+        let destination = directory.path().join("patched.ipa");
+        patch_ipa(
+            &source,
+            &destination,
+            &serde_json::json!({}),
+            "account",
+            &[],
+            &[],
+        )
+        .unwrap();
+        let after = zip_extras(&destination, "Payload/App.app/App");
+        assert_eq!(after, before);
     }
 
     #[test]
