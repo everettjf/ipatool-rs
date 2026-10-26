@@ -7,6 +7,7 @@ pub mod fairplay;
 pub mod host;
 pub mod platform;
 pub mod state;
+pub mod store_profile;
 pub mod transport;
 pub mod version;
 pub mod vision;

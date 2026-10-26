@@ -38,10 +38,10 @@ On macOS, `auth info` reads the existing Go-compatible account from the system K
 | Purchases, owned apps, version history and metadata | Pending |
 | iOS and macOS package downloads and SINF replication | Pending |
 | FairPlay enrollment, diagnostics and decryption | Pending |
-| Store/SAP emulation and runtime profiles | Pending |
+| Embedded Store runtime profile integrity checks | Implemented; emulator and SAP execution pending |
 | MCP server and completion | Pending |
 
-The Go source is about 88,000 lines including generated code and platform-specific implementations. The Rust port needs separate validation against the Go test suite and real account flows before it can claim feature parity. No account credentials or private enrollment material are embedded in this repository.
+The Go source is about 88,000 lines including generated code and platform-specific implementations. The Rust port needs separate validation against the Go test suite and real account flows before it can claim feature parity. The compiled Store profile is embedded from the Go source snapshot; no account credentials or private enrollment material are embedded in this repository.
 
 ## Build and test
 

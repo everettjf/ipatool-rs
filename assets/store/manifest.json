@@ -1,0 +1,24 @@
+{
+  "framework_uuid": "5DFC37A5-4689-3F9D-9655-D4774E1D8D08",
+  "plugin_uuid": "B8C07F94-4868-3CD7-A59A-F01E8C24C1B7",
+  "artifacts": {
+    "metadata": {
+      "name": "Store metadata",
+      "size": 4807917,
+      "sha256": "5e92717743272aa84343bd25f6bab6401155f88ade51b704ec535d3e6b5bd421",
+      "file": "metadata.zst"
+    },
+    "pages": {
+      "name": "Store pages",
+      "size": 20893696,
+      "sha256": "4fd8cf193ca6e71d52a2d6e68d9ca76907332ff33dade332351c97efe5f0caed",
+      "file": "pages.zst"
+    },
+    "plugin": {
+      "name": "Store authentication plugin",
+      "size": 138088,
+      "sha256": "e33fff05a6e6593dd91e33fd103b5d3068b62a787c680df33b859f19b3acc4ea",
+      "file": "plugin.zst"
+    }
+  }
+}
