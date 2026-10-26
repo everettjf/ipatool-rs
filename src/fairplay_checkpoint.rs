@@ -14,18 +14,29 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     fairplay_checkpoint_schema1::{self, SparsePage},
     fairplay_recovery_output::open_private_file,
+    store_memory::{MemoryRegion, exclude_mapped_regions},
+    unicorn_runtime::Engine,
 };
 
 const MAX_COMPRESSED_BYTES: usize = 512 * 1024 * 1024;
 const MAX_PLAIN_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SCHEMA1_PLAIN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const PAGE_BYTES: usize = 4096;
+const REG_X0: i32 = 199;
+const REG_X29: i32 = 1;
+const REG_X30: i32 = 2;
+const REG_SP: i32 = 4;
+const REG_NZCV: i32 = 3;
+const REG_V0: i32 = 228;
+const REG_PC: i32 = 260;
 
 pub struct FairplayCheckpoint {
     pub binary_hash: [u8; 32],
     root: Option<Value>,
     sparse_pages: Option<HashMap<u64, SparsePage>>,
-    sparse_registers: HashMap<String, u64>,
+    sparse_registers: HashMap<String, u128>,
+    sparse_pc: u64,
+    sparse_nzcv: u64,
 }
 
 impl Drop for FairplayCheckpoint {
@@ -37,6 +48,8 @@ impl Drop for FairplayCheckpoint {
         for value in self.sparse_registers.values_mut() {
             value.zeroize();
         }
+        self.sparse_pc.zeroize();
+        self.sparse_nzcv.zeroize();
     }
 }
 
@@ -80,6 +93,8 @@ impl FairplayCheckpoint {
                 root: None,
                 sparse_pages: Some(std::mem::take(&mut parsed.pages)),
                 sparse_registers: std::mem::take(&mut parsed.registers),
+                sparse_pc: parsed.pc,
+                sparse_nzcv: parsed.nzcv,
             });
         }
         let mut plain = Zeroizing::new(Vec::new());
@@ -102,6 +117,8 @@ impl FairplayCheckpoint {
             root: Some(root),
             sparse_pages: None,
             sparse_registers: HashMap::new(),
+            sparse_pc: 0,
+            sparse_nzcv: 0,
         };
         if value_u64(checkpoint.field("schema")?)? != 2 {
             bail!("only page-packed FairPlay checkpoint schema 2 is supported");
@@ -129,6 +146,10 @@ impl FairplayCheckpoint {
     }
 
     pub fn register_u64(&self, name: &str) -> Result<u64> {
+        Ok(u64::try_from(self.register_u128(name)?)?)
+    }
+
+    pub fn register_u128(&self, name: &str) -> Result<u128> {
         if self.sparse_pages.is_some() {
             return self
                 .sparse_registers
@@ -143,7 +164,145 @@ impl FairplayCheckpoint {
         let value = registers
             .get(&HashableValue::String(name.into()))
             .with_context(|| format!("checkpoint has no {name} register"))?;
-        value_u64(value)
+        value_u128(value)
+    }
+
+    pub fn pc(&self) -> Result<u64> {
+        if self.sparse_pages.is_some() {
+            return Ok(self.sparse_pc);
+        }
+        value_u64(self.field("pc")?)
+    }
+
+    pub fn nzcv(&self) -> Result<u64> {
+        if self.sparse_pages.is_some() {
+            return Ok(self.sparse_nzcv);
+        }
+        let flags = match self.field("nzcv")? {
+            Value::Dict(flags) => flags,
+            _ => bail!("checkpoint has invalid NZCV state"),
+        };
+        let mut value = 0u64;
+        for (index, name) in ["n", "z", "c", "v"].into_iter().enumerate() {
+            let flag = flags
+                .get(&HashableValue::String(name.into()))
+                .with_context(|| format!("checkpoint has no NZCV {name} flag"))?;
+            let flag = value_u64(flag)?;
+            if flag > 1 {
+                bail!("checkpoint NZCV flag is outside the bit range");
+            }
+            value |= flag << (31 - index);
+        }
+        Ok(value)
+    }
+
+    /// Restore the checkpoint over any already-loaded image mappings.
+    /// The caller must verify that those image bytes match `binary_hash`.
+    pub fn restore_into(&self, engine: &mut Engine, occupied: &[MemoryRegion]) -> Result<usize> {
+        let pc = self.pc()?;
+        let nzcv = self.nzcv()?;
+        let sp = self.register_u64("sp")?;
+        let mut general = Zeroizing::new(Vec::with_capacity(31));
+        for index in 0..31 {
+            general.push(self.register_u64(&format!("x{index}"))?);
+        }
+        let mut vector = Zeroizing::new(Vec::with_capacity(32));
+        for index in 0..32 {
+            vector.push(self.register_u128(&format!("v{index}"))?.to_le_bytes());
+        }
+
+        let mut addresses = Vec::new();
+        if let Some(pages) = &self.sparse_pages {
+            addresses.extend(pages.keys().copied());
+        } else {
+            let pages = match self.field("memory_pages")? {
+                Value::Dict(pages) => pages,
+                _ => bail!("checkpoint has no page-packed memory map"),
+            };
+            for (address, value) in pages {
+                if !matches!(value, Value::Bytes(bytes) if bytes.len() == PAGE_BYTES) {
+                    bail!("checkpoint page has invalid payload geometry");
+                }
+                addresses.push(page_key_u64(address)?);
+            }
+        }
+        if addresses.is_empty() {
+            bail!("checkpoint has invalid memory pages");
+        }
+        addresses.sort_unstable();
+        let mut grouped: Vec<MemoryRegion> = Vec::new();
+        for &address in &addresses {
+            if address >= 0xf000_0000_0000_0000 || address % PAGE_BYTES as u64 != 0 {
+                bail!("checkpoint has invalid memory page address");
+            }
+            if let Some(last) = grouped.last_mut()
+                && last.address.checked_add(last.size) == Some(address)
+            {
+                last.size += PAGE_BYTES as u64;
+            } else {
+                if grouped.last().is_some_and(|last| {
+                    last.address
+                        .checked_add(last.size)
+                        .is_some_and(|end| address < end)
+                }) {
+                    bail!("checkpoint has repeated memory page address");
+                }
+                grouped.push(MemoryRegion {
+                    address,
+                    size: PAGE_BYTES as u64,
+                });
+            }
+        }
+        let new_regions = exclude_mapped_regions(&grouped, occupied)?;
+        for region in &new_regions {
+            engine.mem_map(region.address, usize::try_from(region.size)?)?;
+        }
+        if let Some(pages) = &self.sparse_pages {
+            for (&address, page) in pages {
+                let already_mapped = occupied.iter().any(|region| {
+                    region.address <= address
+                        && region
+                            .address
+                            .checked_add(region.size)
+                            .is_some_and(|end| end > address)
+                });
+                let mut buffer = Zeroizing::new(if already_mapped {
+                    engine
+                        .mem_read(address, PAGE_BYTES)?
+                        .try_into()
+                        .expect("page size")
+                } else {
+                    [0; PAGE_BYTES]
+                });
+                page.overlay(&mut buffer);
+                engine.mem_write(address, buffer.as_slice())?;
+            }
+        } else {
+            let Value::Dict(pages) = self.field("memory_pages")? else {
+                unreachable!("validated page map")
+            };
+            for (address, value) in pages {
+                let Value::Bytes(bytes) = value else {
+                    unreachable!("validated page payload")
+                };
+                engine.mem_write(page_key_u64(address)?, bytes)?;
+            }
+        }
+        for (index, &value) in general.iter().enumerate() {
+            let register = match index {
+                29 => REG_X29,
+                30 => REG_X30,
+                _ => REG_X0 + index as i32,
+            };
+            engine.reg_write(register, value)?;
+        }
+        engine.reg_write(REG_SP, sp)?;
+        for (index, &value) in vector.iter().enumerate() {
+            engine.reg_write_128(REG_V0 + index as i32, value)?;
+        }
+        engine.reg_write(REG_NZCV, nzcv)?;
+        engine.reg_write(REG_PC, pc)?;
+        Ok(addresses.len())
     }
 
     pub fn read_block<const N: usize>(&self, address: u64) -> Result<Zeroizing<[u8; N]>> {
@@ -201,17 +360,29 @@ impl FairplayCheckpoint {
 }
 
 fn value_u64(value: &Value) -> Result<u64> {
+    Ok(u64::try_from(value_u128(value)?)?)
+}
+
+fn value_u128(value: &Value) -> Result<u128> {
     match value {
-        Value::I64(value) => Ok(u64::try_from(*value)?),
+        Value::I64(value) => Ok(u128::try_from(*value)?),
         Value::Int(value) => Ok(value.to_string().parse()?),
         Value::String(value) => {
             if let Some(hex) = value.strip_prefix("0x") {
-                Ok(u64::from_str_radix(hex, 16)?)
+                Ok(u128::from_str_radix(hex, 16)?)
             } else {
                 Ok(value.parse()?)
             }
         }
         _ => bail!("checkpoint numeric field has invalid type"),
+    }
+}
+
+fn page_key_u64(value: &HashableValue) -> Result<u64> {
+    match value {
+        HashableValue::I64(value) => Ok(u64::try_from(*value)?),
+        HashableValue::Int(value) => Ok(value.to_string().parse()?),
+        _ => bail!("checkpoint page address has invalid type"),
     }
 }
 
@@ -237,11 +408,58 @@ fn clear_value(value: &mut Value) {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+    use std::time::Duration;
 
     const FIXTURE: &[u8] =
         include_bytes!("../tests/fixtures/fairplay-checkpoint-schema2-synthetic.pkl.gz");
     const SCHEMA1_FIXTURE: &[u8] =
         include_bytes!("../tests/fixtures/fairplay-checkpoint-schema1-synthetic.pkl.gz");
+    const RESUME_FIXTURE: &[u8] =
+        include_bytes!("../tests/fixtures/fairplay-checkpoint-resume-synthetic.pkl.gz");
+
+    #[test]
+    fn restores_packed_cpu_snapshot_and_executes_next_instructions() {
+        let checkpoint = FairplayCheckpoint::parse_gzip(RESUME_FIXTURE).unwrap();
+        let mut engine = Engine::new().unwrap();
+        let address = checkpoint.pc().unwrap();
+        assert_eq!(checkpoint.restore_into(&mut engine, &[]).unwrap(), 1);
+        assert_eq!(engine.reg_read(REG_X0).unwrap(), 7);
+        assert_eq!(
+            engine.reg_read(REG_NZCV).unwrap() & 0xf000_0000,
+            0xa000_0000
+        );
+        assert_eq!(
+            engine.reg_read_128(REG_V0).unwrap(),
+            ((1u128 << 127) + 123).to_le_bytes()
+        );
+        engine
+            .start_bounded(address, address + 8, Duration::from_secs(2), 8)
+            .unwrap();
+        assert_eq!(engine.reg_read(REG_X0).unwrap(), 43);
+    }
+
+    #[test]
+    fn restores_sparse_bytes_over_an_existing_image_page() {
+        let checkpoint = FairplayCheckpoint::parse_gzip(SCHEMA1_FIXTURE).unwrap();
+        let mut engine = Engine::new().unwrap();
+        let address = checkpoint.register_u64("x23").unwrap();
+        let page = address & !4095;
+        engine.mem_map(page, 8192).unwrap();
+        engine.mem_write(page, &[0xaa; 8192]).unwrap();
+        let occupied = [MemoryRegion {
+            address: page,
+            size: 8192,
+        }];
+        assert_eq!(checkpoint.restore_into(&mut engine, &occupied).unwrap(), 2);
+        assert_eq!(engine.mem_read(page, 1).unwrap(), [0xaa]);
+        assert_eq!(
+            engine.mem_read(address, 432).unwrap(),
+            (0..432).map(|index| index as u8).collect::<Vec<_>>()
+        );
+        assert_eq!(engine.mem_read(address + 432, 1).unwrap(), [0xaa]);
+        assert_eq!(engine.reg_read(REG_X0 + 23).unwrap(), address);
+        assert_eq!(engine.reg_read(REG_PC).unwrap(), checkpoint.pc().unwrap());
+    }
 
     #[test]
     fn streams_python_protocol_five_byte_addressed_checkpoint() {
@@ -250,6 +468,9 @@ mod tests {
         let address = 0x7100_0001_4ee0;
         assert_eq!(checkpoint.register_u64("x23").unwrap(), address);
         assert!(checkpoint.register_u64("v0").is_err());
+        assert_eq!(checkpoint.register_u128("v0").unwrap(), (1 << 127) + 123);
+        assert_eq!(checkpoint.pc().unwrap(), 0x1005_7ae74);
+        assert_eq!(checkpoint.nzcv().unwrap(), 0xa000_0000);
         let block = checkpoint.read_block::<432>(address).unwrap();
         assert_eq!(
             format!("{:x}", Sha256::digest(block.as_slice())),

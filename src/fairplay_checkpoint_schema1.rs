@@ -43,6 +43,18 @@ impl SparsePage {
         }
         Ok(self.bytes[offset])
     }
+
+    pub fn overlay(&self, page: &mut [u8; PAGE_BYTES]) {
+        for (word_index, &bits) in self.present.iter().enumerate() {
+            let mut remaining = bits;
+            while remaining != 0 {
+                let bit = remaining.trailing_zeros() as usize;
+                let offset = word_index * 64 + bit;
+                page[offset] = self.bytes[offset];
+                remaining &= remaining - 1;
+            }
+        }
+    }
 }
 
 impl Drop for SparsePage {
@@ -54,7 +66,9 @@ impl Drop for SparsePage {
 
 pub struct Schema1Checkpoint {
     pub binary_hash: [u8; 32],
-    pub registers: HashMap<String, u64>,
+    pub pc: u64,
+    pub nzcv: u64,
+    pub registers: HashMap<String, u128>,
     pub pages: HashMap<u64, SparsePage>,
 }
 
@@ -72,6 +86,7 @@ enum MapKind {
     Root,
     Registers,
     Memory,
+    Nzcv,
     Other,
 }
 
@@ -81,6 +96,7 @@ enum Slot {
     Map(MapKind),
     List,
     Int(i128),
+    Wide(u128),
     Text(String),
     Other,
 }
@@ -91,7 +107,9 @@ struct Parser<R> {
     memo: Vec<Slot>,
     schema: Option<i128>,
     hash: Option<String>,
-    registers: HashMap<String, u64>,
+    pc: Option<String>,
+    nzcv: [Option<u8>; 4],
+    registers: HashMap<String, u128>,
     pages: HashMap<u64, SparsePage>,
     memory_entries: usize,
 }
@@ -104,6 +122,8 @@ impl<R: Read> Parser<R> {
             memo: Vec::new(),
             schema: None,
             hash: None,
+            pc: None,
+            nzcv: [None; 4],
             registers: HashMap::new(),
             pages: HashMap::new(),
             memory_entries: 0,
@@ -146,23 +166,24 @@ impl<R: Read> Parser<R> {
         Ok(())
     }
 
-    fn long(&mut self, length: usize) -> Result<Option<i128>> {
+    fn long(&mut self, length: usize) -> Result<Slot> {
         if length > 32 {
             bail!("checkpoint pickle integer exceeds size limit");
         }
         if length > 16 {
-            // The tracer includes 128-bit vector registers. Positive Python
-            // integers above i128::MAX use a 17th sign byte; callers only ask
-            // for scalar machine registers, so retain no giant value here.
-            self.skip(length as u64)?;
-            return Ok(None);
+            let mut bytes = [0; 32];
+            self.reader.read_exact(&mut bytes[..length])?;
+            if length == 17 && bytes[16] == 0 {
+                return Ok(Slot::Wide(u128::from_le_bytes(bytes[..16].try_into()?)));
+            }
+            return Ok(Slot::Other);
         }
         let mut bytes = [0; 16];
         self.reader.read_exact(&mut bytes[..length])?;
         if length != 0 && bytes[length - 1] & 0x80 != 0 {
             bytes[length..].fill(0xff);
         }
-        Ok(Some(i128::from_le_bytes(bytes)))
+        Ok(Slot::Int(i128::from_le_bytes(bytes)))
     }
 
     fn push(&mut self, slot: Slot) -> Result<()> {
@@ -184,6 +205,7 @@ impl<R: Read> Parser<R> {
             None => MapKind::Root,
             Some(Slot::Text(key)) if key == "registers" => MapKind::Registers,
             Some(Slot::Text(key)) if key == "memory" => MapKind::Memory,
+            Some(Slot::Text(key)) if key == "nzcv" => MapKind::Nzcv,
             _ => MapKind::Other,
         }
     }
@@ -197,13 +219,36 @@ impl<R: Read> Parser<R> {
                 (Slot::Text(key), Slot::Text(hash)) if key == "binary_sha256" => {
                     self.hash = Some(hash)
                 }
+                (Slot::Text(key), Slot::Text(pc)) if key == "pc" => self.pc = Some(pc),
                 _ => {}
             },
             MapKind::Registers => {
-                if let (Slot::Text(name), Slot::Int(value)) = (key, value)
-                    && let Ok(value) = u64::try_from(value)
-                {
-                    self.registers.insert(name, value);
+                if let Slot::Text(name) = key {
+                    match value {
+                        Slot::Int(value) => {
+                            if let Ok(value) = u128::try_from(value) {
+                                self.registers.insert(name, value);
+                            }
+                        }
+                        Slot::Wide(value) => {
+                            self.registers.insert(name, value);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            MapKind::Nzcv => {
+                if let (Slot::Text(name), Slot::Int(value)) = (key, value) {
+                    let index = match name.as_str() {
+                        "n" => Some(0),
+                        "z" => Some(1),
+                        "c" => Some(2),
+                        "v" => Some(3),
+                        _ => None,
+                    };
+                    if let Some(index) = index {
+                        self.nzcv[index] = Some(u8::try_from(value)?);
+                    }
                 }
             }
             MapKind::Memory => {
@@ -341,12 +386,12 @@ impl<R: Read> Parser<R> {
                 0x8a => {
                     let length = self.byte()? as usize;
                     let value = self.long(length)?;
-                    self.push(value.map_or(Slot::Other, Slot::Int))?;
+                    self.push(value)?;
                 }
                 0x8b => {
                     let length = u32::from_le_bytes(self.fixed::<4>()?) as usize;
                     let value = self.long(length)?;
-                    self.push(value.map_or(Slot::Other, Slot::Int))?;
+                    self.push(value)?;
                 }
                 b'N' | 0x88 | 0x89 => self.push(Slot::Other)?,
                 b'C' => {
@@ -412,8 +457,21 @@ impl<R: Read> Parser<R> {
             *byte = u8::from_str_radix(&hash[index * 2..index * 2 + 2], 16)
                 .context("checkpoint binary SHA-256 is not hexadecimal")?;
         }
+        let pc_text = self.pc.context("checkpoint has no program counter")?;
+        let pc = u64::from_str_radix(pc_text.strip_prefix("0x").unwrap_or(&pc_text), 16)
+            .context("checkpoint program counter is invalid")?;
+        let mut nzcv = 0u64;
+        for (index, flag) in self.nzcv.into_iter().enumerate() {
+            let flag = flag.context("checkpoint has incomplete NZCV state")?;
+            if flag > 1 {
+                bail!("checkpoint NZCV flag is outside the bit range");
+            }
+            nzcv |= u64::from(flag) << (31 - index);
+        }
         Ok(Schema1Checkpoint {
             binary_hash,
+            pc,
+            nzcv,
             registers: self.registers,
             pages: self.pages,
         })
