@@ -1,6 +1,7 @@
 //! Validate and decrypt all encrypted slices of one Mach-O file.
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -10,7 +11,7 @@ use crate::{
     fairplay_supf::{Supf, decrypt_pages_in_place},
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DecryptedSlice {
     pub cpu_type: u32,
     pub cpu_subtype: u32,

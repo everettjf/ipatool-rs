@@ -1,6 +1,7 @@
 //! Audit embedded CodeDirectory hashes over encrypted Mach-O pages.
 
 use anyhow::{Result, bail};
+use serde::Serialize;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384};
 
@@ -9,7 +10,7 @@ use crate::fairplay_macho::MachOLayout;
 const EMBEDDED_SIGNATURE: u32 = 0xfade0cc0;
 const CODE_DIRECTORY: u32 = 0xfade0c02;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CodeDirectoryAudit {
     pub hash_type: u8,
     pub hash_size: usize,

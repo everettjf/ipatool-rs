@@ -8,7 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
-use ipatool_rs::fairplay_ipa::decrypt_ipa;
+use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
 use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
@@ -155,6 +155,10 @@ enum Command {
         model: PathBuf,
         #[arg(long)]
         output: Option<PathBuf>,
+        #[arg(long)]
+        report: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -669,6 +673,8 @@ fn run() -> Result<()> {
             input,
             model,
             output,
+            report,
+            force,
         } => {
             if !input
                 .extension()
@@ -677,14 +683,16 @@ fn run() -> Result<()> {
                 bail!("FairPlay input must be an IPA file");
             }
             let output = output.unwrap_or_else(|| input.with_extension("decrypted.ipa"));
-            let result = decrypt_ipa(&input, &output, &model)?;
+            let report = report.unwrap_or_else(|| input.with_extension("decrypted.json"));
+            let result = decrypt_ipa_with_options(&input, &output, &model, Some(&report), force)?;
             match cli.format {
                 Format::Json => println!("{}", serde_json::to_string_pretty(&result)?),
                 Format::Text => println!(
-                    "Decrypted {} images ({} pages) to {}",
+                    "Decrypted {} images ({} pages) to {}; report: {}",
                     result.encrypted_images,
                     result.decrypted_pages,
-                    output.display()
+                    output.display(),
+                    report.display()
                 ),
             }
         }

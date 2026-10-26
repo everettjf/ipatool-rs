@@ -4,17 +4,18 @@ use std::{
     collections::HashSet,
     fs::{self, File},
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 use zip::{ZipArchive, ZipWriter};
 
 use crate::{
     fairplay::{inspect_model_path, parse_sinf_selector},
-    fairplay_decrypt::decrypt_macho,
+    fairplay_decrypt::{DecryptedSlice, decrypt_macho},
     fairplay_key::CurrentSinfModel,
     fairplay_macho::{is_macho, parse_macho_slices},
     fairplay_supf::Supf,
@@ -24,6 +25,34 @@ use crate::{
 pub struct IpaDecryptResult {
     pub encrypted_images: usize,
     pub decrypted_pages: usize,
+    pub output_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ImageReport {
+    member: String,
+    supf_member: String,
+    #[serde(flatten)]
+    slice: DecryptedSlice,
+}
+
+#[derive(Serialize)]
+struct ReportFile {
+    path: String,
+    sha256: String,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct DecryptionReport {
+    schema: &'static str,
+    input: ReportFile,
+    output: ReportFile,
+    encrypted_images: usize,
+    decrypted_pages: usize,
+    images: Vec<ImageReport>,
+    complete: bool,
+    warnings: [&'static str; 3],
 }
 
 fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
@@ -71,9 +100,17 @@ fn logical_key(model_path: &Path, sinf: &[u8]) -> Result<[u8; 16]> {
 /// Decrypt an IPA into a new file. The input is never modified. The model must
 /// be a private enrollment file or a private directory containing one match.
 pub fn decrypt_ipa(input: &Path, output: &Path, model_path: &Path) -> Result<IpaDecryptResult> {
-    if output.exists() {
-        bail!("refusing to overwrite output IPA {}", output.display());
-    }
+    decrypt_ipa_with_options(input, output, model_path, None, false)
+}
+
+pub fn decrypt_ipa_with_options(
+    input: &Path,
+    output: &Path,
+    model_path: &Path,
+    report: Option<&Path>,
+    force: bool,
+) -> Result<IpaDecryptResult> {
+    validate_destinations(input, output, model_path, report, force)?;
     let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
     let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
     let mut names = HashSet::with_capacity(archive.len());
@@ -100,6 +137,7 @@ pub fn decrypt_ipa(input: &Path, output: &Path, model_path: &Path) -> Result<Ipa
     let mut writer = ZipWriter::new(temporary.reopen().context("open temporary IPA")?);
     let mut images = 0usize;
     let mut pages = 0usize;
+    let mut image_reports = Vec::new();
     for index in 0..archive.len() {
         let mut member = archive.by_index(index).context("read IPA member")?;
         let name = member.name().to_owned();
@@ -142,18 +180,178 @@ pub fn decrypt_ipa(input: &Path, output: &Path, model_path: &Path) -> Result<Ipa
             .with_context(|| format!("write decrypted IPA member {name}"))?;
         images += reports.len();
         pages += reports.iter().map(|report| report.pages).sum::<usize>();
+        image_reports.extend(reports.into_iter().map(|slice| ImageReport {
+            member: name.clone(),
+            supf_member: supf_name.to_owned(),
+            slice,
+        }));
     }
     if images == 0 {
         bail!("IPA contains no supported encrypted Mach-O images");
     }
     writer.finish()?.sync_all().context("sync decrypted IPA")?;
-    temporary
-        .persist_noclobber(output)
-        .with_context(|| format!("publish decrypted IPA {}", output.display()))?;
+    let output_bytes = fs::metadata(temporary.path())?.len();
+    let output_sha256 = sha256_file(temporary.path())?;
+    let report_stage = if let Some(report_path) = report {
+        let report_data = DecryptionReport {
+            schema: "ipatool-fairplay-decryption-v1",
+            input: ReportFile {
+                path: input.display().to_string(),
+                sha256: sha256_file(input)?,
+                bytes: fs::metadata(input)?.len(),
+            },
+            output: ReportFile {
+                path: output.display().to_string(),
+                sha256: output_sha256.clone(),
+                bytes: output_bytes,
+            },
+            encrypted_images: images,
+            decrypted_pages: pages,
+            images: image_reports,
+            complete: true,
+            warnings: [
+                "Plaintext correctness is not authenticated by the source CodeDirectory.",
+                "CodeDirectory hashes refer to encrypted pages and become stale after decryption.",
+                "Analysis IPA requires recursive re-signing before installation.",
+            ],
+        };
+        let report_parent = report_path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(report_parent)?;
+        let mut staged = tempfile::NamedTempFile::new_in(report_parent)?;
+        serde_json::to_writer_pretty(&mut staged, &report_data)?;
+        staged.write_all(b"\n")?;
+        staged.as_file().sync_all()?;
+        Some(staged)
+    } else {
+        None
+    };
+    validate_destinations(input, output, model_path, report, force)?;
+    let mut staged = vec![(&temporary, output)];
+    if let (Some(staged_report), Some(report_path)) = (&report_stage, report) {
+        staged.push((staged_report, report_path));
+    }
+    publish_staged(&staged, force)?;
     Ok(IpaDecryptResult {
         encrypted_images: images,
         decrypted_pages: pages,
+        output_sha256,
     })
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn canonical_target(path: &Path) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .context("FairPlay destination has no filename")?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    Ok(fs::canonicalize(parent)?.join(name))
+}
+
+fn validate_destinations(
+    input: &Path,
+    output: &Path,
+    model_path: &Path,
+    report: Option<&Path>,
+    force: bool,
+) -> Result<()> {
+    let input = fs::canonicalize(input).context("resolve FairPlay input IPA")?;
+    let model = fs::canonicalize(model_path).context("resolve FairPlay model path")?;
+    let mut destinations = Vec::new();
+    for path in [Some(output), report].into_iter().flatten() {
+        let resolved = canonical_target(path)?;
+        if resolved == input || resolved == model {
+            bail!("refusing to overwrite FairPlay input or private model");
+        }
+        if destinations.contains(&resolved) {
+            bail!("FairPlay output and report paths must be distinct");
+        }
+        destinations.push(resolved);
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.is_file() => {
+                bail!(
+                    "FairPlay destination is not a regular file: {}",
+                    path.display()
+                );
+            }
+            Ok(_) if !force => bail!("refusing to replace {}", path.display()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (left, right);
+        false
+    }
+}
+
+fn publish_staged(files: &[(&tempfile::NamedTempFile, &Path)], force: bool) -> Result<()> {
+    let mut backups = Vec::with_capacity(files.len());
+    for (_, destination) in files {
+        if force && destination.exists() {
+            let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+            let directory = tempfile::Builder::new()
+                .prefix(".fairplay-backup-")
+                .tempdir_in(parent)?;
+            let backup = directory.path().join("previous");
+            fs::hard_link(destination, &backup)?;
+            backups.push(Some((directory, backup)));
+        } else {
+            backups.push(None);
+        }
+    }
+    let mut published: Vec<(PathBuf, fs::Metadata)> = Vec::new();
+    for (staged, destination) in files {
+        let outcome = if force {
+            fs::rename(staged.path(), destination)
+        } else {
+            fs::hard_link(staged.path(), destination)
+        };
+        if let Err(error) = outcome {
+            for ((previous, published_metadata), prior_backup) in published
+                .iter()
+                .rev()
+                .zip(backups[..published.len()].iter().rev())
+            {
+                if fs::metadata(previous)
+                    .is_ok_and(|current| same_file(&current, published_metadata))
+                {
+                    if let Some((_, backup_path)) = prior_backup {
+                        let _ = fs::rename(backup_path, previous);
+                    } else {
+                        let _ = fs::remove_file(previous);
+                    }
+                }
+            }
+            return Err(error).with_context(|| format!("publish {}", destination.display()));
+        }
+        published.push((destination.to_path_buf(), fs::metadata(destination)?));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -250,6 +448,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("source.ipa");
         let output = directory.path().join("decrypted.ipa");
+        let report = directory.path().join("decrypted.json");
         let model_path = directory.path().join("enrollment.bin");
         let logical = [0x31; 16];
         let (model, sinf) = model_and_sinf(logical);
@@ -273,9 +472,20 @@ mod tests {
             writer.write_all(data).unwrap();
         }
         writer.finish().unwrap();
-        let result = decrypt_ipa(&input, &output, &model_path).unwrap();
+        let input_before = fs::read(&input).unwrap();
+        let result =
+            decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), false).unwrap();
         assert_eq!(result.encrypted_images, 1);
         assert_eq!(result.decrypted_pages, 1);
+        let report_data: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(report_data["output"]["sha256"], result.output_sha256);
+        assert_eq!(report_data["images"].as_array().unwrap().len(), 1);
+        assert!(
+            decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), false).is_err()
+        );
+        decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), true).unwrap();
+        assert_eq!(fs::read(&input).unwrap(), input_before);
         let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
         let mut image = Vec::new();
         archive
@@ -291,6 +501,34 @@ mod tests {
             .read_to_end(&mut unchanged)
             .unwrap();
         assert_eq!(unchanged, b"unchanged");
+    }
+
+    #[test]
+    fn publication_rolls_back_output_when_report_cannot_be_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        let second = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        let output = directory.path().join("output.ipa");
+        let report = directory.path().join("report.json");
+        fs::create_dir(&report).unwrap();
+        assert!(publish_staged(&[(&first, &output), (&second, &report)], false).is_err());
+        assert!(!output.exists());
+        assert!(report.is_dir());
+    }
+
+    #[test]
+    fn forced_publication_restores_previous_output_on_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("output.ipa");
+        let report = directory.path().join("report.json");
+        fs::write(&output, b"previous").unwrap();
+        let mut first = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        first.write_all(b"replacement").unwrap();
+        let second = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
+        fs::remove_file(second.path()).unwrap();
+        assert!(publish_staged(&[(&first, &output), (&second, &report)], true).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"previous");
+        assert!(!report.exists());
     }
 
     #[test]
