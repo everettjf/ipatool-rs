@@ -1,6 +1,6 @@
 //! Load a matching fairplayd image and resume a private checkpoint for a
-//! bounded span. External imports are intentionally left as named stubs until
-//! the corresponding FairPlay host services are modeled in Rust.
+//! bounded span. Supported external imports have Rust guest-memory models;
+//! other imports remain named stubs until their host services are modeled.
 
 use std::{
     cell::RefCell,
@@ -33,6 +33,76 @@ const MAX_SNAPSHOT_PAGES: usize = 30_000;
 const MAX_EXTERNAL_BYTES: u64 = 0x1000_0000;
 const EXTERNAL_CHUNK_BYTES: usize = 64 * 1024;
 const RET_X30: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
+const SYNTHETIC_ALLOCATION_BASE: u64 = 0x7101_0000_0000;
+const STATIC_ALLOCATION_START: u64 = 0x7000_1000_0000;
+const STATIC_ALLOCATION_END: u64 = 0x7000_2000_0000;
+const STATIC_ALLOCATION_STRIDE: u64 = 0x10_0000;
+
+struct AllocationState {
+    next: u64,
+    stride: Option<u64>,
+    mapped_pages: BTreeSet<u64>,
+    new_pages: BTreeSet<u64>,
+}
+
+impl AllocationState {
+    fn from_checkpoint(checkpoint: &FairplayCheckpoint) -> Result<Self> {
+        let mapped_pages: BTreeSet<_> = checkpoint.page_addresses()?.into_iter().collect();
+        let static_page = mapped_pages
+            .range(STATIC_ALLOCATION_START..STATIC_ALLOCATION_END)
+            .next_back()
+            .copied();
+        let (next, stride) = if let Some(next) = checkpoint.next_allocation()? {
+            (next, None)
+        } else if let Some(last) = static_page {
+            (
+                last.checked_add(STATIC_ALLOCATION_STRIDE)
+                    .context("static allocation address overflow")?
+                    & !(STATIC_ALLOCATION_STRIDE - 1),
+                Some(STATIC_ALLOCATION_STRIDE),
+            )
+        } else {
+            (SYNTHETIC_ALLOCATION_BASE, None)
+        };
+        Ok(Self {
+            next,
+            stride,
+            mapped_pages,
+            new_pages: BTreeSet::new(),
+        })
+    }
+
+    fn allocate(&mut self, context: &HookContext, size: u64) -> Result<u64> {
+        if size > MAX_EXTERNAL_BYTES {
+            bail!("FairPlay allocation exceeds size limit");
+        }
+        let rounded = size
+            .max(1)
+            .checked_add(PAGE_BYTES - 1)
+            .context("FairPlay allocation size overflow")?
+            & !(PAGE_BYTES - 1);
+        let allocation_size = self.stride.unwrap_or(rounded.max(PAGE_BYTES));
+        let address = self.next;
+        if !address.is_multiple_of(PAGE_BYTES) || address >= 0xf000_0000_0000_0000 {
+            bail!("FairPlay allocation address is invalid");
+        }
+        let end = address
+            .checked_add(allocation_size)
+            .context("FairPlay allocation address overflow")?;
+        if end >= 0xf000_0000_0000_0000 {
+            bail!("FairPlay allocation exceeds guest address range");
+        }
+        for page in (address..end).step_by(PAGE_BYTES as usize) {
+            if !self.mapped_pages.contains(&page) {
+                context.mem_map(page, PAGE_BYTES as usize)?;
+                self.mapped_pages.insert(page);
+                self.new_pages.insert(page);
+            }
+        }
+        self.next = end;
+        Ok(address)
+    }
+}
 
 struct SensitiveValue(Value);
 
@@ -115,6 +185,7 @@ pub struct CheckpointRunner {
     pub start_pc: u64,
     pub modeled_imports: usize,
     external_failure: Rc<RefCell<Option<String>>>,
+    allocation_state: Rc<RefCell<AllocationState>>,
 }
 
 fn guest_register(context: &HookContext, index: i32) -> Result<u64> {
@@ -171,8 +242,26 @@ fn guest_string_length(context: &HookContext, address: u64, limit: u64) -> Resul
     Ok(limit)
 }
 
-fn run_modeled_external(context: &HookContext, symbol: &str) -> Result<()> {
+fn run_modeled_external(
+    context: &HookContext,
+    symbol: &str,
+    allocations: &Rc<RefCell<AllocationState>>,
+) -> Result<()> {
     match symbol {
+        "malloc" | "malloc_type_malloc" | "calloc" | "malloc_type_calloc" => {
+            let size = if matches!(symbol, "calloc" | "malloc_type_calloc") {
+                guest_register(context, 0)?
+                    .checked_mul(guest_register(context, 1)?)
+                    .context("FairPlay calloc size overflow")?
+            } else {
+                guest_register(context, 0)?
+            };
+            let address = allocations.borrow_mut().allocate(context, size)?;
+            if matches!(symbol, "calloc" | "malloc_type_calloc") {
+                fill_guest_memory(context, address, 0, size)?;
+            }
+            context.reg_write(199, address)?;
+        }
         "memcpy" | "memmove" => {
             let destination = guest_register(context, 0)?;
             let source = guest_register(context, 1)?;
@@ -216,11 +305,22 @@ fn install_modeled_external(
     address: u64,
     symbol: &str,
     failure: &Rc<RefCell<Option<String>>>,
+    allocations: &Rc<RefCell<AllocationState>>,
 ) -> Result<bool> {
     let symbol = symbol.trim_start_matches('_');
     if !matches!(
         symbol,
-        "memcpy" | "memmove" | "memset" | "bzero" | "strlen" | "strnlen" | "free"
+        "memcpy"
+            | "memmove"
+            | "memset"
+            | "bzero"
+            | "strlen"
+            | "strnlen"
+            | "malloc"
+            | "malloc_type_malloc"
+            | "calloc"
+            | "malloc_type_calloc"
+            | "free"
     ) {
         return Ok(false);
     }
@@ -230,8 +330,9 @@ fn install_modeled_external(
     engine.mem_write(address, &RET_X30)?;
     let symbol_name = symbol.to_owned();
     let failure = Rc::clone(failure);
+    let allocations = Rc::clone(allocations);
     engine.add_code_hook(address, address, move |context, _, _| {
-        if let Err(error) = run_modeled_external(context, &symbol_name) {
+        if let Err(error) = run_modeled_external(context, &symbol_name, &allocations) {
             *failure.borrow_mut() = Some(format!("FairPlay external {symbol_name}: {error:#}"));
             let _ = context.stop();
         }
@@ -261,9 +362,16 @@ impl CheckpointRunner {
             bail!("checkpoint PC is outside the fairplayd image");
         }
         let external_failure = Rc::new(RefCell::new(None));
+        let allocation_state = Rc::new(RefCell::new(AllocationState::from_checkpoint(checkpoint)?));
         let mut modeled_imports = 0;
         for (&address, symbol) in &image.externals {
-            if install_modeled_external(&mut engine, address, symbol, &external_failure)? {
+            if install_modeled_external(
+                &mut engine,
+                address,
+                symbol,
+                &external_failure,
+                &allocation_state,
+            )? {
                 modeled_imports += 1;
             }
         }
@@ -274,6 +382,7 @@ impl CheckpointRunner {
             start_pc,
             modeled_imports,
             external_failure,
+            allocation_state,
         })
     }
 
@@ -322,6 +431,7 @@ impl CheckpointRunner {
     ) -> Result<usize> {
         let mut addresses: BTreeSet<u64> = source.page_addresses()?.into_iter().collect();
         addresses.extend(self.image.data_pages.iter().copied());
+        addresses.extend(self.allocation_state.borrow().new_pages.iter().copied());
         if addresses.is_empty() || addresses.len() > MAX_SNAPSHOT_PAGES {
             bail!("FairPlay output checkpoint page count is outside the bounded range");
         }
@@ -390,6 +500,10 @@ impl CheckpointRunner {
             ("registers", Value::Dict(registers)),
             ("nzcv", Value::Dict(nzcv)),
             ("memory_pages", std::mem::replace(&mut pages.0, Value::None)),
+            (
+                "next_allocation",
+                Value::Int(self.allocation_state.borrow().next.into()),
+            ),
         ];
         for (name, value) in updates {
             if let Some(mut old) = fields.insert(HashableValue::String(name.into()), value) {
@@ -428,9 +542,15 @@ mod tests {
         engine.mem_map(0x2000, PAGE_BYTES as usize).unwrap();
         engine.mem_write(0x1000, b"abcdef\0").unwrap();
         let failure = Rc::new(RefCell::new(None));
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let allocations = Rc::new(RefCell::new(
+            AllocationState::from_checkpoint(&source).unwrap(),
+        ));
         let call = |engine: &mut Engine, index: u64, symbol: &str, args: [u64; 3]| {
             let address = EXTERNAL_BASE + index * EXTERNAL_STRIDE;
-            assert!(install_modeled_external(engine, address, symbol, &failure).unwrap());
+            assert!(
+                install_modeled_external(engine, address, symbol, &failure, &allocations).unwrap()
+            );
             for (index, value) in args.into_iter().enumerate() {
                 engine.reg_write(199 + index as i32, value).unwrap();
             }
@@ -461,7 +581,8 @@ mod tests {
                 &mut engine,
                 EXTERNAL_BASE + 7 * EXTERNAL_STRIDE,
                 "_unmodeled",
-                &failure
+                &failure,
+                &allocations,
             )
             .unwrap()
         );
@@ -481,13 +602,128 @@ mod tests {
     fn modeled_external_reports_invalid_guest_memory() {
         let mut engine = Engine::new().unwrap();
         let failure = Rc::new(RefCell::new(None));
-        install_modeled_external(&mut engine, EXTERNAL_BASE, "_memset", &failure).unwrap();
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let allocations = Rc::new(RefCell::new(
+            AllocationState::from_checkpoint(&source).unwrap(),
+        ));
+        install_modeled_external(
+            &mut engine,
+            EXTERNAL_BASE,
+            "_memset",
+            &failure,
+            &allocations,
+        )
+        .unwrap();
         engine.reg_write(199, 0x9000).unwrap();
         engine.reg_write(200, 0x41).unwrap();
         engine.reg_write(201, 1).unwrap();
         engine.reg_write(2, 0x5000).unwrap();
         let _ = engine.start_bounded(EXTERNAL_BASE, 0x5000, Duration::from_secs(2), 4);
         assert!(failure.borrow().as_ref().unwrap().contains("memset"));
+    }
+
+    #[test]
+    fn allocation_pages_and_next_address_survive_checkpoint_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let binary_path = directory.path().join("fairplayd.arm64e");
+        let output_path = directory.path().join("resumed.pkl.gz");
+        std::fs::write(&binary_path, SYNTHETIC_BINARY).unwrap();
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        assert_eq!(
+            runner.allocation_state.borrow().next,
+            SYNTHETIC_ALLOCATION_BASE
+        );
+        let malloc_address = EXTERNAL_BASE;
+        install_modeled_external(
+            &mut runner.engine,
+            malloc_address,
+            "_malloc",
+            &runner.external_failure,
+            &runner.allocation_state,
+        )
+        .unwrap();
+        runner.engine.reg_write(199, 5000).unwrap();
+        runner.engine.reg_write(2, 0x5000).unwrap();
+        runner
+            .engine
+            .start_bounded(malloc_address, 0x5000, Duration::from_secs(2), 4)
+            .unwrap();
+        assert_eq!(
+            runner.engine.reg_read(199).unwrap(),
+            SYNTHETIC_ALLOCATION_BASE
+        );
+        runner
+            .engine
+            .mem_write(SYNTHETIC_ALLOCATION_BASE + PAGE_BYTES, b"Rust")
+            .unwrap();
+        let calloc_address = EXTERNAL_BASE + EXTERNAL_STRIDE;
+        install_modeled_external(
+            &mut runner.engine,
+            calloc_address,
+            "_calloc",
+            &runner.external_failure,
+            &runner.allocation_state,
+        )
+        .unwrap();
+        runner.engine.reg_write(199, 2).unwrap();
+        runner.engine.reg_write(200, 32).unwrap();
+        runner.engine.reg_write(2, 0x5000).unwrap();
+        runner
+            .engine
+            .start_bounded(calloc_address, 0x5000, Duration::from_secs(2), 4)
+            .unwrap();
+        assert_eq!(
+            runner.engine.reg_read(199).unwrap(),
+            SYNTHETIC_ALLOCATION_BASE + 2 * PAGE_BYTES
+        );
+        assert_eq!(
+            runner
+                .engine
+                .mem_read(SYNTHETIC_ALLOCATION_BASE + 2 * PAGE_BYTES, 64)
+                .unwrap(),
+            [0; 64]
+        );
+        runner
+            .engine
+            .reg_write(REG_PC, source.pc().unwrap())
+            .unwrap();
+        assert_eq!(
+            runner
+                .write_checkpoint(&source, &binary_path, &output_path)
+                .unwrap(),
+            4
+        );
+        let resumed = FairplayCheckpoint::load_private(&output_path).unwrap();
+        assert_eq!(
+            resumed.next_allocation().unwrap(),
+            Some(SYNTHETIC_ALLOCATION_BASE + 3 * PAGE_BYTES)
+        );
+        assert_eq!(
+            resumed
+                .read_block::<4>(SYNTHETIC_ALLOCATION_BASE + PAGE_BYTES)
+                .unwrap()
+                .as_slice(),
+            b"Rust"
+        );
+        let replay = CheckpointRunner::new(&resumed, SYNTHETIC_BINARY).unwrap();
+        assert_eq!(
+            replay.allocation_state.borrow().next,
+            SYNTHETIC_ALLOCATION_BASE + 3 * PAGE_BYTES
+        );
+        assert_eq!(
+            replay
+                .engine
+                .mem_read(SYNTHETIC_ALLOCATION_BASE + PAGE_BYTES, 4)
+                .unwrap(),
+            b"Rust"
+        );
     }
 
     #[test]

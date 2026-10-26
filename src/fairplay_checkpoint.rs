@@ -363,6 +363,15 @@ impl FairplayCheckpoint {
         pages.keys().map(page_key_u64).collect()
     }
 
+    pub fn next_allocation(&self) -> Result<Option<u64>> {
+        let Some(Value::Dict(root)) = &self.root else {
+            return Ok(None);
+        };
+        root.get(&HashableValue::String("next_allocation".into()))
+            .map(value_u64)
+            .transpose()
+    }
+
     /// Preserve original metadata when writing a resumed schema-2 snapshot.
     pub(crate) fn clone_root(&self) -> Result<Value> {
         if let Some(root) = &self.root {
