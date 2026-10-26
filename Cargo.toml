@@ -44,6 +44,8 @@ lzfse_rust = "0.2.1"
 apfs = "0.4.1"
 apple-xar = { version = "0.20", default-features = false }
 roxmltree = "0.21"
+yaxpeax-arm = { version = "0.5.0", default-features = false, features = ["std", "fmt"] }
+yaxpeax-arch = { version = "0.3.2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 flate2 = "1"

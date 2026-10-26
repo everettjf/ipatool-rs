@@ -5,6 +5,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
+    fairplay_arm64::{Arm64Audit, audit_first_page},
     fairplay_codesign::{CodeDirectoryAudit, audit_code_directories},
     fairplay_macho::parse_macho_slices,
     fairplay_page::PageKeyDeriver,
@@ -19,6 +20,8 @@ pub struct DecryptedSlice {
     pub pages: usize,
     pub encrypted_sha256: String,
     pub decrypted_sha256: String,
+    pub first_plaintext_page_sha256: String,
+    pub first_page_audit: Option<Arm64Audit>,
     pub code_directories: Vec<CodeDirectoryAudit>,
 }
 
@@ -71,6 +74,19 @@ pub fn decrypt_macho(
             records,
             &deriver,
         )?;
+        let first =
+            &image[layout.crypt_offset..layout.crypt_offset + crate::fairplay_supf::PAGE_BYTES];
+        let first_plaintext_page_sha256 = format!("{:x}", Sha256::digest(first));
+        let first_page_audit = if matches!(layout.cpu_type, 0x0100_000c | 0x0200_000c) {
+            Some(
+                audit_first_page(first, layout.crypt_offset, &layout.instruction_ranges)
+                    .with_context(|| {
+                        format!("audit decrypted ARM64 slice at {:#x}", slice.offset)
+                    })?,
+            )
+        } else {
+            None
+        };
         image[layout.crypt_id_offset..layout.crypt_id_offset + 4]
             .copy_from_slice(&0u32.to_le_bytes());
         let decrypted_sha256 = format!("{:x}", Sha256::digest(&*image));
@@ -81,6 +97,8 @@ pub fn decrypt_macho(
             pages: records.len(),
             encrypted_sha256,
             decrypted_sha256,
+            first_plaintext_page_sha256,
+            first_page_audit,
             code_directories: checks,
         });
     }
@@ -116,7 +134,10 @@ pub(crate) mod tests {
         source[60..64].copy_from_slice(&16u32.to_le_bytes());
         source[64..68].copy_from_slice(&(PAGE_BYTES as u32 * 2).to_le_bytes());
         source[68..72].copy_from_slice(&(20u32 + 44 + 2 * 32).to_le_bytes());
-        let plaintext = vec![0x5a; PAGE_BYTES];
+        let mut plaintext = vec![0u8; PAGE_BYTES];
+        for chunk in plaintext.as_chunks_mut::<4>().0 {
+            chunk.copy_from_slice(&0xd503_201fu32.to_le_bytes());
+        }
         source[PAGE_BYTES..PAGE_BYTES * 2].copy_from_slice(&plaintext);
         let key = PageKeyDeriver::from_logical_key(logical)
             .page_key(record[..16].try_into().unwrap(), PAGE_BYTES as u64);
@@ -174,6 +195,11 @@ pub(crate) mod tests {
         assert_eq!(&output[PAGE_BYTES..PAGE_BYTES * 2], &plaintext);
         assert_eq!(&output[48..52], &[0; 4]);
         assert_eq!(reports[0].pages, 1);
+        assert_eq!(
+            reports[0].first_page_audit.as_ref().unwrap().valid_words,
+            1024
+        );
+        assert!(decrypt_macho(&source, &supf, [0x32; 16]).is_err());
         let mut tampered = source;
         tampered[PAGE_BYTES + 99] ^= 1;
         assert!(decrypt_macho(&tampered, &supf, logical).is_err());

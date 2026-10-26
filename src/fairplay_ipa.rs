@@ -52,7 +52,7 @@ struct DecryptionReport {
     decrypted_pages: usize,
     images: Vec<ImageReport>,
     complete: bool,
-    warnings: [&'static str; 3],
+    warnings: [&'static str; 4],
 }
 
 fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
@@ -211,6 +211,7 @@ pub fn decrypt_ipa_with_options(
             complete: true,
             warnings: [
                 "Plaintext correctness is not authenticated by the source CodeDirectory.",
+                "Only ARM64 first pages are checked for instruction plausibility.",
                 "CodeDirectory hashes refer to encrypted pages and become stale after decryption.",
                 "Analysis IPA requires recursive re-signing before installation.",
             ],
