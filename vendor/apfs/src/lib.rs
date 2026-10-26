@@ -113,6 +113,7 @@ pub struct ApfsVolume<R: Read + Seek> {
     vol_omap_root_block: u64,
     catalog_root_block: u64,
     sealed_tree_base: u64,
+    fext_tree_oid: u64,
     info: VolumeInfo,
 }
 
@@ -180,6 +181,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             vol_omap_root_block,
             catalog_root_block,
             sealed_tree_base: vol_sb.root_tree_oid,
+            fext_tree_oid: vol_sb.fext_tree_oid,
             info,
         })
     }
@@ -334,14 +336,7 @@ impl<R: Read + Seek> ApfsVolume<R> {
             None => Ok(None),
             Some(catalog::XattrValue::Embedded(data)) => Ok(Some(data)),
             Some(catalog::XattrValue::DataStream { obj_id, size }) => {
-                let extents = catalog::lookup_extents(
-                    &mut self.reader,
-                    self.catalog_root_block,
-                    self.vol_omap_root_block,
-                    self.block_size,
-                    self.sealed_tree_base,
-                    obj_id,
-                )?;
+                let extents = self.data_extents(obj_id)?;
                 let mut data = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
                 extents::read_file_data(
                     &mut self.reader,
@@ -353,6 +348,65 @@ impl<R: Read + Seek> ApfsVolume<R> {
                 Ok(Some(data))
             }
         }
+    }
+
+    fn data_extents(&mut self, private_id: u64) -> Result<Vec<catalog::FileExtentRecord>> {
+        if self.fext_tree_oid != 0 {
+            catalog::lookup_physical_extents(
+                &mut self.reader,
+                self.fext_tree_oid,
+                self.block_size,
+                private_id,
+            )
+        } else {
+            catalog::lookup_extents(
+                &mut self.reader,
+                self.catalog_root_block,
+                self.vol_omap_root_block,
+                self.block_size,
+                self.sealed_tree_base,
+                private_id,
+            )
+        }
+    }
+
+    /// Open an xattr data stream without buffering the entire attribute.
+    pub fn open_xattr_stream(
+        &mut self,
+        path: &str,
+        name: &str,
+    ) -> Result<extents::ApfsForkReader<'_, R>> {
+        let (oid, _) = catalog::resolve_path(
+            &mut self.reader,
+            self.catalog_root_block,
+            self.vol_omap_root_block,
+            self.block_size,
+            self.sealed_tree_base,
+            path,
+        )?;
+        let value = catalog::lookup_xattr_value(
+            &mut self.reader,
+            self.catalog_root_block,
+            self.vol_omap_root_block,
+            self.block_size,
+            self.sealed_tree_base,
+            oid,
+            name,
+        )?;
+        let (obj_id, size) = match value {
+            Some(catalog::XattrValue::DataStream { obj_id, size }) => (obj_id, size),
+            Some(catalog::XattrValue::Embedded(_)) => {
+                return Err(ApfsError::Unsupported(format!("{name} is embedded, not a data stream")));
+            }
+            None => return Err(ApfsError::FileNotFound(format!("{path}: {name}"))),
+        };
+        let extents = self.data_extents(obj_id)?;
+        Ok(extents::ApfsForkReader::new(
+            &mut self.reader,
+            self.block_size,
+            extents,
+            size,
+        ))
     }
 
     /// The `com.apple.decmpfs` header of a transparently compressed inode, or

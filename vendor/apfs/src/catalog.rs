@@ -468,6 +468,55 @@ pub fn lookup_extents<R: Read + Seek>(
     Ok(extents)
 }
 
+/// Look up a sealed volume's data extents in its physical file extent tree.
+/// Keys are `(private_id, logical_address)` and values are `(length, block)`.
+pub fn lookup_physical_extents<R: Read + Seek>(
+    reader: &mut R,
+    root_block: u64,
+    block_size: u32,
+    private_id: u64,
+) -> Result<Vec<FileExtentRecord>> {
+    let compare = |key: &[u8]| {
+        let bytes = key.get(..8).ok_or_else(|| {
+            ApfsError::InvalidBTree("physical extent key is shorter than its private ID".into())
+        })?;
+        let id = u64::from_le_bytes(bytes.try_into().expect("eight bytes"));
+        Ok(id.cmp(&private_id))
+    };
+    let entries = btree::btree_scan(
+        reader,
+        root_block,
+        block_size,
+        16,
+        16,
+        &compare,
+        None,
+        None,
+    )?;
+    let mut extents = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        let logical_addr = u64::from_le_bytes(
+            key.get(8..16)
+                .ok_or_else(|| ApfsError::InvalidBTree("physical extent key is too short".into()))?
+                .try_into()
+                .expect("eight bytes"),
+        );
+        let value = value.get(..16).ok_or_else(|| {
+            ApfsError::InvalidBTree("physical extent value is too short".into())
+        })?;
+        extents.push(FileExtentRecord {
+            logical_addr,
+            value: FileExtentVal {
+                flags_and_length: u64::from_le_bytes(value[..8].try_into().expect("eight bytes")),
+                phys_block_num: u64::from_le_bytes(value[8..16].try_into().expect("eight bytes")),
+                crypto_id: 0,
+            },
+        });
+    }
+    extents.sort_by_key(|record| record.logical_addr);
+    Ok(extents)
+}
+
 /// Order an on-disk xattr catalog key against the `(oid, name)` being searched for.
 ///
 /// Catalog records sort by OID, then by record type, and xattr records then sort

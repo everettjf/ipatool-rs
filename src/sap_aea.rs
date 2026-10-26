@@ -1011,5 +1011,23 @@ mod tests {
         assert!(stat.size > 568);
         assert_eq!(stat.compression.unwrap().compression_type, 14);
         eprintln!("SystemOS shared cache size: {}", stat.size);
+        let mut fork = volume
+            .open_xattr_stream(path, "com.apple.ResourceFork")
+            .unwrap();
+        let mut table_size = [0u8; 4];
+        std::io::Read::read_exact(&mut fork, &mut table_size).unwrap();
+        eprintln!(
+            "SystemOS resource fork table size: {}",
+            u32::from_le_bytes(table_size)
+        );
+        assert!(u32::from_le_bytes(table_size) > 4);
+        let mut cache = crate::decmpfs::LzBitmapForkReader::open(fork, stat.size).unwrap();
+        let mut header = [0u8; 568];
+        std::io::Read::read_exact(&mut cache, &mut header).unwrap();
+        assert_eq!(&header[..16], b"dyld_v1  arm64e\0");
+        eprintln!(
+            "SystemOS subcache count: {}",
+            u32::from_le_bytes(header[396..400].try_into().unwrap())
+        );
     }
 }

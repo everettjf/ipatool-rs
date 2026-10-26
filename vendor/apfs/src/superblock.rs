@@ -157,6 +157,8 @@ pub struct ApfsSuperblock {
     pub last_mod_time: u64,
     pub fs_flags: u64,
     pub volume_name: String,
+    /// Physical block containing the sealed volume's file extent tree.
+    pub fext_tree_oid: u64,
 }
 
 impl ApfsSuperblock {
@@ -232,6 +234,12 @@ impl ApfsSuperblock {
             String::from_utf8_lossy(&name_buf[..nul_pos]).to_string()
         };
 
+        // Fields following the name: next_doc_id, role, reserved, root_to_xid,
+        // er_state_oid, cloneinfo_id_epoch, cloneinfo_xid, snap_meta_ext_oid,
+        // volume_group_id and integrity_meta_oid.
+        cursor.set_position(cursor.position() + 72);
+        let fext_tree_oid = cursor.read_u64::<LittleEndian>()?;
+
         Ok(ApfsSuperblock {
             header,
             magic,
@@ -264,6 +272,7 @@ impl ApfsSuperblock {
             last_mod_time,
             fs_flags,
             volume_name,
+            fext_tree_oid,
         })
     }
 }
