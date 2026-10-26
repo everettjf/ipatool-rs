@@ -132,6 +132,15 @@ impl StoreBackend {
         self.run(input, bag.as_ref(), Operation::Standard, None)
     }
 
+    pub fn execute_standard_signed(
+        &self,
+        input: StoreBackendRequest<'_>,
+        signer: &mut StoreSigner<'_>,
+    ) -> Result<HostResponse> {
+        let bag = self.bag.lock().expect("Store bag lock poisoned").clone();
+        self.run(input, bag.as_ref(), Operation::Standard, Some(signer))
+    }
+
     pub fn execute_purchase(&self, input: StoreBackendRequest<'_>) -> Result<HostResponse> {
         let bag = self.bag()?;
         self.run(input, Some(&bag), Operation::Purchase, None)
@@ -181,7 +190,10 @@ impl StoreBackend {
             timeout: input.timeout,
         };
         match operation {
-            Operation::Standard => runtime.execute_standard(request),
+            Operation::Standard => match signer {
+                Some(signer) => runtime.execute_standard_signed(request, signer),
+                None => runtime.execute_standard(request),
+            },
             Operation::Purchase => runtime.execute_purchase(request),
             Operation::Authenticate => runtime.execute_authentication(
                 request,

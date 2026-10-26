@@ -10,6 +10,7 @@ use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
 use ipatool_rs::store_backend::StoreBackend;
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput};
+use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT};
 use ipatool_rs::store_purchase::{self, LicenseAlreadyExists, PasswordTokenExpired};
 use ipatool_rs::storefront::country_code_from_storefront;
 use ipatool_rs::{App, CatalogClient, Platform, SearchOutput};
@@ -74,6 +75,15 @@ enum Command {
         app_id: Option<i64>,
         #[arg(short = 'b', long)]
         bundle_identifier: Option<String>,
+        #[arg(long)]
+        platform: Option<String>,
+    },
+    /// List apps owned by the authenticated App Store account.
+    ListPurchases {
+        #[arg(short = 'p', long, default_value_t = 1)]
+        page: usize,
+        #[arg(short = 'l', long, default_value_t = DEFAULT_LIMIT)]
+        max_results: usize,
         #[arg(long)]
         platform: Option<String>,
     },
@@ -277,6 +287,53 @@ fn run() -> Result<()> {
                     }
                     Err(error) if error.downcast_ref::<LicenseAlreadyExists>().is_some() => {
                         print_purchase_success(true, cli.format)?;
+                        break;
+                    }
+                    Err(error)
+                        if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
+                    {
+                        account = store_login::login(
+                            &backend,
+                            &account_store,
+                            LoginInput {
+                                email: account.email.clone(),
+                                password: account.password.clone(),
+                                auth_code: String::new(),
+                            },
+                        )?;
+                        refreshed = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Command::ListPurchases {
+            page,
+            max_results,
+            platform,
+        } => {
+            if page == 0 || max_results == 0 || max_results > MAX_LIMIT {
+                bail!("page must be positive and max results must be between 1 and {MAX_LIMIT}");
+            }
+            let platform = parse_platform(platform.as_deref())?;
+            let account_store = AccountStore::new(open_system_keychain()?);
+            let mut account = account_store.load()?;
+            let backend = StoreBackend::open()?;
+            let mut refreshed = false;
+            loop {
+                match store_owned::owned_apps(&backend, &account, page, max_results, platform) {
+                    Ok(output) => {
+                        match cli.format {
+                            Format::Json => println!("{}", serde_json::to_string(&output)?),
+                            Format::Text => {
+                                println!("count: {}", output.count);
+                                println!("totalCount: {}", output.total_count);
+                                println!("page: {}", output.page);
+                                for app in &output.apps {
+                                    print_app(app, Format::Text)?;
+                                }
+                            }
+                        }
                         break;
                     }
                     Err(error)

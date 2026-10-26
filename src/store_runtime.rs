@@ -536,6 +536,14 @@ impl StoreRuntime {
         self.execute_request(input, StoreOperation::Standard, None)
     }
 
+    pub fn execute_standard_signed(
+        &mut self,
+        input: StoreStandardRequest<'_>,
+        signer: &mut StoreSigner<'_>,
+    ) -> Result<HostResponse> {
+        self.execute_request(input, StoreOperation::Standard, Some(signer))
+    }
+
     /// Prepare, send, and decode a free-app purchase through the pinned Apple
     /// code. The host HTTP transport must be installed with set_transport.
     pub fn execute_purchase(&mut self, input: StoreStandardRequest<'_>) -> Result<HostResponse> {
@@ -9293,5 +9301,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn signs_raw_purchase_history_request_with_pinned_apple_code() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        runtime.set_transport(|request| {
+            assert_eq!(request.method, Method::POST);
+            assert_eq!(
+                request.url.as_str(),
+                "https://pd.itunes.apple.com/WebObjects/MZPurchaseDaap.woa/purchase/update"
+            );
+            assert_eq!(
+                request.headers.get("x-apple-actionsignature").unwrap(),
+                "AQID"
+            );
+            assert_eq!(request.body.as_deref(), Some(b"session-id=7".as_slice()));
+            Ok(HostResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: b"raw DMAP response".to_vec(),
+            })
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Dsid", HeaderValue::from_static("123456"));
+        headers.insert("X-Token", HeaderValue::from_static("test-token"));
+        headers.insert(
+            "X-Apple-Store-Front",
+            HeaderValue::from_static("143441-1,34"),
+        );
+        let mut signer = |body: &[u8]| {
+            assert_eq!(body, b"session-id=7");
+            Ok(vec![1, 2, 3])
+        };
+        let response = runtime.execute_standard_signed(
+            StoreStandardRequest {
+                method: "POST",
+                url: "https://pd.itunes.apple.com/WebObjects/MZPurchaseDaap.woa/purchase/update",
+                headers: &headers,
+                parameters: None,
+                body: Some(b"session-id=7"),
+                bag: None,
+                hardware_id: &[0, 1, 2, 3, 4, 5],
+                raw: true,
+                response_format: "raw",
+                no_redirects: false,
+                timeout: None,
+            },
+            &mut signer,
+        ).unwrap();
+        assert_eq!(response.body, b"raw DMAP response");
     }
 }
