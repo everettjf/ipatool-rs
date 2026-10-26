@@ -27,6 +27,7 @@ pub mod sap_system_os;
 pub mod state;
 pub mod store_agent;
 pub mod store_backend;
+pub mod store_login;
 pub mod store_memory;
 pub mod store_profile;
 pub mod store_runtime;

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
 
 use crate::auth::{SapConfig, sap_config_from_bag_value};
@@ -94,16 +94,18 @@ impl StoreBackend {
             .map(|byte| format!("{byte:02X}"))
             .collect::<String>();
         let url = format!("https://init.itunes.apple.com/bag.xml?guid={guid}");
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/xml"));
         let response = self.run(
             StoreBackendRequest {
                 method: "GET",
                 url: &url,
-                headers: &HeaderMap::new(),
+                headers: &headers,
                 parameters: None,
                 body: None,
                 raw: false,
                 response_format: "plist",
-                no_redirects: false,
+                no_redirects: true,
                 timeout: Some(DEFAULT_AUTHENTICATION_TIMEOUT),
             },
             None,

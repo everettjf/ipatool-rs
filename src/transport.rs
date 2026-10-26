@@ -94,10 +94,7 @@ impl Response {
         if (300..400).contains(&self.status) {
             bail!("redirect response (HTTP {})", self.status);
         }
-        if self.status == 429 {
-            if authentication {
-                return Err(self.unexpected_authentication("rate limited by Apple"));
-            }
+        if self.status == 429 && !authentication {
             bail!(
                 "rate limited by Apple (HTTP 429): {}",
                 body_snippet(&self.body)
@@ -106,6 +103,9 @@ impl Response {
         let normalized = normalize_plist_body(&self.body);
         if !looks_like_plist(&normalized) {
             if authentication {
+                if self.status == 429 {
+                    return Err(self.unexpected_authentication("rate limited by Apple"));
+                }
                 return Err(
                     self.unexpected_authentication("empty or non-plist authentication response")
                 );
