@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
 use ipatool_rs::{App, CatalogClient, Platform, SearchOutput};
@@ -29,6 +30,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Generate a shell completion script for the current command set.
+    Completion { shell: Shell },
     /// Inspect or remove the account stored by ipatool in the system keychain.
     Auth {
         #[command(subcommand)]
@@ -97,6 +100,10 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Completion { shell } => {
+            let mut command = Cli::command();
+            generate(shell, &mut command, "ipatool", &mut std::io::stdout());
+        }
         Command::Auth { command } => {
             let account_store = AccountStore::new(open_system_keychain()?);
             match command {

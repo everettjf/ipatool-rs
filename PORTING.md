@@ -20,7 +20,7 @@ This checklist records behavior in that source tree; the Go README and source ar
 | `fairplay-enroll collect`, `fairplay-enroll recover` | Pending | Native capture, FairPlay binary profiles, recovery runtime |
 | `fairplay-decrypt` | Pending | Page keys, Mach-O crypt regions, IPA reconstruction, report |
 | `mcp` | Pending | Authenticated tool handlers and stdio protocol |
-| Shell completion | Pending | Complete CLI command and flag model |
+| Shell completion | Generator implemented for the current Rust command set; command coverage grows with the port | Complete CLI command and flag model |
 
 `lookup` exists in the Go library but has no top-level Go command. The Rust `lookup` command exposes the ported read-only operation to make it directly testable.
 

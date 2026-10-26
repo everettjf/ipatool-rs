@@ -12,6 +12,7 @@ cargo run -- latest-version-id --app-id 874139669 --platform iphone
 cargo run -- fairplay-doctor --ipa /private/path/app.ipa --model /private/path/model.bin
 cargo run -- auth info
 cargo run -- auth revoke
+cargo run -- completion zsh > _ipatool
 ```
 
 `search` supports iPhone, iPad, Apple TV, Apple Watch, visionOS and macOS platform aliases. It derives platforms from catalog metadata, filters Watch results, and uses the visionOS storefront when appropriate. `lookup` accepts an app ID or bundle identifier. These read-only commands use the public catalog; `--country` defaults to `US` until account storefront support is ported.
@@ -33,6 +34,7 @@ On macOS, `auth info` reads the existing Go-compatible account from the system K
 | `fairplay-doctor` host, capture, IPA and model checks | Implemented; current macOS host output compared with Go |
 | Account inspection and revocation through macOS Keychain | Implemented with in-memory tests; existing real credentials not tested |
 | Account login and other credential backends | Pending |
+| Shell completion for implemented commands | Implemented for Bash, Zsh, Fish, PowerShell and Elvish |
 | Purchases, owned apps, version history and metadata | Pending |
 | iOS and macOS package downloads and SINF replication | Pending |
 | FairPlay enrollment, diagnostics and decryption | Pending |
