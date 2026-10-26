@@ -11,6 +11,7 @@ use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
 use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
 use ipatool_rs::fairplay_download_capture::write_download_capture;
 use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2};
+use ipatool_rs::fairplay_enrollment_v3::{V3Material, build_fpsenr3};
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
@@ -277,6 +278,29 @@ enum FairplayEnrollCommand {
         selector: String,
         #[arg(long)]
         fairplayd_sha256: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Build and validate a private FPSENR3 decoder from three recovered buffers.
+    BuildModelV3 {
+        #[arg(long)]
+        recovered_model: PathBuf,
+        #[arg(long, help = "Private 432-byte white-box entry buffer")]
+        whitebox_entry: PathBuf,
+        #[arg(long, help = "Private 432-byte post-codec entry buffer")]
+        postcodec_entry: PathBuf,
+        #[arg(long, help = "Private 432-byte post-codec exit buffer")]
+        postcodec_exit: PathBuf,
+        #[arg(long, help = "Private SINF fixture for end-to-end validation")]
+        sinf: PathBuf,
+        #[arg(long)]
+        selector: String,
+        #[arg(long)]
+        fairplayd_sha256: String,
+        #[arg(long, help = "Absolute source offset within the SINF, e.g. 0x1e0")]
+        source_offset: String,
+        #[arg(long, default_value = "0x98")]
+        final_xor: String,
         #[arg(long)]
         output: PathBuf,
     },
@@ -1102,6 +1126,57 @@ fn run() -> Result<()> {
                     ),
                 }
             }
+            FairplayEnrollCommand::BuildModelV3 {
+                recovered_model,
+                whitebox_entry,
+                postcodec_entry,
+                postcodec_exit,
+                sinf,
+                selector,
+                fairplayd_sha256,
+                source_offset,
+                final_xor,
+                output,
+            } => {
+                let recovered = read_private_model(&recovered_model)?;
+                let whitebox_entry = read_private_block::<FIRST_TRANSFORM_BYTES>(&whitebox_entry)?;
+                let postcodec_entry =
+                    read_private_block::<FIRST_TRANSFORM_BYTES>(&postcodec_entry)?;
+                let postcodec_exit = read_private_block::<FIRST_TRANSFORM_BYTES>(&postcodec_exit)?;
+                let sinf = read_private_bytes(&sinf, 1024 * 1024)?;
+                let selector = parse_enrollment_selector(&selector)?;
+                let fairplayd_sha256 = parse_sha256(&fairplayd_sha256)?;
+                let source_offset = parse_nonnegative_i32(&source_offset)?;
+                let final_xor = parse_byte(&final_xor)?;
+                let model = build_fpsenr3(V3Material {
+                    recovered: &recovered,
+                    selector,
+                    fairplayd_sha256,
+                    source_offset,
+                    final_xor,
+                    whitebox_entry: &whitebox_entry,
+                    postcodec_entry: &postcodec_entry,
+                    postcodec_exit: &postcodec_exit,
+                    sinf: &sinf,
+                })?;
+                write_private_binary(&output, &model)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "fairplay.enrollment-model.v3",
+                            "output": output,
+                            "selector": selector.identifier(),
+                            "bytes": model.len(),
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Built private FairPlay v3 enrollment model for {} in {}",
+                        selector.identifier(),
+                        output.display()
+                    ),
+                }
+            }
         },
     }
     if cli.verbose {
@@ -1135,6 +1210,23 @@ fn parse_sha256(value: &str) -> Result<[u8; 32]> {
         *byte = u8::from_str_radix(digits, 16).context("invalid fairplayd SHA-256")?;
     }
     Ok(hash)
+}
+
+fn parse_nonnegative_i32(value: &str) -> Result<i32> {
+    let parsed = if let Some(hex) = value.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16)?
+    } else {
+        value.parse::<u32>()?
+    };
+    i32::try_from(parsed).context("SINF source offset exceeds signed 32-bit range")
+}
+
+fn parse_byte(value: &str) -> Result<u8> {
+    if let Some(hex) = value.strip_prefix("0x") {
+        Ok(u8::from_str_radix(hex, 16)?)
+    } else {
+        Ok(value.parse::<u8>()?)
+    }
 }
 
 fn prompt(label: &str, secret: bool) -> Result<String> {
@@ -1378,6 +1470,44 @@ mod tests {
                 command: FairplayEnrollCommand::RecoverState { slot: Some(8), .. }
             }
         ));
+    }
+
+    #[test]
+    fn build_model_v3_requires_fixture_and_accepts_hex_geometry() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "build-model-v3",
+            "--recovered-model",
+            "/private/recovered.json",
+            "--whitebox-entry",
+            "/private/whitebox.bin",
+            "--postcodec-entry",
+            "/private/post-entry.bin",
+            "--postcodec-exit",
+            "/private/post-exit.bin",
+            "--sinf",
+            "/private/installed.sinf",
+            "--selector",
+            "0000000b:0000000d",
+            "--fairplayd-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--source-offset",
+            "0x1e0",
+            "--output",
+            "/private/enrollment.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::BuildModelV3 { .. }
+            }
+        ));
+        assert_eq!(parse_nonnegative_i32("0x1e0").unwrap(), 480);
+        assert_eq!(parse_byte("0x98").unwrap(), 0x98);
+        assert!(parse_nonnegative_i32("0x80000000").is_err());
+        assert!(parse_byte("256").is_err());
     }
 
     #[test]

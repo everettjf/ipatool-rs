@@ -293,7 +293,7 @@ fn validate_legacy_plaintext(plaintext: &[u8]) -> Result<[u8; 16]> {
     Ok(key)
 }
 
-fn validate_v3_plaintext(bytes: &[u8; V3_SOURCE_BYTES]) -> Result<()> {
+pub(crate) fn validate_v3_plaintext(bytes: &[u8; V3_SOURCE_BYTES]) -> Result<()> {
     if &bytes[..4] != b"itun"
         || u32::from_be_bytes(bytes[4..8].try_into().unwrap()) != 12
         || &bytes[8..12] != b"vers"
