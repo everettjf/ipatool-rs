@@ -25,6 +25,7 @@ pub mod fairplay_page;
 pub mod fairplay_recovery;
 pub mod fairplay_recovery_linear;
 pub mod fairplay_recovery_math;
+pub mod fairplay_recovery_output;
 pub mod fairplay_recovery_round;
 pub mod fairplay_recovery_step1;
 pub mod fairplay_recovery_step2;

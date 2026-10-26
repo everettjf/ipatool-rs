@@ -11,6 +11,10 @@ use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
 use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
 use ipatool_rs::fairplay_download_capture::write_download_capture;
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
+use ipatool_rs::fairplay_oracle_model::OracleModel;
+use ipatool_rs::fairplay_recovery;
+use ipatool_rs::fairplay_recovery_output::{read_private_frame, write_private_model};
+use ipatool_rs::fairplay_recovery_target::SidbTarget;
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
 use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
@@ -211,6 +215,15 @@ enum FairplayEnrollCommand {
         product_version: Option<String>,
         #[arg(long)]
         build_version: Option<String>,
+    },
+    /// Recover a private AES model from an exported SIDB oracle model and frame.
+    RecoverOracle {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        enrollment_frame: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -875,6 +888,32 @@ fn run() -> Result<()> {
                     ),
                 }
             }
+            FairplayEnrollCommand::RecoverOracle {
+                model,
+                enrollment_frame,
+                output,
+            } => {
+                let oracle = OracleModel::load_private(&model)?;
+                let frame = read_private_frame(&enrollment_frame)?;
+                let mut target = SidbTarget::new(&oracle, *frame);
+                let recovered = fairplay_recovery::recover(&mut target)?;
+                write_private_model(&output, &recovered)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "darkphoenix.external-encoding-model.v1",
+                            "output": output,
+                            "milliseconds": recovered.milliseconds,
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Recovered private SIDB AES model in {} ({:.1} ms)",
+                        output.display(),
+                        recovered.milliseconds
+                    ),
+                }
+            }
         },
     }
     if cli.verbose {
@@ -1008,6 +1047,37 @@ fn print_purchase_success(already_owned: bool, format: Format) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fairplay_recover_oracle_accepts_private_input_paths() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "recover-oracle",
+            "--model",
+            "/private/model.gz",
+            "--enrollment-frame",
+            "/private/frame.bin",
+            "--output",
+            "/private/recovered.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::FairplayEnroll {
+                command:
+                    FairplayEnrollCommand::RecoverOracle {
+                        model,
+                        enrollment_frame,
+                        output,
+                    },
+            } => {
+                assert_eq!(model, PathBuf::from("/private/model.gz"));
+                assert_eq!(enrollment_frame, PathBuf::from("/private/frame.bin"));
+                assert_eq!(output, PathBuf::from("/private/recovered.json"));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
 
     #[test]
     fn fairplay_download_paths_require_ipa_and_default_beside_it() {
