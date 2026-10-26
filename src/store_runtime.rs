@@ -3,6 +3,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    fmt,
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -71,6 +72,29 @@ enum StoreOperation {
 }
 
 type StoreSigner<'a> = dyn FnMut(&[u8]) -> Result<Vec<u8>> + 'a;
+
+#[derive(Debug)]
+struct StoreFrameworkError {
+    domain: String,
+    code: i64,
+    message: Option<String>,
+}
+
+impl fmt::Display for StoreFrameworkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Store framework error {}/{}",
+            self.domain, self.code
+        )?;
+        if let Some(message) = &self.message {
+            write!(formatter, ": {message}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for StoreFrameworkError {}
 
 struct StoreState {
     heap_cursor: u64,
@@ -678,7 +702,16 @@ impl StoreRuntime {
             self.invoke(request, "setValue:forHTTPHeaderField:", &[encoded, name])?;
         }
 
-        let (result, mut response) = self.send_request(session, request)?;
+        let (result, mut response) = match self.send_request(session, request) {
+            Ok(result) => result,
+            Err(error) if !input.raw && error.downcast_ref::<StoreFrameworkError>().is_some() => {
+                if let Some(response) = self.take_last_http_response() {
+                    return Ok(response);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         if input.raw {
             return Ok(response);
         }
@@ -1038,10 +1071,12 @@ impl StoreRuntime {
                 .invoke(error, "localizedDescription", &[])
                 .ok()
                 .and_then(|address| self.object_string(address).ok());
-            if let Some(message) = message {
-                bail!("Store framework error {domain}/{code}: {message}");
+            return Err(StoreFrameworkError {
+                domain,
+                code,
+                message,
             }
-            bail!("Store framework error {domain}/{code}");
+            .into());
         }
         if result == 0 {
             bail!("Store framework returned no result");
@@ -5515,6 +5550,14 @@ fn dispatch_message(
         return Ok(());
     }
     if !class_method
+        && ((class_name == "NSURLSessionDataTask" && selector == "cancel")
+            || (class_name == "NSURLSession"
+                && matches!(selector, "invalidateAndCancel" | "finishTasksAndInvalidate")))
+    {
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if !class_method
         && class_name == "NSURLSessionConfiguration"
         && matches!(
             selector,
@@ -7013,7 +7056,7 @@ fn dispatch_message(
             )?;
             context.reg_write(REG_X0, process)?;
         }
-        (true, "errorWithDomain:code:userInfo:") if class_name == "NSError" => {
+        (true, "errorWithDomain:code:userInfo:") => {
             let code = new_guest_object(
                 context,
                 profile,
@@ -9133,6 +9176,53 @@ mod tests {
             plist::from_bytes::<Value>(&response.body).unwrap()["status"],
             0
         );
+    }
+
+    #[test]
+    fn preserves_purchase_failure_response_for_appstore_error_handling() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        runtime.set_transport(|_| {
+            Ok(HostResponse {
+                status: 200,
+                headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
+                body: br#"<plist version="1.0"><dict><key>failureType</key><string>9610</string><key>customerMessage</key><string>fixture-value</string></dict></plist>"#.to_vec(),
+            })
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Dsid", HeaderValue::from_static("123456"));
+        headers.insert("X-Token", HeaderValue::from_static("test-token"));
+        headers.insert(
+            "X-Apple-Store-Front",
+            HeaderValue::from_static("143441-1,29"),
+        );
+        let parameters = serde_json::json!({
+            "salableAdamId": "1234",
+            "pricingParameters": "STDQ",
+            "price": "0",
+            "productType": "C",
+            "appleId": "test@example.com",
+            "password": "test"
+        });
+        let bag = serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/request"});
+        let response = runtime
+            .execute_purchase(StoreStandardRequest {
+                method: "POST",
+                url: "https://buy.itunes.apple.com/request",
+                headers: &headers,
+                parameters: Some(&parameters),
+                body: None,
+                bag: Some(&bag),
+                hardware_id: &[0, 1, 2, 3, 4, 5],
+                raw: false,
+                response_format: "plist",
+                no_redirects: false,
+                timeout: None,
+            })
+            .unwrap();
+        let body: Value = plist::from_bytes(&response.body).unwrap();
+        assert_eq!(body["failureType"], "9610");
+        assert_eq!(body["customerMessage"], "fixture-value");
     }
 
     #[test]
