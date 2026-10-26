@@ -10,6 +10,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use base64::Engine as _;
+use reqwest::{
+    Method,
+    header::{HeaderMap, HeaderName, HeaderValue},
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -19,6 +23,7 @@ use crate::{
     sap_assets::SapAssetBundle,
     store_memory::{MemoryRegion, exclude_mapped_regions},
     store_profile::{self, Call, ProfileData},
+    transport::Request as HostRequest,
     unicorn_runtime::{Engine, HookContext, REG_PC, REG_X0},
 };
 
@@ -615,6 +620,70 @@ impl StoreRuntime {
             self.invoke(properties, selector, &[value])?;
         }
         Ok(())
+    }
+
+    pub fn host_request(
+        &self,
+        request: u64,
+        authenticated: bool,
+        no_redirects: bool,
+        timeout: Option<Duration>,
+    ) -> Result<HostRequest> {
+        let state = self.state.borrow();
+        let object = state
+            .objects
+            .get(&request)
+            .context("unknown Store request")?;
+        if !class_is_kind_of(&self.profile, &object.class, "NSURLRequest") {
+            bail!("Store object is not a URL request");
+        }
+        let property = |name: &str| object.properties.get(name).copied().unwrap_or(0);
+        let endpoint = object_string_value(&state, property("URL"))?;
+        let url = url::Url::parse(endpoint).context("invalid Store request URL")?;
+        if !allowed_store_url(&url, authenticated) {
+            bail!("unsupported Store request URL");
+        }
+        let method =
+            Method::from_bytes(object_string_value(&state, property("HTTPMethod"))?.as_bytes())
+                .context("invalid Store request method")?;
+        let body = match property("HTTPBody") {
+            0 => None,
+            address => match &state
+                .objects
+                .get(&address)
+                .context("missing Store request body")?
+                .value
+            {
+                StoreValue::Bytes(bytes) => Some(bytes.clone()),
+                _ => bail!("Store request body is not NSData"),
+            },
+        };
+        let mut headers = HeaderMap::new();
+        if let Some(address) = object.properties.get("allHTTPHeaderFields") {
+            let StoreValue::Entries(entries) = &state
+                .objects
+                .get(address)
+                .context("missing Store request headers")?
+                .value
+            else {
+                bail!("Store request headers are not a dictionary");
+            };
+            for (name, &value) in entries {
+                headers.insert(
+                    HeaderName::from_bytes(name.as_bytes()).context("invalid Store header name")?,
+                    HeaderValue::from_str(object_string_value(&state, value)?)
+                        .context("invalid Store header value")?,
+                );
+            }
+        }
+        Ok(HostRequest {
+            method,
+            url,
+            headers,
+            body,
+            no_redirects,
+            timeout,
+        })
     }
 
     pub fn encode_request(
@@ -4814,6 +4883,23 @@ fn random_uuid_string() -> Result<String> {
     .join("-"))
 }
 
+fn allowed_store_url(url: &url::Url, authenticated: bool) -> bool {
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if !authenticated {
+        return matches!(url.scheme(), "http" | "https");
+    }
+    url.scheme() == "https"
+        && (host.eq_ignore_ascii_case("apple.com")
+            || [".apple.com", ".mzstatic.com", ".cdn-apple.com"]
+                .iter()
+                .any(|suffix| host.to_ascii_lowercase().ends_with(suffix)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4821,6 +4907,26 @@ mod tests {
     #[test]
     fn rejects_unpinned_store_image() {
         assert!(StoreRuntime::open_image(b"wrong image").is_err());
+    }
+
+    #[test]
+    fn limits_authenticated_store_urls() {
+        for value in [
+            "https://apple.com/path",
+            "https://buy.itunes.apple.com/path",
+            "https://images.mzstatic.com/a",
+        ] {
+            assert!(allowed_store_url(&url::Url::parse(value).unwrap(), true));
+        }
+        for value in [
+            "http://apple.com/path",
+            "https://example.com/path",
+            "https://apple.com.evil.test/path",
+            "https://apple.com/path#fragment",
+            "https://user@apple.com/path",
+        ] {
+            assert!(!allowed_store_url(&url::Url::parse(value).unwrap(), true));
+        }
     }
 
     #[test]
@@ -4961,6 +5067,9 @@ mod tests {
             runtime.object_string(url).unwrap(),
             "https://example.com/test"
         );
+        let host_request = runtime.host_request(request, false, true, None).unwrap();
+        assert_eq!(host_request.method, Method::POST);
+        assert_eq!(host_request.url.as_str(), "https://example.com/test");
         runtime.configure_request(request, 0, 0, false).unwrap();
         let session = runtime.new_session().unwrap();
         assert_eq!(
