@@ -882,4 +882,26 @@ mod tests {
             assert!(decode_segment(&main_key, &segment, &compressed).is_err());
         }
     }
+
+    #[test]
+    fn lzfse_decoder_accepts_short_fse_literal_stream() {
+        let original = vec![0u8; 65_536];
+        let mut encoded = Vec::new();
+        lzfse_rust::encode_bytes(&original, &mut encoded).unwrap();
+        assert_eq!(&encoded[..4], b"bvx2");
+        let word = u64::from_le_bytes(encoded[8..16].try_into().unwrap());
+        assert_eq!((word >> 20) & 0x000f_ffff, 0);
+        let header = u32::from_le_bytes(encoded[24..28].try_into().unwrap()) as usize;
+        let mut short = encoded[..header].to_vec();
+        short.extend_from_slice(&[0u8; 4]);
+        short.extend_from_slice(&encoded[header..]);
+        short[8..16].copy_from_slice(&(word | (4u64 << 20)).to_le_bytes());
+        let mut decoder = lzfse_rust::LzfseRingDecoder::default();
+        let mut decoded = Vec::new();
+        decoder
+            .reader_bytes(&short)
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, original);
+    }
 }
