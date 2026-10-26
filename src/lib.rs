@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod capture;
 pub mod catalog;
 pub mod fairplay;
 pub mod platform;

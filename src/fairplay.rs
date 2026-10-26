@@ -4,15 +4,20 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use zeroize::Zeroizing;
 use zip::ZipArchive;
+
+use crate::capture::{
+    EnrollmentCaptureManifest, FairPlayBuildSupport, capture_file_path, load_enrollment_capture,
+    model_matches_capture_build,
+};
 
 const MODEL_V1_BYTES: usize = 8 + 4 + 4 + 32 + 16 + 16 + 16 * 256;
 const MODEL_V2_BYTES: usize = 8 + 4 + 4 + 32 + 4 + 4 + 16 + 16 + 16 * 256;
@@ -20,7 +25,7 @@ const MODEL_V3_SOURCE_BYTES: usize = 27 * 16;
 const MODEL_V3_BYTES: usize =
     8 + 4 + 4 + 32 + 4 + 4 + 4 + 4 + 4 + 16 + 16 * 256 + MODEL_V3_SOURCE_BYTES + 16 * 256;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SinfSelector {
     pub user: u32,
     pub key: u32,
@@ -306,10 +311,23 @@ pub fn inspect_model_path(path: &Path) -> Result<Vec<EnrollmentModelDiagnostic>>
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct EnrollmentCaptureDiagnostic {
+    pub product_version: String,
+    pub build_version: String,
+    pub fairplayd_sha256: String,
+    pub fairplay_support: FairPlayBuildSupport,
+    pub selector_id: String,
+    pub files: usize,
+    pub has_ipa: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct FairPlayDoctorReport {
     pub schema: &'static str,
     pub created_at: String,
     pub ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<EnrollmentCaptureDiagnostic>,
     pub capture_verified: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sinf: Vec<SinfDiagnostic>,
@@ -326,8 +344,8 @@ pub struct FairPlayDoctorReport {
     pub next_actions: Vec<String>,
 }
 
-/// Diagnose IPA and model compatibility offline. Capture and live-host checks
-/// are explicitly reported as unavailable until their native ports land.
+/// Diagnose capture, IPA and model compatibility offline. Live-host checks
+/// remain unavailable until the native host port lands.
 pub fn doctor_fairplay(
     capture_path: Option<&Path>,
     ipa_path: Option<&Path>,
@@ -339,6 +357,7 @@ pub fn doctor_fairplay(
             .format(&Rfc3339)
             .unwrap_or_default(),
         ready: false,
+        capture: None,
         capture_verified: false,
         sinf: Vec::new(),
         models: Vec::new(),
@@ -349,12 +368,42 @@ pub fn doctor_fairplay(
         next_actions: Vec::new(),
     };
 
-    if capture_path.is_some() {
-        report.errors.push(
-            "capture: native enrollment capture validation is not yet implemented in Rust".into(),
-        );
+    let mut capture_manifest: Option<EnrollmentCaptureManifest> = None;
+    let mut resolved_ipa: Option<PathBuf> = ipa_path.map(Path::to_path_buf);
+    if let Some(path) = capture_path {
+        match load_enrollment_capture(path, true) {
+            Ok(manifest) => {
+                report.capture = Some(EnrollmentCaptureDiagnostic {
+                    product_version: manifest.product_version.clone(),
+                    build_version: manifest.build_version.clone(),
+                    fairplayd_sha256: manifest.fairplayd.sha256.clone(),
+                    fairplay_support: manifest.fairplay.clone(),
+                    selector_id: manifest.app.selector_id.clone(),
+                    files: manifest.files.len(),
+                    has_ipa: manifest.ipa.is_some(),
+                });
+                report.capture_verified = true;
+                report.checks.insert("capture_integrity".into(), true);
+                report
+                    .checks
+                    .insert("supported_fairplayd".into(), manifest.fairplay.recovery);
+                if !manifest.fairplay.compatibility_sha256.is_empty() && model_path.is_none() {
+                    report.warnings.push(format!("this capture requires the checked compatibility evaluator; pass --compat-fairplayd with arm64e SHA-256 {} to fairplay-enroll recover", manifest.fairplay.compatibility_sha256));
+                }
+                if resolved_ipa.is_none()
+                    && let Some(ipa) = manifest.ipa.as_ref()
+                {
+                    match capture_file_path(path, &ipa.path) {
+                        Ok(ipa) => resolved_ipa = Some(ipa),
+                        Err(error) => report.errors.push(format!("capture IPA: {error:#}")),
+                    }
+                }
+                capture_manifest = Some(manifest);
+            }
+            Err(error) => report.errors.push(format!("capture: {error:#}")),
+        }
     }
-    if let Some(path) = ipa_path {
+    if let Some(path) = resolved_ipa.as_deref() {
         match inspect_ipa_sinfs(path) {
             Ok(sinfs) => {
                 let current = sinfs.iter().all(|sinf| sinf.current_layout);
@@ -370,7 +419,7 @@ pub fn doctor_fairplay(
             Err(error) => report.errors.push(format!("ipa: {error:#}")),
         }
     }
-    if !report.sinf.is_empty() || capture_path.is_some() {
+    if !report.sinf.is_empty() || capture_manifest.is_some() {
         report.warnings.push("SINF geometry cannot prove account age; current support assumes a newly created, natively enrolled Apple Account".into());
     }
     if let Some(path) = model_path {
@@ -385,10 +434,10 @@ pub fn doctor_fairplay(
     if !report.sinf.is_empty() && !report.models.is_empty() {
         report.compatible_model = report.models.iter().find_map(|model| {
             let id = model.selector_id.as_deref()?;
-            report
-                .sinf
-                .iter()
-                .any(|sinf| sinf.selector_id == id)
+            let build_matches = capture_manifest.as_ref().is_none_or(|capture| {
+                model_matches_capture_build(&model.fairplayd_sha256, capture)
+            });
+            (build_matches && report.sinf.iter().any(|sinf| sinf.selector_id == id))
                 .then(|| model.path.clone())
         });
         let matched = report.compatible_model.is_some();
@@ -399,17 +448,46 @@ pub fn doctor_fairplay(
                 .push("no enrollment model matches the IPA SINF selector".into());
         }
     }
-    if capture_path.is_none() {
+    if let Some(capture) = capture_manifest.as_ref()
+        && !report.sinf.is_empty()
+    {
+        let matched = report
+            .sinf
+            .iter()
+            .any(|sinf| sinf.selector == capture.app.selector);
         report
+            .checks
+            .insert("capture_selector_match".into(), matched);
+        if !matched {
+            report
+                .errors
+                .push("capture selector does not match the IPA".into());
+        }
+    }
+    match capture_manifest.as_ref() {
+        None => report
             .next_actions
-            .push("collect native enrollment with fairplay-enroll collect".into());
+            .push("collect native enrollment with fairplay-enroll collect".into()),
+        Some(capture) if !capture.fairplay.recovery => report
+            .next_actions
+            .push("add and validate an exact evaluator for this fairplayd hash".into()),
+        Some(capture) if model_path.is_none() => {
+            if capture.fairplay.compatibility_sha256.is_empty() {
+                report
+                    .next_actions
+                    .push("recover fairplay-enrollment.bin with fairplay-enroll recover".into());
+            } else {
+                report.next_actions.push("recover fairplay-enrollment.bin with fairplay-enroll recover --compat-fairplayd /private/path/fairplayd.arm64e".into());
+            }
+        }
+        Some(_) => {}
     }
     if report.compatible_model.is_some() {
         report
             .next_actions
             .push("run fairplay-decrypt with the compatible model".into());
     }
-    if ipa_path.is_none() && model_path.is_none() && capture_path.is_none() {
+    if resolved_ipa.is_none() && model_path.is_none() && capture_path.is_none() {
         report
             .errors
             .push("host: local FairPlay host inspection is not yet implemented in Rust".into());
@@ -417,6 +495,10 @@ pub fn doctor_fairplay(
     report.ready = !report.sinf.is_empty()
         && report.errors.is_empty()
         && report.checks.get("current_sinf_layout") == Some(&true)
+        && (capture_manifest.is_none()
+            || report.checks.get("capture_integrity") == Some(&true)
+                && report.checks.get("supported_fairplayd") == Some(&true)
+                && report.checks.get("capture_selector_match") == Some(&true))
         && (model_path.is_none() || report.checks.get("selector_match") == Some(&true));
     report
 }
@@ -620,5 +702,85 @@ mod tests {
                 .iter()
                 .any(|error| error.starts_with("capture:"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_verifies_capture_and_uses_its_ipa() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::capture::{
+            CaptureApp, CaptureFile, ENROLLMENT_CAPTURE_SCHEMA, FAIRPLAY_BUILD_26A428_HASH,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let capture = directory.path().join("capture");
+        fs::create_dir(&capture).unwrap();
+        fs::set_permissions(&capture, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(capture.join("ipa")).unwrap();
+        let ipa = capture.join("ipa/App.ipa");
+        let selector = SinfSelector {
+            user: 0x12345678,
+            key: 2,
+        };
+        let file = fs::File::create(&ipa).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "Payload/App.app/SC_Info/App.sinf",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(&sinf(selector, 448)).unwrap();
+        zip.finish().unwrap();
+        fs::set_permissions(&ipa, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let ipa_bytes = fs::read(&ipa).unwrap();
+        let ipa_entry = CaptureFile {
+            path: "ipa/App.ipa".into(),
+            bytes: ipa_bytes.len() as i64,
+            sha256: format!("{:x}", Sha256::digest(&ipa_bytes)),
+            mode: "0600".into(),
+        };
+        let manifest = EnrollmentCaptureManifest {
+            schema: ENROLLMENT_CAPTURE_SCHEMA.into(),
+            fairplayd: CaptureFile {
+                sha256: FAIRPLAY_BUILD_26A428_HASH.into(),
+                ..CaptureFile::default()
+            },
+            app: CaptureApp {
+                selector,
+                selector_id: selector.identifier(),
+                ..CaptureApp::default()
+            },
+            ipa: Some(ipa_entry.clone()),
+            files: vec![ipa_entry],
+            ..EnrollmentCaptureManifest::default()
+        };
+        fs::write(
+            capture.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let model_path = directory.path().join("model.bin");
+        let mut model_bytes = model(selector);
+        for (index, pair) in FAIRPLAY_BUILD_26A428_HASH
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            model_bytes[16 + index] =
+                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+        }
+        fs::write(&model_path, model_bytes).unwrap();
+        fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let report = doctor_fairplay(Some(&capture), None, Some(&model_path));
+        assert!(report.ready, "{:?}", report.errors);
+        assert!(report.capture_verified);
+        assert!(report.checks["capture_selector_match"]);
+        assert!(report.checks["selector_match"]);
     }
 }
