@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{
     Method,
     header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT},
@@ -17,8 +18,10 @@ use crate::{
     host::hardware_mac_address,
     ipa_metadata::{self, VersionMetadata},
     mac_preflight,
+    sap_assets::SapAssetBundle,
     state::prepare_state_directory_from_environment,
-    store_backend::DEFAULT_USER_AGENT,
+    store_agent::create_kbsync,
+    store_backend::{DEFAULT_USER_AGENT, PURCHASE_USER_AGENT},
     store_purchase::PasswordTokenExpired,
     storefront::country_code_from_storefront,
     transport::{DEFAULT_AUTHENTICATION_TIMEOUT, Request, Response, Transport},
@@ -27,11 +30,15 @@ use crate::{
 const VOLUME_PATH: &str = "/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct";
 const REDOWNLOAD_URL: &str = "https://downloaddispatch.itunes.apple.com/r/redownload";
 const UPDATE_URL: &str = "https://downloaddispatch.itunes.apple.com/up/updateProduct";
+const ENT_DOWNLOAD_URL: &str =
+    "https://downloaddispatch.itunes.apple.com/WebObjects/DownloadDispatch.woa/wa/ent/download";
 type Sender = dyn Fn(Request) -> Result<Response> + Send + Sync;
+type KbsyncGenerator = dyn Fn([u8; 6], u64) -> Result<Vec<u8>> + Send + Sync;
 
 pub struct DownloadProductClient {
     hardware_id: [u8; 6],
     sender: Arc<Sender>,
+    kbsync_generator: Option<Arc<KbsyncGenerator>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -76,9 +83,14 @@ impl DownloadProductClient {
         let hardware_id = hardware_mac_address().context("read Store hardware identity")?;
         let state_directory = prepare_state_directory_from_environment()?;
         let transport = Arc::new(Transport::with_cookies(&state_directory)?);
-        Ok(Self::with_sender(hardware_id, move |request| {
-            transport.send(request)
-        }))
+        Ok(
+            Self::with_sender(hardware_id, move |request| transport.send(request))
+                .with_kbsync_generator(|hardware, dsid| {
+                    let bundle =
+                        SapAssetBundle::load_or_download().context("load StoreAgent assets")?;
+                    create_kbsync(&bundle, &hardware, dsid).context("generate download KBSync")
+                }),
+        )
     }
 
     pub fn with_sender(
@@ -88,7 +100,16 @@ impl DownloadProductClient {
         Self {
             hardware_id,
             sender: Arc::new(sender),
+            kbsync_generator: None,
         }
+    }
+
+    pub fn with_kbsync_generator(
+        mut self,
+        generator: impl Fn([u8; 6], u64) -> Result<Vec<u8>> + Send + Sync + 'static,
+    ) -> Self {
+        self.kbsync_generator = Some(Arc::new(generator));
+        self
     }
 
     /// Select a version and read its history from the authenticated Store response.
@@ -212,22 +233,44 @@ impl DownloadProductClient {
         read_ipa(&item.url).context("read version metadata from IPA")
     }
 
-    /// Try volumeStore, then the bag-provided redownload and update endpoints.
+    /// Prefer ent/download, then try volumeStore, redownload, and update.
     pub fn send_product(
         &self,
         account: &Account,
         app: &App,
         version: &str,
-        fallback_version: impl FnOnce() -> Result<String>,
+        fallback_version: impl Fn() -> Result<String>,
     ) -> Result<DownloadProductResponse> {
         if app.id <= 0 {
             bail!("app ID is required for download metadata");
+        }
+        let mut bag = None;
+        if let Some(generator) = &self.kbsync_generator
+            && let Ok(fetched) = self.fetch_bag()
+        {
+            if let Some(endpoint) = fetched.ent_download.as_deref() {
+                let selected = if version.is_empty() {
+                    fallback_version()
+                } else {
+                    Ok(version.to_owned())
+                };
+                if let Ok(selected) = selected
+                    && let Ok(response) =
+                        self.send_ent_download(endpoint, account, app, &selected, generator)
+                {
+                    return Ok(response);
+                }
+            }
+            bag = Some(fetched);
         }
         let primary = self.send_request(Endpoint::Volume, account, app, version)?;
         if !primary.is_empty_or_unavailable() {
             return Ok(primary);
         }
-        let bag = self.fetch_bag()?;
+        let bag = match bag {
+            Some(bag) => bag,
+            None => self.fetch_bag()?,
+        };
         let Some(redownload_url) = bag.redownload.as_deref() else {
             return Ok(primary);
         };
@@ -277,6 +320,10 @@ impl DownloadProductClient {
             .get("urlBag")
             .context("Store URL bag is missing urlBag")?;
         Ok(DownloadBag {
+            ent_download: bag
+                .get("volumeStoreDownloadProduct")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             redownload: bag
                 .get("redownloadProduct")
                 .and_then(Value::as_str)
@@ -286,6 +333,115 @@ impl DownloadProductClient {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
         })
+    }
+
+    fn send_ent_download(
+        &self,
+        endpoint: &str,
+        account: &Account,
+        app: &App,
+        version: &str,
+        generator: &Arc<KbsyncGenerator>,
+    ) -> Result<DownloadProductResponse> {
+        if endpoint != ENT_DOWNLOAD_URL {
+            bail!("invalid ent/download endpoint in Store bag");
+        }
+        let dsid = account
+            .directory_services_id
+            .parse::<u64>()
+            .context("ent/download requires a numeric account DSID")?;
+        if dsid == 0 || version.is_empty() {
+            bail!("ent/download requires an account DSID and version ID");
+        }
+        let blob = generator(self.hardware_id, dsid)?;
+        if blob.is_empty() {
+            bail!("KBSync generator returned an empty blob");
+        }
+        let guid = self.guid();
+        let serial = [
+            0x54,
+            0xc8,
+            0xb0,
+            0xa9,
+            0x88,
+            self.hardware_id[2],
+            self.hardware_id[3],
+            self.hardware_id[4],
+            self.hardware_id[5],
+        ];
+        let parameters = serde_json::json!({
+            "creditDisplay": "",
+            "guid": guid,
+            "kbsync": STANDARD.encode(blob),
+            "salableAdamId": app.id.to_string(),
+            "serialNumber": STANDARD.encode(serial),
+            "externalVersionId": version,
+        });
+        let mut body = Vec::new();
+        plist::to_writer_xml(&mut body, &parameters).context("encode ent/download plist")?;
+        let mut url = Url::parse(ENT_DOWNLOAD_URL)?;
+        url.query_pairs_mut().append_pair("guid", &guid);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded; charset=utf-8"),
+        );
+        headers.insert(
+            "iCloud-DSID",
+            HeaderValue::from_str(&account.directory_services_id)?,
+        );
+        headers.insert(
+            "X-Dsid",
+            HeaderValue::from_str(&account.directory_services_id)?,
+        );
+        headers.insert(
+            "X-Apple-Store-Front",
+            HeaderValue::from_str(&account.store_front)?,
+        );
+        headers.insert("X-Token", HeaderValue::from_str(&account.password_token)?);
+        headers.insert(USER_AGENT, HeaderValue::from_static(PURCHASE_USER_AGENT));
+        headers.insert(
+            "Accept-Encoding",
+            HeaderValue::from_static("br, gzip, deflate"),
+        );
+        headers.insert("Accept-Language", HeaderValue::from_static("en"));
+        headers.insert(
+            "X-Apple-Client-Application",
+            HeaderValue::from_static("me.majd.ipatool"),
+        );
+        headers.insert("X-Apple-TZ", HeaderValue::from_static("0"));
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&body.len().to_string())?,
+        );
+        let response = (self.sender)(Request {
+            method: Method::POST,
+            url,
+            headers,
+            body: Some(body),
+            no_redirects: true,
+            timeout: Some(DEFAULT_AUTHENTICATION_TIMEOUT),
+        })
+        .context("send ent/download request")?;
+        let data: DownloadProductResult = response.plist(false)?;
+        let result = DownloadProductResponse {
+            status: response.status,
+            data,
+        };
+        validate_fallback(&result, app, version)?;
+        if result.data.failure_type.is_empty()
+            && result
+                .data
+                .items
+                .first()
+                .is_none_or(|item| item.url.is_empty())
+        {
+            bail!("ent/download response has no package URL");
+        }
+        if !result.data.failure_type.is_empty() {
+            bail!("ent/download returned failure {}", result.data.failure_type);
+        }
+        Ok(result)
     }
 
     fn send_request(
@@ -406,6 +562,7 @@ impl DownloadProductResponse {
 }
 
 struct DownloadBag {
+    ent_download: Option<String>,
     redownload: Option<String>,
     update: Option<String>,
 }
@@ -769,5 +926,148 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("StoreAgent decryption"));
+    }
+
+    #[test]
+    fn ent_download_uses_kbsync_and_short_circuits_legacy_path() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            let url = request.url.to_string();
+            seen.lock().unwrap().push(url.clone());
+            if url.contains("bag.xml") {
+                return Ok(response(
+                    serde_json::json!({"urlBag": {"volumeStoreDownloadProduct": ENT_DOWNLOAD_URL}}),
+                ));
+            }
+            assert!(url.starts_with(ENT_DOWNLOAD_URL));
+            assert_eq!(request.headers.get("X-Token").unwrap(), "test-token");
+            assert_eq!(
+                request.headers.get("X-Apple-Store-Front").unwrap(),
+                "143441-1,29"
+            );
+            assert_eq!(
+                request.headers.get(CONTENT_TYPE).unwrap(),
+                "application/x-www-form-urlencoded; charset=utf-8"
+            );
+            assert!(request.no_redirects);
+            let body: Value = plist::from_bytes(request.body.as_ref().unwrap()).unwrap();
+            assert_eq!(body["kbsync"], STANDARD.encode(b"test-kbsync"));
+            assert_eq!(body["salableAdamId"], "42");
+            assert_eq!(
+                body["serialNumber"],
+                STANDARD.encode([0x54, 0xc8, 0xb0, 0xa9, 0x88, 2, 3, 4, 5])
+            );
+            assert_eq!(body["externalVersionId"], "101");
+            Ok(item_response("101"))
+        })
+        .with_kbsync_generator(|hardware, dsid| {
+            assert_eq!(hardware, [0, 1, 2, 3, 4, 5]);
+            assert_eq!(dsid, 123456);
+            Ok(b"test-kbsync".to_vec())
+        });
+        let mut account = account();
+        account.password_token = "test-token".into();
+        let result = client
+            .send_product(&account, &app(), "101", || unreachable!())
+            .unwrap();
+        assert_eq!(result.data.items.len(), 1);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_ent_generation_falls_back_to_legacy_volume_store() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            let url = request.url.to_string();
+            seen.lock().unwrap().push(url.clone());
+            if url.contains("bag.xml") {
+                return Ok(response(
+                    serde_json::json!({"urlBag": {"volumeStoreDownloadProduct": ENT_DOWNLOAD_URL}}),
+                ));
+            }
+            assert!(url.contains("volumeStoreDownloadProduct"));
+            Ok(item_response("101"))
+        })
+        .with_kbsync_generator(|_, _| bail!("test guest unavailable"));
+        let result = client
+            .send_product(&account(), &app(), "101", || unreachable!())
+            .unwrap();
+        assert_eq!(result.data.items.len(), 1);
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ent_download_request_matches_pinned_store_guest() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let captured_guest = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&captured_guest);
+        let guest = StoreBackend::with_sender(
+            assets.apple_media_services,
+            [0, 1, 2, 3, 4, 5],
+            move |request| {
+                *seen.lock().unwrap() = Some(request);
+                Ok(item_response("101"))
+            },
+        );
+        let mut account = account();
+        account.password_token = "test-token".into();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded; charset=utf-8"),
+        );
+        headers.insert("iCloud-DSID", HeaderValue::from_static("123456"));
+        headers.insert("X-Dsid", HeaderValue::from_static("123456"));
+        headers.insert(
+            "X-Apple-Store-Front",
+            HeaderValue::from_static("143441-1,29"),
+        );
+        headers.insert("X-Token", HeaderValue::from_static("test-token"));
+        headers.insert(USER_AGENT, HeaderValue::from_static(PURCHASE_USER_AGENT));
+        let url = format!("{ENT_DOWNLOAD_URL}?guid=000102030405");
+        let parameters = serde_json::json!({
+            "creditDisplay": "", "guid": "000102030405", "kbsync": STANDARD.encode(b"test-kbsync"),
+            "salableAdamId": "42", "serialNumber": STANDARD.encode([0x54, 0xc8, 0xb0, 0xa9, 0x88, 2, 3, 4, 5]),
+            "externalVersionId": "101"
+        });
+        guest
+            .execute_standard(StoreBackendRequest {
+                method: "POST",
+                url: &url,
+                headers: &headers,
+                parameters: Some(&parameters),
+                body: None,
+                raw: false,
+                response_format: "plist",
+                no_redirects: true,
+                timeout: Some(DEFAULT_AUTHENTICATION_TIMEOUT),
+            })
+            .unwrap();
+
+        let captured_native = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&captured_native);
+        let native = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            if request.url.path().ends_with("bag.xml") {
+                return Ok(response(
+                    serde_json::json!({"urlBag": {"volumeStoreDownloadProduct": ENT_DOWNLOAD_URL}}),
+                ));
+            }
+            *seen.lock().unwrap() = Some(request);
+            Ok(item_response("101"))
+        })
+        .with_kbsync_generator(|_, _| Ok(b"test-kbsync".to_vec()));
+        native
+            .send_product(&account, &app(), "101", || unreachable!())
+            .unwrap();
+        let guest = captured_guest.lock().unwrap().take().unwrap();
+        let native = captured_native.lock().unwrap().take().unwrap();
+        assert_eq!(native.method, guest.method);
+        assert_eq!(native.url, guest.url);
+        assert_eq!(native.headers, guest.headers);
+        assert_eq!(native.body, guest.body);
+        assert_eq!(native.no_redirects, guest.no_redirects);
+        assert_eq!(native.timeout, guest.timeout);
     }
 }
