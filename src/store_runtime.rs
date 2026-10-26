@@ -63,6 +63,15 @@ pub struct StoreStandardRequest<'a> {
     pub timeout: Option<Duration>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StoreOperation {
+    Standard,
+    Purchase,
+    Authenticate,
+}
+
+type StoreSigner<'a> = dyn FnMut(&[u8]) -> Result<Vec<u8>> + 'a;
+
 struct StoreState {
     heap_cursor: u64,
     dynamic_selectors: HashMap<String, u64>,
@@ -500,7 +509,7 @@ impl StoreRuntime {
     /// Prepare, send, and decode one ordinary Store request through the pinned
     /// Apple code. The host HTTP transport must be installed with set_transport.
     pub fn execute_standard(&mut self, input: StoreStandardRequest<'_>) -> Result<HostResponse> {
-        self.execute_request(input, false)
+        self.execute_request(input, StoreOperation::Standard, None)
     }
 
     /// Prepare, send, and decode a free-app purchase through the pinned Apple
@@ -512,13 +521,30 @@ impl StoreRuntime {
         if input.parameters.is_none() {
             bail!("purchase parameters are required");
         }
-        self.execute_request(input, true)
+        self.execute_request(input, StoreOperation::Purchase, None)
+    }
+
+    /// Build and sign a Store authentication request using Apple's pinned
+    /// credential task. The caller supplies an initialized SAP signer.
+    pub fn execute_authentication(
+        &mut self,
+        input: StoreStandardRequest<'_>,
+        signer: &mut StoreSigner<'_>,
+    ) -> Result<HostResponse> {
+        if input.method != "POST" {
+            bail!("authentication requests must use POST");
+        }
+        if input.parameters.is_none() {
+            bail!("authentication parameters are required");
+        }
+        self.execute_request(input, StoreOperation::Authenticate, Some(signer))
     }
 
     fn execute_request(
         &mut self,
         input: StoreStandardRequest<'_>,
-        purchase: bool,
+        operation: StoreOperation,
+        mut signer: Option<&mut StoreSigner<'_>>,
     ) -> Result<HostResponse> {
         self.set_hardware_id(input.hardware_id)?;
         self.set_transport_policy(true, input.no_redirects, input.timeout);
@@ -555,16 +581,46 @@ impl StoreRuntime {
             .transpose()?
             .unwrap_or(0);
         let session = self.new_session()?;
-        let delegate = self.new_object("NSObject", StoreValue::Empty)?;
+        let mut parameters = input.parameters.cloned();
+        let delegate = if operation == StoreOperation::Authenticate {
+            let source = parameters
+                .as_ref()
+                .and_then(Value::as_object)
+                .context("authentication parameters must be an object")?;
+            let email = source
+                .get("appleId")
+                .and_then(Value::as_str)
+                .context("authentication Apple ID is required")?;
+            let password = source
+                .get("password")
+                .and_then(Value::as_str)
+                .context("authentication password is required")?;
+            let username = self.new_object("NSString", StoreValue::String(email.into()))?;
+            self.invoke(account, "setUsername:", &[username])?;
+            let (task, mut built) =
+                self.authentication_task(account, bag, password, input.hardware_id)?;
+            for key in ["attempt", "why"] {
+                if let Some(value) = source.get(key) {
+                    built
+                        .as_object_mut()
+                        .context("Store authentication builder returned no dictionary")?
+                        .insert(key.into(), value.clone());
+                }
+            }
+            parameters = Some(built);
+            task
+        } else {
+            self.new_object("NSObject", StoreValue::Empty)?
+        };
         self.invoke(session, "setDelegate:", &[delegate])?;
 
-        let request = if purchase {
+        let request = if operation == StoreOperation::Purchase {
             self.encode_purchase_request(
                 account,
                 bag,
-                input.parameters.expect("validated purchase parameters"),
+                parameters.as_ref().expect("validated purchase parameters"),
             )?
-        } else if let Some(parameters) = input.parameters {
+        } else if let Some(parameters) = parameters.as_ref() {
             self.encode_request(account, bag, input.method, input.url, parameters)?
         } else {
             let request = self.new_object("AMSURLRequest", StoreValue::Empty)?;
@@ -598,6 +654,28 @@ impl StoreRuntime {
             let name = self.new_object("NSString", StoreValue::String(name))?;
             let value = self.new_object("NSString", StoreValue::String(values.join(", ")))?;
             self.invoke(request, "setValue:forHTTPHeaderField:", &[value, name])?;
+        }
+
+        if let Some(sign) = signer.as_mut() {
+            let body = self.invoke(request, "HTTPBody", &[])?;
+            let bytes = match self.state.borrow().objects.get(&body) {
+                Some(StoreObject {
+                    value: StoreValue::Bytes(bytes),
+                    ..
+                }) => bytes.clone(),
+                _ => bail!("signed Store request has no body"),
+            };
+            let signature = sign(&bytes).context("sign Store request")?;
+            if signature.is_empty() {
+                bail!("Store signer returned an empty signature");
+            }
+            let encoded = base64::engine::general_purpose::STANDARD.encode(signature);
+            let encoded = self.new_object("NSString", StoreValue::String(encoded))?;
+            let name = self.new_object(
+                "NSString",
+                StoreValue::String("X-Apple-ActionSignature".into()),
+            )?;
+            self.invoke(request, "setValue:forHTTPHeaderField:", &[encoded, name])?;
         }
 
         let (result, mut response) = self.send_request(session, request)?;
@@ -894,6 +972,17 @@ impl StoreRuntime {
         let username = self.new_object("NSString", StoreValue::String(email.into()))?;
         self.invoke(account, "setUsername:", &[username])?;
 
+        let (_, parameters) = self.authentication_task(account, bag, password, hardware_id)?;
+        Ok(parameters)
+    }
+
+    fn authentication_task(
+        &mut self,
+        account: u64,
+        bag: u64,
+        password: &str,
+        hardware_id: &[u8],
+    ) -> Result<(u64, Value)> {
         let options = self.new_object("AMSAuthenticateOptions", StoreValue::Empty)?;
         self.invoke(options, "init", &[])?;
         for (selector, value) in [
@@ -929,7 +1018,7 @@ impl StoreRuntime {
         {
             bail!("Store authentication hardware identity mismatch");
         }
-        Ok(parameters)
+        Ok((task, parameters))
     }
 
     pub fn new_request_encoder(&mut self, bag: u64) -> Result<u64> {
@@ -9044,5 +9133,59 @@ mod tests {
             plist::from_bytes::<Value>(&response.body).unwrap()["status"],
             0
         );
+    }
+
+    #[test]
+    fn executes_signed_authentication_with_pinned_apple_code() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        runtime.set_transport(|request| {
+            assert_eq!(request.method, Method::POST);
+            assert_eq!(request.url.as_str(), "https://buy.itunes.apple.com/request");
+            assert_eq!(
+                request.headers.get("x-apple-actionsignature").unwrap(),
+                "AQID"
+            );
+            let body: Value = plist::from_bytes(request.body.as_ref().unwrap()).unwrap();
+            assert_eq!(body["appleId"], "test@example.com");
+            assert_eq!(body["guid"], "000102030405");
+            assert_eq!(body["attempt"], 2);
+            assert_eq!(body["why"], "signin");
+            Ok(HostResponse {
+                status: 200,
+                headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
+                body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
+            })
+        });
+        let parameters = serde_json::json!({
+            "appleId": "test@example.com",
+            "password": "test",
+            "attempt": 2,
+            "why": "signin"
+        });
+        let bag = serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/request"});
+        let mut signer = |body: &[u8]| {
+            assert!(!body.is_empty());
+            Ok(vec![1, 2, 3])
+        };
+        let response = runtime
+            .execute_authentication(
+                StoreStandardRequest {
+                    method: "POST",
+                    url: "https://buy.itunes.apple.com/request",
+                    headers: &HeaderMap::new(),
+                    parameters: Some(&parameters),
+                    body: None,
+                    bag: Some(&bag),
+                    hardware_id: &[0, 1, 2, 3, 4, 5],
+                    raw: false,
+                    response_format: "plist",
+                    no_redirects: false,
+                    timeout: None,
+                },
+                &mut signer,
+            )
+            .unwrap();
+        assert_eq!(response.status, 200);
     }
 }
