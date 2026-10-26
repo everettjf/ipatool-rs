@@ -51,6 +51,7 @@ struct StoreState {
     preferences: HashMap<String, u64>,
     current_queue: u64,
     pending: Vec<(u64, u64)>,
+    allocations: HashMap<u64, u64>,
 }
 
 struct CallbackResume {
@@ -60,12 +61,37 @@ struct CallbackResume {
 
 enum CallbackAction {
     ReturnZero,
-    ReturnValue { value: u64 },
-    QueueBlock { block: u64, queue: u64 },
-    StoreAt { destination: u64, value: u64 },
-    RestoreQueue { previous: u64 },
-    RestoreQueueWithValue { previous: u64, value: u64 },
-    CopyProperty { destination: u64 },
+    ReturnValue {
+        value: u64,
+    },
+    QueueBlock {
+        block: u64,
+        queue: u64,
+    },
+    StoreAt {
+        destination: u64,
+        value: u64,
+    },
+    ArrayCopy {
+        destination: u64,
+        source: u64,
+        metadata: u64,
+        stride: u64,
+        count: u64,
+        index: u64,
+        function: u64,
+        reverse: bool,
+    },
+    RestoreQueue {
+        previous: u64,
+    },
+    RestoreQueueWithValue {
+        previous: u64,
+        value: u64,
+    },
+    CopyProperty {
+        destination: u64,
+    },
 }
 
 pub struct StoreObject {
@@ -210,6 +236,7 @@ impl StoreRuntime {
             preferences: HashMap::new(),
             current_queue: 0,
             pending: Vec::new(),
+            allocations: HashMap::new(),
         }));
         let hook_error = Rc::new(RefCell::new(None));
         let error_slot = Rc::clone(&hook_error);
@@ -609,6 +636,7 @@ impl StoreState {
         }
         let address = self.heap_cursor;
         self.heap_cursor = next;
+        self.allocations.insert(address, size);
         Ok(address)
     }
 }
@@ -752,6 +780,23 @@ fn dispatch_call(
         "getgid" | "getegid" => context.reg_write(REG_X0, 20)?,
         "getpid" => context.reg_write(REG_X0, 123)?,
         "chkstk_darwin" | "free" => {}
+        "malloc_size" => {
+            let address = context.reg_read(REG_X0)?;
+            context.reg_write(
+                REG_X0,
+                state.allocations.get(&address).copied().unwrap_or(0),
+            )?;
+        }
+        "malloc" | "calloc" | "malloc_type_malloc" | "malloc_type_calloc" => {
+            let mut size = context.reg_read(REG_X0)?;
+            if matches!(symbol, "calloc" | "malloc_type_calloc") {
+                size = size
+                    .checked_mul(context.reg_read(REG_X0 + 1)?)
+                    .context("guest calloc size overflow")?;
+            }
+            let address = state.allocate(size)?;
+            context.reg_write(REG_X0, address)?;
+        }
         "swift_allocObject" => {
             let metadata = context.reg_read(REG_X0)?;
             let size = context.reg_read(REG_X0 + 1)?;
@@ -762,6 +807,51 @@ fn dispatch_call(
             write_guest_u64(context, object, metadata)?;
             write_guest_u64(context, object + 8, 3)?;
             context.reg_write(REG_X0, object)?;
+        }
+        "swift_arrayInitWithCopy"
+        | "swift_arrayInitWithTakeFrontToBack"
+        | "swift_arrayInitWithTakeBackToFront" => {
+            let destination = context.reg_read(REG_X0)?;
+            let source = context.reg_read(REG_X0 + 1)?;
+            let count = context.reg_read(REG_X0 + 2)?;
+            let metadata = context.reg_read(REG_X0 + 3)?;
+            if count == 0 {
+                context.reg_write(REG_X0, destination)?;
+            } else {
+                let witnesses = read_guest_u64(context, metadata - 8)?;
+                let stride = read_guest_u64(context, witnesses + 72)?;
+                if count > 65_536 || stride > 1_048_576 {
+                    bail!("Swift array copy exceeds budget");
+                }
+                let offset = if symbol == "swift_arrayInitWithCopy" {
+                    16
+                } else {
+                    32
+                };
+                let function = read_guest_u64(context, witnesses + offset)?;
+                let reverse = symbol == "swift_arrayInitWithTakeBackToFront";
+                let element = if reverse { count - 1 } else { 0 };
+                begin_callback(
+                    context,
+                    state,
+                    function,
+                    &[
+                        destination + element * stride,
+                        source + element * stride,
+                        metadata,
+                    ],
+                    CallbackAction::ArrayCopy {
+                        destination,
+                        source,
+                        metadata,
+                        stride,
+                        count,
+                        index: 1,
+                        function,
+                        reverse,
+                    },
+                )?;
+            }
         }
         "swift_getObjectType" => {
             let object = context.reg_read(REG_X0)?;
@@ -1026,6 +1116,39 @@ fn dispatch_call(
                 .get(&name)
                 .map(|&index| profile.index.classes[index].address)
                 .unwrap_or(0);
+            context.reg_write(REG_X0, address)?;
+        }
+        "NSStringFromClass" => {
+            let class = context.reg_read(REG_X0)?;
+            let address = if let Some(name) = profile.runtime.class_names_by_address.get(&class) {
+                new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String(name.clone()),
+                )?
+            } else {
+                0
+            };
+            context.reg_write(REG_X0, address)?;
+        }
+        "NSSelectorFromString" => {
+            let selector = object_string_value(state, context.reg_read(REG_X0)?)?.to_owned();
+            context.reg_write(
+                REG_X0,
+                guest_selector_address(context, profile, state, &selector)?,
+            )?;
+        }
+        "NSStringFromSelector" => {
+            let selector = guest_cstring(context, profile, state, context.reg_read(REG_X0)?)?;
+            let address = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(selector),
+            )?;
             context.reg_write(REG_X0, address)?;
         }
         "CFBundleGetMainBundle" => {
@@ -1396,12 +1519,12 @@ fn dispatch_call(
             let domain = guest_cstring(context, profile, state, context.reg_read(REG_X0)?)?;
             let feature = guest_cstring(context, profile, state, context.reg_read(REG_X0 + 1)?)?;
             let key = format!("{domain}/{feature}");
-            let enabled = profile
-                .index
-                .features
-                .get(&key)
-                .with_context(|| format!("unresolved native feature flag {key}"))?;
-            context.reg_write(REG_X0, u64::from(*enabled))?;
+            let enabled = match profile.index.features.get(&key) {
+                Some(value) => *value,
+                None if key == "AppleMediaServices/BetaLocalAccount" => false,
+                None => bail!("unresolved native feature flag {key}"),
+            };
+            context.reg_write(REG_X0, u64::from(enabled))?;
         }
         "swift_getWitnessTable" => {
             let descriptor = context.reg_read(REG_X0)?;
@@ -1438,6 +1561,17 @@ fn dispatch_call(
             let output = context.reg_read(REG_X0 + 8)?;
             write_guest_u64(context, output, 5)?;
             write_guest_u64(context, output + 8, 0)?;
+        }
+        "$s2os12OSSignpostIDVwst" => {
+            let destination = context.reg_read(REG_X0)?;
+            let tag = context.reg_read(REG_X0 + 1)?;
+            let cases = context.reg_read(REG_X0 + 2)?;
+            if cases != 1 || tag > 1 {
+                bail!("unsupported signpost ID optional tag");
+            }
+            if tag == 1 {
+                write_guest_u64(context, destination, 0)?;
+            }
         }
         "$sSo17OS_dispatch_queueC8DispatchE5label3qos10attributes20autoreleaseFrequency6targetABSS_AC0D3QoSVAbCE10AttributesVAbCE011AutoreleaseI0OABSgtcfC"
         | "$sSo24OS_dispatch_queue_serialC8DispatchE5label3qos10attributes20autoreleaseFrequency6targetABSS_AC0E3QoSVAbCE10AttributesVSo0a1_b1_C0CACE011AutoreleaseJ0OANSgtcfC" =>
@@ -1545,6 +1679,30 @@ fn dispatch_call(
             };
             let value = value.clone();
             return_swift_string(context, state, &value)?;
+        }
+        "$sSS6appendyySSF" => {
+            let destination = context.reg_read(REG_X0 + 20)?;
+            let left = swift_string(
+                context,
+                state,
+                read_guest_u64(context, destination)?,
+                read_guest_u64(context, destination + 8)?,
+            )?;
+            let right = swift_string(
+                context,
+                state,
+                context.reg_read(REG_X0)?,
+                context.reg_read(REG_X0 + 1)?,
+            )?;
+            return_swift_string(context, state, &(left + &right))?;
+            write_guest_u64(context, destination, context.reg_read(REG_X0)?)?;
+            write_guest_u64(context, destination + 8, context.reg_read(REG_X0 + 1)?)?;
+        }
+        "$ss17CodingUserInfoKeyVwCP" | "$sSSwCP" | "$sSSwcp" | "$sSSwca" => {
+            let destination = context.reg_read(REG_X0)?;
+            let source = context.reg_read(REG_X0 + 1)?;
+            context.mem_write(destination, &context.mem_read(source, 16)?)?;
+            context.reg_write(REG_X0, destination)?;
         }
         "$s10ObjectiveC8SelectorV4hash4intoys6HasherVz_tF" => {
             hash_word(
@@ -1668,6 +1826,43 @@ fn resume_callback(
         }
         CallbackAction::StoreAt { destination, value } => {
             write_guest_u64(context, destination, value)?;
+        }
+        CallbackAction::ArrayCopy {
+            destination,
+            source,
+            metadata,
+            stride,
+            count,
+            index,
+            function,
+            reverse,
+        } => {
+            if index < count {
+                let element = if reverse { count - index - 1 } else { index };
+                context.reg_write(REG_LR, resume.link)?;
+                begin_callback(
+                    context,
+                    state,
+                    function,
+                    &[
+                        destination + element * stride,
+                        source + element * stride,
+                        metadata,
+                    ],
+                    CallbackAction::ArrayCopy {
+                        destination,
+                        source,
+                        metadata,
+                        stride,
+                        count,
+                        index: index + 1,
+                        function,
+                        reverse,
+                    },
+                )?;
+                return Ok(());
+            }
+            context.reg_write(REG_X0, destination)?;
         }
         CallbackAction::RestoreQueue { previous } => {
             state.current_queue = previous;
@@ -2124,6 +2319,67 @@ fn dispatch_message(
         context.reg_write(REG_PC, entry)?;
         return Ok(());
     }
+    if !class_method && matches!(class_name.as_str(), "ACAccountStore" | "ACDAccountStore") {
+        if selector == "accountTypeWithIdentifier:completion:" {
+            let identifier = context.reg_read(REG_X0 + 2)?;
+            let completion = context.reg_read(REG_X0 + 3)?;
+            let account_type =
+                new_guest_object(context, profile, state, "ACAccountType", StoreValue::Empty)?;
+            state
+                .objects
+                .get_mut(&account_type)
+                .expect("new account type")
+                .properties
+                .insert("identifier".into(), identifier);
+            begin_callback(
+                context,
+                state,
+                read_guest_u64(context, completion + 16)?,
+                &[completion, account_type, 0],
+                CallbackAction::ReturnZero,
+            )?;
+            return Ok(());
+        }
+        if selector == "accountsWithAccountType:options:completion:" {
+            let completion = context.reg_read(REG_X0 + 4)?;
+            let accounts = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSArray",
+                StoreValue::Addresses(Vec::new()),
+            )?;
+            begin_callback(
+                context,
+                state,
+                read_guest_u64(context, completion + 16)?,
+                &[completion, accounts, 0],
+                CallbackAction::ReturnZero,
+            )?;
+            return Ok(());
+        }
+    }
+    if !class_method && class_is_kind_of(profile, &class_name, "NSError") {
+        let StoreValue::Entries(fields) = &state.objects[&receiver].value else {
+            bail!("invalid Store error object");
+        };
+        if matches!(selector, "domain" | "userInfo" | "code") {
+            let mut value = fields.get(selector).copied().unwrap_or(0);
+            if selector == "code" {
+                let StoreValue::Number(code) = state
+                    .objects
+                    .get(&value)
+                    .context("missing Store error code")?
+                    .value
+                else {
+                    bail!("invalid Store error code");
+                };
+                value = code as u64;
+            }
+            context.reg_write(REG_X0, value)?;
+            return Ok(());
+        }
+    }
     if !class_method && class_name == "NSIndexSet" {
         match selector {
             "initWithIndexesInRange:" => {
@@ -2266,6 +2522,49 @@ fn dispatch_message(
         }
     }
     match (class_method, selector) {
+        (true, "errorWithDomain:code:userInfo:") if class_name == "NSError" => {
+            let code = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSNumber",
+                StoreValue::Number(context.reg_read(REG_X0 + 3)? as i64),
+            )?;
+            let mut entries = HashMap::new();
+            entries.insert("domain".into(), context.reg_read(REG_X0 + 2)?);
+            entries.insert("code".into(), code);
+            entries.insert("userInfo".into(), context.reg_read(REG_X0 + 4)?);
+            let error = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSError",
+                StoreValue::Entries(entries),
+            )?;
+            context.reg_write(REG_X0, error)?;
+        }
+        (true, "isSubclassOfClass:") => {
+            let target = profile
+                .runtime
+                .class_names_by_address
+                .get(&context.reg_read(REG_X0 + 2)?);
+            let value = target.is_some_and(|target| class_is_kind_of(profile, &class_name, target));
+            context.reg_write(REG_X0, u64::from(value))?;
+        }
+        (true, "stringWithFormat:")
+            if matches!(class_name.as_str(), "NSString" | "NSMutableString") =>
+        {
+            let format = object_string_value(state, context.reg_read(REG_X0 + 2)?)?;
+            let value = guest_format(context, profile, state, format, context.reg_read(REG_SP)?)?;
+            let string = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(value),
+            )?;
+            context.reg_write(REG_X0, string)?;
+        }
         (true, "distantPast" | "distantFuture") if class_name == "NSDate" => {
             let seconds = if selector == "distantPast" {
                 -62_135_769_600
@@ -2681,6 +2980,15 @@ fn dispatch_message(
                 bail!("addObject: on {class_name}");
             };
             values.push(value);
+            context.reg_write(REG_X0, 0)?;
+        }
+        (false, "removeAllObjects") => {
+            let object = state.objects.get_mut(&receiver).expect("known collection");
+            match &mut object.value {
+                StoreValue::Addresses(values) => values.clear(),
+                StoreValue::Entries(entries) => entries.clear(),
+                _ => bail!("removeAllObjects on {class_name}"),
+            }
             context.reg_write(REG_X0, 0)?;
         }
         (false, "bundleIdentifier" | "bundlePath" | "processName" | "environment") => {
