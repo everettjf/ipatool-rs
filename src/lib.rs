@@ -15,6 +15,7 @@ pub mod host;
 pub mod ipa_metadata;
 pub mod ipa_patch;
 pub mod lzbitmap;
+pub mod mac_package;
 pub mod mac_preflight;
 pub mod machfixups;
 pub mod machimage;

@@ -23,10 +23,11 @@ use crate::{
     App, CatalogClient, Platform,
     credentials::{Account, CredentialStore, KBSYNC_CACHE_KEY, open_system_keychain},
     download_file::download_file,
-    download_package::validate_ipa_platform,
+    download_package::{package_platform, validate_ipa_platform},
     host::hardware_mac_address,
     ipa_metadata::{self, VersionMetadata},
     ipa_patch::patch_ipa,
+    mac_package::download_mac_package,
     mac_preflight,
     sap_assets::SapAssetBundle,
     state::prepare_state_directory_from_environment,
@@ -182,16 +183,52 @@ impl DownloadProductClient {
             catalog.latest_external_version_id(app, country, platform)
         })?;
         let item = checked_item(&response)?;
+        self.download_mobile_item(account, app, item, platform, output)
+    }
+
+    /// Download the selected macOS offer, including universal apps supplied as IPAs.
+    pub fn download_macos(
+        &self,
+        catalog: &CatalogClient,
+        account: &Account,
+        app: &App,
+        version: &str,
+        output: Option<&Path>,
+    ) -> Result<PathBuf> {
+        let country = country_code_from_storefront(&account.store_front)?;
+        let selected = if version.is_empty() {
+            catalog.latest_external_version_id(app, country, Platform::Macos)?
+        } else {
+            version.to_owned()
+        };
+        let response = self.send_product(account, app, &selected, || Ok(selected.clone()))?;
+        let item = checked_item(&response)?;
+        match package_platform(Platform::Macos, item)? {
+            Platform::Iphone => {
+                self.download_mobile_item(account, app, item, Platform::Iphone, output)
+            }
+            Platform::Macos => {
+                let display_version = display_version(item);
+                let destination = package_destination(app, display_version, output, "pkg")?;
+                download_mac_package(item, &destination, &self.hardware_id)?;
+                Ok(destination)
+            }
+            _ => bail!("unexpected platform in macOS download metadata"),
+        }
+    }
+
+    fn download_mobile_item(
+        &self,
+        account: &Account,
+        app: &App,
+        item: &DownloadItem,
+        platform: Platform,
+        output: Option<&Path>,
+    ) -> Result<PathBuf> {
         if item.url.is_empty() {
             bail!("App Store download response has no IPA URL");
         }
-        let display_version = item
-            .metadata
-            .get("bundleShortVersionString")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("unknown");
-        let destination = ipa_destination(app, display_version, output)?;
+        let destination = package_destination(app, display_version(item), output, "ipa")?;
         let mut temporary = destination.as_os_str().to_os_string();
         temporary.push(".tmp");
         let temporary = PathBuf::from(temporary);
@@ -756,15 +793,29 @@ fn volume_url(account: &Account) -> Result<Url> {
     Url::parse(&format!("https://{host}{VOLUME_PATH}")).context("invalid Store volume URL")
 }
 
-fn ipa_destination(app: &App, version: &str, output: Option<&Path>) -> Result<PathBuf> {
+fn display_version(item: &DownloadItem) -> &str {
+    item.metadata
+        .get("bundleShortVersionString")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+}
+
+fn package_destination(
+    app: &App,
+    version: &str,
+    output: Option<&Path>,
+    extension: &str,
+) -> Result<PathBuf> {
     let parts = [
         (!app.bundle_id.is_empty()).then(|| safe_filename_part(&app.bundle_id)),
         (app.id > 0).then(|| app.id.to_string()),
         (!version.is_empty()).then(|| safe_filename_part(version)),
     ];
     let name = format!(
-        "{}.ipa",
-        parts.into_iter().flatten().collect::<Vec<_>>().join("_")
+        "{}.{}",
+        parts.into_iter().flatten().collect::<Vec<_>>().join("_"),
+        extension
     );
     let destination = match output {
         Some(path) if path.is_dir() => path.join(name),
@@ -774,7 +825,7 @@ fn ipa_destination(app: &App, version: &str, output: Option<&Path>) -> Result<Pa
             .join(name),
     };
     if destination.file_name().is_none() {
-        bail!("IPA output path has no file name");
+        bail!("package output path has no file name");
     }
     Ok(destination)
 }
@@ -1524,5 +1575,70 @@ mod tests {
             metadata.as_dictionary().unwrap()["apple-id"].as_string(),
             Some("person@example.test")
         );
+    }
+
+    #[test]
+    fn mac_offer_with_mobile_sinf_downloads_as_ipa() {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "Payload/App.app/Info.plist",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .write_all(br#"<plist version="1.0"><dict><key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array><key>CFBundleExecutable</key><string>App</string></dict></plist>"#)
+            .unwrap();
+        let ipa = archive.finish().unwrap().into_inner();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/app.ipa", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0u8; 1];
+            let mut request = Vec::new();
+            while std::io::Read::read_exact(&mut stream, &mut byte).is_ok() {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                ipa.len()
+            )
+            .unwrap();
+            stream.write_all(&ipa).unwrap();
+        });
+        let plist = format!(
+            r#"<plist version="1.0"><dict><key>songList</key><array><dict><key>URL</key><string>{url}</string><key>sinfs</key><array><dict><key>sinf</key><data>AQID</data></dict></array><key>metadata</key><dict><key>software-platform</key><string>ios</string><key>itemId</key><integer>42</integer><key>softwareVersionBundleId</key><string>com.example.app</string><key>softwareVersionExternalIdentifier</key><string>101</string><key>bundleShortVersionString</key><string>2.0</string></dict></dict></array></dict></plist>"#
+        );
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |_| {
+            Ok(Response {
+                status: 200,
+                headers: Default::default(),
+                body: plist.as_bytes().to_vec(),
+            })
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = client
+            .download_macos(
+                &CatalogClient::new().unwrap(),
+                &account(),
+                &app(),
+                "101",
+                Some(directory.path()),
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(path.extension().unwrap(), "ipa");
+        let mut archive = zip::ZipArchive::new(fs::File::open(path).unwrap()).unwrap();
+        let mut sinf = Vec::new();
+        std::io::Read::read_to_end(
+            &mut archive.by_name("Payload/App.app/SC_Info/App.sinf").unwrap(),
+            &mut sinf,
+        )
+        .unwrap();
+        assert_eq!(sinf, [1, 2, 3]);
     }
 }

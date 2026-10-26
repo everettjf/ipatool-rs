@@ -80,7 +80,7 @@ enum Command {
         #[arg(long)]
         platform: Option<String>,
     },
-    /// Download an owned mobile app package from the App Store.
+    /// Download an owned app package from the App Store.
     Download {
         #[arg(short = 'i', long)]
         app_id: Option<i64>,
@@ -379,14 +379,25 @@ fn run() -> Result<()> {
                         Err(_) => {}
                     }
                 }
-                match backend.download_ipa(
-                    &catalog,
-                    &account,
-                    &app,
-                    &external_version_id,
-                    platform,
-                    output.as_deref(),
-                ) {
+                let result = if platform == Platform::Macos {
+                    backend.download_macos(
+                        &catalog,
+                        &account,
+                        &app,
+                        &external_version_id,
+                        output.as_deref(),
+                    )
+                } else {
+                    backend.download_ipa(
+                        &catalog,
+                        &account,
+                        &app,
+                        &external_version_id,
+                        platform,
+                        output.as_deref(),
+                    )
+                };
+                match result {
                     Ok(path) => {
                         match cli.format {
                             Format::Json => println!(
