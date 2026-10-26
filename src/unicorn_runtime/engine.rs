@@ -22,6 +22,7 @@ const QUERY_TIMEOUT: i32 = 4;
 const CONTROL_CPU_MODEL: u32 = 7 | 1 << 26 | 1 << 30;
 const ARM64_CPU_MODEL_MAX: u32 = 3;
 const HOOK_CODE: i32 = 1 << 2;
+const HOOK_UNMAPPED_MEMORY: i32 = 1 << 4 | 1 << 5 | 1 << 6;
 
 type Handle = *mut c_void;
 
@@ -85,32 +86,83 @@ impl Api {
 
 pub struct HookContext {
     handle: Handle,
-    stop: unsafe extern "C" fn(Handle) -> i32,
+    operations: HookOperations,
 }
 
 impl HookContext {
     pub fn stop(&self) -> Result<()> {
-        let code = unsafe { (self.stop)(self.handle) };
+        let code = unsafe { (self.operations.stop)(self.handle) };
         if code == 0 {
             Ok(())
         } else {
             bail!("failed to stop Unicorn emulator: error {code}")
         }
     }
+
+    pub fn mem_map(&self, address: u64, size: usize) -> Result<()> {
+        let code = unsafe { (self.operations.mem_map)(self.handle, address, size, PROT_ALL) };
+        if code == 0 {
+            Ok(())
+        } else {
+            bail!("failed to map Unicorn memory: error {code}")
+        }
+    }
+
+    pub fn mem_write(&self, address: u64, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let code = unsafe {
+            (self.operations.mem_write)(self.handle, address, data.as_ptr().cast(), data.len())
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            bail!("failed to write Unicorn memory: error {code}")
+        }
+    }
 }
 
 type CodeCallback = dyn FnMut(&HookContext, u64, u32);
+type FaultCallback = dyn FnMut(&HookContext, u64, u32) -> bool;
+
+#[derive(Clone, Copy)]
+struct HookOperations {
+    stop: unsafe extern "C" fn(Handle) -> i32,
+    mem_map: unsafe extern "C" fn(Handle, u64, usize, u32) -> i32,
+    mem_write: unsafe extern "C" fn(Handle, u64, *const c_void, usize) -> i32,
+}
 
 struct HookData {
     callback: RefCell<Box<CodeCallback>>,
     failure: RefCell<Option<String>>,
-    stop: unsafe extern "C" fn(Handle) -> i32,
+    operations: HookOperations,
+}
+
+struct MemoryFaultData {
+    callback: RefCell<Box<FaultCallback>>,
+    failure: RefCell<Option<String>>,
+    operations: HookOperations,
+}
+
+enum HookOwner {
+    Code(Box<HookData>),
+    Fault(Box<MemoryFaultData>),
+}
+
+impl HookOwner {
+    fn failure(&self) -> Option<String> {
+        match self {
+            Self::Code(data) => data.failure.borrow().clone(),
+            Self::Fault(data) => data.failure.borrow().clone(),
+        }
+    }
 }
 
 struct HookRegistration {
     id: u64,
     handle: usize,
-    _data: Box<HookData>,
+    data: HookOwner,
 }
 
 extern "C" fn code_trampoline(handle: Handle, address: u64, size: u32, user_data: *mut c_void) {
@@ -120,7 +172,7 @@ extern "C" fn code_trampoline(handle: Handle, address: u64, size: u32, user_data
     let data = unsafe { &*user_data.cast::<HookData>() };
     let context = HookContext {
         handle,
-        stop: data.stop,
+        operations: data.operations,
     };
     let result = catch_unwind(AssertUnwindSafe(|| {
         let Ok(mut callback) = data.callback.try_borrow_mut() else {
@@ -130,7 +182,39 @@ extern "C" fn code_trampoline(handle: Handle, address: u64, size: u32, user_data
     }));
     if result.is_err() {
         *data.failure.borrow_mut() = Some("Unicorn code hook panicked".to_owned());
-        unsafe { (data.stop)(handle) };
+        unsafe { (data.operations.stop)(handle) };
+    }
+}
+
+extern "C" fn fault_trampoline(
+    handle: Handle,
+    _kind: i32,
+    address: u64,
+    size: i32,
+    _value: i64,
+    user_data: *mut c_void,
+) -> bool {
+    if user_data.is_null() {
+        return false;
+    }
+    let data = unsafe { &*user_data.cast::<MemoryFaultData>() };
+    let context = HookContext {
+        handle,
+        operations: data.operations,
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let Ok(mut callback) = data.callback.try_borrow_mut() else {
+            panic!("reentrant Unicorn memory fault hook");
+        };
+        callback(&context, address, size.max(0) as u32)
+    }));
+    match result {
+        Ok(retry) => retry,
+        Err(_) => {
+            *data.failure.borrow_mut() = Some("Unicorn memory fault hook panicked".to_owned());
+            unsafe { (data.operations.stop)(handle) };
+            false
+        }
     }
 }
 
@@ -235,11 +319,7 @@ impl Engine {
         let result = self.check(unsafe {
             (self.api.emu_start)(self.handle, begin, end, micros, instruction_limit)
         });
-        if let Some(failure) = self
-            .hooks
-            .iter()
-            .find_map(|hook| hook._data.failure.borrow().clone())
-        {
+        if let Some(failure) = self.hooks.iter().find_map(|hook| hook.data.failure()) {
             bail!("{failure}");
         }
         result?;
@@ -264,7 +344,7 @@ impl Engine {
         let data = Box::new(HookData {
             callback: RefCell::new(Box::new(callback)),
             failure: RefCell::new(None),
-            stop: self.api.emu_stop,
+            operations: self.hook_operations(),
         });
         let mut hook_handle = 0usize;
         let user_data = (&*data as *const HookData).cast_mut().cast::<c_void>();
@@ -284,7 +364,43 @@ impl Engine {
         self.hooks.push(HookRegistration {
             id,
             handle: hook_handle,
-            _data: data,
+            data: HookOwner::Code(data),
+        });
+        Ok(id)
+    }
+
+    pub fn add_memory_fault_hook<F>(&mut self, callback: F) -> Result<u64>
+    where
+        F: FnMut(&HookContext, u64, u32) -> bool + 'static,
+    {
+        let id = self.next_hook_id;
+        let next_id = id.checked_add(1).context("Unicorn hook ID overflow")?;
+        let data = Box::new(MemoryFaultData {
+            callback: RefCell::new(Box::new(callback)),
+            failure: RefCell::new(None),
+            operations: self.hook_operations(),
+        });
+        let mut hook_handle = 0usize;
+        let user_data = (&*data as *const MemoryFaultData)
+            .cast_mut()
+            .cast::<c_void>();
+        let trampoline = fault_trampoline as *const () as *mut c_void;
+        self.check(unsafe {
+            (self.api.hook_add)(
+                self.handle,
+                &mut hook_handle,
+                HOOK_UNMAPPED_MEMORY,
+                trampoline,
+                user_data,
+                1,
+                0,
+            )
+        })?;
+        self.next_hook_id = next_id;
+        self.hooks.push(HookRegistration {
+            id,
+            handle: hook_handle,
+            data: HookOwner::Fault(data),
         });
         Ok(id)
     }
@@ -314,6 +430,14 @@ impl Engine {
             Ok(())
         } else {
             Err(api_error(&self.api, code))
+        }
+    }
+
+    fn hook_operations(&self) -> HookOperations {
+        HookOperations {
+            stop: self.api.emu_stop,
+            mem_map: self.api.mem_map,
+            mem_write: self.api.mem_write,
         }
     }
 
@@ -383,5 +507,30 @@ mod tests {
             .start_bounded(0x1000, 0x1008, Duration::from_secs(1), 10)
             .unwrap();
         assert_eq!(engine.reg_read(REG_X0).unwrap(), 2);
+    }
+
+    #[test]
+    #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
+    fn memory_fault_hook_maps_and_retries_missing_page() {
+        let mut engine = Engine::new().unwrap();
+        engine.mem_map(0x1000, 4096).unwrap();
+        engine.mem_write(0x1000, &[0x20, 0x00, 0x40, 0xf9]).unwrap();
+        engine.reg_write(REG_X1, 0x2000).unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let observed = Rc::clone(&calls);
+        engine
+            .add_memory_fault_hook(move |context, address, size| {
+                assert_eq!((address, size), (0x2000, 8));
+                observed.set(observed.get() + 1);
+                context.mem_map(0x2000, 4096).unwrap();
+                context.mem_write(0x2000, &42u64.to_le_bytes()).unwrap();
+                true
+            })
+            .unwrap();
+        engine
+            .start_bounded(0x1000, 0x1004, Duration::from_secs(1), 10)
+            .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(engine.reg_read(REG_X0).unwrap(), 42);
     }
 }
