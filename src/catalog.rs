@@ -1,11 +1,12 @@
-use std::time::Duration;
-
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::{platform::Platform, vision};
+use crate::{
+    platform::Platform,
+    transport::{Request, Response, Transport},
+    vision,
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct App {
@@ -98,16 +99,21 @@ impl From<CatalogApp> for App {
 }
 
 pub struct CatalogClient {
-    http: Client,
+    http: Transport,
 }
 
 impl CatalogClient {
     pub fn new() -> Result<Self> {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .context("failed to create HTTP client")?;
+        let http = Transport::new()?;
         Ok(Self { http })
+    }
+
+    fn get(&self, url: Url) -> Result<Response> {
+        let mut request = Request::get(url);
+        request.timeout = Some(std::time::Duration::from_secs(30));
+        let response = self.http.send(request)?;
+        response.ensure_success()?;
+        Ok(response)
     }
 
     pub fn search(
@@ -123,12 +129,7 @@ impl CatalogClient {
         }
         let url = search_url(term, country, limit, platform)?;
         let response: CatalogResponse = self
-            .http
-            .get(url)
-            .send()
-            .context("App Store search request failed")?
-            .error_for_status()
-            .context("App Store search returned an error")?
+            .get(url)?
             .json()
             .context("failed to decode App Store search results")?;
         Ok(search_output(response, platform))
@@ -136,7 +137,8 @@ impl CatalogClient {
 
     fn search_vision(&self, term: &str, country: &str, limit: i64) -> Result<SearchOutput> {
         let url = vision::search_url(term, country)?;
-        let body = self.http.get(url).send()?.error_for_status()?.text()?;
+        let body = self.get(url)?.body;
+        let body = String::from_utf8(body).context("visionOS search page is not UTF-8")?;
         let mut apps = vision::storefront_apps(&body, limit)?;
         if apps.is_empty() {
             return Ok(SearchOutput { count: 0, apps });
@@ -144,7 +146,7 @@ impl CatalogClient {
 
         let ids: Vec<i64> = apps.iter().map(|app| app.id).collect();
         let url = lookup_url(Some(&ids), None, country, Some(Platform::Visionos))?;
-        let response: CatalogResponse = self.http.get(url).send()?.error_for_status()?.json()?;
+        let response: CatalogResponse = self.get(url)?.json()?;
         let hydrated: std::collections::HashMap<i64, App> = response
             .results
             .into_iter()
@@ -174,7 +176,7 @@ impl CatalogClient {
         validate_country(country)?;
         let ids = id.map(|value| vec![value]);
         let url = lookup_url(ids.as_deref(), bundle_id, country, platform)?;
-        let response: CatalogResponse = self.http.get(url).send()?.error_for_status()?.json()?;
+        let response: CatalogResponse = self.get(url)?.json()?;
         let app = response
             .results
             .into_iter()

@@ -24,7 +24,7 @@ This checklist records behavior in that source tree; the Go README and source ar
 
 ## Internal subsystems
 
-1. Port `pkg/http`, `pkg/keychain`, state directory migration, account data, and cookie persistence. Verify format compatibility with a throwaway Go session before using any existing credentials.
+1. Finish `pkg/http` (cookie persistence and Store executor), then port `pkg/keychain` and account data. Shared HTTP response decoding and state directory migration are implemented. Verify format compatibility with a throwaway Go session before using any existing credentials.
 2. Port `internal/store` and its generated profile data, then `internal/sap` signing and runtime support. Login, authenticated search country selection, purchase, and owned-app listing depend on these.
 3. Port iOS/tvOS/watchOS/visionOS download flows, resume and range logic, ZIP framing, SINF replication, and all package tests.
 4. Port macOS preflight, version metadata, package download, encrypted payload processing, and publish behavior.
