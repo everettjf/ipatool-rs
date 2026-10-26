@@ -142,6 +142,50 @@ impl HookContext {
         Ok(data)
     }
 
+    pub fn reg_read(&self, register: i32) -> Result<u64> {
+        let mut value = 0u64;
+        let code = unsafe {
+            (self.operations.reg_read)(self.handle, register, (&mut value as *mut u64).cast())
+        };
+        if code == 0 {
+            Ok(value)
+        } else {
+            bail!("failed to read Unicorn register {register}: error {code}")
+        }
+    }
+
+    pub fn reg_write(&self, register: i32, value: u64) -> Result<()> {
+        let code = unsafe {
+            (self.operations.reg_write)(self.handle, register, (&value as *const u64).cast())
+        };
+        if code == 0 {
+            Ok(())
+        } else {
+            bail!("failed to write Unicorn register {register}: error {code}")
+        }
+    }
+
+    pub fn reg_read_128(&self, register: i32) -> Result<[u8; 16]> {
+        let mut value = [0u8; 16];
+        let code =
+            unsafe { (self.operations.reg_read)(self.handle, register, value.as_mut_ptr().cast()) };
+        if code == 0 {
+            Ok(value)
+        } else {
+            bail!("failed to read Unicorn register {register}: error {code}")
+        }
+    }
+
+    pub fn reg_write_128(&self, register: i32, value: [u8; 16]) -> Result<()> {
+        let code =
+            unsafe { (self.operations.reg_write)(self.handle, register, value.as_ptr().cast()) };
+        if code == 0 {
+            Ok(())
+        } else {
+            bail!("failed to write Unicorn register {register}: error {code}")
+        }
+    }
+
     fn check_memory(&self, address: u64, size: usize) -> Result<()> {
         if size != 0 {
             let check = self.operations.guard_slot.borrow().clone();
@@ -165,6 +209,8 @@ struct HookOperations {
     mem_map: unsafe extern "C" fn(Handle, u64, usize, u32) -> i32,
     mem_read: unsafe extern "C" fn(Handle, u64, *mut c_void, usize) -> i32,
     mem_write: unsafe extern "C" fn(Handle, u64, *const c_void, usize) -> i32,
+    reg_read: unsafe extern "C" fn(Handle, i32, *mut c_void) -> i32,
+    reg_write: unsafe extern "C" fn(Handle, i32, *const c_void) -> i32,
     guard_slot: GuardSlot,
 }
 
@@ -654,6 +700,8 @@ impl Engine {
             mem_map: self.api.mem_map,
             mem_read: self.api.mem_read,
             mem_write: self.api.mem_write,
+            reg_read: self.api.reg_read,
+            reg_write: self.api.reg_write,
             guard_slot: Rc::clone(&self.guard_slot),
         }
     }
@@ -695,6 +743,8 @@ fn api_error(api: &Api, code: i32) -> anyhow::Error {
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    const REG_V0: i32 = 228;
 
     #[test]
     #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
@@ -867,5 +917,29 @@ mod tests {
         assert_eq!(denied.get(), 2);
         allow_data.set(true);
         assert_eq!(engine.mem_read(0x2000, 1).unwrap(), [0]);
+    }
+
+    #[test]
+    #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
+    fn hook_context_can_read_and_write_guest_registers() {
+        let mut engine = Engine::new().unwrap();
+        engine.mem_map(0x1000, 4096).unwrap();
+        engine
+            .mem_write(0x1000, &[0x20, 0x00, 0x80, 0xd2, 0x00, 0x04, 0x00, 0x91])
+            .unwrap();
+        engine
+            .add_code_hook(0x1004, 0x1004, |context, _, _| {
+                assert_eq!(context.reg_read(REG_X0).unwrap(), 1);
+                context.reg_write(REG_X0, 7).unwrap();
+                let vector = [0xa5; 16];
+                context.reg_write_128(REG_V0, vector).unwrap();
+                assert_eq!(context.reg_read_128(REG_V0).unwrap(), vector);
+                context.stop().unwrap();
+            })
+            .unwrap();
+        engine
+            .start_bounded(0x1000, 0x1008, Duration::from_secs(1), 10)
+            .unwrap();
+        assert_eq!(engine.reg_read(REG_X0).unwrap(), 7);
     }
 }
