@@ -349,6 +349,24 @@ impl FairplayCheckpoint {
         Ok(output)
     }
 
+    /// Page addresses already represented by this checkpoint.
+    pub fn page_addresses(&self) -> Result<Vec<u64>> {
+        if let Some(pages) = &self.sparse_pages {
+            return Ok(pages.keys().copied().collect());
+        }
+        let Value::Dict(pages) = self.field("memory_pages")? else {
+            bail!("checkpoint has no page-packed memory map");
+        };
+        pages.keys().map(page_key_u64).collect()
+    }
+
+    /// Preserve the original metadata when writing a resumed schema-2 snapshot.
+    pub(crate) fn clone_root(&self) -> Result<Value> {
+        self.root
+            .clone()
+            .context("schema-1 checkpoints cannot yet be exported as schema 2")
+    }
+
     fn field(&self, name: &str) -> Result<&Value> {
         let root = match self.root.as_ref() {
             Some(Value::Dict(root)) => root,
@@ -386,7 +404,7 @@ fn page_key_u64(value: &HashableValue) -> Result<u64> {
     }
 }
 
-fn clear_value(value: &mut Value) {
+pub(crate) fn clear_value(value: &mut Value) {
     match value {
         Value::Bytes(bytes) => bytes.zeroize(),
         Value::String(text) => text.zeroize(),

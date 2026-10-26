@@ -233,6 +233,11 @@ enum FairplayEnrollCommand {
         checkpoint: PathBuf,
         #[arg(long)]
         fairplayd: PathBuf,
+        #[arg(
+            long,
+            help = "Write a private checkpoint after reaching the stop address"
+        )]
+        output_checkpoint: Option<PathBuf>,
         #[arg(long, help = "Instruction address at which to stop")]
         stop_address: String,
         #[arg(long, default_value_t = 100_000)]
@@ -1030,6 +1035,7 @@ fn run() -> Result<()> {
             FairplayEnrollCommand::ContinueCheckpoint {
                 checkpoint,
                 fairplayd,
+                output_checkpoint,
                 stop_address,
                 instruction_limit,
                 timeout_seconds,
@@ -1059,6 +1065,10 @@ fn run() -> Result<()> {
                     Duration::from_secs(timeout_seconds),
                     instruction_limit,
                 )?;
+                let written_pages = output_checkpoint
+                    .as_ref()
+                    .map(|output| runner.write_checkpoint(&snapshot, &fairplayd, output))
+                    .transpose()?;
                 match cli.format {
                     Format::Json => println!(
                         "{}",
@@ -1069,12 +1079,19 @@ fn run() -> Result<()> {
                             "checkpoint_pages": runner.checkpoint_pages,
                             "fairplayd_fixups": runner.image.fixups,
                             "external_imports": runner.image.externals.len(),
+                            "output_checkpoint": output_checkpoint,
+                            "output_pages": written_pages,
                         })
                     ),
-                    Format::Text => println!(
-                        "Resumed FairPlay checkpoint from {:#x} to {stop:#x}",
-                        runner.start_pc
-                    ),
+                    Format::Text => {
+                        println!(
+                            "Resumed FairPlay checkpoint from {:#x} to {stop:#x}",
+                            runner.start_pc
+                        );
+                        if let Some(path) = output_checkpoint {
+                            println!("Saved private checkpoint to {}", path.display());
+                        }
+                    }
                 }
             }
             FairplayEnrollCommand::EvaluateState { input, output } => {

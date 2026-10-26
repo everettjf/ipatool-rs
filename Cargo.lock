@@ -1452,6 +1452,7 @@ dependencies = [
  "libloading",
  "lzfse_rust",
  "md-5",
+ "num-bigint",
  "p256 0.13.2",
  "plist",
  "regex",
