@@ -10,7 +10,7 @@ use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{doctor_fairplay, write_doctor_report};
 use ipatool_rs::store_backend::StoreBackend;
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput};
-use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT};
+use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
 use ipatool_rs::store_purchase::{
     self, LicenseAlreadyExists, NativePurchaseBackend, PasswordTokenExpired,
 };
@@ -321,7 +321,7 @@ fn run() -> Result<()> {
             let platform = parse_platform(platform.as_deref())?;
             let account_store = AccountStore::new(open_system_keychain()?);
             let mut account = account_store.load()?;
-            let backend = StoreBackend::open()?;
+            let backend = NativeOwnedBackend::open()?;
             let mut refreshed = false;
             loop {
                 match store_owned::owned_apps(&backend, &account, page, max_results, platform) {
@@ -342,8 +342,9 @@ fn run() -> Result<()> {
                     Err(error)
                         if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
                     {
+                        let authentication_backend = StoreBackend::open()?;
                         account = store_login::login(
-                            &backend,
+                            &authentication_backend,
                             &account_store,
                             LoginInput {
                                 email: account.email.clone(),

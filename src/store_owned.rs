@@ -1,7 +1,13 @@
 //! Purchase-history record parsing and result selection.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail};
-use reqwest::header::{HeaderMap, HeaderValue};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use reqwest::{
+    Method,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
+};
 use serde::Serialize;
 use time::{
     OffsetDateTime,
@@ -9,15 +15,17 @@ use time::{
 };
 
 use crate::{
-    auth::SapConfig,
+    auth::{SapConfig, sap_config_from_bag_value},
     catalog::App,
     credentials::Account,
     dmap,
+    host::hardware_mac_address,
     platform::Platform,
     sap_signer::Signer,
-    store_backend::{StoreBackend, StoreBackendRequest},
+    state::prepare_state_directory_from_environment,
+    store_backend::{DEFAULT_USER_AGENT, StoreBackend, StoreBackendRequest},
     store_purchase::PasswordTokenExpired,
-    transport::Response,
+    transport::{DEFAULT_AUTHENTICATION_TIMEOUT, Request, Response, Transport},
 };
 
 pub const DEFAULT_LIMIT: usize = 10;
@@ -27,9 +35,127 @@ const ARCADE_MEDIA_KIND: u64 = 262_144;
 const MAC_MEDIA_KIND: u64 = 67_108_864;
 const PURCHASE_DAAP_BASE: &str =
     "https://pd.itunes.apple.com/WebObjects/MZPurchaseDaap.woa/purchase";
+const PURCHASE_DAAP_PATH: &str = "/WebObjects/MZPurchaseDaap.woa/purchase";
 const PURCHASE_QUERY: &str = "('com.apple.itunes.extended\\-media\\-kind:131072','com.apple.itunes.extended\\-media\\-kind:262144','com.apple.itunes.extended\\-media\\-kind:67108864')";
 
 type ActionSigner<'a> = dyn FnMut(&[u8]) -> Result<Vec<u8>> + 'a;
+type HistorySender = dyn Fn(Request) -> Result<Response> + Send + Sync;
+
+/// Direct HTTP backend for purchase history; SAP signing remains separate.
+pub struct NativeOwnedBackend {
+    hardware_id: [u8; 6],
+    sender: Arc<HistorySender>,
+}
+
+impl NativeOwnedBackend {
+    pub fn open() -> Result<Self> {
+        let hardware_id = hardware_mac_address().context("read Store hardware identity")?;
+        let state_directory = prepare_state_directory_from_environment()?;
+        let transport = Arc::new(Transport::with_cookies(&state_directory)?);
+        Ok(Self::with_sender(hardware_id, move |request| {
+            transport.send(request)
+        }))
+    }
+
+    pub fn with_sender(
+        hardware_id: [u8; 6],
+        sender: impl Fn(Request) -> Result<Response> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            hardware_id,
+            sender: Arc::new(sender),
+        }
+    }
+}
+
+impl OwnedBackend for NativeOwnedBackend {
+    fn hardware_id(&self) -> [u8; 6] {
+        self.hardware_id
+    }
+
+    fn sap_config(&self) -> Result<SapConfig> {
+        let guid = self
+            .hardware_id
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        let url = url::Url::parse(&format!(
+            "https://init.itunes.apple.com/bag.xml?guid={guid}"
+        ))?;
+        let mut request = Request::get(url);
+        request
+            .headers
+            .insert("Accept", HeaderValue::from_static("application/xml"));
+        request
+            .headers
+            .insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
+        request.no_redirects = true;
+        request.timeout = Some(DEFAULT_AUTHENTICATION_TIMEOUT);
+        let response = (self.sender)(request).context("request Apple URL bag")?;
+        response.ensure_success()?;
+        let bag: serde_json::Value = response.plist(false)?;
+        sap_config_from_bag_value(&bag)
+    }
+
+    fn send_history(
+        &self,
+        request: StoreBackendRequest<'_>,
+        signer: Option<&mut ActionSigner<'_>>,
+    ) -> Result<Response> {
+        if request.method != "POST" || request.parameters.is_some() || !request.raw {
+            bail!("invalid native purchase-history request");
+        }
+        let url = url::Url::parse(request.url).context("invalid purchase-history URL")?;
+        if url.scheme() != "https"
+            || url.host_str() != Some("pd.itunes.apple.com")
+            || !valid_history_path(url.path())
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            bail!("unsupported native purchase-history URL");
+        }
+        let mut headers = request.headers.clone();
+        headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
+        if let Some(signer) = signer {
+            let body = request
+                .body
+                .context("signed purchase-history request has no body")?;
+            let signature = signer(body).context("sign purchase-history request")?;
+            if signature.is_empty() {
+                bail!("purchase-history signer returned an empty signature");
+            }
+            headers.insert(
+                "X-Apple-ActionSignature",
+                HeaderValue::from_str(&STANDARD.encode(signature))?,
+            );
+        }
+        (self.sender)(Request {
+            method: Method::POST,
+            url,
+            headers,
+            body: request.body.map(ToOwned::to_owned),
+            no_redirects: request.no_redirects,
+            timeout: request.timeout,
+        })
+    }
+}
+
+fn valid_history_path(path: &str) -> bool {
+    if path == format!("{PURCHASE_DAAP_PATH}/login")
+        || path == format!("{PURCHASE_DAAP_PATH}/update")
+    {
+        return true;
+    }
+    let Some(remainder) = path.strip_prefix(&format!("{PURCHASE_DAAP_PATH}/databases/")) else {
+        return false;
+    };
+    let Some(id) = remainder.strip_suffix("/items") else {
+        return false;
+    };
+    !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
+}
 
 pub trait OwnedBackend {
     fn hardware_id(&self) -> [u8; 6];
@@ -62,8 +188,8 @@ impl OwnedBackend for StoreBackend {
     }
 }
 
-pub fn owned_apps(
-    backend: &StoreBackend,
+pub fn owned_apps<B: OwnedBackend>(
+    backend: &B,
     account: &Account,
     page: usize,
     limit: usize,
@@ -456,6 +582,41 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[derive(Debug, PartialEq)]
+    struct WireHistory {
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    fn wire_history(request: &Request) -> WireHistory {
+        let mut headers: Vec<_> = request
+            .headers
+            .iter()
+            .map(|(name, value)| {
+                let name = name.to_string();
+                let value = if matches!(name.as_str(), "date" | "x-apple-i-client-time") {
+                    "<time>".into()
+                } else {
+                    value.to_str().unwrap().to_owned()
+                };
+                (name, value)
+            })
+            .collect();
+        headers.sort();
+        let mut body = request.body.clone().unwrap_or_default();
+        if request.url.path().ends_with("/items") {
+            assert_eq!(&body[..4], b"adsr");
+            assert_eq!(&body[8..12], b"mstc");
+            body[16..20].fill(0);
+        }
+        WireHistory {
+            url: request.url.to_string(),
+            headers,
+            body,
+        }
+    }
+
     fn item(id: u32, media: u32, products: u8, timestamp: u32) -> Vec<u8> {
         let mut body = Vec::new();
         body.extend(dmap::uint32(b"aeSI", id).unwrap());
@@ -634,5 +795,74 @@ mod tests {
                 .unwrap();
         assert_eq!(output.total_count, 1);
         assert_eq!(calls.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn native_purchase_history_matches_pinned_store_requests() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let guest_requests = Arc::new(Mutex::new(Vec::new()));
+        let observed_guest = Arc::clone(&guest_requests);
+        let guest_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&guest_calls);
+        let guest = StoreBackend::with_sender(
+            assets.apple_media_services,
+            [0, 1, 2, 3, 4, 5],
+            move |request| {
+                observed_guest.lock().unwrap().push(wire_history(&request));
+                let call = observed_calls.fetch_add(1, Ordering::SeqCst);
+                history_response(call)
+            },
+        );
+        let native_requests = Arc::new(Mutex::new(Vec::new()));
+        let observed_native = Arc::clone(&native_requests);
+        let native_calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&native_calls);
+        let native = NativeOwnedBackend::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            observed_native.lock().unwrap().push(wire_history(&request));
+            let call = observed_calls.fetch_add(1, Ordering::SeqCst);
+            history_response(call)
+        });
+        let mut account = Account::default();
+        account.store_front = "143441-1,29".into();
+        account.directory_services_id = "123".into();
+        account.password_token = "token".into();
+        owned_apps_with_signer(&guest, &account, 1, 10, None, &mut |_| Ok(vec![1, 2, 3])).unwrap();
+        owned_apps_with_signer(&native, &account, 1, 10, None, &mut |_| Ok(vec![1, 2, 3])).unwrap();
+        assert_eq!(
+            *native_requests.lock().unwrap(),
+            *guest_requests.lock().unwrap()
+        );
+    }
+
+    fn history_response(call: usize) -> Result<Response> {
+        let body = match call % 3 {
+            0 => dmap::tag(b"mlog", &dmap::uint32(b"mlid", 7)?)?,
+            1 => dmap::tag(b"mupd", &dmap::uint32(b"musr", 99)?)?,
+            _ => dmap::tag(b"mlcl", &item(42, APP_MEDIA_KIND as u32, 1, 100))?,
+        };
+        Ok(Response {
+            status: 200,
+            headers: std::collections::HashMap::new(),
+            body,
+        })
+    }
+
+    #[test]
+    fn native_backend_reads_sap_config_without_store_guest() {
+        let backend = NativeOwnedBackend::with_sender([0, 1, 2, 3, 4, 5], |request| {
+            assert_eq!(request.method, Method::GET);
+            assert_eq!(
+                request.url.as_str(),
+                "https://init.itunes.apple.com/bag.xml?guid=000102030405"
+            );
+            assert!(request.no_redirects);
+            Ok(Response {
+                status: 200,
+                headers: std::collections::HashMap::new(),
+                body: br#"<plist version="1.0"><dict><key>urlBag</key><dict/></dict></plist>"#
+                    .to_vec(),
+            })
+        });
+        assert_eq!(backend.sap_config().unwrap().version, 200);
     }
 }

@@ -16,7 +16,7 @@ use crate::transport::{
     DEFAULT_AUTHENTICATION_TIMEOUT, Request as HostRequest, Response as HostResponse, Transport,
 };
 
-const DEFAULT_USER_AGENT: &str =
+pub(crate) const DEFAULT_USER_AGENT: &str =
     "Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6";
 pub(crate) const PURCHASE_USER_AGENT: &str =
     "Configurator/2.18 (Macintosh; OS X 15.3.2; 24D81) AppleWebKit/0620.2.4.11.6";
