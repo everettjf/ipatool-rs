@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     fmt::Debug,
-    io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    io::{self, Cursor, Read, Seek, SeekFrom},
 };
 
 use anyhow::{Context, Result, bail};
@@ -16,7 +16,6 @@ use url::Url;
 use crate::{ipa_metadata::VersionMetadata, transport::Transport};
 
 const MAX_TOC_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_DISTRIBUTION_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_preflight_version_metadata(url: &str, bundle_id: &str) -> Result<VersionMetadata> {
     read_preflight_version_metadata_using(url, bundle_id, None)
@@ -116,20 +115,17 @@ fn parse_preflight_reader<R: Read + Seek + Debug>(
         .data
         .as_ref()
         .context("Mac preflight Distribution has no data")?;
-    if data.size > MAX_DISTRIBUTION_BYTES as u64 || data.length > MAX_DISTRIBUTION_BYTES as u64 {
-        bail!("Mac preflight Distribution exceeds size limit");
-    }
     let mut raw = Vec::new();
     archive
         .write_file_data_heap_from_file(distribution, &mut raw)
         .context("read Mac preflight Distribution")?;
     verify_file_checksum(&raw, &data.archived_checksum)?;
-    let mut decoded = LimitedWriter::default();
+    let mut decoded = Vec::new();
     archive
         .write_file_data_decoded_from_file(distribution, &mut decoded)
         .context("decode Mac preflight Distribution")?;
-    verify_file_checksum(&decoded.0, &data.extracted_checksum)?;
-    parse_distribution(&decoded.0, bundle_id)
+    verify_file_checksum(&decoded, &data.extracted_checksum)?;
+    parse_distribution(&decoded, bundle_id)
 }
 
 fn verify_file_checksum(
@@ -160,25 +156,6 @@ fn verify_file_checksum(
         bail!("Mac preflight Distribution checksum mismatch");
     }
     Ok(())
-}
-
-#[derive(Default)]
-struct LimitedWriter(Vec<u8>);
-
-impl Write for LimitedWriter {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > MAX_DISTRIBUTION_BYTES.saturating_sub(self.0.len()) {
-            return Err(std::io::Error::other(
-                "Mac preflight Distribution exceeds size limit",
-            ));
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 fn parse_distribution(bytes: &[u8], bundle_id: &str) -> Result<VersionMetadata> {
@@ -280,7 +257,7 @@ mod tests {
     use super::*;
     use apple_xar::table_of_contents::ChecksumType;
     use flate2::{Compression, write::ZlibEncoder};
-    use std::{net::TcpListener, thread};
+    use std::{io::Write, net::TcpListener, thread};
 
     const DISTRIBUTION: &str = r#"<installer-gui-script><product id="com.example.mac" version="4.2"/>
 <pkg-ref id="com.example.pkg"><relocate><bundle id="com.example.mac"/></relocate></pkg-ref>
@@ -354,6 +331,21 @@ mod tests {
                 .to_string()
                 .contains("checksum mismatch")
         );
+    }
+
+    #[test]
+    fn reads_preflight_distribution_larger_than_four_megabytes() {
+        let distribution = DISTRIBUTION.replace(
+            "</installer-gui-script>",
+            &format!(
+                "<note>{}</note></installer-gui-script>",
+                "x".repeat(4 * 1024 * 1024)
+            ),
+        );
+        assert!(distribution.len() > 4 * 1024 * 1024);
+        let metadata = parse_preflight_xar(&fixture_xar(&distribution), "com.example.mac").unwrap();
+        assert_eq!(metadata.display_version, "4.2");
+        assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
     }
 
     #[test]

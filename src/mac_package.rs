@@ -25,7 +25,6 @@ use crate::{
 };
 
 const MAX_TOC: u64 = 64 * 1024 * 1024;
-const MAX_PACKAGE_INFO: usize = 4 * 1024 * 1024;
 
 pub fn mac_dp_info(item: &DownloadItem) -> Result<Vec<u8>> {
     let mut result: Option<&[u8]> = None;
@@ -155,19 +154,16 @@ fn read_package_version_from_path(path: &Path, bundle_id: &str) -> Result<Versio
             continue;
         }
         let data = entry.data.as_ref().context("Mac PackageInfo has no data")?;
-        if data.size > MAX_PACKAGE_INFO as u64 || data.length > MAX_PACKAGE_INFO as u64 {
-            bail!("Mac PackageInfo exceeds size limit");
-        }
-        let mut decoded = BoundedPackageInfo(Vec::new());
+        let mut decoded = Vec::new();
         archive
             .write_file_data_decoded_from_file(entry, &mut decoded)
             .context("decode Mac PackageInfo")?;
         let expected = decode_hex(&data.extracted_checksum.checksum)?;
-        let actual = data.extracted_checksum.style.digest_data(&decoded.0)?;
+        let actual = data.extracted_checksum.style.digest_data(&decoded)?;
         if actual != expected {
             bail!("Mac PackageInfo checksum mismatch");
         }
-        let text = std::str::from_utf8(&decoded.0).context("Mac PackageInfo is not UTF-8")?;
+        let text = std::str::from_utf8(&decoded).context("Mac PackageInfo is not UTF-8")?;
         let document = Document::parse(text).context("parse Mac PackageInfo")?;
         for bundle in document
             .root_element()
@@ -210,22 +206,6 @@ fn read_package_version_from_path(path: &Path, bundle_id: &str) -> Result<Versio
         }
     }
     result.context("Mac package has no metadata for the requested bundle")
-}
-
-struct BoundedPackageInfo(Vec<u8>);
-
-impl Write for BoundedPackageInfo {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if bytes.len() > MAX_PACKAGE_INFO.saturating_sub(self.0.len()) {
-            return Err(std::io::Error::other("Mac PackageInfo exceeds size limit"));
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
 }
 
 fn download_mac_package_with(
@@ -589,6 +569,25 @@ mod tests {
             .unwrap();
             assert!(read_package_version_from_path(&path, "com.example.mac").is_err());
         }
+    }
+
+    #[test]
+    fn reads_package_info_larger_than_four_megabytes() {
+        let package_info = format!(
+            "<pkg-info><bundle id=\"com.example.mac\" CFBundleShortVersionString=\"4.2\"/><note>{}</note></pkg-info>",
+            "x".repeat(4 * 1024 * 1024)
+        );
+        assert!(package_info.len() > 4 * 1024 * 1024);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(
+            &path,
+            xar_with_package_info(&package_info, Some("2012-07-06T09:54:33Z")),
+        )
+        .unwrap();
+        let metadata = read_package_version_from_path(&path, "com.example.mac").unwrap();
+        assert_eq!(metadata.display_version, "4.2");
+        assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
     }
 
     #[test]
