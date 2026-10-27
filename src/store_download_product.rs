@@ -27,7 +27,7 @@ use crate::{
     host::hardware_mac_address,
     ipa_metadata::{self, VersionMetadata},
     ipa_patch::patch_ipa,
-    mac_package::download_mac_package,
+    mac_package::{download_mac_package, read_mac_package_version_metadata},
     mac_preflight,
     sap_assets::SapAssetBundle,
     state::prepare_state_directory_from_environment,
@@ -435,8 +435,13 @@ impl DownloadProductClient {
             app,
             version,
             platform,
-            ipa_metadata::read_version_metadata_from_ipa,
-            mac_preflight::read_preflight_version_metadata,
+            (
+                ipa_metadata::read_version_metadata_from_ipa,
+                mac_preflight::read_preflight_version_metadata,
+                |item, bundle_id| {
+                    read_mac_package_version_metadata(item, &self.hardware_id, bundle_id)
+                },
+            ),
         )
     }
 
@@ -446,9 +451,13 @@ impl DownloadProductClient {
         app: &App,
         version: &str,
         platform: Option<Platform>,
-        read_ipa: impl FnOnce(&str) -> Result<VersionMetadata>,
-        read_mac: impl FnOnce(&str, &str) -> Result<VersionMetadata>,
+        readers: (
+            impl FnOnce(&str) -> Result<VersionMetadata>,
+            impl FnOnce(&str, &str) -> Result<VersionMetadata>,
+            impl FnOnce(&DownloadItem, &str) -> Result<VersionMetadata>,
+        ),
     ) -> Result<VersionMetadata> {
+        let (read_ipa, read_preflight, read_mac_package) = readers;
         if version.is_empty() || platform == Some(Platform::Unknown) {
             bail!("a version ID and valid platform are required");
         }
@@ -481,19 +490,20 @@ impl DownloadProductClient {
                     .and_then(plist::Value::as_data)
                     .is_some_and(|data| !data.is_empty())
             });
+            let bundle_id = if app.bundle_id.is_empty() {
+                item.metadata
+                    .get("softwareVersionBundleId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            } else {
+                &app.bundle_id
+            };
             if !has_dp_info && !item.preflight_package_url.is_empty() {
-                let bundle_id = if app.bundle_id.is_empty() {
-                    item.metadata
-                        .get("softwareVersionBundleId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                } else {
-                    &app.bundle_id
-                };
-                return read_mac(&item.preflight_package_url, bundle_id)
+                return read_preflight(&item.preflight_package_url, bundle_id)
                     .context("read version metadata from Mac preflight package");
             }
-            bail!("macOS package version metadata requires StoreAgent decryption");
+            return read_mac_package(item, bundle_id)
+                .context("read version metadata from decrypted Mac package");
         }
         if item.url.is_empty() {
             bail!("App Store download response has no IPA URL");
@@ -1365,14 +1375,17 @@ mod tests {
                 &app(),
                 "101",
                 Some(Platform::Iphone),
-                |url| {
-                    assert_eq!(url, "https://example.test/app.ipa");
-                    Ok(VersionMetadata {
-                        display_version: "1.0".into(),
-                        release_date: "2025-01-01T00:00:00Z".into(),
-                    })
-                },
-                |_, _| unreachable!(),
+                (
+                    |url| {
+                        assert_eq!(url, "https://example.test/app.ipa");
+                        Ok(VersionMetadata {
+                            display_version: "1.0".into(),
+                            release_date: "2025-01-01T00:00:00Z".into(),
+                        })
+                    },
+                    |_, _| unreachable!(),
+                    |_, _| unreachable!(),
+                ),
             )
             .unwrap();
         assert_eq!(metadata.display_version, "1.0");
@@ -1383,8 +1396,11 @@ mod tests {
                     &app(),
                     "101",
                     Some(Platform::Macos),
-                    |_| unreachable!(),
-                    |_, _| unreachable!()
+                    (
+                        |_| unreachable!(),
+                        |_, _| unreachable!(),
+                        |item, _| crate::mac_package::mac_dp_info(item).map(|_| unreachable!()),
+                    )
                 )
                 .is_err()
         );
@@ -1408,15 +1424,18 @@ mod tests {
                 },
                 "101",
                 None,
-                |_| unreachable!(),
-                |url, bundle| {
-                    assert_eq!(url, "https://example.test/preflight.pkg");
-                    assert_eq!(bundle, "com.example.mac");
-                    Ok(VersionMetadata {
-                        display_version: "4.2".into(),
-                        release_date: "2012-07-06T09:54:33Z".into(),
-                    })
-                },
+                (
+                    |_| unreachable!(),
+                    |url, bundle| {
+                        assert_eq!(url, "https://example.test/preflight.pkg");
+                        assert_eq!(bundle, "com.example.mac");
+                        Ok(VersionMetadata {
+                            display_version: "4.2".into(),
+                            release_date: "2012-07-06T09:54:33Z".into(),
+                        })
+                    },
+                    |_, _| unreachable!(),
+                ),
             )
             .unwrap();
         assert_eq!(result.display_version, "4.2");
@@ -1431,17 +1450,28 @@ mod tests {
                 body: br#"<plist version="1.0"><dict><key>songList</key><array><dict><key>URL</key><string>https://example.test/encrypted.pkg</string><key>preflightPackageURL</key><string>https://example.test/preflight.pkg</string><key>metadata</key><dict><key>software-platform</key><string>macos</string></dict><key>sinfs</key><array><dict><key>dpInfo</key><data>AQID</data></dict></array></dict></array></dict></plist>"#.to_vec(),
             })
         });
-        let error = client
+        let metadata = client
             .get_version_metadata_with(
                 &account(),
                 &app(),
                 "101",
                 Some(Platform::Macos),
-                |_| unreachable!(),
-                |_, _| unreachable!(),
+                (
+                    |_| unreachable!(),
+                    |_, _| unreachable!(),
+                    |item, bundle| {
+                        assert_eq!(item.url, "https://example.test/encrypted.pkg");
+                        assert_eq!(bundle, "com.example.app");
+                        assert_eq!(crate::mac_package::mac_dp_info(item)?, [1, 2, 3]);
+                        Ok(VersionMetadata {
+                            display_version: "4.2".into(),
+                            release_date: "2012-07-06T09:54:33Z".into(),
+                        })
+                    },
+                ),
             )
-            .unwrap_err();
-        assert!(error.to_string().contains("StoreAgent decryption"));
+            .unwrap();
+        assert_eq!(metadata.display_version, "4.2");
     }
 
     #[test]

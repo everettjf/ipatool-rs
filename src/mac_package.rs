@@ -11,14 +11,17 @@ use apple_xar::{
     reader::XarReader,
     table_of_contents::{ChecksumType, FileType},
 };
+use roxmltree::Document;
 use sha2::digest::DynDigest;
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use crate::{
-    download_file::download_file, sap_assets::SapAssetBundle, store_agent::StoreAgentSession,
-    store_download_product::DownloadItem,
+    download_file::download_file, ipa_metadata::VersionMetadata, sap_assets::SapAssetBundle,
+    store_agent::StoreAgentSession, store_download_product::DownloadItem,
 };
 
 const MAX_TOC: u64 = 64 * 1024 * 1024;
+const MAX_PACKAGE_INFO: usize = 4 * 1024 * 1024;
 
 pub fn mac_dp_info(item: &DownloadItem) -> Result<Vec<u8>> {
     let mut result: Option<&[u8]> = None;
@@ -63,6 +66,105 @@ pub fn download_mac_package(
             output.sync_all().context("sync decrypted macOS package")
         },
     )
+}
+
+pub fn read_mac_package_version_metadata(
+    item: &DownloadItem,
+    hardware_id: &[u8],
+    bundle_id: &str,
+) -> Result<VersionMetadata> {
+    let directory = tempfile::Builder::new()
+        .prefix("ipatool-version-metadata-")
+        .tempdir()
+        .context("create Mac version metadata staging")?;
+    let package = directory.path().join("app.pkg");
+    download_mac_package(item, &package, hardware_id)?;
+    read_package_version_from_path(&package, bundle_id)
+}
+
+fn read_package_version_from_path(path: &Path, bundle_id: &str) -> Result<VersionMetadata> {
+    let mut archive = XarReader::new(File::open(path)?).context("open Mac package for metadata")?;
+    if !archive.verify_table_of_contents_checksum()? {
+        bail!("Mac package table of contents checksum mismatch");
+    }
+    let files = archive.files().context("list Mac package entries")?;
+    let mut result = None;
+    for (name, entry) in &files {
+        if name.rsplit('/').next() != Some("PackageInfo")
+            || !matches!(entry.file_type, FileType::File)
+        {
+            continue;
+        }
+        let data = entry.data.as_ref().context("Mac PackageInfo has no data")?;
+        if data.size > MAX_PACKAGE_INFO as u64 || data.length > MAX_PACKAGE_INFO as u64 {
+            bail!("Mac PackageInfo exceeds size limit");
+        }
+        let mut decoded = BoundedPackageInfo(Vec::new());
+        archive
+            .write_file_data_decoded_from_file(entry, &mut decoded)
+            .context("decode Mac PackageInfo")?;
+        let expected = decode_hex(&data.extracted_checksum.checksum)?;
+        let actual = data.extracted_checksum.style.digest_data(&decoded.0)?;
+        if actual != expected {
+            bail!("Mac PackageInfo checksum mismatch");
+        }
+        let text = std::str::from_utf8(&decoded.0).context("Mac PackageInfo is not UTF-8")?;
+        let document = Document::parse(text).context("parse Mac PackageInfo")?;
+        for bundle in document
+            .root_element()
+            .children()
+            .filter(|node| node.has_tag_name("bundle"))
+        {
+            if !bundle_id.is_empty() && bundle.attribute("id") != Some(bundle_id) {
+                continue;
+            }
+            let display_version = bundle
+                .attribute("CFBundleShortVersionString")
+                .unwrap_or_default()
+                .trim();
+            if display_version.is_empty() {
+                bail!("Mac package has no display version");
+            }
+            if result.is_some() {
+                bail!("Mac package contains multiple matching bundles");
+            }
+            let payload = match name.rsplit_once('/') {
+                Some((directory, _)) => format!("{directory}/Payload"),
+                None => "Payload".to_owned(),
+            };
+            let modified = files
+                .iter()
+                .find(|(candidate, _)| candidate == &payload)
+                .and_then(|(_, file)| file.mtime.as_deref())
+                .context("Mac package has no payload timestamp")?;
+            let release_date = OffsetDateTime::parse(modified, &Rfc3339)
+                .context("invalid Mac package payload timestamp")?
+                .to_offset(UtcOffset::UTC)
+                .replace_nanosecond(0)?
+                .format(&Rfc3339)?;
+            result = Some(VersionMetadata {
+                display_version: display_version.to_owned(),
+                release_date,
+            });
+        }
+    }
+    result.context("Mac package has no metadata for the requested bundle")
+}
+
+struct BoundedPackageInfo(Vec<u8>);
+
+impl Write for BoundedPackageInfo {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_PACKAGE_INFO.saturating_sub(self.0.len()) {
+            return Err(std::io::Error::other("Mac PackageInfo exceeds size limit"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn download_mac_package_with(
@@ -269,6 +371,44 @@ mod tests {
         archive
     }
 
+    fn xar_with_package_info(package_info: &str, mtime: Option<&str>) -> Vec<u8> {
+        let info = package_info.as_bytes();
+        let payload = b"installer payload";
+        let info_checksum = sha1::Sha1::digest(info);
+        let payload_checksum = sha1::Sha1::digest(payload);
+        let mtime = mtime
+            .map(|value| format!("<mtime>{value}</mtime>"))
+            .unwrap_or_default();
+        let toc = format!(
+            "<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><creation-time>2025-01-01T00:00:00Z</creation-time><file id=\"1\"><type>directory</type><name>App.pkg</name><file id=\"2\"><type>file</type><name>PackageInfo</name><data><length>{}</length><offset>20</offset><size>{}</size><encoding style=\"application/octet-stream\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file><file id=\"3\"><type>file</type><name>Payload</name>{mtime}<data><length>{}</length><offset>{}</offset><size>{}</size><encoding style=\"application/octet-stream\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file></file></toc></xar>",
+            info.len(),
+            info.len(),
+            hex(&info_checksum),
+            hex(&info_checksum),
+            payload.len(),
+            20 + info.len(),
+            payload.len(),
+            hex(&payload_checksum),
+            hex(&payload_checksum)
+        );
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(toc.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let toc_checksum = sha1::Sha1::digest(&compressed);
+        let mut archive = vec![0u8; 28];
+        archive[..4].copy_from_slice(b"xar!");
+        archive[4..6].copy_from_slice(&28u16.to_be_bytes());
+        archive[6..8].copy_from_slice(&1u16.to_be_bytes());
+        archive[8..16].copy_from_slice(&(compressed.len() as u64).to_be_bytes());
+        archive[16..24].copy_from_slice(&(toc.len() as u64).to_be_bytes());
+        archive[24..28].copy_from_slice(&1u32.to_be_bytes());
+        archive.extend_from_slice(&compressed);
+        archive.extend_from_slice(&toc_checksum);
+        archive.extend_from_slice(info);
+        archive.extend_from_slice(payload);
+        archive
+    }
+
     fn item(url: String, dp_info: &[u8]) -> DownloadItem {
         let mut fields = plist::Dictionary::new();
         fields.insert("dpInfo".into(), plist::Value::Data(dp_info.to_vec()));
@@ -318,6 +458,35 @@ mod tests {
                 .to_string()
                 .contains("checksum")
         );
+    }
+
+    #[test]
+    fn reads_selected_mac_package_version_and_payload_timestamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(
+            &path,
+            xar_with_package_info(
+                r#"<pkg-info><bundle id="com.other.app" CFBundleShortVersionString="1.0"/><bundle id="com.example.mac" CFBundleShortVersionString="4.2"/></pkg-info>"#,
+                Some("2012-07-06T09:54:33Z"),
+            ),
+        )
+        .unwrap();
+        validate_mac_package(&path).unwrap();
+        let metadata = read_package_version_from_path(&path, "com.example.mac").unwrap();
+        assert_eq!(metadata.display_version, "4.2");
+        assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
+        assert!(read_package_version_from_path(&path, "com.missing.app").is_err());
+        assert!(read_package_version_from_path(&path, "").is_err());
+        fs::write(
+            &path,
+            xar_with_package_info(
+                r#"<pkg-info><bundle id="com.example.mac" CFBundleShortVersionString="4.2"/></pkg-info>"#,
+                None,
+            ),
+        )
+        .unwrap();
+        assert!(read_package_version_from_path(&path, "com.example.mac").is_err());
     }
 
     #[test]
