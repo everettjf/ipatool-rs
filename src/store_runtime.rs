@@ -1280,12 +1280,7 @@ impl StoreRuntime {
             StoreValue::Bytes(body) => body.clone(),
             _ => bail!("purchase encoder returned an invalid body"),
         };
-        let encoded: Value = plist::from_bytes(&body).context("invalid encoded purchase")?;
-        for key in ["price", "salableAdamId", "pricingParameters", "productType"] {
-            if encoded.get(key).map(json_scalar) != parameters.get(key).map(json_scalar) {
-                bail!("purchase encoder changed product or price");
-            }
-        }
+        validate_encoded_purchase(&body, parameters)?;
         Ok(request)
     }
 
@@ -1336,6 +1331,36 @@ fn json_scalar(value: &Value) -> String {
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| value.to_string())
+}
+
+fn validate_encoded_purchase(
+    body: &[u8],
+    parameters: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let encoded: plist::Value = plist::from_bytes(body).context("invalid encoded purchase")?;
+    let encoded = encoded
+        .as_dictionary()
+        .context("encoded purchase is not a dictionary")?;
+    for key in ["price", "salableAdamId", "pricingParameters", "productType"] {
+        let actual = encoded.get(key).and_then(plist_scalar);
+        if actual != parameters.get(key).map(json_scalar) {
+            bail!("purchase encoder changed product or price");
+        }
+    }
+    Ok(())
+}
+
+fn plist_scalar(value: &plist::Value) -> Option<String> {
+    match value {
+        plist::Value::String(value) => Some(value.clone()),
+        plist::Value::Boolean(value) => Some(value.to_string()),
+        plist::Value::Integer(value) => value
+            .as_signed()
+            .map(|value| value.to_string())
+            .or_else(|| value.as_unsigned().map(|value| value.to_string())),
+        plist::Value::Real(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 impl StoreState {
@@ -8838,6 +8863,20 @@ fn allowed_store_url(url: &url::Url, authenticated: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purchase_validation_accepts_unrelated_plist_data() {
+        let body = br#"<plist version="1.0"><dict><key>price</key><string>0</string><key>salableAdamId</key><string>1234</string><key>pricingParameters</key><string>STDQ</string><key>productType</key><string>C</string><key>opaque</key><data>AQID</data></dict></plist>"#;
+        let parameters = serde_json::json!({
+            "price": "0", "salableAdamId": "1234", "pricingParameters": "STDQ", "productType": "C"
+        });
+        let parameters = parameters.as_object().unwrap();
+        validate_encoded_purchase(body, parameters).unwrap();
+        let changed = serde_json::json!({
+            "price": "1", "salableAdamId": "1234", "pricingParameters": "STDQ", "productType": "C"
+        });
+        assert!(validate_encoded_purchase(body, changed.as_object().unwrap()).is_err());
+    }
 
     #[test]
     fn rejects_unpinned_store_image() {
