@@ -68,8 +68,8 @@ enum Format {
 )]
 struct Cli {
     /// Print the ipatool version.
-    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
-    _version: bool,
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version, required = false)]
+    _version: Option<bool>,
     #[arg(long, global = true, value_enum, default_value_t = Format::Text)]
     format: Format,
     #[arg(long, global = true)]
@@ -1011,17 +1011,30 @@ fn run() -> Result<()> {
                             && error.downcast_ref::<LicenseRequired>().is_some() =>
                     {
                         let purchase_backend = NativePurchaseBackend::open()?;
-                        match store_purchase::purchase(
-                            &purchase_backend,
-                            &account,
-                            &app,
-                            Some(platform),
-                        ) {
-                            Ok(()) => {}
-                            Err(error)
-                                if error.downcast_ref::<LicenseAlreadyExists>().is_some() => {}
-                            Err(error) => return Err(error),
-                        }
+                        acquire_download_license(
+                            &mut account,
+                            &mut refreshed,
+                            |account| {
+                                store_purchase::purchase(
+                                    &purchase_backend,
+                                    account,
+                                    &app,
+                                    Some(platform),
+                                )
+                            },
+                            |account| {
+                                let authentication_backend = NativeAuthenticationBackend::open()?;
+                                store_login::login(
+                                    &authentication_backend,
+                                    &account_store,
+                                    LoginInput {
+                                        email: account.email.clone(),
+                                        password: account.password.clone(),
+                                        auth_code: String::new(),
+                                    },
+                                )
+                            },
+                        )?;
                         purchased = true;
                     }
                     Err(error)
@@ -2479,9 +2492,66 @@ fn print_purchase_success(already_owned: bool, format: Format) -> Result<()> {
     Ok(())
 }
 
+fn acquire_download_license(
+    account: &mut Account,
+    refreshed: &mut bool,
+    mut purchase: impl FnMut(&Account) -> Result<()>,
+    mut refresh: impl FnMut(&Account) -> Result<Account>,
+) -> Result<()> {
+    loop {
+        match purchase(account) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.downcast_ref::<LicenseAlreadyExists>().is_some() => return Ok(()),
+            Err(error) if !*refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() => {
+                *account = refresh(account)?;
+                *refreshed = true;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_version_flag_does_not_make_other_commands_require_it() {
+        let version = Cli::try_parse_from(["ipatool", "-v"]).unwrap_err();
+        assert_eq!(version.kind(), clap::error::ErrorKind::DisplayVersion);
+        Cli::try_parse_from(["ipatool", "mcp"]).unwrap();
+    }
+
+    #[test]
+    fn automatic_download_purchase_retries_with_refreshed_account() {
+        let mut account = Account::default();
+        account.password_token = "expired-token".into();
+        let mut refreshed = false;
+        let mut purchase_tokens = Vec::new();
+        let mut refresh_count = 0;
+        acquire_download_license(
+            &mut account,
+            &mut refreshed,
+            |account| {
+                purchase_tokens.push(account.password_token.clone());
+                if account.password_token == "expired-token" {
+                    return Err(PasswordTokenExpired.into());
+                }
+                Ok(())
+            },
+            |account| {
+                assert_eq!(account.password_token, "expired-token");
+                refresh_count += 1;
+                let mut refreshed_account = Account::default();
+                refreshed_account.password_token = "refreshed-token".into();
+                Ok(refreshed_account)
+            },
+        )
+        .unwrap();
+        assert!(refreshed);
+        assert_eq!(refresh_count, 1);
+        assert_eq!(purchase_tokens, ["expired-token", "refreshed-token"]);
+    }
 
     #[test]
     fn catalog_defaults_to_account_storefront_and_honors_explicit_country() {
