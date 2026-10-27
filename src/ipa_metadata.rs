@@ -172,14 +172,17 @@ fn parse_release_date(value: &Value) -> Result<OffsetDateTime> {
             if let Ok(date) = OffsetDateTime::parse(text, &Rfc3339) {
                 return Ok(date.to_offset(time::UtcOffset::UTC));
             }
-            for layout in [
-                "[weekday repr:long], [month repr:long] [day padding:none], [year]",
-                "[year]-[month]-[day]",
-            ] {
-                let format = time::format_description::parse_borrowed::<2>(layout)?;
-                if let Ok(date) = Date::parse(text, &format) {
+            if let Some(named_date) = canonical_go_named_date(text) {
+                let format = time::format_description::parse_borrowed::<2>(
+                    "[weekday repr:long], [month repr:long] [day padding:none], [year]",
+                )?;
+                if let Ok(date) = Date::parse(&named_date, &format) {
                     return Ok(date.with_time(Time::MIDNIGHT).assume_utc());
                 }
+            }
+            let format = time::format_description::parse_borrowed::<2>("[year]-[month]-[day]")?;
+            if let Ok(date) = Date::parse(text, &format) {
+                return Ok(date.with_time(Time::MIDNIGHT).assume_utc());
             }
             bail!("invalid IPA release date")
         }
@@ -198,6 +201,43 @@ fn parse_release_date(value: &Value) -> Result<OffsetDateTime> {
         }
         _ => bail!("IPA release date has unsupported type"),
     }
+}
+
+fn canonical_go_named_date(text: &str) -> Option<String> {
+    const WEEKDAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let (weekday, rest) = text.split_once(',')?;
+    let rest = rest.strip_prefix(' ')?.trim_start_matches(' ');
+    let (month, rest) = rest.split_once(' ')?;
+    let rest = rest.trim_start_matches(' ');
+    let weekday = WEEKDAYS
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(weekday))?;
+    let month = MONTHS
+        .iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(month))?;
+    Some(format!("{weekday}, {month} {rest}"))
 }
 
 fn go_dos_time(dos_date: u16, dos_time: u16) -> Result<OffsetDateTime> {
@@ -638,6 +678,35 @@ mod tests {
                 .unwrap(),
             "1980-03-03T08:04:02Z"
         );
+    }
+
+    #[test]
+    fn parses_go_release_date_string_forms() {
+        for (input, expected) in [
+            ("Tuesday, January 2, 2006", "2006-01-02T00:00:00Z"),
+            ("MONDAY, JANUARY 2, 2006", "2006-01-02T00:00:00Z"),
+            ("Monday,  January  2, 2006", "2006-01-02T00:00:00Z"),
+            ("Monday, January 02, 2006", "2006-01-02T00:00:00Z"),
+            (
+                "2025-01-02T03:04:05.1234567890Z",
+                "2025-01-02T03:04:05.123456789Z",
+            ),
+            ("2025-01-02T03:04:05+15:00", "2025-01-01T12:04:05Z"),
+        ] {
+            let parsed = parse_release_date(&Value::String(input.into()))
+                .unwrap_or_else(|error| panic!("{input}: {error:#}"));
+            assert_eq!(parsed.format(&Rfc3339).unwrap(), expected);
+        }
+
+        let info = br#"<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>1.0</string><key>releaseDate</key><string>MONDAY, JANUARY 2, 2006</string></dict></plist>"#;
+        let metadata = read_version_metadata_with_sender(
+            "https://example.test/app.ipa",
+            fixture_sender(Arc::new(fixture_ipa(info)), Arc::new(AtomicUsize::new(0))),
+        )
+        .unwrap();
+        assert_eq!(metadata.release_date, "2006-01-02T00:00:00Z");
+        assert!(parse_release_date(&Value::String("Monday,January 2, 2006".into())).is_err());
+        assert!(parse_release_date(&Value::String("Mon, January 2, 2006".into())).is_err());
     }
 
     #[test]
