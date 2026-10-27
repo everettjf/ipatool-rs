@@ -734,7 +734,7 @@ impl StoreRuntime {
             parameters = Some(built);
             task
         } else {
-            self.new_object("NSObject", StoreValue::Empty)?
+            self.new_object("IPAToolStoreDelegate", StoreValue::Empty)?
         };
         self.invoke(session, "setDelegate:", &[delegate])?;
 
@@ -1512,6 +1512,15 @@ fn responds_to(profile: &ProfileData, state: &StoreState, receiver: u64, selecto
         return false;
     };
     if method_address(profile, class_name, selector, meta.is_some()).is_some() {
+        return true;
+    }
+    if class_name == "IPAToolStoreDelegate"
+        && matches!(
+            selector,
+            "AMSURLSession:task:handleAuthenticateRequest:completion:"
+                | "AMSURLSession:task:handleDialogRequest:completion:"
+        )
+    {
         return true;
     }
     if meta.is_some() {
@@ -6255,6 +6264,59 @@ fn dispatch_message(
             .class
             .clone()
     };
+    if class_name == "AMSConcurrency" && selector == "logFaultFromSwiftConcurrencyOnInternalBuild" {
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if !class_method && class_name == "IPAToolStoreDelegate" {
+        let code = match selector {
+            "AMSURLSession:task:handleAuthenticateRequest:completion:" => Some(1),
+            "AMSURLSession:task:handleDialogRequest:completion:" => Some(2),
+            _ => None,
+        };
+        if let Some(code) = code {
+            let completion = context.reg_read(REG_X0 + 5)?;
+            let domain = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String("IPAToolStoreInteraction".into()),
+            )?;
+            let code = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSNumber",
+                StoreValue::Number(code),
+            )?;
+            let user_info = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSDictionary",
+                StoreValue::Entries(HashMap::new()),
+            )?;
+            let error = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSError",
+                StoreValue::Entries(HashMap::from([
+                    ("domain".into(), domain),
+                    ("code".into(), code),
+                    ("userInfo".into(), user_info),
+                ])),
+            )?;
+            return begin_callback(
+                context,
+                state,
+                read_guest_u64(context, completion + 16)?,
+                &[completion, 0, error],
+                CallbackAction::ReturnZero,
+            );
+        }
+    }
     if !class_method
         && selector == "copy"
         && let Some(entry) = method_address(profile, &class_name, "copyWithZone:", false)
@@ -6379,6 +6441,10 @@ fn dispatch_message(
         return Ok(());
     }
     if !class_method && matches!(class_name.as_str(), "ACAccountStore" | "ACDAccountStore") {
+        if selector == "accountWithIdentifier:" {
+            context.reg_write(REG_X0, 0)?;
+            return Ok(());
+        }
         if matches!(
             selector,
             "accounts"
@@ -6512,6 +6578,41 @@ fn dispatch_message(
             StoreValue::String(value),
         )?;
         context.reg_write(REG_X0, string)?;
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "NSURL"
+        && matches!(
+            selector,
+            "URLByAppendingPathComponent:" | "URLByAppendingPathComponent:isDirectory:"
+        )
+    {
+        let mut base = url::Url::parse(object_string_value(state, receiver)?)?;
+        let component = object_string_value(state, context.reg_read(REG_X0 + 2)?)?;
+        base.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("Store URL cannot have path segments"))?
+            .pop_if_empty()
+            .extend(component.split('/').filter(|segment| !segment.is_empty()));
+        let address = new_guest_object(
+            context,
+            profile,
+            state,
+            "NSURL",
+            StoreValue::String(base.into()),
+        )?;
+        context.reg_write(REG_X0, address)?;
+        return Ok(());
+    }
+    if !class_method && class_name == "NSURL" && selector == "fileSystemRepresentation" {
+        let url = url::Url::parse(object_string_value(state, receiver)?)?;
+        let mut bytes = percent_encoding::percent_decode_str(url.path())
+            .decode_utf8()?
+            .as_bytes()
+            .to_vec();
+        bytes.push(0);
+        let address = state.allocate(bytes.len() as u64)?;
+        context.mem_write(address, &bytes)?;
+        context.reg_write(REG_X0, address)?;
         return Ok(());
     }
     if !class_method
@@ -6678,6 +6779,32 @@ fn dispatch_message(
     }
     if !class_method
         && class_name == "NSURLComponents"
+        && matches!(selector, "query" | "percentEncodedQuery")
+    {
+        let url = url::Url::parse(object_string_value(state, receiver)?)?;
+        let value = if let Some(raw) = url.query() {
+            let value = if selector == "query" {
+                percent_encoding::percent_decode_str(raw)
+                    .decode_utf8()?
+                    .into_owned()
+            } else {
+                raw.to_owned()
+            };
+            new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(value),
+            )?
+        } else {
+            0
+        };
+        context.reg_write(REG_X0, value)?;
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "NSURLComponents"
         && matches!(selector, "setQueryItems:" | "setPercentEncodedQueryItems:")
     {
         let array = context.reg_read(REG_X0 + 2)?;
@@ -6749,6 +6876,86 @@ fn dispatch_message(
             .value = StoreValue::String(url.into());
         context.reg_write(REG_X0, 0)?;
         return Ok(());
+    }
+    if !class_method && class_name == "NSHTTPCookie" {
+        if selector == "initWithProperties:" {
+            let fields = context.reg_read(REG_X0 + 2)?;
+            let StoreValue::Entries(entries) = &state
+                .objects
+                .get(&fields)
+                .context("unknown cookie properties")?
+                .value
+            else {
+                bail!("cookie properties are not a dictionary");
+            };
+            let entries = entries.clone();
+            let mut properties = HashMap::from([("properties".into(), fields)]);
+            for (field, property) in [
+                ("Name", "name"),
+                ("Value", "value"),
+                ("Domain", "domain"),
+                ("Path", "path"),
+                ("Expires", "expiresDate"),
+            ] {
+                if let Some(&value) = entries.get(field) {
+                    properties.insert(property.into(), value);
+                }
+            }
+            for (field, property) in [("Secure", "isSecure"), ("HttpOnly", "isHTTPOnly")] {
+                let truthy = entries.get(field).copied().is_some_and(|value| {
+                    state
+                        .objects
+                        .get(&value)
+                        .is_some_and(|object| match &object.value {
+                            StoreValue::String(text) => text.eq_ignore_ascii_case("TRUE"),
+                            StoreValue::Boolean(value) => *value,
+                            StoreValue::Number(value) => *value != 0,
+                            _ => false,
+                        })
+                });
+                properties.insert(property.into(), u64::from(truthy));
+            }
+            state
+                .objects
+                .get_mut(&receiver)
+                .expect("known cookie")
+                .properties = properties;
+            context.reg_write(REG_X0, receiver)?;
+            return Ok(());
+        }
+        if matches!(
+            selector,
+            "properties"
+                | "name"
+                | "value"
+                | "domain"
+                | "path"
+                | "expiresDate"
+                | "isSecure"
+                | "isHTTPOnly"
+        ) {
+            let value = state.objects[&receiver]
+                .properties
+                .get(selector)
+                .copied()
+                .unwrap_or(0);
+            context.reg_write(REG_X0, value)?;
+            return Ok(());
+        }
+        if selector == "isSessionOnly" {
+            let session_only = state.objects[&receiver]
+                .properties
+                .get("expiresDate")
+                .copied()
+                .unwrap_or(0)
+                == 0;
+            context.reg_write(REG_X0, u64::from(session_only))?;
+            return Ok(());
+        }
+        if selector == "version" {
+            context.reg_write(REG_X0, 0)?;
+            return Ok(());
+        }
     }
     if !class_method && class_name == "NSBundle" && selector == "objectForInfoDictionaryKey:" {
         let key = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
@@ -7249,6 +7456,44 @@ fn dispatch_message(
         && (class_is_kind_of(profile, &class_name, "ACAccount")
             || matches!(class_name.as_str(), "ACAccountType" | "ACAccountCredential"))
     {
+        if matches!(
+            selector,
+            "accountPropertyForKey:" | "setAccountProperty:forKey:"
+        ) {
+            let properties = state.objects[&receiver]
+                .properties
+                .get("accountProperties")
+                .copied()
+                .context("Store account has no properties dictionary")?;
+            let key_register = if selector == "accountPropertyForKey:" {
+                2
+            } else {
+                3
+            };
+            let key =
+                object_string_value(state, context.reg_read(REG_X0 + key_register)?)?.to_owned();
+            let StoreValue::Entries(entries) = &mut state
+                .objects
+                .get_mut(&properties)
+                .context("unknown Store account properties")?
+                .value
+            else {
+                bail!("Store account properties are not a dictionary");
+            };
+            let value = if selector == "accountPropertyForKey:" {
+                entries.get(&key).copied().unwrap_or(0)
+            } else {
+                let value = context.reg_read(REG_X0 + 2)?;
+                if value == 0 {
+                    entries.remove(&key);
+                } else {
+                    entries.insert(key, value);
+                }
+                0
+            };
+            context.reg_write(REG_X0, value)?;
+            return Ok(());
+        }
         if let Some(key) = setter_property_key(selector) {
             let value = context.reg_read(REG_X0 + 2)?;
             state
@@ -7613,6 +7858,50 @@ fn dispatch_message(
         }
     }
     match (class_method, selector) {
+        (true, "componentsWithURL:resolvingAgainstBaseURL:") if class_name == "NSURLComponents" => {
+            let source = context.reg_read(REG_X0 + 2)?;
+            let value = object_string_value(state, source)?.to_owned();
+            url::Url::parse(&value)?;
+            let components = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSURLComponents",
+                StoreValue::String(value),
+            )?;
+            context.reg_write(REG_X0, components)?;
+        }
+        (true, "queryItemWithName:value:") if class_name == "NSURLQueryItem" => {
+            let item =
+                new_guest_object(context, profile, state, "NSURLQueryItem", StoreValue::Empty)?;
+            state
+                .objects
+                .get_mut(&item)
+                .expect("new query item")
+                .properties
+                .extend([
+                    ("name".into(), context.reg_read(REG_X0 + 2)?),
+                    ("value".into(), context.reg_read(REG_X0 + 3)?),
+                ]);
+            context.reg_write(REG_X0, item)?;
+        }
+        (true, "cookieWithProperties:") if class_name == "NSHTTPCookie" => {
+            let fields = context.reg_read(REG_X0 + 2)?;
+            let cookie =
+                new_guest_object(context, profile, state, "NSHTTPCookie", StoreValue::Empty)?;
+            // The instance initializer keeps the same property normalization for both constructors.
+            context.reg_write(REG_X0, cookie)?;
+            context.reg_write(REG_X0 + 1, selector_address)?;
+            context.reg_write(REG_X0 + 2, fields)?;
+            return dispatch_message(
+                context,
+                profile,
+                state,
+                "initWithProperties:",
+                selector_address,
+                true,
+            );
+        }
         (true, "currentLocale" | "systemLocale") if class_name == "NSLocale" => {
             let locale = new_guest_object(
                 context,
@@ -8334,6 +8623,47 @@ fn dispatch_message(
                     "NSString",
                     StoreValue::String(cookie.path().unwrap_or("/").into()),
                 )?;
+                let mut fields = HashMap::from([
+                    ("Name".into(), name),
+                    ("Value".into(), value),
+                    ("Domain".into(), domain),
+                    ("Path".into(), path),
+                ]);
+                let expires = if let Some(expires) = cookie.expires_datetime() {
+                    let date = new_guest_object(
+                        context,
+                        profile,
+                        state,
+                        "NSDate",
+                        StoreValue::Float(expires.unix_timestamp() as f64),
+                    )?;
+                    fields.insert("Expires".into(), date);
+                    date
+                } else {
+                    0
+                };
+                for (enabled, key) in [
+                    (cookie.secure().unwrap_or(false), "Secure"),
+                    (cookie.http_only().unwrap_or(false), "HttpOnly"),
+                ] {
+                    if enabled {
+                        let yes = new_guest_object(
+                            context,
+                            profile,
+                            state,
+                            "NSString",
+                            StoreValue::String("TRUE".into()),
+                        )?;
+                        fields.insert(key.into(), yes);
+                    }
+                }
+                let property_dictionary = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSDictionary",
+                    StoreValue::Entries(fields),
+                )?;
                 let object =
                     new_guest_object(context, profile, state, "NSHTTPCookie", StoreValue::Empty)?;
                 state
@@ -8346,6 +8676,8 @@ fn dispatch_message(
                         ("value".into(), value),
                         ("domain".into(), domain),
                         ("path".into(), path),
+                        ("properties".into(), property_dictionary),
+                        ("expiresDate".into(), expires),
                         (
                             "isSecure".into(),
                             u64::from(cookie.secure().unwrap_or(false)),
@@ -11591,6 +11923,243 @@ mod tests {
         };
         assert!(state.objects.contains_key(&entries["custom"]));
         assert!(state.objects.contains_key(&entries["second"]));
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_interactive_delegate_declines_native_dialogs() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let delegate = runtime
+            .new_object("IPAToolStoreDelegate", StoreValue::Empty)
+            .unwrap();
+        let callback = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.symbol == "objc_retain")
+            .unwrap()
+            .address;
+        let completion = runtime.allocate(32).unwrap();
+        runtime.write_u64(completion + 16, callback).unwrap();
+        for selector in [
+            "AMSURLSession:task:handleAuthenticateRequest:completion:",
+            "AMSURLSession:task:handleDialogRequest:completion:",
+        ] {
+            assert!(responds_to(
+                &runtime.profile,
+                &runtime.state.borrow(),
+                delegate,
+                selector
+            ));
+            assert_eq!(
+                runtime
+                    .invoke(delegate, selector, &[0, 0, 0, completion])
+                    .unwrap(),
+                0
+            );
+        }
+        let state = runtime.state.borrow();
+        let mut codes = state
+            .objects
+            .values()
+            .filter_map(|object| {
+                let StoreValue::Entries(fields) = &object.value else {
+                    return None;
+                };
+                if object.class != "NSError"
+                    || object_string_value(&state, *fields.get("domain")?).ok()?
+                        != "IPAToolStoreInteraction"
+                {
+                    return None;
+                }
+                let StoreValue::Number(code) = &state.objects.get(fields.get("code")?)?.value
+                else {
+                    return None;
+                };
+                Some(*code)
+            })
+            .collect::<Vec<_>>();
+        codes.sort();
+        assert_eq!(codes, vec![1, 2]);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_account_url_and_cookie_helpers() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let components_class = runtime.profile.index.classes
+            [runtime.profile.runtime.classes_by_name["NSURLComponents"]]
+            .address;
+        let cookie_class =
+            runtime.profile.index.classes[runtime.profile.runtime.classes_by_name["NSHTTPCookie"]]
+                .address;
+        let account_store = runtime
+            .new_object("ACAccountStore", StoreValue::Empty)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .invoke(account_store, "accountWithIdentifier:", &[0])
+                .unwrap(),
+            0
+        );
+        let account = runtime.new_object("ACAccount", StoreValue::Empty).unwrap();
+        let account_type = runtime
+            .new_object("ACAccountType", StoreValue::Empty)
+            .unwrap();
+        runtime
+            .invoke(account, "initWithAccountType:", &[account_type])
+            .unwrap();
+        let key = runtime
+            .new_object("NSString", StoreValue::String("test".into()))
+            .unwrap();
+        let value = runtime
+            .new_object("NSString", StoreValue::String("value".into()))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .invoke(account, "setAccountProperty:forKey:", &[value, key])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            runtime
+                .invoke(account, "accountPropertyForKey:", &[key])
+                .unwrap(),
+            value
+        );
+        runtime
+            .invoke(account, "setAccountProperty:forKey:", &[0, key])
+            .unwrap();
+        assert_eq!(
+            runtime
+                .invoke(account, "accountPropertyForKey:", &[key])
+                .unwrap(),
+            0
+        );
+
+        let url = runtime
+            .new_object("NSURL", StoreValue::String("file:///tmp/base".into()))
+            .unwrap();
+        let component = runtime
+            .new_object("NSString", StoreValue::String("next".into()))
+            .unwrap();
+        let appended = runtime
+            .invoke(url, "URLByAppendingPathComponent:", &[component])
+            .unwrap();
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), appended).unwrap(),
+            "file:///tmp/base/next"
+        );
+        let nested = runtime
+            .new_object("NSString", StoreValue::String("nested/file".into()))
+            .unwrap();
+        let nested_url = runtime
+            .invoke(url, "URLByAppendingPathComponent:", &[nested])
+            .unwrap();
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), nested_url).unwrap(),
+            "file:///tmp/base/nested/file"
+        );
+        let path = runtime
+            .invoke(appended, "fileSystemRepresentation", &[])
+            .unwrap();
+        assert_eq!(
+            runtime.engine.mem_read(path, 15).unwrap(),
+            b"/tmp/base/next\0"
+        );
+
+        let url = runtime
+            .new_object(
+                "NSURL",
+                StoreValue::String("https://example.com/?a=%2F".into()),
+            )
+            .unwrap();
+        let components = runtime
+            .invoke(
+                components_class,
+                "componentsWithURL:resolvingAgainstBaseURL:",
+                &[url, 0],
+            )
+            .unwrap();
+        let query = runtime.invoke(components, "query", &[]).unwrap();
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), query).unwrap(),
+            "a=/"
+        );
+        let encoded = runtime
+            .invoke(components, "percentEncodedQuery", &[])
+            .unwrap();
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), encoded).unwrap(),
+            "a=%2F"
+        );
+
+        let name = runtime
+            .new_object("NSString", StoreValue::String("session".into()))
+            .unwrap();
+        let fields = runtime
+            .new_object(
+                "NSDictionary",
+                StoreValue::Entries(HashMap::from([
+                    ("Name".into(), name),
+                    ("Value".into(), value),
+                ])),
+            )
+            .unwrap();
+        let cookie = runtime
+            .invoke(cookie_class, "cookieWithProperties:", &[fields])
+            .unwrap();
+        assert_eq!(runtime.invoke(cookie, "name", &[]).unwrap(), name);
+        assert_eq!(runtime.invoke(cookie, "isSessionOnly", &[]).unwrap(), 1);
+        assert_eq!(runtime.invoke(cookie, "properties", &[]).unwrap(), fields);
+        let header = runtime
+            .new_object(
+                "NSString",
+                StoreValue::String(
+                    "token=abc; Path=/; Expires=Wed, 21 Oct 2037 07:28:00 GMT".into(),
+                ),
+            )
+            .unwrap();
+        let headers = runtime
+            .new_object(
+                "NSDictionary",
+                StoreValue::Entries(HashMap::from([("Set-Cookie".into(), header)])),
+            )
+            .unwrap();
+        let response_cookies = runtime
+            .invoke(
+                cookie_class,
+                "cookiesWithResponseHeaderFields:forURL:",
+                &[headers, url],
+            )
+            .unwrap();
+        let response_cookie = match &runtime.state.borrow().objects[&response_cookies].value {
+            StoreValue::Addresses(items) => items[0],
+            _ => panic!("response cookies are not an array"),
+        };
+        assert_eq!(
+            runtime
+                .invoke(response_cookie, "isSessionOnly", &[])
+                .unwrap(),
+            0
+        );
+        assert_ne!(
+            runtime.invoke(response_cookie, "expiresDate", &[]).unwrap(),
+            0
+        );
+        let response_properties = runtime.invoke(response_cookie, "properties", &[]).unwrap();
+        let state = runtime.state.borrow();
+        let StoreValue::Entries(entries) = &state.objects[&response_properties].value else {
+            panic!("response cookie has no property dictionary");
+        };
+        assert_eq!(
+            object_string_value(&state, entries["Name"]).unwrap(),
+            "token"
+        );
+        assert!(entries.contains_key("Expires"));
     }
 
     #[test]

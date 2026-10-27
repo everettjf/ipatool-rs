@@ -1740,6 +1740,7 @@ dependencies = [
  "md-5",
  "num-bigint",
  "p256 0.13.2",
+ "percent-encoding",
  "plist",
  "psl",
  "regex",
