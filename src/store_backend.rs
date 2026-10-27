@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
 
-use crate::auth::{SapConfig, sap_config_from_bag_value};
+use crate::auth::{SapConfig, sap_config_from_bag_plist};
 use crate::host::hardware_mac_address;
 use crate::sap_assets::SapAssetBundle;
 use crate::state::prepare_state_directory_from_environment;
@@ -28,7 +28,7 @@ pub struct StoreBackend {
     image: Arc<[u8]>,
     hardware_id: [u8; 6],
     sender: Arc<StoreSender>,
-    bag: Mutex<Option<Value>>,
+    bag: Mutex<Option<plist::Value>>,
 }
 
 pub struct StoreBackendRequest<'a> {
@@ -84,7 +84,7 @@ impl StoreBackend {
         self.hardware_id
     }
 
-    pub fn bag(&self) -> Result<Value> {
+    pub fn bag(&self) -> Result<plist::Value> {
         if let Some(bag) = self.bag.lock().expect("Store bag lock poisoned").clone() {
             return Ok(bag);
         }
@@ -120,13 +120,12 @@ impl StoreBackend {
         if raw.as_dictionary().is_none() {
             bail!("Store URL bag is not a dictionary");
         }
-        let bag = serde_json::to_value(&raw).context("convert Store URL bag for guest")?;
-        *self.bag.lock().expect("Store bag lock poisoned") = Some(bag.clone());
-        Ok(bag)
+        *self.bag.lock().expect("Store bag lock poisoned") = Some(raw.clone());
+        Ok(raw)
     }
 
     pub fn sap_config(&self) -> Result<SapConfig> {
-        sap_config_from_bag_value(&self.bag()?)
+        sap_config_from_bag_plist(&self.bag()?)
     }
 
     pub fn execute_standard(&self, input: StoreBackendRequest<'_>) -> Result<HostResponse> {
@@ -160,7 +159,7 @@ impl StoreBackend {
     fn run(
         &self,
         input: StoreBackendRequest<'_>,
-        bag: Option<&Value>,
+        bag: Option<&plist::Value>,
         operation: Operation,
         signer: Option<&mut StoreSigner<'_>>,
     ) -> Result<HostResponse> {
@@ -269,7 +268,13 @@ mod tests {
             .unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!(backend.bag().is_ok());
+        let bag = backend.bag().unwrap();
+        let bag = bag.as_dictionary().unwrap();
+        assert_eq!(
+            bag["unrelatedCertificate"].as_data(),
+            Some([1, 2, 3].as_slice())
+        );
+        assert!(matches!(bag["unrelatedDate"], plist::Value::Date(_)));
         assert_eq!(backend.sap_config().unwrap().version, 200);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }

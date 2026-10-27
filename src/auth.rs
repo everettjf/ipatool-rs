@@ -193,6 +193,11 @@ pub fn sap_config_from_bag_value(value: &Value) -> Result<SapConfig> {
     config_from_bag(parsed)
 }
 
+pub(crate) fn sap_config_from_bag_plist(value: &plist::Value) -> Result<SapConfig> {
+    let parsed: BagResponse = plist::from_value(value).context("invalid Store URL bag")?;
+    config_from_bag(parsed)
+}
+
 fn config_from_bag(parsed: BagResponse) -> Result<SapConfig> {
     // Apple may omit the legacy Store and SAP keys from an otherwise valid
     // bag. Use the independently validated endpoints only for absent keys.

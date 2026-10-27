@@ -56,7 +56,7 @@ pub struct StoreStandardRequest<'a> {
     pub headers: &'a HeaderMap,
     pub parameters: Option<&'a Value>,
     pub body: Option<&'a [u8]>,
-    pub bag: Option<&'a Value>,
+    pub bag: Option<&'a plist::Value>,
     pub hardware_id: &'a [u8],
     pub raw: bool,
     pub response_format: &'a str,
@@ -609,17 +609,22 @@ impl StoreRuntime {
         };
         let mut bag_values = input.bag.cloned();
         if operation == StoreOperation::Purchase
-            && let Some(values) = bag_values.as_mut().and_then(Value::as_object_mut)
+            && let Some(values) = bag_values
+                .as_mut()
+                .and_then(plist::Value::as_dictionary_mut)
         {
-            let endpoint = Value::String(input.url.into());
+            let endpoint = plist::Value::String(input.url.into());
             values.insert("buyProduct".into(), endpoint.clone());
-            if let Some(nested) = values.get_mut("urlBag").and_then(Value::as_object_mut) {
+            if let Some(nested) = values
+                .get_mut("urlBag")
+                .and_then(plist::Value::as_dictionary_mut)
+            {
                 nested.insert("buyProduct".into(), endpoint);
             }
         }
         let bag = bag_values
             .as_ref()
-            .map(|value| self.frozen_bag_from_values(value))
+            .map(|value| self.frozen_bag_from_plist(value))
             .transpose()?
             .unwrap_or(0);
         let session = self.new_session()?;
@@ -735,14 +740,16 @@ impl StoreRuntime {
         }
         let object = self.invoke(result, "object", &[])?;
         if object != 0 {
-            let value = self.export(object)?;
             let json = input.response_format == "json"
                 || response
                     .header("content-type")
                     .is_some_and(|content_type| content_type.to_ascii_lowercase().contains("json"));
             let body = if json {
+                let value = self.export(object)?;
                 serde_json::to_vec(&value).context("encode decoded Store JSON")?
             } else {
+                let value =
+                    export_plist_object(&self.state.borrow(), object, &mut HashSet::new(), 0)?;
                 let mut bytes = Vec::new();
                 plist::to_writer_xml(&mut bytes, &value)
                     .context("encode decoded Store property list")?;
@@ -795,14 +802,29 @@ impl StoreRuntime {
     /// Build the same short-lived frozen Store bag as the Go backend. A nested
     /// `urlBag` overrides its parent entries, matching the input bag response.
     pub fn frozen_bag_from_values(&mut self, values: &Value) -> Result<u64> {
+        let values = plist::to_value(values).context("convert Store bag to property list")?;
+        self.frozen_bag_from_plist(&values)
+    }
+
+    pub fn frozen_bag_from_plist(&mut self, values: &plist::Value) -> Result<u64> {
         let source = values
-            .as_object()
-            .context("Store bag must be a JSON object")?;
+            .as_dictionary()
+            .context("Store bag must be a property list dictionary")?;
         let mut flattened = source.clone();
-        if let Some(nested) = source.get("urlBag").and_then(Value::as_object) {
+        if let Some(nested) = source.get("urlBag").and_then(plist::Value::as_dictionary) {
             flattened.extend(nested.clone());
         }
-        let data = self.import_json(&Value::Object(flattened))?;
+        let mut bytes = Vec::new();
+        plist::to_writer_binary(&mut bytes, &plist::Value::Dictionary(flattened))?;
+        let bytes = self.new_object("NSData", StoreValue::Bytes(bytes))?;
+        let serializer = self
+            .class_address("NSPropertyListSerialization")
+            .context("Store profile is missing NSPropertyListSerialization")?;
+        let data = self.invoke(
+            serializer,
+            "propertyListWithData:options:format:error:",
+            &[bytes, 0, 0, 0],
+        )?;
         let profile = self.new_object("NSString", StoreValue::String("AMSPurchase".into()))?;
         let version = self.new_object("NSString", StoreValue::String("1".into()))?;
         let expiration = self.new_object(
@@ -8567,6 +8589,58 @@ fn export_object(
     Ok(result)
 }
 
+fn export_plist_object(
+    state: &StoreState,
+    address: u64,
+    active: &mut HashSet<u64>,
+    depth: usize,
+) -> Result<plist::Value> {
+    if address == 0 || depth > 32 || !active.insert(address) {
+        bail!("null, cyclic, or excessively nested Store property list value");
+    }
+    let object = state
+        .objects
+        .get(&address)
+        .with_context(|| format!("unknown exported Store object {address:#x}"))?;
+    let result = match &object.value {
+        StoreValue::Empty => bail!("empty Store property list value"),
+        StoreValue::String(value) => plist::Value::String(value.clone()),
+        StoreValue::Number(value) => plist::Value::Integer((*value).into()),
+        StoreValue::Float(value) if object.class == "NSDate" => {
+            if !value.is_finite() || value.abs() > 253_402_300_799.0 {
+                bail!("Store date is out of range");
+            }
+            let time = if *value >= 0.0 {
+                std::time::UNIX_EPOCH + Duration::from_secs_f64(*value)
+            } else {
+                std::time::UNIX_EPOCH - Duration::from_secs_f64(-*value)
+            };
+            plist::Value::Date(time.into())
+        }
+        StoreValue::Float(value) => plist::Value::Real(*value),
+        StoreValue::Boolean(value) => plist::Value::Boolean(*value),
+        StoreValue::Bytes(value) => plist::Value::Data(value.clone()),
+        StoreValue::Addresses(values) => plist::Value::Array(
+            values
+                .iter()
+                .map(|&address| export_plist_object(state, address, active, depth + 1))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        StoreValue::Entries(values) => {
+            let mut result = plist::Dictionary::new();
+            for (key, &address) in values {
+                result.insert(
+                    key.clone(),
+                    export_plist_object(state, address, active, depth + 1)?,
+                );
+            }
+            plist::Value::Dictionary(result)
+        }
+    };
+    active.remove(&address);
+    Ok(result)
+}
+
 fn foundation_equal(state: &StoreState, first: u64, second: u64, depth: usize) -> bool {
     if first == second {
         return true;
@@ -9176,6 +9250,26 @@ mod tests {
     }
 
     #[test]
+    fn frozen_bag_keeps_binary_data_and_date_objects() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let bag: plist::Value = plist::from_bytes(
+            br#"<plist version="1.0"><dict><key>unrelatedCertificate</key><data>AQID</data><key>unrelatedDate</key><date>2024-05-01T00:00:00Z</date></dict></plist>"#,
+        )
+        .unwrap();
+        runtime.frozen_bag_from_plist(&bag).unwrap();
+        let state = runtime.state.borrow();
+        assert!(state.objects.values().any(|object| {
+            object.class == "NSData"
+                && matches!(&object.value, StoreValue::Bytes(bytes) if bytes == &[1, 2, 3])
+        }));
+        assert!(state.objects.values().any(|object| {
+            object.class == "NSDate"
+                && matches!(object.value, StoreValue::Float(seconds) if seconds == 1_714_521_600.0)
+        }));
+    }
+
+    #[test]
     fn executes_free_purchase_with_pinned_apple_code() {
         let assets = SapAssetBundle::load_cached().unwrap();
         let mut runtime = StoreRuntime::open(&assets).unwrap();
@@ -9206,7 +9300,10 @@ mod tests {
             "appleId": "test@example.com",
             "password": "test"
         });
-        let bag = serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/stale"});
+        let bag = plist::to_value(
+            &serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/stale"}),
+        )
+        .unwrap();
         let response = runtime
             .execute_purchase(StoreStandardRequest {
                 method: "POST",
@@ -9255,7 +9352,10 @@ mod tests {
             "appleId": "test@example.com",
             "password": "test"
         });
-        let bag = serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/request"});
+        let bag = plist::to_value(
+            &serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/request"}),
+        )
+        .unwrap();
         let response = runtime
             .execute_purchase(StoreStandardRequest {
                 method: "POST",
@@ -9304,7 +9404,10 @@ mod tests {
             "attempt": 2,
             "why": "signin"
         });
-        let bag = serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/request"});
+        let bag = plist::to_value(
+            &serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/request"}),
+        )
+        .unwrap();
         let mut signer = |body: &[u8]| {
             assert!(!body.is_empty());
             Ok(vec![1, 2, 3])
