@@ -359,16 +359,25 @@ fn local_timezone(now: OffsetDateTime) -> (String, i64) {
         let mut local: libc::tm = unsafe { std::mem::zeroed() };
         // SAFETY: timestamp and local are valid pointers for this call.
         if !unsafe { libc::localtime_r(&timestamp, &mut local) }.is_null() {
-            let timezone = std::env::var("TZ").unwrap_or_else(|_| "Local".into());
+            let timezone = timezone_label();
             return (timezone, local.tm_gmtoff / 60);
         }
     }
     #[cfg(windows)]
     if let Ok(offset) = time::UtcOffset::local_offset_at(now) {
-        let timezone = std::env::var("TZ").unwrap_or_else(|_| "Local".into());
+        let timezone = timezone_label();
         return (timezone, i64::from(offset.whole_seconds()) / 60);
     }
     ("UTC".into(), 0)
+}
+
+fn timezone_label() -> String {
+    match std::env::var("TZ") {
+        // Go's time.Local also resolves an explicitly empty TZ to UTC.
+        Ok(value) if value.is_empty() => "UTC".into(),
+        Ok(value) => value,
+        Err(_) => "Local".into(),
+    }
 }
 
 fn items_body(session: u32, revision: u32, now: OffsetDateTime) -> Result<Vec<u8>> {
