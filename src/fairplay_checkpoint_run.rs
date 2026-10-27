@@ -1479,6 +1479,29 @@ impl CheckpointRunner {
         })
     }
 
+    pub(crate) fn replay_allocation_cursor(&self) -> u64 {
+        self.allocation_state.borrow().next
+    }
+
+    pub(crate) fn replay_new_pages(&self) -> BTreeSet<u64> {
+        self.allocation_state.borrow().new_pages.clone()
+    }
+
+    pub(crate) fn reset_replay_allocations(&mut self, original_next: u64) -> Result<()> {
+        let pages = self.replay_new_pages();
+        for &page in &pages {
+            self.engine.mem_unmap(page, PAGE_BYTES as usize)?;
+        }
+        let mut state = self.allocation_state.borrow_mut();
+        for page in pages {
+            state.mapped_pages.remove(&page);
+        }
+        state.new_pages.clear();
+        state.next = original_next;
+        self.external_failure.borrow_mut().take();
+        Ok(())
+    }
+
     pub fn add_file_payload(&mut self, suffix: &str, data: Zeroizing<Vec<u8>>) -> Result<()> {
         if suffix.is_empty() || suffix.len() > 4096 || data.len() > MAX_VIRTUAL_FILE_BYTES {
             bail!("FairPlay virtual file suffix or payload exceeds limit");

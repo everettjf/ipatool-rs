@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::{self, IsTerminal, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -19,6 +19,7 @@ use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2
 use ipatool_rs::fairplay_enrollment_v3::{V3Material, build_fpsenr3};
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
 use ipatool_rs::fairplay_key::CurrentSinfModel;
+use ipatool_rs::fairplay_oracle_domains::learn_26b118_domains;
 use ipatool_rs::fairplay_oracle_export::export_checked_model;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
@@ -295,6 +296,19 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Learn all 26B118 indexed-fault domains by replaying a private checkpoint.
+    LearnIndexDomains {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long)]
+        fairplayd: PathBuf,
+        #[arg(long, default_value_t = 20_000)]
+        max_inputs: usize,
+        #[arg(long, default_value_t = 2)]
+        timeout_seconds: u64,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Transform a private 192/224-byte source with the embedded 26A428 state model.
     EvaluateState {
         #[arg(long)]
@@ -494,6 +508,23 @@ fn main() {
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }
+}
+
+fn read_fairplayd_binary(path: &Path) -> Result<Vec<u8>> {
+    const MAX_FAIRPLAYD_BYTES: u64 = 256 * 1024 * 1024;
+    let file = File::open(path).with_context(|| format!("open fairplayd {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_FAIRPLAYD_BYTES {
+        bail!("fairplayd has invalid file type or size");
+    }
+    let mut binary = Vec::new();
+    file.take(MAX_FAIRPLAYD_BYTES + 1)
+        .read_to_end(&mut binary)
+        .context("read fairplayd image")?;
+    if binary.len() as u64 > MAX_FAIRPLAYD_BYTES {
+        bail!("fairplayd exceeds size limit");
+    }
+    Ok(binary)
 }
 
 fn run() -> Result<()> {
@@ -1175,20 +1206,7 @@ fn run() -> Result<()> {
                 if read_range.is_some() && memory_trace_output.is_some() {
                     bail!("memory tracing currently requires --stop-address");
                 }
-                const MAX_FAIRPLAYD_BYTES: u64 = 256 * 1024 * 1024;
-                let file = File::open(&fairplayd)
-                    .with_context(|| format!("open fairplayd {}", fairplayd.display()))?;
-                let metadata = file.metadata()?;
-                if !metadata.file_type().is_file() || metadata.len() > MAX_FAIRPLAYD_BYTES {
-                    bail!("fairplayd has invalid file type or size");
-                }
-                let mut binary = Vec::new();
-                file.take(MAX_FAIRPLAYD_BYTES + 1)
-                    .read_to_end(&mut binary)
-                    .context("read fairplayd image")?;
-                if binary.len() as u64 > MAX_FAIRPLAYD_BYTES {
-                    bail!("fairplayd exceeds size limit");
-                }
+                let binary = read_fairplayd_binary(&fairplayd)?;
                 let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
                 let binary_sha256 = format!("{:x}", Sha256::digest(&binary));
                 let preserved_text = preserve_text_instructions
@@ -1338,20 +1356,7 @@ fn run() -> Result<()> {
                 index_domains,
                 output,
             } => {
-                const MAX_FAIRPLAYD_BYTES: u64 = 256 * 1024 * 1024;
-                let file = File::open(&fairplayd)
-                    .with_context(|| format!("open fairplayd {}", fairplayd.display()))?;
-                let metadata = file.metadata()?;
-                if !metadata.file_type().is_file() || metadata.len() > MAX_FAIRPLAYD_BYTES {
-                    bail!("fairplayd has invalid file type or size");
-                }
-                let mut binary = Vec::new();
-                file.take(MAX_FAIRPLAYD_BYTES + 1)
-                    .read_to_end(&mut binary)
-                    .context("read fairplayd image")?;
-                if binary.len() as u64 > MAX_FAIRPLAYD_BYTES {
-                    bail!("fairplayd exceeds size limit");
-                }
+                let binary = read_fairplayd_binary(&fairplayd)?;
                 let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
                 let model = export_checked_model(
                     &snapshot,
@@ -1374,6 +1379,43 @@ fn run() -> Result<()> {
                     Format::Text => println!(
                         "Exported private FairPlay oracle model with {} pages to {}",
                         model.pages,
+                        output.display()
+                    ),
+                }
+            }
+            FairplayEnrollCommand::LearnIndexDomains {
+                checkpoint,
+                fairplayd,
+                max_inputs,
+                timeout_seconds,
+                output,
+            } => {
+                if !(1..=30).contains(&timeout_seconds) {
+                    bail!("index-domain replay timeout must be between 1 and 30 seconds");
+                }
+                let binary = read_fairplayd_binary(&fairplayd)?;
+                let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
+                let result = learn_26b118_domains(
+                    &snapshot,
+                    &binary,
+                    max_inputs,
+                    Duration::from_secs(timeout_seconds),
+                )?;
+                write_private_binary(&output, &result.json)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "fairplay.index-domains-export.v1",
+                            "output": output,
+                            "inputs": result.inputs,
+                            "domains": result.domains,
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Learned {} private FairPlay index domains from {} inputs in {}",
+                        result.domains,
+                        result.inputs,
                         output.display()
                     ),
                 }
@@ -2516,6 +2558,45 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn fairplay_index_domain_learning_accepts_private_capture_paths() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "learn-index-domains",
+            "--checkpoint",
+            "/private/26b118.pkl.gz",
+            "--fairplayd",
+            "/private/fairplayd",
+            "--max-inputs",
+            "4096",
+            "--timeout-seconds",
+            "3",
+            "--output",
+            "/private/index-domains.json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::FairplayEnroll {
+                command:
+                    FairplayEnrollCommand::LearnIndexDomains {
+                        checkpoint,
+                        fairplayd,
+                        max_inputs,
+                        timeout_seconds,
+                        output,
+                    },
+            } => {
+                assert_eq!(checkpoint, PathBuf::from("/private/26b118.pkl.gz"));
+                assert_eq!(fairplayd, PathBuf::from("/private/fairplayd"));
+                assert_eq!(max_inputs, 4096);
+                assert_eq!(timeout_seconds, 3);
+                assert_eq!(output, PathBuf::from("/private/index-domains.json"));
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 
     #[test]
