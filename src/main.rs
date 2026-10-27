@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
+use ipatool_rs::catalog::AppNotFound;
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
 use ipatool_rs::fairplay_26b118;
@@ -740,8 +741,9 @@ fn run() -> Result<()> {
                     let country = country_code_from_storefront(&account.store_front)?;
                     match catalog.lookup(None, Some(bundle_id), country, Some(platform)) {
                         Ok(found) => app = found,
-                        Err(error) if app.id <= 0 => return Err(error),
-                        Err(_) => {}
+                        Err(error)
+                            if app.id > 0 && error.downcast_ref::<AppNotFound>().is_some() => {}
+                        Err(error) => return Err(error),
                     }
                 }
                 let mut captured_download = None;

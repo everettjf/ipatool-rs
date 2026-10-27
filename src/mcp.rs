@@ -4,6 +4,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail};
+use ipatool_rs::catalog::AppNotFound;
 use ipatool_rs::credentials::{Account, AccountStore, open_system_keychain};
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
 use ipatool_rs::store_login::{self, LoginInput, NativeAuthenticationBackend};
@@ -37,8 +38,13 @@ impl AppStoreServer {
     }
 
     async fn run(&self, work: impl FnOnce() -> Result<Value> + Send + 'static) -> CallToolResult {
-        let _guard = self.gate.lock().await;
-        match tokio::task::spawn_blocking(work).await {
+        let guard = Arc::clone(&self.gate).lock_owned().await;
+        match tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            work()
+        })
+        .await
+        {
             Ok(Ok(value)) => CallToolResult::structured(value),
             Ok(Err(error)) => {
                 CallToolResult::structured_error(json!({ "error": format!("{error:#}") }))
@@ -335,11 +341,13 @@ fn resolve_app(
     let country = country_code_from_storefront(&account.store_front)?;
     match catalog.lookup(None, Some(bundle), country, platform) {
         Ok(app) => Ok(app),
-        Err(_) if allow_delisted && id > 0 => Ok(App {
-            id,
-            bundle_id: bundle.to_owned(),
-            ..App::default()
-        }),
+        Err(error) if allow_delisted && id > 0 && error.downcast_ref::<AppNotFound>().is_some() => {
+            Ok(App {
+                id,
+                bundle_id: bundle.to_owned(),
+                ..App::default()
+            })
+        }
         Err(error) => Err(error),
     }
 }
@@ -353,6 +361,51 @@ fn app_value(app: &App) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_call_keeps_store_gate_until_blocking_work_finishes() {
+        let server = AppStoreServer::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = tokio::spawn({
+            let server = server.clone();
+            async move {
+                server
+                    .run(move || {
+                        let _ = started_tx.send(());
+                        release_rx.recv()?;
+                        Ok(json!({ "first": true }))
+                    })
+                    .await
+            }
+        });
+        started_rx.await.unwrap();
+        first.abort();
+        let (second_started_tx, mut second_started_rx) = tokio::sync::oneshot::channel();
+        let second = tokio::spawn(async move {
+            server
+                .run(move || {
+                    let _ = second_started_tx.send(());
+                    Ok(json!({ "second": true }))
+                })
+                .await
+        });
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                &mut second_started_rx
+            )
+            .await
+            .is_err(),
+            "second Store call entered while cancelled first call was still running"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), second_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        second.await.unwrap();
+    }
 
     #[test]
     fn exposes_all_six_store_tools_with_object_schemas() {

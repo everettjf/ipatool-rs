@@ -1,4 +1,6 @@
-use anyhow::{Context, Result, anyhow, bail};
+use std::{error::Error, fmt};
+
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -27,6 +29,17 @@ pub struct SearchOutput {
     pub count: usize,
     pub apps: Vec<App>,
 }
+
+#[derive(Debug)]
+pub struct AppNotFound;
+
+impl fmt::Display for AppNotFound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("app not found")
+    }
+}
+
+impl Error for AppNotFound {}
 
 #[derive(Debug, Deserialize)]
 struct CatalogResponse {
@@ -177,22 +190,22 @@ impl CatalogClient {
         let ids = id.map(|value| vec![value]);
         let url = lookup_url(ids.as_deref(), bundle_id, country, platform)?;
         let response: CatalogResponse = self.get(url)?.json()?;
-        let app = response
-            .results
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("app not found"))?;
-        let app = App::from(app);
-        if platform == Some(Platform::Watchos)
-            && !app
-                .platforms
-                .as_ref()
-                .is_some_and(|p| p.contains(&Platform::Watchos))
-        {
-            bail!("app not found");
-        }
-        Ok(app)
+        select_lookup_app(response, platform)
     }
+}
+
+fn select_lookup_app(response: CatalogResponse, platform: Option<Platform>) -> Result<App> {
+    let app = response.results.into_iter().next().ok_or(AppNotFound)?;
+    let app = App::from(app);
+    if platform == Some(Platform::Watchos)
+        && !app
+            .platforms
+            .as_ref()
+            .is_some_and(|p| p.contains(&Platform::Watchos))
+    {
+        return Err(AppNotFound.into());
+    }
+    Ok(app)
 }
 
 fn search_output(response: CatalogResponse, platform: Option<Platform>) -> SearchOutput {
@@ -316,5 +329,32 @@ mod tests {
         assert_eq!(query["limit"], "1");
         assert!(!query.contains_key("id"));
         assert!(lookup_url(None, None, "US", None).is_err());
+    }
+
+    #[test]
+    fn lookup_returns_typed_not_found_only_for_missing_app() {
+        let empty: CatalogResponse =
+            serde_json::from_str(r#"{"resultCount":0,"results":[]}"#).unwrap();
+        assert!(
+            select_lookup_app(empty, None)
+                .unwrap_err()
+                .downcast_ref::<AppNotFound>()
+                .is_some()
+        );
+        let iphone_only: CatalogResponse = serde_json::from_str(
+            r#"{"resultCount":1,"results":[{"trackId":42,"supportedDevices":["iPhone6"]}]}"#,
+        )
+        .unwrap();
+        assert!(
+            select_lookup_app(iphone_only, Some(Platform::Watchos))
+                .unwrap_err()
+                .downcast_ref::<AppNotFound>()
+                .is_some()
+        );
+        let available: CatalogResponse = serde_json::from_str(
+            r#"{"resultCount":1,"results":[{"trackId":42,"supportedDevices":["iPhone6"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(select_lookup_app(available, None).unwrap().id, 42);
     }
 }
