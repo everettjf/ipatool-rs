@@ -53,6 +53,8 @@ pub mod host;
 pub mod ipa_metadata;
 pub mod ipa_patch;
 mod ipa_zip_repack;
+#[cfg(target_os = "linux")]
+mod linux_secret_service;
 pub mod lzbitmap;
 pub mod mac_package;
 pub mod mac_preflight;

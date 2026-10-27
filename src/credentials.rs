@@ -6,6 +6,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
 use crate::file_keychain::FileKeychain;
+#[cfg(target_os = "linux")]
+use crate::linux_secret_service::LinuxSecretService;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::state::KEYCHAIN_SERVICE_NAME;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -185,6 +187,19 @@ pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> 
         let options = FILE_KEYCHAIN_OPTIONS
             .get()
             .context("file keychain is not configured")?;
+        #[cfg(target_os = "linux")]
+        {
+            let explicit_file_backend = options
+                .passphrase
+                .lock()
+                .map_err(|_| anyhow!("file keychain lock failed"))?
+                .is_some();
+            if !explicit_file_backend
+                && let Some(service) = LinuxSecretService::probe(options.interactive)
+            {
+                return Ok(Box::new(service));
+            }
+        }
         let directory = prepare_state_directory_from_environment()?;
         Ok(Box::new(LazyFileKeychain { directory, options }))
     }

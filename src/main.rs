@@ -78,7 +78,7 @@ struct Cli {
     /// Disable terminal prompts and Apple Keychain authorization dialogs.
     #[arg(long, global = true)]
     non_interactive: bool,
-    /// Passphrase for the encrypted file keychain on Linux or Windows.
+    /// Passphrase for the encrypted file keychain on Linux or Windows (selects file storage on Linux).
     #[arg(long, global = true)]
     keychain_passphrase: Option<String>,
     #[command(subcommand)]

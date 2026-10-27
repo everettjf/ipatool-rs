@@ -155,13 +155,13 @@ impl CredentialStore for FileKeychain {
 }
 
 #[derive(Deserialize, Serialize)]
-struct GoKeyringItem {
+pub(crate) struct GoKeyringItem {
     #[serde(rename = "Key")]
-    key: String,
+    pub key: String,
     #[serde(rename = "Data")]
-    data: String,
+    pub data: String,
     #[serde(rename = "Label", default)]
-    label: String,
+    pub label: String,
 }
 
 impl Drop for GoKeyringItem {
