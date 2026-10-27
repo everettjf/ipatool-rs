@@ -1047,9 +1047,16 @@ fn package_destination(
         parts.into_iter().flatten().collect::<Vec<_>>().join("_"),
         extension
     );
-    let destination = match output {
-        Some(path) if path.is_dir() => path.join(name),
-        Some(path) => path.to_owned(),
+    let destination = match output.filter(|path| !path.as_os_str().is_empty()) {
+        Some(path) => match fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => path.join(name),
+            Ok(_) => path.to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => path.to_owned(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect package output {}", path.display()));
+            }
+        },
         None => std::env::current_dir()
             .context("read current directory")?
             .join(name),
@@ -1263,6 +1270,36 @@ mod tests {
             bundle_id: "com.example.app".into(),
             ..App::default()
         }
+    }
+
+    #[test]
+    fn destination_uses_default_for_empty_output_and_preserves_explicit_file() {
+        let expected_name = "com.example.app_42_1.2.3.ipa";
+        let current = std::env::current_dir().unwrap();
+        assert_eq!(
+            package_destination(&app(), "1.2.3", Some(Path::new("")), "ipa").unwrap(),
+            current.join(expected_name)
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            package_destination(&app(), "1.2.3", Some(directory.path()), "ipa").unwrap(),
+            directory.path().join(expected_name)
+        );
+        let explicit = directory.path().join("custom.ipa");
+        fs::write(&explicit, b"previous").unwrap();
+        assert_eq!(
+            package_destination(&app(), "1.2.3", Some(&explicit), "ipa").unwrap(),
+            explicit
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_propagates_metadata_errors() {
+        let error =
+            package_destination(&app(), "1.2.3", Some(Path::new("bad\0path")), "ipa").unwrap_err();
+        assert!(error.to_string().contains("inspect package output"));
     }
 
     fn response(value: Value) -> Response {
