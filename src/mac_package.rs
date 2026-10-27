@@ -79,19 +79,21 @@ fn download_mac_package_using(
             let assets = SapAssetBundle::load_or_download().context("load StoreAgent assets")?;
             let mut agent = StoreAgentSession::open(&assets, hardware_id, dp_info)
                 .context("open StoreAgent package decrypter")?;
-            let mut input = File::open(source).context("open encrypted macOS package")?;
-            let mut output = create_private_decrypted_file(target)
-                .context("create decrypted package staging")?;
-            let decrypted = agent
-                .decrypt(&mut input, &mut output)
-                .context("decrypt macOS package");
+            let decrypted = (|| {
+                let mut input = File::open(source).context("open encrypted macOS package")?;
+                let mut output = create_private_decrypted_file(target)
+                    .context("create decrypted package staging")?;
+                agent
+                    .decrypt(&mut input, &mut output)
+                    .context("decrypt macOS package")?;
+                output.sync_all().context("sync decrypted macOS package")
+            })();
             let closed = agent.close().context("close StoreAgent decrypter");
             match (decrypted, closed) {
-                (Ok(_), Ok(())) => {}
-                (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
-                (Err(decrypt), Err(close)) => return Err(decrypt.context(close)),
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                (Err(decrypt), Err(close)) => Err(decrypt.context(close)),
             }
-            output.sync_all().context("sync decrypted macOS package")
         },
     )
 }
