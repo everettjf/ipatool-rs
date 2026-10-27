@@ -18,8 +18,10 @@ use libloading::Library;
 
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
+#[cfg(target_arch = "x86_64")]
 const MEM_RELEASE: u32 = 0x8000;
 const PAGE_READWRITE: u32 = 0x04;
+#[cfg(target_arch = "x86_64")]
 const PAGE_EXECUTE_READ: u32 = 0x20;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 
@@ -31,14 +33,30 @@ static LONGJMP_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn VirtualProtect(address: *mut c_void, size: usize, protection: u32, old: *mut u32) -> i32;
+    #[cfg(target_arch = "x86_64")]
     fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32;
+    #[cfg(target_arch = "x86_64")]
     fn GetCurrentProcess() -> *mut c_void;
+    #[cfg(target_arch = "x86_64")]
     fn FlushInstructionCache(process: *mut c_void, address: *const c_void, size: usize) -> i32;
 }
 
 type VirtualAllocFn = unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void;
 
-pub(super) fn load(path: &Path) -> Result<Library> {
+pub(super) fn load(
+    path: &Path,
+    dependencies: &[std::path::PathBuf],
+) -> Result<(Library, Vec<Library>)> {
+    let mut loaded_dependencies = Vec::with_capacity(dependencies.len());
+    for dependency in dependencies {
+        let library = unsafe { Library::new(dependency) }.with_context(|| {
+            format!(
+                "failed to load Unicorn dependency: {}",
+                dependency.display()
+            )
+        })?;
+        loaded_dependencies.push(library);
+    }
     let os_library = unsafe { libloading::os::windows::Library::new(path.as_os_str()) }
         .with_context(|| format!("failed to load Unicorn library: {}", path.display()))?;
     let handle = os_library.into_raw();
@@ -46,7 +64,7 @@ pub(super) fn load(path: &Path) -> Result<Library> {
     // Reconstruct even on failure so the module is unloaded correctly.
     let library = unsafe { libloading::os::windows::Library::from_raw(handle) };
     prepared?;
-    Ok(library.into())
+    Ok((library.into(), loaded_dependencies))
 }
 
 fn prepare(base: usize) -> Result<()> {
@@ -77,7 +95,18 @@ fn prepare_architecture(image: &Image) -> Result<()> {
     replace_import(slot, replacement).context("patch Unicorn longjmp")
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+fn prepare_architecture(image: &Image) -> Result<()> {
+    const MINGW_LONGJMP_PATTERN: &[u8] = &[
+        0x13, 0x50, 0x41, 0xa9, 0x15, 0x58, 0x42, 0xa9, 0x17, 0x60, 0x43, 0xa9, 0x19, 0x68, 0x44,
+        0xa9,
+    ];
+    let slot = image.find_import("api-ms-win-crt-private-l1-1-0.dll", "longjmp")?;
+    let replacement = image.find_unique_pattern(MINGW_LONGJMP_PATTERN)?;
+    replace_import(slot, replacement).context("patch Unicorn ARM64 longjmp")
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn prepare_architecture(_image: &Image) -> Result<()> {
     bail!("Windows Unicorn preparation is not implemented for this architecture")
 }
@@ -286,5 +315,21 @@ impl Image {
             }
         }
         bail!("Unicorn import {dll}!{function} was not found")
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn find_unique_pattern(&self, pattern: &[u8]) -> Result<usize> {
+        let image = self.bytes(self.base, self.size)?;
+        let mut offsets = image
+            .windows(pattern.len())
+            .enumerate()
+            .filter_map(|(offset, candidate)| (candidate == pattern).then_some(offset));
+        let first = offsets
+            .next()
+            .context("Unicorn ARM64 longjmp pattern was not found")?;
+        if offsets.next().is_some() {
+            bail!("Unicorn ARM64 longjmp pattern is not unique");
+        }
+        Ok(self.base + first)
     }
 }

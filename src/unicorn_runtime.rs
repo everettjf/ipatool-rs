@@ -14,6 +14,8 @@ use tempfile::NamedTempFile;
 use zip::ZipArchive;
 
 mod engine;
+#[cfg(any(test, all(target_os = "windows", target_arch = "aarch64")))]
+mod windows_arm64;
 #[cfg(target_os = "windows")]
 mod windows_prepare;
 pub use engine::{Engine, HookContext, REG_PC, REG_X0, REG_X1};
@@ -35,10 +37,13 @@ struct Artifact {
 enum ArchiveFormat {
     Zip,
     SevenZip,
+    TarZstd,
 }
 
 pub struct UnicornLibrary {
     library: Library,
+    #[cfg(target_os = "windows")]
+    _dependencies: Vec<Library>,
 }
 
 impl UnicornLibrary {
@@ -61,13 +66,24 @@ pub fn load() -> Result<UnicornLibrary> {
         .build()
         .context("failed to create Unicorn downloader")?;
     let path = ensure_library(&root, selected, &client)?;
+    #[cfg(target_os = "windows")]
+    let dependencies = current_dependencies()
+        .iter()
+        .map(|artifact| ensure_library(&root, *artifact, &client))
+        .collect::<Result<Vec<_>>>()?;
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    let path = windows_arm64::prepare_runtime_library(&path)?;
     // The library is selected by platform and verified against the pinned digest.
     #[cfg(not(target_os = "windows"))]
     let library = unsafe { Library::new(&path) }
         .with_context(|| format!("failed to load Unicorn library: {}", path.display()))?;
     #[cfg(target_os = "windows")]
-    let library = windows_prepare::load(&path)?;
-    let library = UnicornLibrary { library };
+    let (library, loaded_dependencies) = windows_prepare::load(&path, &dependencies)?;
+    let library = UnicornLibrary {
+        library,
+        #[cfg(target_os = "windows")]
+        _dependencies: loaded_dependencies,
+    };
     let (major, minor) = library.api_version()?;
     if (major, minor) != (2, 1) {
         bail!("unsupported Unicorn API version {major}.{minor}");
@@ -140,9 +156,36 @@ fn artifact_for(os: &str, arch: &str, musl: bool) -> Result<Artifact> {
             filename: "libunicorn.dll",
             format: ArchiveFormat::SevenZip,
         },
+        ("windows", "aarch64", _) => Artifact {
+            url: "https://mirror.msys2.org/mingw/clangarm64/mingw-w64-clang-aarch64-unicorn-2.1.4-5-any.pkg.tar.zst",
+            archive_sha256: "e28aab2165d9cff048c29c58d6a40eb97928b23cf8ddeb78056a4b5b9805ac61",
+            library_sha256: "0ee1ebab91653645ef2b0615a8225123f7af9a49df4b6fcc5fb5d45d540ae9c2",
+            member: "clangarm64/bin/libunicorn.dll",
+            filename: "libunicorn.dll",
+            format: ArchiveFormat::TarZstd,
+        },
         _ => bail!("unsupported Unicorn runtime platform {os}/{arch}"),
     };
     Ok(selected)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+const ARM64_DEPENDENCIES: [Artifact; 1] = [Artifact {
+    url: "https://mirror.msys2.org/mingw/clangarm64/mingw-w64-clang-aarch64-libwinpthread-14.0.0.r302.gd7f3c5201-1-any.pkg.tar.zst",
+    archive_sha256: "dd20ad17543608915a2ff9ef6f39146d5621298531e0f50706fd1e78bf1da834",
+    library_sha256: "b80722a2586c0d1de605724569a564f3c139d184deaa33b7df7415477d733467",
+    member: "clangarm64/bin/libwinpthread-1.dll",
+    filename: "libwinpthread-1.dll",
+    format: ArchiveFormat::TarZstd,
+}];
+
+#[cfg(target_os = "windows")]
+fn current_dependencies() -> &'static [Artifact] {
+    if cfg!(target_arch = "aarch64") {
+        &ARM64_DEPENDENCIES
+    } else {
+        &[]
+    }
 }
 
 fn ensure_library(
@@ -220,7 +263,12 @@ fn extract_library(
 ) -> Result<NamedTempFile> {
     match selected.format {
         ArchiveFormat::Zip => extract_zip_library(directory, archive_path, selected),
+        #[cfg(any(test, target_os = "windows"))]
         ArchiveFormat::SevenZip => extract_sevenz_library(directory, archive_path, selected),
+        #[cfg(any(test, target_os = "windows"))]
+        ArchiveFormat::TarZstd => extract_tar_zstd_library(directory, archive_path, selected),
+        #[cfg(not(any(test, target_os = "windows")))]
+        _ => bail!("unsupported Unicorn archive format on this platform"),
     }
 }
 
@@ -262,6 +310,7 @@ fn extract_zip_library(
     Ok(extracted)
 }
 
+#[cfg(any(test, target_os = "windows"))]
 fn extract_sevenz_library(
     directory: &Path,
     archive_path: &Path,
@@ -312,6 +361,50 @@ fn extract_sevenz_library(
         .sync_all()
         .context("failed to sync Unicorn library")?;
     Ok(extracted)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn extract_tar_zstd_library(
+    directory: &Path,
+    archive_path: &Path,
+    selected: Artifact,
+) -> Result<NamedTempFile> {
+    let file = File::open(archive_path).context("failed to open Unicorn archive")?;
+    let decoder = zstd::stream::read::Decoder::new(file).context("invalid Unicorn zstd archive")?;
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries().context("invalid Unicorn tar archive")? {
+        let entry = entry.context("invalid Unicorn tar entry")?;
+        if entry.path()?.as_ref() != Path::new(selected.member) {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() || entry.size() > MAX_ARTIFACT_SIZE {
+            bail!("Unicorn library has invalid size or type");
+        }
+        let expected_size = entry.size();
+        let mut extracted =
+            NamedTempFile::new_in(directory).context("failed to create Unicorn library")?;
+        let mut hash = Sha256::new();
+        let written = std::io::copy(
+            &mut entry.take(MAX_ARTIFACT_SIZE + 1),
+            &mut HashWriter {
+                file: extracted.as_file_mut(),
+                hash: &mut hash,
+            },
+        )
+        .context("failed to extract Unicorn library from tar archive")?;
+        if written != expected_size || written > MAX_ARTIFACT_SIZE {
+            bail!("Unicorn library has invalid size");
+        }
+        if format!("{:x}", hash.finalize()) != selected.library_sha256 {
+            bail!("Unicorn library failed integrity verification");
+        }
+        extracted
+            .as_file()
+            .sync_all()
+            .context("failed to sync Unicorn library")?;
+        return Ok(extracted);
+    }
+    bail!("Unicorn library missing from tar archive")
 }
 
 fn file_matches_sha256(path: &Path, expected: &str) -> Result<bool> {
@@ -387,6 +480,17 @@ mod tests {
     #[ignore = "downloads the pinned Unicorn release artifact"]
     fn extracts_checked_windows_archive() {
         let selected = artifact_for("windows", "x86_64", false).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let client = reqwest::blocking::Client::new();
+        let archive = download_archive(directory.path(), selected, &client).unwrap();
+        let library = extract_library(directory.path(), archive.path(), selected).unwrap();
+        assert!(file_matches_sha256(library.path(), selected.library_sha256).unwrap());
+    }
+
+    #[test]
+    #[ignore = "downloads the pinned Windows ARM64 pthread package"]
+    fn extracts_checked_arm64_dependency() {
+        let selected = ARM64_DEPENDENCIES[0];
         let directory = tempfile::tempdir().unwrap();
         let client = reqwest::blocking::Client::new();
         let archive = download_archive(directory.path(), selected, &client).unwrap();
