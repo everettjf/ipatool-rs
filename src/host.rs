@@ -1,11 +1,11 @@
-//! Local macOS FairPlay host inspection and arm64e Mach-O selection.
+//! Host hardware identity, local FairPlay inspection, and arm64e Mach-O selection.
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::OnceLock};
 
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 #[cfg(any(target_os = "macos", test))]
 use plist::Value;
 use serde::Serialize;
@@ -198,7 +198,7 @@ fn ioreg_best_hardware_mac(data: &[u8]) -> Result<[u8; 6]> {
         .context("no usable built-in hardware MAC address in IORegistry")
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 fn linux_hardware_mac(root: &Path) -> Result<[u8; 6]> {
     let mut selected: Option<(u8, [u8; 6])> = None;
     for entry in fs::read_dir(root)
@@ -249,6 +249,14 @@ fn linux_hardware_mac(root: &Path) -> Result<[u8; 6]> {
 
 /// Hardware identity used by the Store guest and SAP signer.
 pub fn hardware_mac_address() -> Result<[u8; 6]> {
+    static CACHED: OnceLock<std::result::Result<[u8; 6], String>> = OnceLock::new();
+    match CACHED.get_or_init(|| discover_hardware_mac().map_err(|error| format!("{error:#}"))) {
+        Ok(mac) => Ok(*mac),
+        Err(error) => Err(anyhow!("{error}")),
+    }
+}
+
+fn discover_hardware_mac() -> Result<[u8; 6]> {
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("/usr/sbin/ioreg")
@@ -264,7 +272,11 @@ pub fn hardware_mac_address() -> Result<[u8; 6]> {
     {
         linux_hardware_mac(Path::new("/sys/class/net"))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::windows_hardware::hardware_mac_address()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         bail!("automatic Store hardware identity is not yet implemented for this platform")
     }
@@ -351,6 +363,7 @@ pub fn inspect_local_fairplay_host() -> Result<FairPlayHostDiagnostic> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn linux_mac_prefers_physical_and_stable_address_order() {
         let root = tempfile::tempdir().unwrap();

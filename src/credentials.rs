@@ -4,32 +4,32 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
 use crate::file_keychain::FileKeychain;
 #[cfg(target_os = "macos")]
 use crate::state::KEYCHAIN_SERVICE_NAME;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::state::prepare_state_directory_from_environment;
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
 struct FileKeychainOptions {
     passphrase: std::sync::Mutex<Option<Zeroizing<String>>>,
     interactive: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 static FILE_KEYCHAIN_OPTIONS: std::sync::OnceLock<FileKeychainOptions> = std::sync::OnceLock::new();
 
-/// Configure the Go-compatible file keychain before opening it on Linux.
+/// Configure the Go-compatible file keychain before opening it on Linux or Windows.
 pub fn configure_file_keychain(passphrase: Option<String>, interactive: bool) {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         let _ = FILE_KEYCHAIN_OPTIONS.set(FileKeychainOptions {
             passphrase: std::sync::Mutex::new(passphrase.map(Zeroizing::new)),
             interactive,
         });
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = (passphrase, interactive);
     }
@@ -91,7 +91,7 @@ pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> 
     {
         Ok(Box::new(MacKeychain))
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         let options = FILE_KEYCHAIN_OPTIONS
             .get()
@@ -99,13 +99,13 @@ pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> 
         let directory = prepare_state_directory_from_environment()?;
         open_file_keychain(directory, options)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         bail!("system credential storage is not yet implemented for this platform")
     }
 }
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
 fn open_file_keychain(
     directory: std::path::PathBuf,
     options: &FileKeychainOptions,
@@ -155,6 +155,52 @@ fn prompt_file_passphrase() -> Result<String> {
         return Err(std::io::Error::last_os_error()).context("hide keychain passphrase input");
     }
     let guard = EchoGuard(original);
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("read keychain passphrase")?;
+    drop(guard);
+    eprintln!();
+    let passphrase = input.trim_end_matches(['\r', '\n']).to_owned();
+    input.zeroize();
+    if passphrase.is_empty() {
+        bail!("file keychain passphrase must not be empty");
+    }
+    Ok(passphrase)
+}
+
+#[cfg(target_os = "windows")]
+fn prompt_file_passphrase() -> Result<String> {
+    use std::io::{self, Write};
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::Console::{
+            ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+        },
+    };
+
+    struct EchoGuard(windows_sys::Win32::Foundation::HANDLE, u32);
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            // SAFETY: the handle and original mode came from this process's input console.
+            unsafe { SetConsoleMode(self.0, self.1) };
+        }
+    }
+    // SAFETY: GetStdHandle returns a process-owned handle; GetConsoleMode writes one u32.
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        bail!("input console is unavailable; use --keychain-passphrase");
+    }
+    let mut original = 0;
+    if unsafe { GetConsoleMode(handle, &mut original) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("read console settings");
+    }
+    eprint!("enter passphrase to unlock ipatool file keychain (separate from Apple ID password): ");
+    io::stderr().flush()?;
+    if unsafe { SetConsoleMode(handle, original & !ENABLE_ECHO_INPUT) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("hide keychain passphrase input");
+    }
+    let guard = EchoGuard(handle, original);
     let mut input = String::new();
     io::stdin()
         .read_line(&mut input)

@@ -57,5 +57,9 @@ num-bigint = "0.4"
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+time = { version = "0.3", features = ["local-offset"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_Console"] }
+
 [patch.crates-io]
 apfs = { path = "vendor/apfs" }

@@ -53,13 +53,38 @@ pub fn prepare_state_directory(
 }
 
 pub fn prepare_state_directory_from_environment() -> Result<PathBuf> {
+    #[cfg(windows)]
+    let home = windows_home_directory(
+        std::env::var_os("HOMEDRIVE"),
+        std::env::var_os("HOMEPATH"),
+        std::env::var_os("USERPROFILE"),
+        std::env::var_os("HOME"),
+    )
+    .context("home directory is unavailable")?;
+    #[cfg(not(windows))]
     let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .context("home directory is unavailable")?;
     let xdg_state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
     let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
     prepare_state_directory(&home, xdg_state_home.as_deref(), xdg_data_home.as_deref())
+}
+
+#[cfg(any(windows, test))]
+fn windows_home_directory(
+    drive: Option<std::ffi::OsString>,
+    path: Option<std::ffi::OsString>,
+    profile: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let (Some(mut drive), Some(path)) = (drive, path)
+        && !drive.is_empty()
+        && !path.is_empty()
+    {
+        drive.push(path);
+        return Some(PathBuf::from(drive));
+    }
+    profile.or(home).map(PathBuf::from)
 }
 
 fn create_private_directory(path: &Path) -> std::io::Result<()> {
@@ -122,6 +147,19 @@ mod tests {
         fs::remove_dir(&legacy).unwrap();
         fs::write(&legacy, b"file").unwrap();
         assert!(prepare_state_directory(&home, None, None).is_err());
+    }
+
+    #[test]
+    fn windows_home_prefers_the_go_homedrive_and_homepath_pair() {
+        use std::ffi::OsString;
+        let home = windows_home_directory(
+            Some(OsString::from("C:")),
+            Some(OsString::from("\\Users\\person")),
+            Some(OsString::from("D:\\Other")),
+            Some(OsString::from("/tmp/wrong")),
+        )
+        .unwrap();
+        assert_eq!(home.as_os_str(), OsString::from("C:\\Users\\person"));
     }
 
     #[cfg(unix)]

@@ -69,7 +69,7 @@ struct Cli {
     verbose: bool,
     #[arg(long, global = true)]
     non_interactive: bool,
-    /// Passphrase for the encrypted file keychain on Linux.
+    /// Passphrase for the encrypted file keychain on Linux or Windows.
     #[arg(long, global = true)]
     keychain_passphrase: Option<String>,
     #[command(subcommand)]
@@ -2204,19 +2204,19 @@ fn parse_byte(value: &str) -> Result<u8> {
 fn prompt(label: &str, secret: bool) -> Result<String> {
     eprint!("{label}");
     io::stderr().flush().context("write prompt")?;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let echo = if secret {
         Some(EchoGuard::hide()?)
     } else {
         None
     };
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     if secret {
         bail!("hidden password prompt is unavailable on this platform; use --password");
     }
     let mut input = String::new();
     io::stdin().read_line(&mut input).context("read prompt")?;
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     drop(echo);
     if secret {
         eprintln!();
@@ -2251,6 +2251,44 @@ impl Drop for EchoGuard {
     fn drop(&mut self) {
         // SAFETY: this restores the terminal settings captured by tcgetattr.
         unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0) };
+    }
+}
+
+#[cfg(windows)]
+struct EchoGuard(windows_sys::Win32::Foundation::HANDLE, u32);
+
+#[cfg(windows)]
+impl EchoGuard {
+    fn hide() -> Result<Self> {
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            System::Console::{
+                ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
+            },
+        };
+
+        // SAFETY: the process owns its standard input handle; GetConsoleMode writes one u32.
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            bail!("input console is unavailable; use --password");
+        }
+        let mut mode = 0;
+        if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+            return Err(io::Error::last_os_error()).context("read console settings");
+        }
+        if unsafe { SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT) } == 0 {
+            return Err(io::Error::last_os_error()).context("hide password input");
+        }
+        Ok(Self(handle, mode))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::SetConsoleMode;
+        // SAFETY: this restores the original settings of the same input console.
+        unsafe { SetConsoleMode(self.0, self.1) };
     }
 }
 

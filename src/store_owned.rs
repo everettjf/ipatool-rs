@@ -364,6 +364,11 @@ fn local_timezone(now: OffsetDateTime) -> (String, i64) {
             return (timezone, local.tm_gmtoff / 60);
         }
     }
+    #[cfg(windows)]
+    if let Ok(offset) = time::UtcOffset::local_offset_at(now) {
+        let timezone = std::env::var("TZ").unwrap_or_else(|_| "Local".into());
+        return (timezone, i64::from(offset.whole_seconds()) / 60);
+    }
     ("UTC".into(), 0)
 }
 

@@ -83,6 +83,8 @@ pub mod transport;
 pub mod unicorn_runtime;
 pub mod version;
 pub mod vision;
+#[cfg(target_os = "windows")]
+mod windows_hardware;
 
 pub use catalog::{App, CatalogClient, SearchOutput};
 pub use platform::Platform;
