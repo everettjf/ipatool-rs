@@ -20,7 +20,7 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 - `cargo test --all-targets`: 295 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
 - `cargo clippy --all-targets -- -D warnings` passed after the current CLI and MCP changes.
 - `cargo check` passed for macOS x86_64, Linux x86_64 and ARM64, Windows x86_64 GNU and ARM64 GNU/LLVM, and iOS ARM64. Cross-target C dependencies required local cross compiler and archiver wrappers on this macOS host.
-- Release binaries were built for macOS ARM64 and x86_64 (Mach-O), Linux x86_64 and ARM64 (ELF), Windows x86_64 and ARM64 (PE), and iOS ARM64 (Mach-O). The macOS x86_64 binary ran under Rosetta and completed a public catalog search. The iOS binary is signed, declares iOS 15.0 as its minimum, and contains the Unicorn API symbols. None of these checks substitutes for target-system runtime testing.
+- Release binaries were built for macOS ARM64 and x86_64 (Mach-O), Linux x86_64 and ARM64 (ELF), Windows x86_64 and ARM64 (PE), and iOS ARM64 (Mach-O). The macOS x86_64 binary ran under Rosetta and completed a public catalog search. The iOS binary is signed with `ldid` and private entitlements for a jailbroken device, declares iOS 15.0 as its minimum, and contains the Unicorn API symbols. `ldid -e` confirms the embedded entitlements, while macOS `codesign --verify` does not accept this signature; execution and trust must be checked on the target device.
 - `scripts/build-windows-arm64.sh` reproducibly links the Windows ARM64 release with a checksum-pinned llvm-mingw toolchain cached under `target/toolchains`. The resulting PE reports `IMAGE_FILE_MACHINE_ARM64` and does not import the toolchain's `libunwind.dll`; Windows ARM64 runtime behavior still requires a target host.
 - The Linux ARM64 and x86_64 release binaries booted inside QEMU with SHA-256-verified Debian netboot kernel/initramfs images. Both returned version 0.1.0, completed a live public `Apple`/US search, and served MCP over stdio with six tools and the expected invalid-search error. This checks executable startup, TLS/HTTP catalog access, and MCP transport on Linux; authenticated Store and package workflows remain untested there.
 - The pinned Apple Store guest boot and StoreAgent initialization tests passed using cached framework assets, without an account or device.
@@ -34,5 +34,40 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 3. Validate private FairPlay enrollment and 26B118 oracle/model operations against a supported macOS host and paired private capture. Public fixtures cannot prove these private-data paths.
 4. Exercise authenticated Store and package workflows on Linux, and run the x86_64 and ARM64 Windows binaries on target systems. QEMU Linux smoke runs do not validate account storage or real downloads.
 5. Record any discovered differences, fix them in Rust, rerun the relevant verification, and commit each fix.
+
+## Target-system checks
+
+The current `ipatool-ios-arm64` is an `ldid`-signed iOS 15+ CLI binary for a
+jailbroken arm64 device. Copy it to the device, make it executable, and first
+run these read-only commands:
+
+```sh
+./ipatool-ios-arm64 --version
+./ipatool-ios-arm64 --format json search Apple --country US --platform iphone --limit 1
+```
+
+With a controlled Apple account, continue interactively so the password does
+not enter shell history. Replace `APP_ID` with a free app that this account may
+obtain and `VERSION_ID` with a value returned by `list-versions`:
+
+```sh
+./ipatool-ios-arm64 auth login
+./ipatool-ios-arm64 auth info
+./ipatool-ios-arm64 list-purchases --platform iphone --max-results 2
+./ipatool-ios-arm64 purchase --app-id APP_ID --platform iphone
+./ipatool-ios-arm64 list-versions --app-id APP_ID --platform iphone
+./ipatool-ios-arm64 get-version-metadata --app-id APP_ID --platform iphone --external-version-id VERSION_ID
+./ipatool-ios-arm64 download --app-id APP_ID --platform iphone --output /var/mobile/Downloads/test.ipa
+./ipatool-ios-arm64 fairplay-doctor --ipa /var/mobile/Downloads/test.ipa
+```
+
+The same account workflow should be checked on Linux and Windows with their
+respective release binaries. Linux and Windows keychain encryption requires
+`--keychain-passphrase` or an interactive passphrase prompt. Private FairPlay
+26B118 capture and differential validation require a matching supported macOS
+`fairplayd` host; run `fairplay-enroll collect --help` and
+`fairplay-enroll validate-oracle-model --help` there. Keep passwords, cookies,
+private capture files, and enrollment models outside the repository; a failing
+command, platform/build, and redacted error output are sufficient for repair.
 
 The executable no longer invokes Go, Python, or a separate Swift executable at runtime. The Store and SAP signing paths still load pinned Apple framework images as guest code; removing that dependency would require replacing those private Apple algorithms with independently validated Rust implementations.
