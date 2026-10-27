@@ -84,7 +84,6 @@ pub fn validate_ipa_platform(path: &Path, platform: Platform) -> Result<()> {
         if parts.len() != 3
             || parts[0] != "Payload"
             || !parts[1].ends_with(".app")
-            || parts[1].len() <= ".app".len()
             || parts[2] != "Info.plist"
         {
             continue;
@@ -239,5 +238,36 @@ mod tests {
 
         assert!(validate_ipa_platform(file.path(), Platform::Iphone).is_ok());
         assert!(validate_ipa_platform(file.path(), Platform::Visionos).is_err());
+    }
+
+    #[test]
+    fn accepts_go_top_level_app_name_and_patches_without_sinf() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ZipWriter::new(File::create(file.path()).unwrap());
+        writer
+            .start_file("Payload/.app/Info.plist", SimpleFileOptions::default())
+            .unwrap();
+        let mut fields = plist::Dictionary::new();
+        fields.insert(
+            "CFBundleSupportedPlatforms".into(),
+            Value::Array(vec![Value::String("iPhoneOS".into())]),
+        );
+        plist::to_writer_xml(&mut writer, &Value::Dictionary(fields)).unwrap();
+        writer.finish().unwrap();
+
+        validate_ipa_platform(file.path(), Platform::Iphone).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("patched.ipa");
+        crate::ipa_patch::patch_ipa(
+            file.path(),
+            &output,
+            &Value::Dictionary(plist::Dictionary::new()),
+            "person@example.test",
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
+        assert!(archive.by_name("iTunesMetadata.plist").is_ok());
     }
 }

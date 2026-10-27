@@ -17,7 +17,7 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 
 ## Build and test evidence
 
-- `cargo test --all-targets`: 325 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
+- `cargo test --all-targets`: 326 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
 - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` passed after the HTTP 500 redownload fallback fix.
 - Local sender fixtures confirmed that an unpinned redownload uses the Go reference's 30-second timeout, while pinned redownload and update requests retain no request timeout.
 - IPA version metadata now accepts HTTP and HTTPS byte-range URLs like the Go reader and the Rust full-package downloader; the range and archive checks remain in place.
@@ -30,6 +30,7 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 - Store transfer responses retain automatic decompression for artwork and Mac preflight packages, while IPA/PKG range requests preserve raw bytes. A local gzip artwork fixture covers the authenticated transfer path.
 - Artwork and IPA version-metadata range transfers no longer impose 30-second whole-response timeouts; the Go transfer client has no timeout for these requests, so slow responses may finish normally. The IPA range sender fixture checks this request setting.
 - IPA and Mac preflight metadata readers now accept HTTP URLs with user information and fragments, as the Go transfer path does; the Mac fixture confirms both direct and authenticated transfer clients send only the path. The IPA Info.plist selector also accepts the `.app` directory name handled by the Go predicate.
+- Mobile IPA platform validation now accepts the same `.app` top-level directory predicate as Go. An offline IPA fixture confirms this package can be validated and published with account metadata when the Store response has no SINF entries.
 - `cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings` passed with the Linux Secret Service backend compiled in.
 - `cargo check` passed for macOS x86_64, Linux x86_64 and ARM64, Windows x86_64 GNU and ARM64 GNU/LLVM, and iOS ARM64. Cross-target C dependencies required local cross compiler and archiver wrappers on this macOS host.
 - `cargo check --target aarch64-apple-ios` and `cargo check --target x86_64-pc-windows-gnu` passed after the output-path change. The desktop release artifacts below were built from the preceding commit; rebuild them before testing this path change on a target system.
