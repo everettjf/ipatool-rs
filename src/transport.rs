@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Mutex, Weak,
@@ -195,7 +196,7 @@ impl Transport {
         let trace = VERBOSE_HTTP
             .load(Ordering::Relaxed)
             .then(|| (request.method.clone(), request.url.clone(), Instant::now()));
-        let result = self.send_inner(request);
+        let result = self.send_inner(request, None);
         if let Some((method, url, started)) = trace {
             let status = result.as_ref().map_or_else(
                 |_| "error".to_owned(),
@@ -207,6 +208,11 @@ impl Transport {
             );
         }
         result
+    }
+
+    /// Share Store cookies while bounding responses from setup endpoints.
+    pub(crate) fn send_bounded(&self, request: Request, max_body: usize) -> Result<Response> {
+        self.send_inner(request, Some(max_body))
     }
 
     /// Send a Store transfer without buffering its body. Transfers share the
@@ -296,9 +302,9 @@ impl Transport {
         unreachable!("redirect limit returns before loop exhaustion")
     }
 
-    fn send_inner(&self, request: Request) -> Result<Response> {
+    fn send_inner(&self, request: Request, max_body: Option<usize>) -> Result<Response> {
         if let Some(cookies) = &self.cookies {
-            return self.send_with_cookies(request, cookies);
+            return self.send_with_cookies(request, cookies, max_body);
         }
         let client = if request.no_redirects {
             &self.no_redirects
@@ -315,13 +321,14 @@ impl Transport {
             builder = builder.timeout(timeout);
         }
         let response = builder.send().context("request failed")?;
-        Self::response_from_http(response)
+        Self::response_from_http(response, max_body)
     }
 
     fn send_with_cookies(
         &self,
         request: Request,
         cookies: &Mutex<SavedCookies>,
+        max_body: Option<usize>,
     ) -> Result<Response> {
         let mut method = request.method;
         let mut url = request.url;
@@ -371,10 +378,10 @@ impl Transport {
                 .get(LOCATION)
                 .and_then(|value| value.to_str().ok())
             else {
-                return Self::response_from_http(response);
+                return Self::response_from_http(response, max_body);
             };
             if request.no_redirects || !matches!(status, 301 | 302 | 303 | 307 | 308) {
-                return Self::response_from_http(response);
+                return Self::response_from_http(response, max_body);
             }
             if redirects == 10 {
                 bail!("too many HTTP redirects");
@@ -400,7 +407,7 @@ impl Transport {
         unreachable!("redirect limit returns before loop exhaustion")
     }
 
-    fn response_from_http(response: HttpResponse) -> Result<Response> {
+    fn response_from_http(response: HttpResponse, max_body: Option<usize>) -> Result<Response> {
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -412,10 +419,24 @@ impl Transport {
                 )
             })
             .collect();
-        let body = response
-            .bytes()
-            .context("failed to read response body")?
-            .to_vec();
+        let body = if max_body.is_some() && status != 200 {
+            Vec::new()
+        } else if let Some(limit) = max_body {
+            let mut body = Vec::new();
+            response
+                .take(limit.saturating_add(1) as u64)
+                .read_to_end(&mut body)
+                .context("failed to read response body")?;
+            if body.len() > limit {
+                bail!("Apple response exceeds {limit} bytes");
+            }
+            body
+        } else {
+            response
+                .bytes()
+                .context("failed to read response body")?
+                .to_vec()
+        };
         Ok(Response {
             status,
             headers,

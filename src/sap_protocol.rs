@@ -1,15 +1,19 @@
 //! Certificate and setup-message exchange for Apple's SAP signer.
 
-use std::{io::Read, time::Duration};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use plist::{Dictionary, Value};
 use reqwest::{
     Method,
-    blocking::Client,
-    header::{CONTENT_TYPE, USER_AGENT},
+    header::{CONTENT_TYPE, HeaderValue, USER_AGENT},
 };
 use url::Url;
+
+use crate::{
+    state::prepare_state_directory_from_environment,
+    transport::{Request, Transport},
+};
 
 const CERTIFICATE_KEY: &str = "sign-sap-setup-cert";
 const BUFFER_KEY: &str = "sign-sap-setup-buffer";
@@ -35,15 +39,14 @@ pub trait SapHttpClient {
 }
 
 pub struct ReqwestSapClient {
-    client: Client,
+    transport: Transport,
 }
 
 impl ReqwestSapClient {
     pub fn new() -> Result<Self> {
+        let state_directory = prepare_state_directory_from_environment()?;
         Ok(Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
+            transport: Transport::with_cookies(&state_directory)
                 .context("create SAP HTTP client")?,
         })
     }
@@ -51,31 +54,26 @@ impl ReqwestSapClient {
 
 impl SapHttpClient for ReqwestSapClient {
     fn send(&self, request: SapRequest) -> Result<SapResponse> {
-        let mut builder = self.client.request(request.method, request.url);
-        builder = builder.header(USER_AGENT, request.user_agent);
+        let mut host_request = Request::get(request.url);
+        host_request.method = request.method;
+        host_request.timeout = Some(Duration::from_secs(30));
+        host_request
+            .headers
+            .insert(USER_AGENT, HeaderValue::from_static(request.user_agent));
         if let Some(content_type) = request.content_type {
-            builder = builder.header(CONTENT_TYPE, content_type);
+            host_request
+                .headers
+                .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
         }
-        if let Some(body) = request.body {
-            builder = builder.body(body);
-        }
-        let response = builder.send().context("send SAP request")?;
-        let status = response.status().as_u16();
-        if status != 200 {
-            return Ok(SapResponse {
-                status,
-                body: Vec::new(),
-            });
-        }
-        let mut body = Vec::new();
-        response
-            .take((MAX_SETUP_BODY + 1) as u64)
-            .read_to_end(&mut body)
-            .context("read SAP response")?;
-        if body.len() > MAX_SETUP_BODY {
-            bail!("apple response exceeds {MAX_SETUP_BODY} bytes");
-        }
-        Ok(SapResponse { status, body })
+        host_request.body = request.body;
+        let response = self
+            .transport
+            .send_bounded(host_request, MAX_SETUP_BODY)
+            .context("send SAP request")?;
+        Ok(SapResponse {
+            status: response.status,
+            body: response.body,
+        })
     }
 }
 
@@ -164,7 +162,12 @@ fn plist_bytes(document: &[u8], key: &str) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{
+        cell::RefCell,
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     use super::*;
 
@@ -241,5 +244,105 @@ mod tests {
         assert!(plist_bytes(b"<plist><dict/></plist>", CERTIFICATE_KEY).is_err());
         assert!(validate_endpoint(&Url::parse("http://example.test").unwrap()).is_err());
         assert!(validate_endpoint(&Url::parse("https://user@example.test").unwrap()).is_err());
+    }
+
+    #[test]
+    fn sap_setup_shares_store_session_cookies() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut lines = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    lines.push(line);
+                }
+                let length = lines
+                    .iter()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let (value, cookie) = match index {
+                    0 => {
+                        assert!(lines[0].starts_with("GET /store "));
+                        (b"ok".to_vec(), "Set-Cookie: session=fixture; Path=/\r\n")
+                    }
+                    1 => {
+                        assert!(lines[0].starts_with("GET /certificate "));
+                        assert!(lines.iter().any(|line| {
+                            line.to_ascii_lowercase()
+                                .starts_with("cookie: session=fixture")
+                        }));
+                        (
+                            encode_plist_bytes(CERTIFICATE_KEY, b"certificate").unwrap(),
+                            "Set-Cookie: sap=ready; Path=/\r\n",
+                        )
+                    }
+                    _ => {
+                        assert!(lines[0].starts_with("POST /exchange "));
+                        assert_eq!(plist_bytes(&body, BUFFER_KEY).unwrap(), b"request");
+                        assert!(
+                            lines
+                                .iter()
+                                .any(|line| line.to_ascii_lowercase().contains("session=fixture")
+                                    && line.contains("sap=ready"))
+                        );
+                        (encode_plist_bytes(BUFFER_KEY, b"reply").unwrap(), "")
+                    }
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\n{cookie}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    value.len()
+                )
+                .unwrap();
+                stream.write_all(&value).unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let store = Transport::with_cookies(directory.path()).unwrap();
+        let sap = ReqwestSapClient {
+            transport: Transport::with_cookies(directory.path()).unwrap(),
+        };
+        store
+            .send(Request::get(
+                Url::parse(&format!("http://{address}/store")).unwrap(),
+            ))
+            .unwrap();
+        let certificate = sap
+            .send(SapRequest {
+                method: Method::GET,
+                url: Url::parse(&format!("http://{address}/certificate")).unwrap(),
+                user_agent: USER_AGENT_VALUE,
+                content_type: None,
+                body: None,
+            })
+            .unwrap();
+        assert_eq!(
+            plist_bytes(&certificate.body, CERTIFICATE_KEY).unwrap(),
+            b"certificate"
+        );
+        let exchange = sap
+            .send(SapRequest {
+                method: Method::POST,
+                url: Url::parse(&format!("http://{address}/exchange")).unwrap(),
+                user_agent: USER_AGENT_VALUE,
+                content_type: Some("application/x-plist"),
+                body: Some(encode_plist_bytes(BUFFER_KEY, b"request").unwrap()),
+            })
+            .unwrap();
+        assert_eq!(plist_bytes(&exchange.body, BUFFER_KEY).unwrap(), b"reply");
+        server.join().unwrap();
     }
 }
