@@ -268,7 +268,7 @@ fn purchase_with_pricing<B: PurchaseBackend>(
         body: None,
         raw: false,
         response_format: "plist",
-        no_redirects: true,
+        no_redirects: false,
         timeout: None,
     })?;
     let result: PurchaseResponse = response.plist(false)?;
@@ -372,7 +372,7 @@ mod tests {
             assert_eq!(request.headers["X-Dsid"], "123456");
             assert_eq!(request.headers["X-Token"], "token");
             assert_eq!(request.headers["X-Apple-Store-Front"], "143441-1,29");
-            assert!(request.no_redirects);
+            assert!(!request.no_redirects);
             assert_eq!(request.parameters.unwrap()["guid"], "000102030405");
             assert_eq!(request.parameters.unwrap()["salableAdamId"], 1234);
             self.pricing.lock().unwrap().push(
@@ -548,6 +548,7 @@ mod tests {
                         r#"<plist version="1.0"><dict><key>urlBag</key><dict><key>buyProduct</key><string>https://buy.itunes.apple.com/stale</string></dict></dict></plist>"#,
                     ));
                 }
+                assert!(request.no_redirects);
                 *observed_guest.lock().unwrap() = Some(wire_purchase(&request));
                 Ok(response(
                     r#"<plist version="1.0"><dict><key>jingleDocType</key><string>purchaseSuccess</string><key>status</key><integer>0</integer></dict></plist>"#,
@@ -557,6 +558,7 @@ mod tests {
         let native_request = Arc::new(Mutex::new(None));
         let observed_native = Arc::clone(&native_request);
         let native = NativePurchaseBackend::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            assert!(!request.no_redirects);
             *observed_native.lock().unwrap() = Some(wire_purchase(&request));
             Ok(response(
                 r#"<plist version="1.0"><dict><key>jingleDocType</key><string>purchaseSuccess</string><key>status</key><integer>0</integer></dict></plist>"#,
