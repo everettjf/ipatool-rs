@@ -204,11 +204,23 @@ impl TaskLocalBindings {
 }
 
 enum PendingWork {
-    Guest { block: u64, queue: u64 },
-    Http { task: u64 },
-    DeliverData { task: u64 },
-    Complete { task: u64 },
-    SwiftTask { task: u64 },
+    Guest {
+        block: u64,
+        queue: u64,
+        group: Option<u64>,
+    },
+    Http {
+        task: u64,
+    },
+    DeliverData {
+        task: u64,
+    },
+    Complete {
+        task: u64,
+    },
+    SwiftTask {
+        task: u64,
+    },
 }
 
 enum HostBlockAction {
@@ -225,6 +237,11 @@ enum CallbackAction {
     QueueBlock {
         block: u64,
         queue: u64,
+        group: Option<u64>,
+    },
+    LeaveGroup {
+        group: u64,
+        then: Box<CallbackAction>,
     },
     StoreAt {
         destination: u64,
@@ -2939,7 +2956,7 @@ fn dispatch_call(
         "dispatch_async" => {
             let queue = context.reg_read(REG_X0)?;
             let block = context.reg_read(REG_X0 + 1)?;
-            copy_and_queue_block(context, state, queue, block)?;
+            copy_and_queue_block(context, state, queue, block, None)?;
         }
         "dispatch_set_target_queue" => {
             let queue = context.reg_read(REG_X0)?;
@@ -3139,12 +3156,10 @@ fn dispatch_call(
         }
         "$sSo17OS_dispatch_queueC8DispatchE5async5group3qos5flags7executeySo0a1_b1_F0CSg_AC0D3QoSVAC0D13WorkItemFlagsVyyXBtF" =>
         {
-            if context.reg_read(REG_X0)? != 0 {
-                bail!("Swift dispatch group is unsupported");
-            }
+            let group = context.reg_read(REG_X0)?;
             let queue = context.reg_read(REG_X0 + 20)?;
             let block = context.reg_read(REG_X0 + 3)?;
-            copy_and_queue_block(context, state, queue, block)?;
+            copy_and_queue_block(context, state, queue, block, (group != 0).then_some(group))?;
         }
         "$sSo18OS_dispatch_sourceC8DispatchE16makeSignalSource6signal5queueSo0a1_b1_c1_H0_ps5Int32V_So0a1_b1_I0CSgtFZ" =>
         {
@@ -4155,9 +4170,13 @@ fn copy_and_queue_block(
     state: &mut StoreState,
     queue: u64,
     block: u64,
+    group: Option<u64>,
 ) -> Result<()> {
     if block == 0 {
         bail!("cannot dispatch null block");
+    }
+    if let Some(group) = group {
+        group_count(state, group)?;
     }
     let flags = read_guest_u64(context, block + 8)? as u32;
     let copied = if flags & (1 << 28) != 0 {
@@ -4179,18 +4198,46 @@ fn copy_and_queue_block(
                 CallbackAction::QueueBlock {
                     block: copied,
                     queue,
+                    group,
                 },
             )?;
             return Ok(());
         }
         copied
     };
-    state.pending.push(PendingWork::Guest {
-        block: copied,
-        queue,
-    });
+    queue_guest_block(state, copied, queue, group)?;
     context.reg_write(REG_X0, 0)?;
     Ok(())
+}
+
+fn queue_guest_block(
+    state: &mut StoreState,
+    block: u64,
+    queue: u64,
+    group: Option<u64>,
+) -> Result<()> {
+    if let Some(group) = group {
+        let count = group_count(state, group)?;
+        *count = count
+            .checked_add(1)
+            .context("guest dispatch group overflow")?;
+    }
+    state.pending.push(PendingWork::Guest {
+        block,
+        queue,
+        group,
+    });
+    Ok(())
+}
+
+fn group_callback_action(group: Option<u64>, action: CallbackAction) -> CallbackAction {
+    match group {
+        Some(group) => CallbackAction::LeaveGroup {
+            group,
+            then: Box::new(action),
+        },
+        None => action,
+    }
 }
 
 fn new_host_block(
@@ -4917,17 +4964,24 @@ fn dispatch_pending_for_semaphore(
     work: PendingWork,
 ) -> Result<()> {
     match work {
-        PendingWork::Guest { block, queue } => {
+        PendingWork::Guest {
+            block,
+            queue,
+            group,
+        } => {
             let previous_queue = std::mem::replace(&mut state.current_queue, queue);
             begin_callback(
                 context,
                 state,
                 read_guest_u64(context, block + 16)?,
                 &[block],
-                CallbackAction::SemaphoreWait {
-                    semaphore,
-                    previous_queue,
-                },
+                group_callback_action(
+                    group,
+                    CallbackAction::SemaphoreWait {
+                        semaphore,
+                        previous_queue,
+                    },
+                ),
             )
         }
         PendingWork::SwiftTask { task } => {
@@ -4992,18 +5046,25 @@ fn dispatch_pending_for_group(
     work: PendingWork,
 ) -> Result<()> {
     match work {
-        PendingWork::Guest { block, queue } => {
+        PendingWork::Guest {
+            block,
+            queue,
+            group: work_group,
+        } => {
             let previous_queue = std::mem::replace(&mut state.current_queue, queue);
             begin_callback(
                 context,
                 state,
                 read_guest_u64(context, block + 16)?,
                 &[block],
-                CallbackAction::GroupWait {
-                    group,
-                    timeout,
-                    previous_queue,
-                },
+                group_callback_action(
+                    work_group,
+                    CallbackAction::GroupWait {
+                        group,
+                        timeout,
+                        previous_queue,
+                    },
+                ),
             )
         }
         PendingWork::SwiftTask { task } => {
@@ -5054,7 +5115,11 @@ fn poll_swift_continuation(
         bail!("Swift continuation has no runnable completion");
     };
     match work {
-        PendingWork::Guest { block, queue } => {
+        PendingWork::Guest {
+            block,
+            queue,
+            group,
+        } => {
             let previous_queue = std::mem::replace(&mut state.current_queue, queue);
             state.current_swift_task = None;
             begin_callback(
@@ -5062,11 +5127,14 @@ fn poll_swift_continuation(
                 state,
                 read_guest_u64(context, block + 16)?,
                 &[block],
-                CallbackAction::PollSwiftContinuation {
-                    task,
-                    continuation,
-                    previous_queue,
-                },
+                group_callback_action(
+                    group,
+                    CallbackAction::PollSwiftContinuation {
+                        task,
+                        continuation,
+                        previous_queue,
+                    },
+                ),
             )
         }
         PendingWork::SwiftTask { task: child } => {
@@ -5155,9 +5223,29 @@ fn resume_callback(
             )?;
             return Ok(());
         }
-        CallbackAction::QueueBlock { block, queue } => {
-            state.pending.push(PendingWork::Guest { block, queue });
+        CallbackAction::QueueBlock {
+            block,
+            queue,
+            group,
+        } => {
+            queue_guest_block(state, block, queue, group)?;
             context.reg_write(REG_X0, 0)?;
+        }
+        CallbackAction::LeaveGroup { group, then } => {
+            let count = group_count(state, group)?;
+            if *count <= 0 {
+                bail!("guest dispatch group leave without enter");
+            }
+            *count -= 1;
+            return resume_callback(
+                context,
+                profile,
+                state,
+                CallbackResume {
+                    link: resume.link,
+                    action: *then,
+                },
+            );
         }
         CallbackAction::ScheduleComplete { task } => {
             state.pending.push(PendingWork::Complete { task });
@@ -6921,14 +7009,21 @@ fn dispatch_message(
                     bail!("guest condition has no runnable callback");
                 };
                 match work {
-                    PendingWork::Guest { block, queue } => {
+                    PendingWork::Guest {
+                        block,
+                        queue,
+                        group,
+                    } => {
                         let previous = std::mem::replace(&mut state.current_queue, queue);
                         begin_callback(
                             context,
                             state,
                             read_guest_u64(context, block + 16)?,
                             &[block],
-                            CallbackAction::RestoreQueueWithValue { previous, value: 1 },
+                            group_callback_action(
+                                group,
+                                CallbackAction::RestoreQueueWithValue { previous, value: 1 },
+                            ),
                         )?;
                     }
                     PendingWork::Http { task } => perform_http(context, profile, state, task)?,
@@ -7201,7 +7296,7 @@ fn dispatch_message(
     }
     if !class_method && class_name == "NSOperationQueue" && selector == "addOperationWithBlock:" {
         let block = context.reg_read(REG_X0 + 2)?;
-        copy_and_queue_block(context, state, receiver, block)?;
+        copy_and_queue_block(context, state, receiver, block, None)?;
         return Ok(());
     }
     if !class_method
@@ -10075,6 +10170,7 @@ mod tests {
         runtime.state.borrow_mut().pending.push(PendingWork::Guest {
             block: semaphore,
             queue: suspended_queue,
+            group: None,
         });
         assert!(
             runtime
@@ -10086,6 +10182,7 @@ mod tests {
         runtime.state.borrow_mut().pending.push(PendingWork::Guest {
             block: semaphore,
             queue: 0,
+            group: None,
         });
         assert_eq!(runtime.call(wait, &[semaphore, 0]).unwrap(), 0);
         assert_eq!(runtime.state.borrow().pending.len(), 1);
@@ -10137,6 +10234,7 @@ mod tests {
             runtime.state.borrow_mut().pending.push(PendingWork::Guest {
                 block: group,
                 queue: 0,
+                group: None,
             });
         }
         assert_eq!(runtime.call(wait, &[group, 1]).unwrap(), 1);
@@ -10148,6 +10246,115 @@ mod tests {
             panic!("guest dispatch group count is not numeric");
         };
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_swift_group_async_leaves_after_queued_block() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let profile = Arc::clone(&runtime.profile);
+        let call_address = |symbol: &str| {
+            profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.symbol == symbol)
+                .unwrap()
+                .address
+        };
+        let group = runtime
+            .call(call_address("dispatch_group_create"), &[])
+            .unwrap();
+        let semaphore = runtime
+            .call(call_address("dispatch_semaphore_create"), &[0])
+            .unwrap();
+        let queue = runtime.new_object("HostQueue", StoreValue::Empty).unwrap();
+        runtime.write_u64(semaphore + 8, 1 << 28).unwrap();
+        runtime
+            .write_u64(semaphore + 16, call_address("dispatch_semaphore_signal"))
+            .unwrap();
+        let swift_async = call_address(
+            "$sSo17OS_dispatch_queueC8DispatchE5async5group3qos5flags7executeySo0a1_b1_F0CSg_AC0D3QoSVAC0D13WorkItemFlagsVyyXBtF",
+        );
+        runtime.engine.reg_write(REG_X0 + 20, queue).unwrap();
+        assert!(
+            runtime
+                .call(swift_async, &[semaphore, 0, 0, semaphore])
+                .is_err()
+        );
+        assert_eq!(runtime.state.borrow().pending.len(), 0);
+        runtime.engine.reg_write(REG_X0 + 20, queue).unwrap();
+        runtime
+            .call(swift_async, &[group, 0, 0, semaphore])
+            .unwrap();
+        assert_eq!(runtime.state.borrow().pending.len(), 1);
+        let state = runtime.state.borrow();
+        let StoreValue::Number(count) = state.objects[&group].value else {
+            panic!("guest dispatch group count is not numeric");
+        };
+        assert_eq!(count, 1);
+        drop(state);
+        assert_eq!(
+            runtime
+                .call(call_address("dispatch_group_wait"), &[group, u64::MAX])
+                .unwrap(),
+            0
+        );
+        assert_eq!(runtime.state.borrow().pending.len(), 0);
+        assert_eq!(
+            runtime
+                .call(call_address("dispatch_semaphore_wait"), &[semaphore, 0])
+                .unwrap(),
+            0
+        );
+        let state = runtime.state.borrow();
+        let StoreValue::Number(count) = state.objects[&group].value else {
+            panic!("guest dispatch group count is not numeric");
+        };
+        assert_eq!(count, 0);
+        drop(state);
+
+        let retain = call_address("objc_retain");
+        let descriptor = runtime.allocate(32).unwrap();
+        runtime.write_u64(descriptor + 8, 32).unwrap();
+        runtime.write_u64(descriptor + 16, retain).unwrap();
+        let block = runtime.allocate(32).unwrap();
+        runtime.write_u64(block + 8, 1 << 25).unwrap();
+        runtime.write_u64(block + 16, retain).unwrap();
+        runtime.write_u64(block + 24, descriptor).unwrap();
+        runtime.engine.reg_write(REG_X0 + 20, queue).unwrap();
+        runtime.call(swift_async, &[group, 0, 0, block]).unwrap();
+        assert_eq!(runtime.state.borrow().pending.len(), 1);
+        assert_eq!(
+            runtime
+                .call(call_address("dispatch_group_wait"), &[group, u64::MAX])
+                .unwrap(),
+            0
+        );
+        let state = runtime.state.borrow();
+        let StoreValue::Number(count) = state.objects[&group].value else {
+            panic!("guest dispatch group count is not numeric");
+        };
+        assert_eq!(count, 0);
+        drop(state);
+
+        runtime.engine.reg_write(REG_X0 + 20, queue).unwrap();
+        runtime
+            .call(swift_async, &[group, 0, 0, semaphore])
+            .unwrap();
+        assert_eq!(
+            runtime
+                .call(call_address("dispatch_semaphore_wait"), &[semaphore, 0])
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            runtime
+                .call(call_address("dispatch_group_wait"), &[group, 0])
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
