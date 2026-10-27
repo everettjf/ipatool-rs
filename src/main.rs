@@ -11,7 +11,6 @@ use clap_complete::{Shell, generate};
 use ipatool_rs::catalog::AppNotFound;
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
-use ipatool_rs::fairplay_26b118;
 use ipatool_rs::fairplay_checkpoint::FairplayCheckpoint;
 use ipatool_rs::fairplay_checkpoint_run::{CheckpointRunner, MemoryTraceOptions, VirtualFileStat};
 use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
@@ -29,7 +28,7 @@ use ipatool_rs::fairplay_recovery_output::{
     read_private_block, read_private_bytes, read_private_frame, read_private_model,
     write_private_binary, write_private_model,
 };
-use ipatool_rs::fairplay_recovery_target::{SidbTarget, WhiteboxTarget};
+use ipatool_rs::fairplay_recovery_target::{OracleJob, OracleTarget, SidbTarget, WhiteboxTarget};
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
 use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
@@ -339,7 +338,7 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         slot: Option<usize>,
     },
-    /// Evaluate one private 16-byte block with a checked 26B118 oracle model.
+    /// Evaluate one private 16-byte block with a checked 26A428 or 26B118 oracle model.
     EvaluateWhitebox {
         #[arg(long)]
         model: PathBuf,
@@ -411,7 +410,7 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Recover a 26B118 AES model from a private white-box oracle model.
+    /// Recover a 26A428 or 26B118 AES model from a private white-box oracle model.
     RecoverWhitebox {
         #[arg(long)]
         model: PathBuf,
@@ -1528,7 +1527,11 @@ fn run() -> Result<()> {
                 let input = read_private_block::<16>(&input)?;
                 let metadata = u32::try_from(parse_address(&metadata)?)
                     .context("white-box fault metadata exceeds 32 bits")?;
-                let result = fairplay_26b118::evaluate(&model, &input, metadata)?;
+                let mut target = WhiteboxTarget::new(&model)?;
+                let result = target.evaluate_jobs(&[OracleJob {
+                    block: *input,
+                    metadata,
+                }])?[0];
                 write_private_binary(&output, &result)?;
                 match cli.format {
                     Format::Json => println!(
@@ -1539,10 +1542,9 @@ fn run() -> Result<()> {
                             "metadata": format!("{metadata:#x}"),
                         })
                     ),
-                    Format::Text => println!(
-                        "Evaluated private 26B118 white-box block in {}",
-                        output.display()
-                    ),
+                    Format::Text => {
+                        println!("Evaluated private white-box block in {}", output.display())
+                    }
                 }
             }
             FairplayEnrollCommand::RecoverState {
@@ -1709,7 +1711,7 @@ fn run() -> Result<()> {
                         })
                     ),
                     Format::Text => println!(
-                        "Recovered private 26B118 white-box AES model in {}",
+                        "Recovered private white-box AES model in {}",
                         output.display()
                     ),
                 }

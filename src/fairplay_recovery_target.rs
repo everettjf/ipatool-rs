@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
-    fairplay_26b118,
+    fairplay_26a428, fairplay_26b118,
     fairplay_frame::BUILD_HASH,
     fairplay_oracle_model::{FaultKind, OracleModel, OracleState},
     fairplay_recovery_math::{Encoding, mix_columns, shift_rows},
@@ -98,21 +98,37 @@ impl OracleTarget for SidbTarget<'_> {
 pub struct WhiteboxTarget<'a> {
     model: &'a OracleModel,
     state: OracleState<'a>,
+    build: WhiteboxBuild,
+}
+
+enum WhiteboxBuild {
+    Macos26A428,
+    Macos26B118,
 }
 
 impl<'a> WhiteboxTarget<'a> {
     pub fn new(model: &'a OracleModel) -> Result<Self> {
-        if model.binary_hash != fairplay_26b118::BUILD_HASH {
-            bail!("white-box oracle model does not match the checked 26B118 build");
-        }
-        for (pc, register) in fairplay_26b118::required_index_sites() {
-            if model.domain(pc, register).is_none() {
-                bail!("26B118 white-box model lacks learned index domain at {pc:#x}/x{register}");
+        let build = if model.binary_hash == BUILD_HASH {
+            if model.block_address != fairplay_26a428::BLOCK_ADDRESS {
+                bail!("26A428 white-box model has the wrong block address");
             }
-        }
+            WhiteboxBuild::Macos26A428
+        } else if model.binary_hash == fairplay_26b118::BUILD_HASH {
+            for (pc, register) in fairplay_26b118::required_index_sites() {
+                if model.domain(pc, register).is_none() {
+                    bail!(
+                        "26B118 white-box model lacks learned index domain at {pc:#x}/x{register}"
+                    );
+                }
+            }
+            WhiteboxBuild::Macos26B118
+        } else {
+            bail!("white-box oracle model does not match a checked build");
+        };
         Ok(Self {
             model,
             state: model.state(),
+            build,
         })
     }
 }
@@ -120,14 +136,20 @@ impl<'a> WhiteboxTarget<'a> {
 impl OracleTarget for WhiteboxTarget<'_> {
     fn evaluate_jobs(&mut self, jobs: &[OracleJob]) -> Result<Vec<[u8; 16]>> {
         jobs.iter()
-            .map(|job| {
-                let fault = fairplay_26b118::fault_for_metadata(job.metadata)?;
-                if fault.kind == FaultKind::Index
-                    && self.model.domain(fault.pc, fault.register).is_none()
-                {
-                    bail!("26B118 index fault requires its learned domain");
+            .map(|job| match self.build {
+                WhiteboxBuild::Macos26A428 => {
+                    let fault = fairplay_26a428::fault_for_metadata(job.metadata)?;
+                    fairplay_26a428::evaluate_in_state(&mut self.state, &job.block, fault)
                 }
-                fairplay_26b118::evaluate_in_state(&mut self.state, &job.block, fault)
+                WhiteboxBuild::Macos26B118 => {
+                    let fault = fairplay_26b118::fault_for_metadata(job.metadata)?;
+                    if fault.kind == FaultKind::Index
+                        && self.model.domain(fault.pc, fault.register).is_none()
+                    {
+                        bail!("26B118 index fault requires its learned domain");
+                    }
+                    fairplay_26b118::evaluate_in_state(&mut self.state, &job.block, fault)
+                }
             })
             .collect()
     }
@@ -160,6 +182,35 @@ pub fn attack_view(raw: [u8; 16], output: &[Encoding], reverse_mc: bool) -> [u8;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whitebox_target_evaluates_checked_26a428_core() {
+        let model = OracleModel::parse_gzip(include_bytes!(
+            "../tests/fixtures/fairplay-oracle-26a428-synthetic.model.gz"
+        ))
+        .unwrap();
+        let input = deterministic_input(0);
+        let mut target = WhiteboxTarget::new(&model).unwrap();
+        let jobs = [
+            OracleJob {
+                block: input,
+                metadata: 0xffff,
+            },
+            OracleJob {
+                block: input,
+                metadata: 0x0700_0006,
+            },
+        ];
+        let outputs = target.evaluate_jobs(&jobs).unwrap();
+        assert_eq!(
+            outputs[0],
+            fairplay_26a428::evaluate(&model, &input, 0xffff).unwrap()
+        );
+        assert_eq!(
+            outputs[1],
+            fairplay_26a428::evaluate(&model, &input, 0x0700_0006).unwrap()
+        );
+    }
     use crate::fairplay_recovery_math::Encoding;
 
     #[test]
