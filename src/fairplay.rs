@@ -380,6 +380,8 @@ pub fn doctor_fairplay(
     let mut report = FairPlayDoctorReport {
         schema: "ipatool-fairplay-doctor-v1",
         created_at: OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .expect("zero nanoseconds are valid")
             .format(&Rfc3339)
             .unwrap_or_default(),
         ready: false,
