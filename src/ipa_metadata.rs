@@ -3,7 +3,6 @@
 use std::{
     io::{self, Read, Seek, SeekFrom},
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,7 +17,6 @@ use crate::transport::{Request, Response, Transport};
 
 const CHUNK_SIZE: u64 = 256 * 1024;
 const MAX_INFO_PLIST: u64 = 4 * 1024 * 1024;
-const RANGE_TIMEOUT: Duration = Duration::from_secs(30);
 type Sender = dyn Fn(Request) -> Result<Response> + Send + Sync;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -247,7 +245,6 @@ fn send_range(sender: &Arc<Sender>, url: &Url, start: u64, end: u64) -> Result<R
         "Range",
         HeaderValue::from_str(&format!("bytes={start}-{end}"))?,
     );
-    request.timeout = Some(RANGE_TIMEOUT);
     request.no_redirects = false;
     sender(request).context("request IPA byte range")
 }
@@ -333,6 +330,7 @@ mod tests {
     ) -> impl Fn(Request) -> Result<Response> + Send + Sync + 'static {
         move |request| {
             assert_eq!(request.method, Method::GET);
+            assert!(request.timeout.is_none());
             assert_eq!(request.headers.get("Accept-Encoding").unwrap(), "identity");
             let range = request.headers.get("Range").unwrap().to_str().unwrap();
             let (start, end) = range

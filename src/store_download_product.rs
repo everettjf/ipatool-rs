@@ -1209,10 +1209,9 @@ fn fetch_artwork_with_transport(url: &str, transport: Option<&Transport>) -> Res
         bail!("Store artwork URL must use HTTP or HTTPS");
     }
     let mut response = if let Some(transport) = transport {
-        transport.stream_get(url, HeaderMap::new(), Some(DEFAULT_AUTHENTICATION_TIMEOUT))?
+        transport.stream_get(url, HeaderMap::new(), None)?
     } else {
         reqwest::blocking::Client::builder()
-            .timeout(DEFAULT_AUTHENTICATION_TIMEOUT)
             .build()
             .context("create artwork HTTP client")?
             .get(url)
