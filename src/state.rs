@@ -53,6 +53,9 @@ pub fn prepare_state_directory(
 }
 
 pub fn prepare_state_directory_from_environment() -> Result<PathBuf> {
+    if let Some(explicit) = std::env::var_os("IPATOOL_STATE_DIR") {
+        return prepare_explicit_state_directory(Path::new(&explicit));
+    }
     #[cfg(windows)]
     let home = windows_home_directory(
         std::env::var_os("HOMEDRIVE"),
@@ -68,6 +71,15 @@ pub fn prepare_state_directory_from_environment() -> Result<PathBuf> {
     let xdg_state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
     let xdg_data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
     prepare_state_directory(&home, xdg_state_home.as_deref(), xdg_data_home.as_deref())
+}
+
+fn prepare_explicit_state_directory(path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        bail!("IPATOOL_STATE_DIR must be an absolute path");
+    }
+    create_private_directory(path)
+        .with_context(|| format!("create explicit state directory: {}", path.display()))?;
+    Ok(path.to_path_buf())
 }
 
 #[cfg(any(windows, test))]
@@ -171,5 +183,26 @@ mod tests {
         let path = prepare_state_directory(&home, None, None).unwrap();
         let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_state_directory_is_private_without_migrating_legacy_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join(".ipatool");
+        fs::create_dir(&legacy).unwrap();
+        fs::write(legacy.join("cookies"), b"keep").unwrap();
+        let explicit = root.path().join("isolated");
+        assert_eq!(
+            prepare_explicit_state_directory(&explicit).unwrap(),
+            explicit
+        );
+        assert_eq!(fs::read(legacy.join("cookies")).unwrap(), b"keep");
+        assert_eq!(
+            fs::metadata(&explicit).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(prepare_explicit_state_directory(Path::new("relative")).is_err());
     }
 }

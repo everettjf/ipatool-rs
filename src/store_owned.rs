@@ -134,7 +134,10 @@ impl OwnedBackend for NativeOwnedBackend {
             method: Method::POST,
             url,
             headers,
-            body: request.body.map(ToOwned::to_owned),
+            // The DAAP login is a POST without a payload. Go sends it with
+            // Content-Length: 0; reqwest omits that header for `None`, and
+            // the live purchase-history endpoint rejects it with HTTP 411.
+            body: Some(request.body.unwrap_or_default().to_owned()),
             no_redirects: request.no_redirects,
             timeout: request.timeout,
         })

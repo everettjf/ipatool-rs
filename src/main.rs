@@ -78,7 +78,10 @@ struct Cli {
     /// Disable terminal prompts and Apple Keychain authorization dialogs.
     #[arg(long, global = true)]
     non_interactive: bool,
-    /// Passphrase for the encrypted file keychain on Linux or Windows (selects file storage on Linux).
+    /// Use encrypted file storage instead of macOS Keychain or Linux Secret Service.
+    #[arg(long, global = true)]
+    file_keychain: bool,
+    /// Passphrase for encrypted file storage (also selects it on macOS and Linux).
     #[arg(long, global = true)]
     keychain_passphrase: Option<String>,
     #[command(subcommand)]
@@ -649,9 +652,11 @@ fn run() -> Result<()> {
             && matches!(cli.format, Format::Text)
             && io::stderr().is_terminal(),
     );
+    let force_file_keychain = cli.file_keychain || cli.keychain_passphrase.is_some();
     configure_file_keychain(
         cli.keychain_passphrase.take(),
         !cli.non_interactive && io::stdin().is_terminal(),
+        force_file_keychain,
     );
     configure_apple_keychain_ui(
         !cli.non_interactive && !matches!(&cli.command, Command::Mcp) && io::stdin().is_terminal(),
@@ -3509,5 +3514,13 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn file_keychain_can_be_selected_without_password_in_arguments() {
+        let cli = Cli::try_parse_from(["ipatool", "--file-keychain", "auth", "login"]).unwrap();
+        assert!(cli.file_keychain);
+        assert!(cli.keychain_passphrase.is_none());
+        assert!(matches!(cli.command, Command::Auth { .. }));
     }
 }

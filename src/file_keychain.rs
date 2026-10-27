@@ -64,7 +64,7 @@ impl FileKeychain {
         Self::path_for(&self.directory, key)
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows", test))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows", test))]
     pub(crate) fn item_exists(directory: &Path, key: &str) -> Result<bool> {
         let path = Self::path_for(directory, key)?;
         match fs::symlink_metadata(path) {

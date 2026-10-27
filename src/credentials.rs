@@ -4,30 +4,51 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
-#[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    all(test, unix)
+))]
 use crate::file_keychain::FileKeychain;
 #[cfg(target_os = "linux")]
 use crate::linux_secret_service::LinuxSecretService;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::state::KEYCHAIN_SERVICE_NAME;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use crate::state::prepare_state_directory_from_environment;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    all(test, unix)
+))]
 struct FileKeychainOptions {
     passphrase: std::sync::Mutex<Option<Zeroizing<String>>>,
     interactive: bool,
+    force_file: bool,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    all(test, unix)
+))]
 struct LazyFileKeychain<'a> {
     directory: std::path::PathBuf,
     options: &'a FileKeychainOptions,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    all(test, unix)
+))]
 impl CredentialStore for LazyFileKeychain<'_> {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         if !FileKeychain::item_exists(&self.directory, key)? {
@@ -45,21 +66,22 @@ impl CredentialStore for LazyFileKeychain<'_> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 static FILE_KEYCHAIN_OPTIONS: std::sync::OnceLock<FileKeychainOptions> = std::sync::OnceLock::new();
 
-/// Configure the Go-compatible file keychain before opening it on Linux or Windows.
-pub fn configure_file_keychain(passphrase: Option<String>, interactive: bool) {
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+/// Configure the encrypted file credential store before opening it.
+pub fn configure_file_keychain(passphrase: Option<String>, interactive: bool, force_file: bool) {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         let _ = FILE_KEYCHAIN_OPTIONS.set(FileKeychainOptions {
             passphrase: std::sync::Mutex::new(passphrase.map(Zeroizing::new)),
             interactive,
+            force_file,
         });
     }
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        let _ = (passphrase, interactive);
+        let _ = (passphrase, interactive, force_file);
     }
 }
 
@@ -92,6 +114,10 @@ pub struct AppleKeychain {
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 static APPLE_KEYCHAIN_UI_ALLOWED: AtomicBool = AtomicBool::new(true);
+#[cfg(target_os = "macos")]
+static NONINTERACTIVE_KEYCHAIN_GUARD: std::sync::Mutex<
+    Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
+> = std::sync::Mutex::new(None);
 
 /// Control whether Apple Keychain operations may display an authorization dialog.
 pub fn configure_apple_keychain_ui(allow_ui: bool) {
@@ -132,11 +158,16 @@ fn apple_password_options(
 fn apple_keychain_error(
     operation: &str,
     key: &str,
+    allow_ui: bool,
     error: security_framework::base::Error,
 ) -> anyhow::Error {
     if error.code() == -25308 {
         anyhow!(
             "{operation} Apple Keychain item {key}: interactive authorization is required; approve access from an interactive ipatool account command"
+        )
+    } else if !allow_ui && error.code() == -25293 {
+        anyhow!(
+            "{operation} Apple Keychain item {key}: access failed without authorization UI (OSStatus -25293); retry from an interactive ipatool account command"
         )
     } else {
         anyhow!("{operation} Apple Keychain item {key}: {error}")
@@ -153,7 +184,7 @@ impl CredentialStore for AppleKeychain {
         match generic_password(apple_password_options(key, self.allow_ui)) {
             Ok(data) => Ok(Some(data)),
             Err(error) if error.code() == -25300 => Ok(None),
-            Err(error) => Err(apple_keychain_error("read", key, error)),
+            Err(error) => Err(apple_keychain_error("read", key, self.allow_ui, error)),
         }
     }
 
@@ -162,7 +193,7 @@ impl CredentialStore for AppleKeychain {
             data,
             apple_password_options(key, self.allow_ui),
         )
-        .map_err(|error| apple_keychain_error("save", key, error))
+        .map_err(|error| apple_keychain_error("save", key, self.allow_ui, error))
     }
 
     fn remove(&self, key: &str) -> Result<bool> {
@@ -170,7 +201,7 @@ impl CredentialStore for AppleKeychain {
         match delete_generic_password_options(apple_password_options(key, self.allow_ui)) {
             Ok(()) => Ok(true),
             Err(error) if error.code() == -25300 => Ok(false),
-            Err(error) => Err(apple_keychain_error("remove", key, error)),
+            Err(error) => Err(apple_keychain_error("remove", key, self.allow_ui, error)),
         }
     }
 }
@@ -178,9 +209,28 @@ impl CredentialStore for AppleKeychain {
 pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        Ok(Box::new(AppleKeychain {
-            allow_ui: APPLE_KEYCHAIN_UI_ALLOWED.load(Ordering::Relaxed),
-        }))
+        #[cfg(target_os = "macos")]
+        if let Some(options) = FILE_KEYCHAIN_OPTIONS.get()
+            && options.force_file
+        {
+            let directory = prepare_state_directory_from_environment()?;
+            return Ok(Box::new(LazyFileKeychain { directory, options }));
+        }
+        let allow_ui = APPLE_KEYCHAIN_UI_ALLOWED.load(Ordering::Relaxed);
+        #[cfg(target_os = "macos")]
+        if !allow_ui {
+            let mut guard = NONINTERACTIVE_KEYCHAIN_GUARD
+                .lock()
+                .map_err(|_| anyhow!("non-interactive Keychain guard lock is poisoned"))?;
+            if guard.is_none() {
+                *guard = Some(
+                    security_framework::os::macos::keychain::SecKeychain::disable_user_interaction(
+                    )
+                    .context("disable macOS Keychain authorization UI")?,
+                );
+            }
+        }
+        Ok(Box::new(AppleKeychain { allow_ui }))
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
@@ -189,11 +239,12 @@ pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> 
             .context("file keychain is not configured")?;
         #[cfg(target_os = "linux")]
         {
-            let explicit_file_backend = options
-                .passphrase
-                .lock()
-                .map_err(|_| anyhow!("file keychain lock failed"))?
-                .is_some();
+            let explicit_file_backend = options.force_file
+                || options
+                    .passphrase
+                    .lock()
+                    .map_err(|_| anyhow!("file keychain lock failed"))?
+                    .is_some();
             if !explicit_file_backend
                 && let Some(service) = LinuxSecretService::probe(options.interactive)
             {
@@ -214,7 +265,12 @@ pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> 
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    all(test, unix)
+))]
 fn open_file_keychain(
     directory: std::path::PathBuf,
     options: &FileKeychainOptions,
@@ -238,7 +294,7 @@ fn open_file_keychain(
     Ok(Box::new(FileKeychain::new(directory, passphrase)?))
 }
 
-#[cfg(any(target_os = "linux", all(test, unix)))]
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
 fn prompt_file_passphrase() -> Result<String> {
     use std::io::{self, Write};
 
@@ -459,6 +515,7 @@ mod tests {
         let options = FileKeychainOptions {
             passphrase: Mutex::new(Some(Zeroizing::new("test passphrase".into()))),
             interactive: false,
+            force_file: true,
         };
         let store =
             AccountStore::new(open_file_keychain(directory.path().to_owned(), &options).unwrap());
@@ -478,6 +535,7 @@ mod tests {
         let missing = FileKeychainOptions {
             passphrase: Mutex::new(None),
             interactive: false,
+            force_file: true,
         };
         assert!(open_file_keychain(directory.path().to_owned(), &missing).is_err());
     }
@@ -489,6 +547,7 @@ mod tests {
         let options = FileKeychainOptions {
             passphrase: Mutex::new(None),
             interactive: false,
+            force_file: true,
         };
         let store = LazyFileKeychain {
             directory: directory.path().to_owned(),
