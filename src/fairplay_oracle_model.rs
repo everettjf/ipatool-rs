@@ -443,7 +443,7 @@ impl<'a> OracleState<'a> {
         let old = self.registers[register];
         self.registers[register] = match selected.kind {
             FaultKind::None => old,
-            FaultKind::Index => {
+            FaultKind::Index | FaultKind::IndexAfter => {
                 if let Some(values) = self.model.domain(pc, selected.register) {
                     let needle = old as u32 as u64;
                     let index = values.binary_search(&needle).map_err(|_| {
@@ -454,9 +454,6 @@ impl<'a> OracleState<'a> {
                     (old as u32 ^ (selected.value as u32).wrapping_shl(selected.shift as u32))
                         as u64
                 }
-            }
-            FaultKind::IndexAfter => {
-                (old as u32 ^ (selected.value as u32).wrapping_shl(selected.shift as u32)) as u64
             }
             FaultKind::Pointer => {
                 let table = selected.table_bytes as u64;

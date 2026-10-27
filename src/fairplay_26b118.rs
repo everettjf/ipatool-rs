@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn learned_domains_match_go_except_index_after_site() {
+    fn learned_domains_match_go_including_index_after_rejections() {
         let model = OracleModel::parse_gzip(include_bytes!(
             "../tests/fixtures/fairplay-oracle-26b118-synthetic-domains.model.gz"
         ))
@@ -242,6 +242,16 @@ mod tests {
                 u8::from_str_radix(&input[byte * 2..byte * 2 + 2], 16).unwrap()
             });
             let fault = fault_for_metadata(metadata).unwrap();
+            if kind == "fault" && matches!(index, "57" | "58" | "59") {
+                // Go classifies this post-lookup XOR as an index fault when
+                // an extra domain is present and rejects the out-of-domain
+                // register value. Checked exports omit this eighteenth domain.
+                assert_eq!(fault.kind, FaultKind::IndexAfter);
+                let error = evaluate_in_state(&mut state, &input, fault).unwrap_err();
+                assert!(format!("{error:#}").contains("outside the learned domain"));
+                index_after.push(index);
+                continue;
+            }
             let output = evaluate_in_state(&mut state, &input, fault).unwrap_or_else(|error| {
                 panic!("Go vector {kind} {index} failed with learned domains: {error:#}")
             });
@@ -251,14 +261,56 @@ mod tests {
                 .collect::<String>();
             assert_eq!(output_hex, expected_output, "Go vector {kind} {index}");
             assert_eq!(state.digest(), expected_digest, "Go vector {kind} {index}");
-            if kind == "fault" && matches!(index, "57" | "58" | "59") {
-                // Go classifies the post-lookup XOR at 0x100222c58 as an index
-                // lookup and rejects this value when a domain is present. The
-                // checked instruction geometry uses a direct XOR at this site.
-                assert_eq!(fault.kind, FaultKind::IndexAfter);
-                index_after.push(index);
-            }
         }
         assert_eq!(index_after, ["57", "58", "59"]);
+    }
+
+    #[test]
+    fn checked_domains_preserve_index_after_xor() {
+        let model = OracleModel::parse_gzip(include_bytes!(
+            "../tests/fixtures/fairplay-oracle-26b118-synthetic-checked-domains.model.gz"
+        ))
+        .unwrap();
+        assert_eq!(model.domain_count(), 17);
+        assert!(model.domain(INDEX_AFTER_PC, 9).is_none());
+        crate::fairplay_recovery_target::WhiteboxTarget::new(&model).unwrap();
+
+        let mut state = model.state();
+        let mut checked = 0;
+        for line in include_str!("../tests/fixtures/fairplay-26b118-go-vectors.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let [
+                kind,
+                index,
+                metadata,
+                input,
+                expected_output,
+                expected_digest,
+            ] = line
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            if kind != "fault" || !matches!(index, "57" | "58" | "59") {
+                continue;
+            }
+            let metadata = u32::from_str_radix(metadata, 16).unwrap();
+            let input = core::array::from_fn(|byte| {
+                u8::from_str_radix(&input[byte * 2..byte * 2 + 2], 16).unwrap()
+            });
+            let fault = fault_for_metadata(metadata).unwrap();
+            assert_eq!(fault.kind, FaultKind::IndexAfter);
+            let output = evaluate_in_state(&mut state, &input, fault).unwrap();
+            let output_hex = output
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(output_hex, expected_output, "Go vector {index}");
+            assert_eq!(state.digest(), expected_digest, "Go vector {index}");
+            checked += 1;
+        }
+        assert_eq!(checked, 3);
     }
 }

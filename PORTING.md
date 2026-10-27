@@ -17,8 +17,8 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 
 ## Build and test evidence
 
-- `cargo test --all-targets`: 308 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
-- `cargo clippy --all-targets -- -D warnings` passed after the file keychain change.
+- `cargo test --all-targets`: 309 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
+- `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` passed after the 26B118 index-fault change.
 - `cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings` passed with the Linux Secret Service backend compiled in.
 - `cargo check` passed for macOS x86_64, Linux x86_64 and ARM64, Windows x86_64 GNU and ARM64 GNU/LLVM, and iOS ARM64. Cross-target C dependencies required local cross compiler and archiver wrappers on this macOS host.
 - Release binaries were built for macOS ARM64 and x86_64 (Mach-O), Linux x86_64 and ARM64 (ELF), Windows x86_64 and ARM64 (PE), and iOS ARM64 (Mach-O). The macOS x86_64 binary ran under Rosetta and completed a public catalog search. The iOS binary is signed with `ldid` and private entitlements for a jailbroken device, declares iOS 15.0 as its minimum, and contains the Unicorn API symbols. `ldid -e` confirms the embedded entitlements, while macOS `codesign --verify` does not accept this signature; execution and trust must be checked on the target device.
@@ -37,7 +37,7 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 - Twenty-four additional opt-in tests passed with locally cached assets, public endpoints, or the current host's `fairplayd`, including guest ABI and memory guards, authentication parameters, StoreAgent KBSync, public bag retrieval, live SAP setup/signing, FairPlay image loading, and hardware MAC selection. These tests do not perform an authenticated Store transaction.
 - A live non-interactive iPhone catalog search succeeded without `--country` or keychain access. `IPATOOL_SAP_CACHE_DIR` selected the four prevalidated framework files and booted the Store guest; an explicit invalid cache fails without fetching a restore image.
 - The rebuilt macOS ARM64 MCP server completed a live public `search_apps` request with `country: "JP"` and returned one result without accessing account storage.
-- The 26B118 Go evaluator generated 208 output and full-state vectors from an account-free synthetic model; Rust matches all 208. With the domain-bearing variant, 205 cases match Go. At the post-lookup XOR site `0x100222c58`, Go classifies three cases as index-domain faults and rejects them; Rust applies the direct XOR. This known semantic difference still needs confirmation against private native capture.
+- The 26B118 Go evaluator generated 208 output and full-state vectors from an account-free synthetic model; Rust matches all 208. With an extra eighteenth domain at the post-lookup XOR site `0x100222c58`, Rust now matches Go on 205 outputs and the three index-domain rejections. A checked 17-domain synthetic variant confirms that those three cases instead take the direct XOR and match the Go vectors when that extra domain is absent. Private native capture still needs differential validation.
 
 ## Gates before claiming full parity
 
