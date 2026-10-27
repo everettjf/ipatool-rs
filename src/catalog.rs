@@ -173,8 +173,7 @@ impl CatalogClient {
     fn search_vision(&self, term: &str, country: &str, limit: i64) -> Result<SearchOutput> {
         let url = vision::search_url(term, country)?;
         let body = self.get(url)?.body;
-        let body = String::from_utf8(body).context("visionOS search page is not UTF-8")?;
-        let mut apps = vision::storefront_apps(&body, limit)?;
+        let mut apps = vision::storefront_apps_bytes(&body, limit)?;
         if apps.is_empty() {
             return Ok(SearchOutput { count: 0, apps });
         }

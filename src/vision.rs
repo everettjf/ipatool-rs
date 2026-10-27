@@ -27,26 +27,34 @@ pub fn product_url(app_id: i64, country: &str) -> Result<Url> {
     Ok(url)
 }
 
-pub(crate) fn serialized_server_data(body: &str) -> Result<&str> {
-    let marker = body
-        .find(&format!("id=\"{SCRIPT_ID}\""))
-        .or_else(|| body.find(&format!("id='{SCRIPT_ID}'")))
+pub(crate) fn serialized_server_data_bytes(body: &[u8]) -> Result<&str> {
+    let marker = find_bytes(body, format!("id=\"{SCRIPT_ID}\"").as_bytes())
+        .or_else(|| find_bytes(body, format!("id='{SCRIPT_ID}'").as_bytes()))
         .ok_or_else(|| anyhow!("serialized server data was not found"))?;
     let script_start = body[..marker]
-        .rfind("<script")
+        .windows(b"<script".len())
+        .rposition(|part| part == b"<script")
         .ok_or_else(|| anyhow!("serialized server data script was not found"))?;
     let opening_end = body[marker..]
-        .find('>')
+        .iter()
+        .position(|byte| *byte == b'>')
         .map(|offset| marker + offset + 1)
         .ok_or_else(|| anyhow!("serialized server data script is malformed"))?;
-    if script_start > marker || body[script_start..marker].contains('>') {
+    if script_start > marker || body[script_start..marker].contains(&b'>') {
         bail!("serialized server data script is malformed");
     }
-    let closing = body[opening_end..]
-        .find("</script>")
+    let closing = find_bytes(&body[opening_end..], b"</script>")
         .map(|offset| opening_end + offset)
         .ok_or_else(|| anyhow!("serialized server data script is not closed"))?;
-    Ok(body[opening_end..closing].trim())
+    Ok(std::str::from_utf8(&body[opening_end..closing])
+        .context("serialized server data is not UTF-8")?
+        .trim())
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|part| part == needle)
 }
 
 fn vision_version_id(value: &Value, app_id: i64) -> Option<String> {
@@ -101,7 +109,11 @@ fn vision_version_id(value: &Value, app_id: i64) -> Option<String> {
 }
 
 pub fn storefront_apps(body: &str, limit: i64) -> Result<Vec<App>> {
-    let data = serialized_server_data(body)?;
+    storefront_apps_bytes(body.as_bytes(), limit)
+}
+
+pub(crate) fn storefront_apps_bytes(body: &[u8], limit: i64) -> Result<Vec<App>> {
+    let data = serialized_server_data_bytes(body)?;
     let page: Value =
         serde_json::from_str(data).context("failed to decode serialized server data")?;
     let max_count = limit.max(0).min(MAX_RESULTS as i64) as usize;
@@ -158,7 +170,11 @@ pub fn storefront_apps(body: &str, limit: i64) -> Result<Vec<App>> {
 }
 
 pub fn product_version_id(body: &str, app_id: i64) -> Result<String> {
-    let data = serialized_server_data(body)?;
+    product_version_id_bytes(body.as_bytes(), app_id)
+}
+
+pub(crate) fn product_version_id_bytes(body: &[u8], app_id: i64) -> Result<String> {
+    let data = serialized_server_data_bytes(body)?;
     let page: Value =
         serde_json::from_str(data).context("failed to decode serialized server data")?;
     match vision_version_id(&page, app_id) {
@@ -229,5 +245,18 @@ mod tests {
             );
             assert!(product_version_id(&body, 100).is_err());
         }
+    }
+
+    #[test]
+    fn reads_product_and_search_json_with_non_utf8_html_outside_script() {
+        let mut body = vec![0xff];
+        body.extend_from_slice(fixture().as_bytes());
+        body.push(0xfe);
+        assert_eq!(product_version_id_bytes(&body, 200).unwrap(), "2000");
+        assert_eq!(storefront_apps_bytes(&body, 2).unwrap().len(), 2);
+        let mut invalid_script = body;
+        let marker = find_bytes(&invalid_script, b"\"AppSearchResult\"").unwrap();
+        invalid_script[marker] = 0xff;
+        assert!(product_version_id_bytes(&invalid_script, 200).is_err());
     }
 }

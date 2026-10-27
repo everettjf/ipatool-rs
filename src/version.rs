@@ -44,15 +44,13 @@ impl CatalogClient {
         if platform == Platform::Visionos {
             let url = vision::product_url(app.id, country)?;
             let body = self.get(url)?.body;
-            let body = String::from_utf8(body)?;
-            return vision::product_version_id(&body, app.id);
+            return vision::product_version_id_bytes(&body, app.id);
         }
 
         if platform == Platform::Macos {
             let url = macos::product_url(app.id, country)?;
             let body = self.get(url)?.body;
-            let body = String::from_utf8(body)?;
-            return macos::product_version_id(&body, app);
+            return macos::product_version_id_bytes(&body, app);
         }
 
         let catalogs: &[&str] = match platform {

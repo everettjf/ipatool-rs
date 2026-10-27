@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use url::Url;
 
-use crate::{App, buy_params::parse_buy_params, vision::serialized_server_data};
+use crate::{App, buy_params::parse_buy_params, vision::serialized_server_data_bytes};
 
 pub fn product_url(app_id: i64, country: &str) -> Result<Url> {
     let mut url = Url::parse(&format!(
@@ -18,7 +18,11 @@ pub fn product_url(app_id: i64, country: &str) -> Result<Url> {
 }
 
 pub fn product_version_id(body: &str, app: &App) -> Result<String> {
-    let data = serialized_server_data(body)?;
+    product_version_id_bytes(body.as_bytes(), app)
+}
+
+pub(crate) fn product_version_id_bytes(body: &[u8], app: &App) -> Result<String> {
+    let data = serialized_server_data_bytes(body)?;
     let page: Value = serde_json::from_str(data).context("failed to decode Mac product page")?;
     let mut versions = HashSet::new();
     collect_versions(&page, app, &mut versions);
@@ -125,5 +129,16 @@ mod tests {
             r#"<script>const example = "id='serialized-server-data'";</script><script id="serialized-server-data">{MAC_OFFER}</script>"#
         );
         assert_eq!(product_version_id(&body, &app()).unwrap(), "876660716");
+    }
+
+    #[test]
+    fn reads_product_json_when_unrelated_html_bytes_are_not_utf8() {
+        let mut body = vec![0xff];
+        body.extend_from_slice(page(MAC_OFFER).as_bytes());
+        body.push(0xfe);
+        assert_eq!(
+            product_version_id_bytes(&body, &app()).unwrap(),
+            "876660716"
+        );
     }
 }
