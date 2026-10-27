@@ -397,6 +397,57 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_transfer_streams_package_beyond_store_body_limit() {
+        const SIZE: usize = (32 << 20) + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while stream.read_exact(&mut byte).is_ok() {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            assert!(
+                String::from_utf8(request)
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("range: bytes=0-\r\n")
+            );
+            write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{SIZE}\r\nContent-Length: {SIZE}\r\nConnection: close\r\n\r\n", SIZE - 1).unwrap();
+            let chunk = [0x5a; 64 * 1024];
+            for _ in 0..(SIZE / chunk.len()) {
+                stream.write_all(&chunk).unwrap();
+            }
+            stream.write_all(&chunk[..SIZE % chunk.len()]).unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let transport = Transport::with_cookies(directory.path()).unwrap();
+        let package = directory.path().join("large.ipa");
+        assert_eq!(
+            download_file_with_transport(
+                &transport,
+                &format!("http://{address}/large.ipa"),
+                &package
+            )
+            .unwrap(),
+            SIZE as u64
+        );
+        server.join().unwrap();
+        let mut file = fs::File::open(package).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), SIZE as u64);
+        let mut byte = [0];
+        file.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [0x5a]);
+        file.seek(SeekFrom::End(-1)).unwrap();
+        file.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [0x5a]);
+    }
+
+    #[test]
     fn resumes_after_valid_range_and_checks_request_header() {
         let (url, request, server) = spawn_server(
             b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 7-14/15\r\nContent-Length: 8\r\nConnection: close\r\n\r\ndownload",
