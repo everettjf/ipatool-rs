@@ -7366,6 +7366,22 @@ fn dispatch_message(
         return Ok(());
     }
     if !class_method
+        && class_name == "NSFileManager"
+        && matches!(
+            selector,
+            "isWritableFileAtPath:" | "fileExistsAtPath:" | "fileExistsAtPath:isDirectory:"
+        )
+    {
+        if selector == "fileExistsAtPath:isDirectory:" {
+            let is_directory = context.reg_read(REG_X0 + 3)?;
+            if is_directory != 0 {
+                context.mem_write(is_directory, &[0])?;
+            }
+        }
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if !class_method
         && class_name == "NSNotification"
         && matches!(selector, "name" | "object" | "userInfo")
     {
@@ -7665,6 +7681,17 @@ fn dispatch_message(
                 state,
                 "NSCharacterSet",
                 StoreValue::String("0123456789".into()),
+            )?;
+            context.reg_write(REG_X0, set)?;
+        }
+        (true, "characterSetWithCharactersInString:") if class_name == "NSCharacterSet" => {
+            let characters = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
+            let set = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSCharacterSet",
+                StoreValue::String(characters),
             )?;
             context.reg_write(REG_X0, set)?;
         }
@@ -8016,6 +8043,31 @@ fn dispatch_message(
         (true, "mainBundle") => {
             context.reg_write(REG_X0, new_main_bundle(context, profile, state)?)?;
         }
+        (true, "bundleForClass:") if class_name == "NSBundle" => {
+            let bundle = new_main_bundle(context, profile, state)?;
+            let target = context.reg_read(REG_X0 + 2)?;
+            if profile
+                .runtime
+                .class_names_by_address
+                .get(&target)
+                .is_some_and(|name| name.contains("AMS"))
+            {
+                let identifier = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    "NSString",
+                    StoreValue::String("com.apple.AppleMediaServices".into()),
+                )?;
+                state
+                    .objects
+                    .get_mut(&bundle)
+                    .expect("new bundle")
+                    .properties
+                    .insert("bundleIdentifier".into(), identifier);
+            }
+            context.reg_write(REG_X0, bundle)?;
+        }
         (true, "currentThread") => {
             let address = new_guest_object(context, profile, state, "NSThread", StoreValue::Empty)?;
             context.reg_write(REG_X0, address)?;
@@ -8365,6 +8417,25 @@ fn dispatch_message(
             };
             entries.remove(&key);
             context.reg_write(REG_X0, 0)?;
+        }
+        (false, "boolForKey:") if class_name == "NSUserDefaults" => {
+            let key = object_string_value(state, context.reg_read(REG_X0 + 2)?)?;
+            let StoreValue::Entries(entries) = &state.objects[&receiver].value else {
+                bail!("user defaults storage is not a dictionary");
+            };
+            let address = entries.get(key).copied().unwrap_or(0);
+            let value = if address == 0 {
+                0
+            } else {
+                match &state.objects[&address].value {
+                    StoreValue::Number(value) => *value as u64,
+                    StoreValue::Float(value) => u64::from(*value != 0.0),
+                    StoreValue::Boolean(value) => u64::from(*value),
+                    StoreValue::String(value) => value.parse::<i64>().unwrap_or(0) as u64,
+                    _ => 0,
+                }
+            };
+            context.reg_write(REG_X0, value)?;
         }
         (false, "allKeys" | "allValues") => {
             let StoreValue::Entries(entries) = &state.objects[&receiver].value else {
@@ -10507,6 +10578,116 @@ mod tests {
         };
         assert_eq!(items.len(), 1);
         assert_eq!(object_string_value(&state, items[0]).unwrap(), "en-US");
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_user_defaults_and_file_manager_fallbacks() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |selector: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.selector == selector)
+                .unwrap()
+                .address
+        };
+        let defaults_call = call_address("standardUserDefaults");
+        let bool_call = call_address("boolForKey:");
+        let set_call = call_address("setObject:forKey:");
+        let manager_call = call_address("defaultManager");
+        let exists_call = call_address("fileExistsAtPath:");
+        let writable_call = call_address("isWritableFileAtPath:");
+        let defaults_class = runtime.profile.index.classes
+            [runtime.profile.runtime.classes_by_name["NSUserDefaults"]]
+            .address;
+        let manager_class = runtime.profile.index.classes
+            [runtime.profile.runtime.classes_by_name["NSFileManager"]]
+            .address;
+        let defaults = runtime.call(defaults_call, &[defaults_class]).unwrap();
+        let key = runtime
+            .new_object("NSString", StoreValue::String("feature".into()))
+            .unwrap();
+        assert_eq!(runtime.call(bool_call, &[defaults, 0, key]).unwrap(), 0);
+        let value = runtime
+            .new_object("NSNumber", StoreValue::Number(2))
+            .unwrap();
+        assert_eq!(
+            runtime.call(set_call, &[defaults, 0, value, key]).unwrap(),
+            0
+        );
+        assert_eq!(runtime.call(bool_call, &[defaults, 0, key]).unwrap(), 2);
+
+        let manager = runtime.call(manager_call, &[manager_class]).unwrap();
+        let path = runtime
+            .new_object("NSString", StoreValue::String("/tmp/nonexistent".into()))
+            .unwrap();
+        assert_eq!(runtime.call(exists_call, &[manager, 0, path]).unwrap(), 0);
+        assert_eq!(runtime.call(writable_call, &[manager, 0, path]).unwrap(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_character_set_from_string() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.selector == "characterSetWithCharactersInString:")
+            .unwrap()
+            .address;
+        let class = runtime.profile.index.classes
+            [runtime.profile.runtime.classes_by_name["NSCharacterSet"]]
+            .address;
+        let characters = runtime
+            .new_object("NSString", StoreValue::String("é9".into()))
+            .unwrap();
+        let set = runtime.call(call, &[class, 0, characters]).unwrap();
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), set).unwrap(),
+            "é9"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_bundle_for_class_uses_ams_identifier() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.selector == "bundleForClass:")
+            .unwrap()
+            .address;
+        let class = |name: &str| {
+            runtime.profile.index.classes[runtime.profile.runtime.classes_by_name[name]].address
+        };
+        let bundle_class = class("NSBundle");
+        let ams_class = class("AMSURLRequest");
+        let string_class = class("NSString");
+        let bundle = runtime.call(call, &[bundle_class, 0, ams_class]).unwrap();
+        let identifier = runtime.state.borrow().objects[&bundle].properties["bundleIdentifier"];
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), identifier).unwrap(),
+            "com.apple.AppleMediaServices"
+        );
+        let bundle = runtime
+            .call(call, &[bundle_class, 0, string_class])
+            .unwrap();
+        let identifier = runtime.state.borrow().objects[&bundle].properties["bundleIdentifier"];
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), identifier).unwrap(),
+            "me.majd.ipatool"
+        );
     }
 
     #[test]
