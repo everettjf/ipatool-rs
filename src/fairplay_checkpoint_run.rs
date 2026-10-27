@@ -90,6 +90,13 @@ pub struct MemoryTraceOptions {
     pub max_events: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryReadStop {
+    pub pc: u64,
+    pub address: u64,
+    pub size: u32,
+}
+
 fn record_memory_event(
     context: &HookContext,
     address: u64,
@@ -1489,7 +1496,7 @@ impl CheckpointRunner {
         timeout: Duration,
         instruction_limit: usize,
     ) -> Result<()> {
-        if instruction_limit == 0 || instruction_limit > 100_000_000 {
+        if instruction_limit == 0 || instruction_limit > 500_000_000 {
             bail!("FairPlay instruction limit is outside the bounded range");
         }
         if stop_hit == 0 || stop_hit > 1_000_000 {
@@ -1540,6 +1547,73 @@ impl CheckpointRunner {
             bail!("FairPlay stopped at {actual:#x} before target {stop_pc:#x}");
         }
         Ok(())
+    }
+
+    pub fn run_until_memory_read_range(
+        &mut self,
+        range_start: u64,
+        range_size: u64,
+        timeout: Duration,
+        instruction_limit: usize,
+    ) -> Result<MemoryReadStop> {
+        if instruction_limit == 0 || instruction_limit > 500_000_000 {
+            bail!("FairPlay instruction limit is outside the bounded range");
+        }
+        if range_size == 0 || range_size > 0x1000_0000 {
+            bail!("FairPlay memory-read range size is outside the bounded range");
+        }
+        let range_end = range_start
+            .checked_add(range_size)
+            .context("FairPlay memory-read range overflows address space")?;
+        let observed = Rc::new(RefCell::new(None));
+        let failure = Rc::new(RefCell::new(None));
+        let hook_observed = Rc::clone(&observed);
+        let hook_failure = Rc::clone(&failure);
+        let hook = self
+            .engine
+            .add_memory_read_hook(move |context, address, size| {
+                if address >= range_end || address.saturating_add(u64::from(size)) <= range_start {
+                    return;
+                }
+                match context.reg_read(REG_PC) {
+                    Ok(pc) => {
+                        *hook_observed.borrow_mut() = Some(MemoryReadStop { pc, address, size });
+                    }
+                    Err(error) => {
+                        *hook_failure.borrow_mut() =
+                            Some(format!("read FairPlay memory stop PC: {error:#}"));
+                    }
+                }
+                if let Err(error) = context.stop() {
+                    *hook_failure.borrow_mut() =
+                        Some(format!("stop FairPlay memory read: {error:#}"));
+                }
+            })?;
+        let start = self.engine.reg_read(REG_PC)?;
+        let execution = self
+            .engine
+            .start_bounded(start, 0, timeout, instruction_limit);
+        self.engine.remove_hook(hook)?;
+        if let Some(message) = failure.borrow().as_deref() {
+            bail!("{message}");
+        }
+        if let Some(message) = self.external_failure.borrow().as_deref() {
+            bail!("{message}");
+        }
+        execution.with_context(|| format!("resume FairPlay checkpoint at {start:#x}"))?;
+        let stop = observed
+            .borrow()
+            .as_ref()
+            .copied()
+            .context("FairPlay instruction limit reached before memory-read range")?;
+        let actual = self.engine.reg_read(REG_PC)?;
+        if actual != stop.pc {
+            bail!(
+                "FairPlay memory read stopped at {actual:#x}, expected {:#x}",
+                stop.pc
+            );
+        }
+        Ok(stop)
     }
 
     pub fn run_until_hit_with_memory_trace(
@@ -2686,6 +2760,37 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("memory trace event limit")
+        );
+    }
+
+    #[test]
+    fn stops_on_a_guest_read_overlapping_the_requested_range() {
+        let checkpoint = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&checkpoint, SYNTHETIC_BINARY).unwrap();
+        runner.engine.mem_map(0x3000, PAGE_BYTES as usize).unwrap();
+        runner.engine.mem_map(0x4000, PAGE_BYTES as usize).unwrap();
+        runner
+            .engine
+            .mem_write(0x3000, &0xf940_0020u32.to_le_bytes())
+            .unwrap(); // ldr x0, [x1]
+        runner.engine.reg_write(REG_PC, 0x3000).unwrap();
+        runner.engine.reg_write(200, 0x4000).unwrap();
+        let stopped = runner
+            .run_until_memory_read_range(0x4004, 4, Duration::from_secs(2), 10)
+            .unwrap();
+        assert_eq!(
+            stopped,
+            MemoryReadStop {
+                pc: 0x3000,
+                address: 0x4000,
+                size: 8,
+            }
+        );
+        assert_eq!(runner.engine.reg_read(REG_PC).unwrap(), 0x3000);
+        assert!(
+            runner
+                .run_until_memory_read_range(0x4000, 0, Duration::from_secs(2), 10)
+                .is_err()
         );
     }
 

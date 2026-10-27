@@ -241,7 +241,13 @@ enum FairplayEnrollCommand {
         )]
         output_checkpoint: Option<PathBuf>,
         #[arg(long, help = "Instruction address at which to stop")]
-        stop_address: String,
+        stop_address: Option<String>,
+        #[arg(
+            long,
+            value_name = "START:SIZE",
+            help = "Stop when a guest read overlaps this range"
+        )]
+        stop_memory_read_range: Option<String>,
         #[arg(long, default_value_t = 1, help = "Stop on this visit to the address")]
         stop_hit: usize,
         #[arg(long, default_value_t = 100_000)]
@@ -1073,6 +1079,7 @@ fn run() -> Result<()> {
                 fairplayd,
                 output_checkpoint,
                 stop_address,
+                stop_memory_read_range,
                 stop_hit,
                 instruction_limit,
                 timeout_seconds,
@@ -1086,8 +1093,27 @@ fn run() -> Result<()> {
                 mac_address_file,
                 iokit15_output,
             } => {
-                if timeout_seconds == 0 || timeout_seconds > 300 {
-                    bail!("FairPlay timeout must be between 1 and 300 seconds");
+                if timeout_seconds == 0 || timeout_seconds > 3600 {
+                    bail!("FairPlay timeout must be between 1 and 3600 seconds");
+                }
+                let stop = stop_address.as_deref().map(parse_address).transpose()?;
+                let read_range = stop_memory_read_range
+                    .as_deref()
+                    .map(|specification| {
+                        let (start, size) = specification
+                            .split_once(':')
+                            .context("--stop-memory-read-range requires START:SIZE")?;
+                        Ok::<_, anyhow::Error>((parse_address(start)?, parse_address(size)?))
+                    })
+                    .transpose()?;
+                if stop.is_some() == read_range.is_some() {
+                    bail!("choose exactly one of --stop-address or --stop-memory-read-range");
+                }
+                if read_range.is_some() && stop_hit != 1 {
+                    bail!("--stop-hit requires --stop-address");
+                }
+                if read_range.is_some() && memory_trace_output.is_some() {
+                    bail!("memory tracing currently requires --stop-address");
                 }
                 const MAX_FAIRPLAYD_BYTES: u64 = 256 * 1024 * 1024;
                 let file = File::open(&fairplayd)
@@ -1104,7 +1130,6 @@ fn run() -> Result<()> {
                     bail!("fairplayd exceeds size limit");
                 }
                 let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
-                let stop = parse_address(&stop_address)?;
                 let binary_sha256 = format!("{:x}", Sha256::digest(&binary));
                 let mut runner = CheckpointRunner::new(&snapshot, &binary)?;
                 if let Some(path) = mac_address_file {
@@ -1145,28 +1170,44 @@ fn run() -> Result<()> {
                 if memory_trace_output.is_none() && (trace_memory_reads || trace_memory_writes) {
                     bail!("memory trace flags require --memory-trace-output");
                 }
-                let trace = if memory_trace_output.is_some() {
+                let (trace, read_stop) = if memory_trace_output.is_some() {
+                    let stop = stop.context("memory tracing requires --stop-address")?;
                     let trace_both = !trace_memory_reads && !trace_memory_writes;
-                    Some(runner.run_until_hit_with_memory_trace(
-                        stop,
-                        stop_hit,
-                        Duration::from_secs(timeout_seconds),
-                        instruction_limit,
-                        MemoryTraceOptions {
-                            reads: trace_memory_reads || trace_both,
-                            writes: trace_memory_writes || trace_both,
-                            max_events: max_memory_events,
-                        },
-                    )?)
-                } else {
+                    (
+                        Some(runner.run_until_hit_with_memory_trace(
+                            stop,
+                            stop_hit,
+                            Duration::from_secs(timeout_seconds),
+                            instruction_limit,
+                            MemoryTraceOptions {
+                                reads: trace_memory_reads || trace_both,
+                                writes: trace_memory_writes || trace_both,
+                                max_events: max_memory_events,
+                            },
+                        )?),
+                        None,
+                    )
+                } else if let Some(stop) = stop {
                     runner.run_until_hit(
                         stop,
                         stop_hit,
                         Duration::from_secs(timeout_seconds),
                         instruction_limit,
                     )?;
-                    None
+                    (None, None)
+                } else {
+                    let (start, size) = read_range.context("missing memory-read stop range")?;
+                    let stopped = runner.run_until_memory_read_range(
+                        start,
+                        size,
+                        Duration::from_secs(timeout_seconds),
+                        instruction_limit,
+                    )?;
+                    (None, Some(stopped))
                 };
+                let stop_pc = runner
+                    .engine
+                    .reg_read(ipatool_rs::unicorn_runtime::REG_PC)?;
                 let written_pages = output_checkpoint
                     .as_ref()
                     .map(|output| runner.write_checkpoint(&snapshot, &fairplayd, output))
@@ -1176,7 +1217,7 @@ fn run() -> Result<()> {
                         "schema": "fairplay.checkpoint-memory-trace.v1",
                         "binary_sha256": binary_sha256,
                         "start_pc": format!("{:#x}", runner.start_pc),
-                        "stop_pc": format!("{stop:#x}"),
+                        "stop_pc": format!("{stop_pc:#x}"),
                         "stop_hit": stop_hit,
                         "memory_read_events": trace.memory_read_events,
                         "memory_write_events": trace.memory_write_events,
@@ -1189,8 +1230,14 @@ fn run() -> Result<()> {
                         serde_json::json!({
                             "schema": "fairplay.checkpoint-run.v1",
                             "start_pc": format!("{:#x}", runner.start_pc),
-                            "stop_pc": format!("{stop:#x}"),
-                            "stop_hit": stop_hit,
+                            "stop_pc": format!("{stop_pc:#x}"),
+                            "stop_hit": stop.map(|_| stop_hit),
+                            "stop_memory_read_range": stop_memory_read_range,
+                            "memory_read_stop": read_stop.map(|hit| serde_json::json!({
+                                "pc": format!("{:#x}", hit.pc),
+                                "address": format!("{:#x}", hit.address),
+                                "size": hit.size,
+                            })),
                             "checkpoint_pages": runner.checkpoint_pages,
                             "fairplayd_fixups": runner.image.fixups,
                             "external_imports": runner.image.externals.len(),
@@ -1203,9 +1250,15 @@ fn run() -> Result<()> {
                     ),
                     Format::Text => {
                         println!(
-                            "Resumed FairPlay checkpoint from {:#x} to {stop:#x}",
+                            "Resumed FairPlay checkpoint from {:#x} to {stop_pc:#x}",
                             runner.start_pc
                         );
+                        if let Some(hit) = read_stop {
+                            println!(
+                                "Stopped on guest read at {:#x} ({} bytes)",
+                                hit.address, hit.size
+                            );
+                        }
                         if let Some(path) = output_checkpoint {
                             println!("Saved private checkpoint to {}", path.display());
                         }
@@ -2164,6 +2217,47 @@ mod tests {
                 assert_eq!(fairplayd, PathBuf::from("/private/fairplayd"));
                 assert_eq!(memory_trace, PathBuf::from("/private/oracle-trace.json"));
                 assert_eq!(output, PathBuf::from("/private/oracle-model.gz"));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn fairplay_checkpoint_accepts_memory_read_stop_range() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "continue-checkpoint",
+            "--checkpoint",
+            "/private/entry.pkl.gz",
+            "--fairplayd",
+            "/private/fairplayd",
+            "--stop-memory-read-range",
+            "0x710000014ee0:432",
+            "--instruction-limit",
+            "10000000",
+            "--timeout-seconds",
+            "600",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::FairplayEnroll {
+                command:
+                    FairplayEnrollCommand::ContinueCheckpoint {
+                        stop_address,
+                        stop_memory_read_range,
+                        instruction_limit,
+                        timeout_seconds,
+                        ..
+                    },
+            } => {
+                assert!(stop_address.is_none());
+                assert_eq!(
+                    stop_memory_read_range.as_deref(),
+                    Some("0x710000014ee0:432")
+                );
+                assert_eq!(instruction_limit, 10_000_000);
+                assert_eq!(timeout_seconds, 600);
             }
             _ => panic!("unexpected command"),
         }
