@@ -1161,15 +1161,12 @@ fn fetch_artwork(url: &str) -> Result<Vec<u8>> {
     if response.status().as_u16() != 200 {
         bail!("unexpected Store artwork status: {}", response.status());
     }
-    const MAX_ARTWORK: u64 = 32 * 1024 * 1024;
     let mut bytes = Vec::new();
     response
-        .by_ref()
-        .take(MAX_ARTWORK + 1)
         .read_to_end(&mut bytes)
         .context("read Store artwork")?;
-    if bytes.is_empty() || bytes.len() as u64 > MAX_ARTWORK {
-        bail!("Store artwork is empty or too large");
+    if bytes.is_empty() {
+        bail!("Store artwork is empty");
     }
     Ok(bytes)
 }
@@ -2265,6 +2262,38 @@ mod tests {
                 .unwrap();
             assert!(client.cached_kbsync(123456, "000102030405").is_none());
         }
+    }
+
+    #[test]
+    fn downloads_artwork_larger_than_previous_limit() {
+        const SIZE: usize = 32 * 1024 * 1024 + 1;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/artwork", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while std::io::Read::read_exact(&mut stream, &mut byte).is_ok() {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {SIZE}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let chunk = [0x5a; 64 * 1024];
+            for _ in 0..(SIZE / chunk.len()) {
+                stream.write_all(&chunk).unwrap();
+            }
+            stream.write_all(&chunk[..SIZE % chunk.len()]).unwrap();
+        });
+        let artwork = fetch_artwork(&url).unwrap();
+        server.join().unwrap();
+        assert_eq!(artwork.len(), SIZE);
+        assert!(artwork.iter().all(|byte| *byte == 0x5a));
     }
 
     #[test]
