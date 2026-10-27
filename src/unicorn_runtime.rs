@@ -58,6 +58,19 @@ impl UnicornLibrary {
 }
 
 pub fn load() -> Result<UnicornLibrary> {
+    #[cfg(target_os = "ios")]
+    {
+        // The iOS CLI links Unicorn into its main executable. iOS cannot load
+        // the desktop wheels used by the other targets.
+        let library = libloading::os::unix::Library::this().into();
+        checked_library(library)
+    }
+    #[cfg(not(target_os = "ios"))]
+    load_cached()
+}
+
+#[cfg_attr(target_os = "ios", allow(dead_code))]
+fn load_cached() -> Result<UnicornLibrary> {
     let selected = current_artifact()?;
     let cache = dirs::cache_dir().context("user cache directory is unavailable")?;
     let root = cache.join("ipatool").join("unicorn").join(VERSION);
@@ -79,11 +92,31 @@ pub fn load() -> Result<UnicornLibrary> {
         .with_context(|| format!("failed to load Unicorn library: {}", path.display()))?;
     #[cfg(target_os = "windows")]
     let (library, loaded_dependencies) = windows_prepare::load(&path, &dependencies)?;
-    let library = UnicornLibrary {
-        library,
-        #[cfg(target_os = "windows")]
-        _dependencies: loaded_dependencies,
-    };
+    #[cfg(not(target_os = "windows"))]
+    {
+        checked_library(library)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let library = UnicornLibrary {
+            library,
+            _dependencies: loaded_dependencies,
+        };
+        verify_library(library)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn checked_library(library: Library) -> Result<UnicornLibrary> {
+    let library = UnicornLibrary { library };
+    verify_library(library)
+}
+
+fn verify_library(library: UnicornLibrary) -> Result<UnicornLibrary> {
+    #[cfg(target_os = "ios")]
+    if unsafe { library.library.get::<unsafe extern "C" fn()>(b"uc_version") }.is_err() {
+        bail!("Unicorn is not linked into the iOS executable; build with scripts/build-ios.sh");
+    }
     let (major, minor) = library.api_version()?;
     if (major, minor) != (2, 1) {
         bail!("unsupported Unicorn API version {major}.{minor}");
