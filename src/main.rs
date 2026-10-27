@@ -273,6 +273,13 @@ enum FairplayEnrollCommand {
     RecoverCapture {
         #[arg(long)]
         capture: PathBuf,
+        #[arg(
+            long,
+            help = "Exact checked 26A428 arm64e fairplayd for a 26B118 capture"
+        )]
+        compat_fairplayd: Option<PathBuf>,
+        #[arg(long, hide = true, conflicts_with = "compat_fairplayd")]
+        native_26b_research: bool,
         #[arg(long)]
         startup_profile: Option<PathBuf>,
         #[arg(long, help = "Private verified 0x228-byte IOKit selector 0x15 output")]
@@ -1299,6 +1306,8 @@ fn run() -> Result<()> {
             }
             FairplayEnrollCommand::RecoverCapture {
                 capture,
+                compat_fairplayd,
+                native_26b_research,
                 startup_profile,
                 iokit15_output,
                 output,
@@ -1307,6 +1316,8 @@ fn run() -> Result<()> {
             } => {
                 let result = recover_capture(RecoverCaptureOptions {
                     capture: &capture,
+                    compat_fairplayd: compat_fairplayd.as_deref(),
+                    native_26b_research,
                     startup_profile: startup_profile.as_deref(),
                     iokit15_output: iokit15_output.as_deref(),
                     output: &output,
@@ -2970,6 +2981,32 @@ mod tests {
                 command: FairplayEnrollCommand::RecoverCapture {
                     startup_profile: None,
                     timeout_seconds: 600,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn fairplay_recover_accepts_checked_compatibility_binary() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "recover",
+            "--capture",
+            "/private/capture",
+            "--compat-fairplayd",
+            "/private/fairplayd.arm64e",
+            "--output",
+            "/private/recovery",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::RecoverCapture {
+                    compat_fairplayd: Some(_),
+                    startup_profile: None,
                     ..
                 }
             }

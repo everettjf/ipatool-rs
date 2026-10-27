@@ -62,6 +62,8 @@ pub struct RecoverFromSinfCopyOptions<'a> {
 
 pub struct RecoverCaptureOptions<'a> {
     pub capture: &'a Path,
+    pub compat_fairplayd: Option<&'a Path>,
+    pub native_26b_research: bool,
     pub startup_profile: Option<&'a Path>,
     pub iokit15_output: Option<&'a Path>,
     pub output: &'a Path,
@@ -253,9 +255,18 @@ pub fn recover_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureReco
         bail!("recovery phase timeout must be between 1 and 3600 seconds");
     }
     let manifest = load_enrollment_capture(options.capture, true)?;
-    let (stop, stat, preserved_text) = match manifest.fairplayd.sha256.as_str() {
-        FAIRPLAY_BUILD_26A428_HASH => (ACCOUNT_ENTRY, None, &[][..]),
-        FAIRPLAY_BUILD_26B118_HASH => (
+    let (stop, stat, preserved_text, effective_hash) = match (
+        manifest.fairplayd.sha256.as_str(),
+        options.compat_fairplayd,
+        options.native_26b_research,
+    ) {
+        (FAIRPLAY_BUILD_26A428_HASH, None, false) => {
+            (ACCOUNT_ENTRY, None, &[][..], FAIRPLAY_BUILD_26A428_HASH)
+        }
+        (FAIRPLAY_BUILD_26B118_HASH, Some(_), false) => {
+            (ACCOUNT_ENTRY, None, &[][..], FAIRPLAY_BUILD_26A428_HASH)
+        }
+        (FAIRPLAY_BUILD_26B118_HASH, None, true) => (
             0x1005_d0374,
             Some(VirtualFileStat {
                 mode: 0o666,
@@ -263,14 +274,32 @@ pub fn recover_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureReco
                 gid: 265,
             }),
             &PRESERVED_26B118_TEXT[..],
+            FAIRPLAY_BUILD_26B118_HASH,
         ),
+        (FAIRPLAY_BUILD_26A428_HASH, Some(_), _) => {
+            bail!("--compat-fairplayd is only valid for a 26B118 capture")
+        }
+        (FAIRPLAY_BUILD_26A428_HASH, None, true) => {
+            bail!("--native-26b-research is only valid for a 26B118 capture")
+        }
+        (FAIRPLAY_BUILD_26B118_HASH, None, false) => {
+            bail!(
+                "26B118 recovery requires --compat-fairplayd with arm64e SHA-256 {FAIRPLAY_BUILD_26A428_HASH}; --native-26b-research selects the unverified native path"
+            )
+        }
+        (FAIRPLAY_BUILD_26B118_HASH, Some(_), true) => {
+            bail!("choose either compatibility recovery or native 26B118 research")
+        }
         _ => bail!("capture fairplayd build has no native recovery profile"),
     };
     if manifest.app.selector.identifier() != manifest.app.selector_id {
         bail!("capture selector and selector ID disagree");
     }
-    let fairplayd = capture_file_path(options.capture, &manifest.fairplayd.path)?;
-    let binary = read_checked_fairplayd(&fairplayd, &manifest.fairplayd.sha256)?;
+    let fairplayd = match options.compat_fairplayd {
+        Some(path) => path.to_path_buf(),
+        None => capture_file_path(options.capture, &manifest.fairplayd.path)?,
+    };
+    let binary = read_checked_fairplayd(&fairplayd, effective_hash)?;
     let executable = &manifest.app.executable;
     if executable.is_empty() || executable.contains('/') || executable.contains('\\') {
         bail!("capture executable name is invalid");
@@ -285,7 +314,7 @@ pub fn recover_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureReco
     let startup_profile = match options.startup_profile {
         Some(path) => path.to_path_buf(),
         None => {
-            let bytes = embedded_startup_profile(&manifest.fairplayd.sha256)
+            let bytes = embedded_startup_profile(effective_hash)
                 .context("capture fairplayd has no bundled startup profile")?;
             let path = temporary.path().join("startup-profile.json.gz");
             fs::write(&path, bytes).context("stage bundled FairPlay startup profile")?;
@@ -318,14 +347,17 @@ pub fn recover_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureReco
     runner.write_checkpoint(&seed, &fairplayd, &first_path)?;
     drop(runner);
 
-    if manifest.fairplayd.sha256 == FAIRPLAY_BUILD_26A428_HASH {
-        recover_from_account(RecoverFromAccountOptions {
-            capture: options.capture,
-            account_checkpoint: &first_path,
-            output: options.output,
-            timeout: options.timeout,
-            skip_differential: options.skip_differential,
-        })
+    if effective_hash == FAIRPLAY_BUILD_26A428_HASH {
+        recover_from_account_with_binary(
+            RecoverFromAccountOptions {
+                capture: options.capture,
+                account_checkpoint: &first_path,
+                output: options.output,
+                timeout: options.timeout,
+                skip_differential: options.skip_differential,
+            },
+            options.compat_fairplayd,
+        )
     } else {
         recover_from_sinf_copy(RecoverFromSinfCopyOptions {
             capture: options.capture,
@@ -340,16 +372,29 @@ pub fn recover_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureReco
 pub fn recover_from_account(
     options: RecoverFromAccountOptions<'_>,
 ) -> Result<CaptureRecoveryResult> {
+    recover_from_account_with_binary(options, None)
+}
+
+fn recover_from_account_with_binary(
+    options: RecoverFromAccountOptions<'_>,
+    compatibility_fairplayd: Option<&Path>,
+) -> Result<CaptureRecoveryResult> {
     if options.timeout.is_zero() || options.timeout > Duration::from_secs(3600) {
         bail!("recovery phase timeout must be between 1 and 3600 seconds");
     }
     let manifest = load_enrollment_capture(options.capture, true)?;
-    if manifest.fairplayd.sha256 != FAIRPLAY_BUILD_26A428_HASH {
+    let compatible_capture = manifest.fairplayd.sha256 == FAIRPLAY_BUILD_26B118_HASH
+        && manifest.fairplay.compatibility_sha256 == FAIRPLAY_BUILD_26A428_HASH
+        && compatibility_fairplayd.is_some();
+    if manifest.fairplayd.sha256 != FAIRPLAY_BUILD_26A428_HASH && !compatible_capture {
         bail!("account-checkpoint recovery currently requires the checked 26A428 capture");
     }
     let ipa_entry = manifest.ipa.as_ref().context("capture has no IPA")?;
     let ipa = capture_file_path(options.capture, &ipa_entry.path)?;
-    let fairplayd = capture_file_path(options.capture, &manifest.fairplayd.path)?;
+    let fairplayd = match compatibility_fairplayd {
+        Some(path) => path.to_path_buf(),
+        None => capture_file_path(options.capture, &manifest.fairplayd.path)?,
+    };
     let binary = read_checked_fairplayd(&fairplayd, FAIRPLAY_BUILD_26A428_HASH)?;
     let account = FairplayCheckpoint::load_private(options.account_checkpoint)?;
     let binary_hash: [u8; 32] = Sha256::digest(&*binary).into();
@@ -440,7 +485,7 @@ pub fn recover_from_account(
         &trace_path,
         &serde_json::to_vec(&serde_json::json!({
             "schema": "fairplay.checkpoint-memory-trace.v1",
-            "binary_sha256": manifest.fairplayd.sha256,
+            "binary_sha256": FAIRPLAY_BUILD_26A428_HASH,
             "start_pc": format!("{ORACLE_ENTRY:#x}"),
             "stop_pc": format!("{ORACLE_ENTRY:#x}"),
             "stop_hit": 2,
@@ -504,9 +549,9 @@ pub fn recover_from_account(
             Sha256::digest(fs::read(options.capture.join("manifest.json"))?)
         ),
         selector: manifest.app.selector_id,
-        fairplayd_sha256: manifest.fairplayd.sha256.clone(),
+        fairplayd_sha256: FAIRPLAY_BUILD_26A428_HASH.into(),
         capture_fairplayd_sha256: manifest.fairplayd.sha256,
-        compatibility_profile: None,
+        compatibility_profile: compatible_capture.then(|| "macos26a428".into()),
         profile: None,
         enrollment_model,
         enrollment_model_sha256: format!("{:x}", Sha256::digest(&enrollment)),
@@ -906,6 +951,8 @@ mod tests {
         let output = root.path().join("recovery");
         let error = recover_capture(RecoverCaptureOptions {
             capture: &capture,
+            compat_fairplayd: None,
+            native_26b_research: false,
             startup_profile: Some(&root.path().join("missing.json.gz")),
             iokit15_output: None,
             output: &output,
@@ -914,6 +961,58 @@ mod tests {
         })
         .unwrap_err();
         assert!(format!("{error:#}").contains("no native recovery profile"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn compatibility_recovery_rejects_wrong_fairplayd_before_output() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join("capture");
+        private_directory(&capture).unwrap();
+        let mut manifest = EnrollmentCaptureManifest {
+            schema: ENROLLMENT_CAPTURE_SCHEMA.into(),
+            ..EnrollmentCaptureManifest::default()
+        };
+        manifest.fairplayd.sha256 = FAIRPLAY_BUILD_26B118_HASH.into();
+        manifest.app.selector_id = manifest.app.selector.identifier();
+        fs::write(
+            capture.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let wrong_binary = root.path().join("wrong-fairplayd");
+        fs::write(&wrong_binary, b"not the checked 26A428 fairplayd").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&wrong_binary, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let output = root.path().join("recovery");
+        let missing = recover_capture(RecoverCaptureOptions {
+            capture: &capture,
+            compat_fairplayd: None,
+            native_26b_research: false,
+            startup_profile: None,
+            iokit15_output: None,
+            output: &output,
+            timeout: Duration::from_secs(1),
+            skip_differential: true,
+        })
+        .unwrap_err();
+        assert!(format!("{missing:#}").contains("requires --compat-fairplayd"));
+        assert!(!output.exists());
+        let error = recover_capture(RecoverCaptureOptions {
+            capture: &capture,
+            compat_fairplayd: Some(&wrong_binary),
+            native_26b_research: false,
+            startup_profile: None,
+            iokit15_output: None,
+            output: &output,
+            timeout: Duration::from_secs(1),
+            skip_differential: true,
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("checked SHA-256"));
         assert!(!output.exists());
     }
 }
