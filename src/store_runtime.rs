@@ -2770,6 +2770,10 @@ fn dispatch_call(
             };
             context.reg_write(REG_X0, base.wrapping_add(offset))?;
         }
+        "clock_gettime_nsec_np" => {
+            let clock = context.reg_read(REG_X0)?;
+            context.reg_write(REG_X0, guest_clock_gettime_nsec(clock)?)?;
+        }
         "dispatch_after" => {
             // The Go guest retains deadline blocks without firing them. The
             // request promise supplies its own completion path.
@@ -9339,6 +9343,53 @@ fn write_guest_tm(context: &HookContext, address: u64, fields: [i32; 9]) -> Resu
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux"))]
+fn guest_clock_gettime_nsec(clock: u64) -> Result<u64> {
+    #[cfg(target_os = "linux")]
+    let host_clock = match clock {
+        0 => libc::CLOCK_REALTIME,
+        4 | 5 => libc::CLOCK_MONOTONIC_RAW,
+        6 | 8 | 9 => libc::CLOCK_MONOTONIC,
+        _ => bail!("unsupported Store clock {clock}"),
+    };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let host_clock = libc::clockid_t::try_from(clock).context("invalid Store clock identifier")?;
+    let mut value = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `value` is a writable timespec and `host_clock` is passed by value.
+    if unsafe { libc::clock_gettime(host_clock, &mut value) } != 0 {
+        bail!(
+            "read Store clock {clock}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let seconds = u64::try_from(value.tv_sec).context("Store clock is before its epoch")?;
+    let nanoseconds = u64::try_from(value.tv_nsec).context("invalid Store clock nanoseconds")?;
+    seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanoseconds))
+        .context("Store clock nanoseconds overflow")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+fn guest_clock_gettime_nsec(clock: u64) -> Result<u64> {
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    let duration = match clock {
+        0 => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("Store clock is before the Unix epoch")?,
+        4 | 5 | 6 | 8 | 9 => {
+            static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            START.get_or_init(Instant::now).elapsed()
+        }
+        _ => bail!("unsupported Store clock {clock}"),
+    };
+    u64::try_from(duration.as_nanos()).context("Store clock nanoseconds overflow")
+}
+
 fn normalize_guest_tm(fields: [i32; 9]) -> Result<time::OffsetDateTime> {
     let month = i64::from(fields[4]);
     let year = i64::from(fields[5]) + 1900 + month.div_euclid(12);
@@ -9898,6 +9949,35 @@ mod tests {
             panic!("guest semaphore count is not numeric");
         };
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_clock_gettime_nsec_uses_host_clock() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.symbol == "clock_gettime_nsec_np")
+            .unwrap()
+            .address;
+        let epoch_nanoseconds = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        };
+        let before = epoch_nanoseconds();
+        let actual = u128::from(runtime.call(call, &[0]).unwrap());
+        let after = epoch_nanoseconds();
+        assert!((before..=after).contains(&actual));
+        let first = runtime.call(call, &[6]).unwrap();
+        let second = runtime.call(call, &[6]).unwrap();
+        assert!(first > 0 && second >= first);
+        assert!(runtime.call(call, &[u64::MAX]).is_err());
     }
 
     #[test]
