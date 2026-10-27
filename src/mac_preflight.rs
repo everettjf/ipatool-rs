@@ -20,7 +20,7 @@ const MAX_DISTRIBUTION_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_preflight_version_metadata(url: &str, bundle_id: &str) -> Result<VersionMetadata> {
     let url = Url::parse(url).context("invalid Mac preflight URL")?;
-    if url.scheme() != "https"
+    if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -30,7 +30,7 @@ pub fn read_preflight_version_metadata(url: &str, bundle_id: &str) -> Result<Ver
     }
     let client = reqwest::blocking::Client::builder()
         .redirect(Policy::custom(|attempt| {
-            if attempt.previous().len() < 10 && attempt.url().scheme() == "https" {
+            if attempt.previous().len() < 10 && matches!(attempt.url().scheme(), "http" | "https") {
                 attempt.follow()
             } else {
                 attempt.stop()
@@ -260,6 +260,7 @@ mod tests {
     use super::*;
     use apple_xar::table_of_contents::ChecksumType;
     use flate2::{Compression, write::ZlibEncoder};
+    use std::{net::TcpListener, thread};
 
     const DISTRIBUTION: &str = r#"<installer-gui-script><product id="com.example.mac" version="4.2"/>
 <pkg-ref id="com.example.pkg"><relocate><bundle id="com.example.mac"/></relocate></pkg-ref>
@@ -314,6 +315,33 @@ mod tests {
                 .to_string()
                 .contains("checksum mismatch")
         );
+    }
+
+    #[test]
+    fn reads_preflight_metadata_over_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let package = fixture_xar(DISTRIBUTION);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            assert!(request[..read].starts_with(b"GET /preflight.pkg HTTP/1.1"));
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                package.len()
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream.write_all(&package).unwrap();
+        });
+        let metadata = read_preflight_version_metadata(
+            &format!("http://{address}/preflight.pkg"),
+            "com.example.mac",
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(metadata.display_version, "4.2");
+        assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
     }
 
     #[test]
