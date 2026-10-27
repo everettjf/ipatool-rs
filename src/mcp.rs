@@ -184,12 +184,9 @@ impl AppStoreServer {
             let limit = input.limit.unwrap_or(5);
             if limit < 1 { bail!("limit must be greater than 0"); }
             let platform = parse_platform(input.platform.as_deref())?;
-            with_account(|account| {
-                let country = country_code_from_storefront(&account.store_front)?;
-                let result = CatalogClient::new()?.search(&input.term, country, limit, platform)?;
-                Ok(json!({"term": input.term, "limit": limit, "platform": platform_value(platform), "count": result.count,
-                    "apps": result.apps.iter().map(app_value).collect::<Vec<_>>() }))
-            })
+            let result = CatalogClient::new()?.search(&input.term, "US", limit, platform)?;
+            Ok(json!({"term": input.term, "limit": limit, "platform": platform_value(platform), "count": result.count,
+                "apps": result.apps.iter().map(app_value).collect::<Vec<_>>() }))
         }).await
     }
 
