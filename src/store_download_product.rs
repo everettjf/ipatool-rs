@@ -1140,14 +1140,9 @@ fn volume_url(account: &Account) -> Result<Url> {
 }
 
 fn display_version(item: &DownloadItem) -> String {
-    match item.metadata_field("bundleShortVersionString") {
-        None => "unknown".into(),
-        Some(plist::Value::String(value)) => value.clone(),
-        Some(plist::Value::Integer(value)) => value.to_string(),
-        Some(plist::Value::Real(value)) => value.to_string(),
-        Some(plist::Value::Boolean(value)) => value.to_string(),
-        Some(_) => "unknown".into(),
-    }
+    item.metadata_field("bundleShortVersionString")
+        .map(ipa_metadata::go_display_value)
+        .unwrap_or_else(|| "unknown".into())
 }
 
 fn package_destination(
@@ -1567,7 +1562,13 @@ mod tests {
             (plist::Value::String(String::new()), ""),
             (plist::Value::Integer(42.into()), "42"),
             (plist::Value::Real(2.5), "2.5"),
+            (plist::Value::Real(1e6), "1e+06"),
             (plist::Value::Boolean(true), "true"),
+            (plist::Value::Data(vec![1, 2, 3]), "[1 2 3]"),
+            (
+                plist::Value::Array(vec![plist::Value::String("1".into()), 2.into()]),
+                "[1 2]",
+            ),
         ] {
             item.metadata
                 .as_dictionary_mut()

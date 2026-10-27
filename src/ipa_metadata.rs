@@ -78,16 +78,7 @@ fn parse_info_plist<'a>(
         .iter()
         .find_map(|key| fields.get(key))
         .context("IPA Info.plist has no display version")?;
-    let display_version = match display {
-        Value::String(text) => text.trim().to_owned(),
-        Value::Integer(number) => number
-            .as_signed()
-            .map(|n| n.to_string())
-            .or_else(|| number.as_unsigned().map(|n| n.to_string()))
-            .unwrap_or_default(),
-        Value::Real(number) => number.to_string(),
-        _ => bail!("IPA display version has unsupported type"),
-    };
+    let display_version = go_display_value(display).trim().to_owned();
     if display_version.is_empty() {
         bail!("IPA display version is empty");
     }
@@ -104,6 +95,70 @@ fn parse_info_plist<'a>(
         display_version,
         release_date: release_date.format(&Rfc3339)?,
     })
+}
+
+pub(crate) fn go_display_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Integer(number) => number.to_string(),
+        Value::Real(number) => go_float_string(*number),
+        Value::Boolean(value) => value.to_string(),
+        Value::Data(bytes) => format!(
+            "[{}]",
+            bytes
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(go_display_value)
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        Value::Dictionary(values) => {
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+            format!(
+                "map[{}]",
+                entries
+                    .iter()
+                    .map(|(key, value)| format!("{key}:{}", go_display_value(value)))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        }
+        Value::Date(value) => {
+            let xml = value.to_xml_format();
+            let timestamp = xml.strip_suffix('Z').unwrap_or(&xml).replace('T', " ");
+            format!("{timestamp} +0000 UTC")
+        }
+        Value::Uid(value) => value.get().to_string(),
+        _ => format!("{value:?}"),
+    }
+}
+
+fn go_float_string(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".into();
+    }
+    if value == f64::INFINITY {
+        return "+Inf".into();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-Inf".into();
+    }
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific.split_once('e').expect("Rust float exponent");
+    let exponent: i32 = exponent.parse().expect("Rust float exponent number");
+    if !(-4..6).contains(&exponent) {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        return format!("{mantissa}e{sign}{:02}", exponent.unsigned_abs());
+    }
+    value.to_string()
 }
 
 fn parse_release_date(value: &Value) -> Result<OffsetDateTime> {
@@ -451,6 +506,51 @@ mod tests {
         .unwrap();
         assert_eq!(metadata.display_version, "2.3.4");
         assert_eq!(metadata.release_date, "2025-01-02T03:04:05Z");
+    }
+
+    #[test]
+    fn formats_non_string_display_versions_like_go() {
+        for (value, expected) in [
+            ("<true/>", "true"),
+            ("<data>AQID</data>", "[1 2 3]"),
+            (
+                "<array><string>1</string><integer>2</integer><true/></array>",
+                "[1 2 true]",
+            ),
+            (
+                "<dict><key>x</key><integer>2</integer><key>a</key><string>foo</string></dict>",
+                "map[a:foo x:2]",
+            ),
+            (
+                "<date>2025-01-02T03:04:05Z</date>",
+                "2025-01-02 03:04:05 +0000 UTC",
+            ),
+            ("<real>1000000</real>", "1e+06"),
+        ] {
+            let info = format!(
+                "<plist version=\"1.0\"><dict><key>CFBundleShortVersionString</key>{value}<key>releaseDate</key><string>2025-01-02T03:04:05Z</string></dict></plist>"
+            );
+            let data = Arc::new(fixture_ipa(info.as_bytes()));
+            let metadata = read_version_metadata_with_sender(
+                "https://example.test/app.ipa",
+                fixture_sender(data, Arc::new(AtomicUsize::new(0))),
+            )
+            .unwrap();
+            assert_eq!(metadata.display_version, expected);
+        }
+        for (value, expected) in [
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (999999.0, "999999"),
+            (1000000.0, "1e+06"),
+            (1.2e20, "1.2e+20"),
+            (f64::INFINITY, "+Inf"),
+            (f64::NEG_INFINITY, "-Inf"),
+        ] {
+            assert_eq!(go_float_string(value), expected);
+        }
+        assert_eq!(go_float_string(f64::NAN), "NaN");
+        assert_eq!(go_float_string(-0.0), "-0");
     }
 
     #[test]
