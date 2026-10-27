@@ -2,8 +2,10 @@
 
 use std::{
     fs::OpenOptions,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -12,6 +14,76 @@ use reqwest::{
     header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
 };
 use url::Url;
+
+static SHOW_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Enable terminal progress for CLI package downloads.
+pub fn set_progress(enabled: bool) {
+    SHOW_PROGRESS.store(enabled, Ordering::Relaxed);
+}
+
+struct ProgressDisplay {
+    enabled: bool,
+    shown: bool,
+    last_update: Option<Instant>,
+    latest: Option<(u64, Option<u64>)>,
+    printed: Option<(u64, Option<u64>)>,
+}
+
+impl ProgressDisplay {
+    fn new() -> Self {
+        Self {
+            enabled: SHOW_PROGRESS.load(Ordering::Relaxed),
+            shown: false,
+            last_update: None,
+            latest: None,
+            printed: None,
+        }
+    }
+
+    fn update(&mut self, current: u64, total: Option<u64>) {
+        if !self.enabled {
+            return;
+        }
+        self.latest = Some((current, total));
+        let now = Instant::now();
+        if self
+            .last_update
+            .is_some_and(|last| now.duration_since(last) < Duration::from_millis(100))
+            && total != Some(current)
+        {
+            return;
+        }
+        self.last_update = Some(now);
+        self.shown = true;
+        self.printed = self.latest;
+        let message = if let Some(total) = total {
+            let percent = if total == 0 {
+                100
+            } else {
+                (u128::from(current) * 100 / u128::from(total)) as u64
+            };
+            format!("downloading: {current}/{total} bytes ({percent}%)")
+        } else {
+            format!("downloading: {current} bytes")
+        };
+        let mut stderr = io::stderr().lock();
+        let _ = write!(stderr, "\r{message}");
+        let _ = stderr.flush();
+    }
+
+    fn finish(&mut self) {
+        if self.latest != self.printed
+            && let Some((current, total)) = self.latest
+        {
+            self.last_update = None;
+            self.update(current, total);
+        }
+        if self.shown {
+            let _ = writeln!(io::stderr());
+        }
+    }
+}
 
 enum RangePlan {
     Complete(u64),
@@ -31,10 +103,21 @@ pub fn download_file(url: &str, destination: &Path) -> Result<u64> {
         .no_deflate()
         .build()
         .context("create package HTTP client")?;
-    download_file_with_client(&client, url, destination)
+    let mut progress = ProgressDisplay::new();
+    let result =
+        download_file_with_client_progress(&client, url, destination, &mut |current, total| {
+            progress.update(current, total)
+        });
+    progress.finish();
+    result
 }
 
-fn download_file_with_client(client: &Client, url: &str, destination: &Path) -> Result<u64> {
+fn download_file_with_client_progress(
+    client: &Client,
+    url: &str,
+    destination: &Path,
+    progress: &mut impl FnMut(u64, Option<u64>),
+) -> Result<u64> {
     let url = Url::parse(url).context("invalid package URL")?;
     if !matches!(url.scheme(), "https" | "http") {
         bail!("package URL must use HTTP or HTTPS");
@@ -55,7 +138,10 @@ fn download_file_with_client(client: &Client, url: &str, destination: &Path) -> 
         .context("request package download")?;
     let plan = response_range(&response, local_size)?;
     let (offset, length, total) = match plan {
-        RangePlan::Complete(size) => return Ok(size),
+        RangePlan::Complete(size) => {
+            progress(size, Some(size));
+            return Ok(size);
+        }
         RangePlan::Transfer {
             offset,
             length,
@@ -68,9 +154,15 @@ fn download_file_with_client(client: &Client, url: &str, destination: &Path) -> 
     file.seek(SeekFrom::Start(offset))
         .context("seek partial package")?;
     let written = if let Some(length) = length {
-        io::copy(&mut response.take(length), &mut file).context("write package download")?
+        copy_with_progress(
+            &mut response.take(length),
+            &mut file,
+            offset,
+            total,
+            progress,
+        )?
     } else {
-        io::copy(&mut response, &mut file).context("write package download")?
+        copy_with_progress(&mut response, &mut file, offset, total, progress)?
     };
     if length.is_some_and(|length| written != length)
         || total.is_some_and(|total| offset.checked_add(written) != Some(total))
@@ -78,6 +170,30 @@ fn download_file_with_client(client: &Client, url: &str, destination: &Path) -> 
         bail!("package download is incomplete");
     }
     Ok(offset + written)
+}
+
+fn copy_with_progress(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    offset: u64,
+    total: Option<u64>,
+    progress: &mut impl FnMut(u64, Option<u64>),
+) -> Result<u64> {
+    progress(offset, total);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut written = 0u64;
+    loop {
+        let bytes = reader.read(&mut buffer).context("read package download")?;
+        if bytes == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..bytes])
+            .context("write package download")?;
+        written += bytes as u64;
+        progress(offset + written, total);
+    }
+    Ok(written)
 }
 
 fn response_range(response: &Response, local_size: u64) -> Result<RangePlan> {
@@ -185,7 +301,21 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("app.tmp");
         fs::write(&path, b"partial").unwrap();
-        assert_eq!(download_file(&url, &path).unwrap(), 15);
+        let mut updates = Vec::new();
+        assert_eq!(
+            download_file_with_client_progress(
+                &Client::new(),
+                &url,
+                &path,
+                &mut |current, total| {
+                    updates.push((current, total));
+                }
+            )
+            .unwrap(),
+            15
+        );
+        assert_eq!(updates.first(), Some(&(7, Some(15))));
+        assert_eq!(updates.last(), Some(&(15, Some(15))));
         server.join().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"partialdownload");
         let request = request.lock().unwrap();
