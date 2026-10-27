@@ -52,14 +52,14 @@ pub fn patch_ipa(
     if !sinfs.is_empty() {
         let paths = sinf_paths(&mut archive, sinfs.len())?;
         for (path, sinf) in paths.into_iter().zip(sinfs) {
-            let data = sinf
+            let fields = sinf
                 .as_dictionary()
-                .and_then(|fields| fields.get("sinf"))
-                .and_then(Value::as_data)
-                .context("Store SINF entry has no data")?;
-            if data.is_empty() {
-                bail!("Store SINF entry is empty");
-            }
+                .context("Store SINF entry is not a dictionary")?;
+            let data = match fields.get("sinf") {
+                Some(Value::Data(data)) => data.as_slice(),
+                None => &[],
+                Some(_) => bail!("Store SINF data has an invalid type"),
+            };
             writer
                 .start_file(path, SimpleFileOptions::default())
                 .context("create IPA SINF entry")?;
@@ -639,5 +639,52 @@ mod tests {
             .is_err()
         );
         assert!(!bad_output.exists());
+    }
+
+    #[test]
+    fn accepts_empty_sinf_data_with_and_without_manifest() {
+        for manifest in [Some("SC_Info/Custom.sinf"), None] {
+            let (directory, input) = source(manifest);
+            let output = directory.path().join("patched.ipa");
+            let mut fields = plist::Dictionary::new();
+            fields.insert("sinf".into(), Value::Data(Vec::new()));
+            patch_ipa(
+                &input,
+                &output,
+                &serde_json::json!({}),
+                "account",
+                &[],
+                &[Value::Dictionary(fields)],
+            )
+            .unwrap();
+            let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+            let name = manifest.unwrap_or("SC_Info/App.sinf");
+            let path = format!("Payload/App.app/{name}");
+            let entry = archive.by_name(&path).unwrap();
+            assert_eq!(entry.size(), 0);
+        }
+    }
+
+    #[test]
+    fn accepts_omitted_sinf_data_as_empty() {
+        let (directory, input) = source(None);
+        let output = directory.path().join("patched.ipa");
+        patch_ipa(
+            &input,
+            &output,
+            &serde_json::json!({}),
+            "account",
+            &[],
+            &[Value::Dictionary(plist::Dictionary::new())],
+        )
+        .unwrap();
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        assert_eq!(
+            archive
+                .by_name("Payload/App.app/SC_Info/App.sinf")
+                .unwrap()
+                .size(),
+            0
+        );
     }
 }
