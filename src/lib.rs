@@ -43,6 +43,7 @@ pub mod fairplay_recovery_step2;
 pub mod fairplay_recovery_step3;
 pub mod fairplay_recovery_target;
 pub mod fairplay_sidb;
+pub mod fairplay_startup;
 pub mod fairplay_state;
 pub mod fairplay_supf;
 pub mod host;

@@ -36,6 +36,7 @@ use ipatool_rs::fairplay_recovery_output::{
     write_private_binary, write_private_model,
 };
 use ipatool_rs::fairplay_recovery_target::{OracleJob, OracleTarget, SidbTarget, WhiteboxTarget};
+use ipatool_rs::fairplay_startup::seed_request_checkpoint;
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
 use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
@@ -263,6 +264,17 @@ enum FairplayEnrollCommand {
         timeout_seconds: u64,
         #[arg(long)]
         skip_differential: bool,
+    },
+    /// Seed the first private request checkpoint from a matching fairplayd startup profile.
+    SeedRequestCheckpoint {
+        #[arg(long)]
+        startup_profile: PathBuf,
+        #[arg(long)]
+        fairplayd: PathBuf,
+        #[arg(long)]
+        executable_path: String,
+        #[arg(long)]
+        output: PathBuf,
     },
     /// Resume a matching private FairPlay checkpoint for a bounded instruction span.
     ContinueCheckpoint {
@@ -1254,6 +1266,33 @@ fn run() -> Result<()> {
                         "Recovered FairPlay enrollment for {} and decrypted IPA to {}",
                         result.selector,
                         result.decrypted_ipa.display()
+                    ),
+                }
+            }
+            FairplayEnrollCommand::SeedRequestCheckpoint {
+                startup_profile,
+                fairplayd,
+                executable_path,
+                output,
+            } => {
+                let plain_bytes = seed_request_checkpoint(
+                    &startup_profile,
+                    &fairplayd,
+                    &executable_path,
+                    &output,
+                )?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "fairplay.request-checkpoint.v1",
+                            "output": output,
+                            "plain_bytes": plain_bytes,
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Seeded private FairPlay request checkpoint in {}",
+                        output.display()
                     ),
                 }
             }
