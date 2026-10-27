@@ -411,8 +411,8 @@ fn image_report(
     decrypted: DecryptedSlice,
 ) -> Result<ImageReport> {
     let layout = &slice.layout;
-    let id = slice.offset + layout.crypt_id_offset;
-    let start = slice.offset + layout.crypt_offset;
+    let id = layout.crypt_id_offset;
+    let start = layout.crypt_offset;
     let end = start + layout.crypt_size;
     if context.before.len() != context.after.len()
         || end > context.before.len()
@@ -628,16 +628,17 @@ pub fn decrypt_ipa_with_options(
             bail!("{name}: encrypted slice inventory changed during decryption");
         }
         let encrypted_slices = slices.iter().filter(|slice| slice.layout.crypt_id != 0);
-        let context = ImageReportContext {
-            member: &name,
-            supf_member: supf_name,
-            before: &blob,
-            after: &decrypted,
-            supf: &supf,
-            deriver: &deriver,
-            app_mask_sha256: &app_mask_sha256,
-        };
         for (slice, decrypted_report) in encrypted_slices.zip(reports) {
+            let range = slice.offset..slice.offset + slice.size;
+            let context = ImageReportContext {
+                member: &name,
+                supf_member: supf_name,
+                before: &blob[range.clone()],
+                after: &decrypted[range],
+                supf: &supf,
+                deriver: &deriver,
+                app_mask_sha256: &app_mask_sha256,
+            };
             image_reports.push(image_report(&context, slice, decrypted_report)?);
         }
     }
@@ -1120,6 +1121,95 @@ mod tests {
             .read_to_end(&mut unchanged)
             .unwrap();
         assert_eq!(unchanged, unencrypted);
+    }
+
+    #[test]
+    fn decrypts_two_encrypted_slices_in_one_universal_macho() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.ipa");
+        let output = directory.path().join("decrypted.ipa");
+        let report = directory.path().join("decrypted.json");
+        let model_path = directory.path().join("model.bin");
+        let logical = [0x31; 16];
+        let (model, sinf) = model_and_sinf(logical);
+        fs::write(&model_path, model).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let (template, record, plaintext) = encrypted_fixture(logical);
+        let mut fat = vec![0u8; PAGE_BYTES * 7];
+        fat[..4].copy_from_slice(&0xcafe_babeu32.to_be_bytes());
+        fat[4..8].copy_from_slice(&2u32.to_be_bytes());
+        let deriver = PageKeyDeriver::from_logical_key(logical);
+        for (index, offset) in [PAGE_BYTES, PAGE_BYTES * 4].into_iter().enumerate() {
+            let mut thin = template.clone();
+            thin[PAGE_BYTES..PAGE_BYTES * 2].copy_from_slice(&plaintext);
+            let key = deriver.page_key(
+                record[..16].try_into().unwrap(),
+                (offset + PAGE_BYTES) as u64,
+            );
+            let cipher = Aes128::new_from_slice(&key).unwrap();
+            let mut previous: [u8; 16] = record[16..].try_into().unwrap();
+            for chunk in thin[PAGE_BYTES..PAGE_BYTES * 2].as_chunks_mut::<16>().0 {
+                let mut block = GenericArray::clone_from_slice(chunk);
+                for byte in 0..16 {
+                    block[byte] ^= previous[byte];
+                }
+                cipher.encrypt_block(&mut block);
+                chunk.copy_from_slice(&block);
+                previous.copy_from_slice(&block);
+            }
+            let slot = PAGE_BYTES * 2 + 20 + 44 + 32;
+            let page_hash = Sha256::digest(&thin[PAGE_BYTES..PAGE_BYTES * 2]);
+            thin[slot..slot + 32].copy_from_slice(&page_hash);
+            let entry = 8 + index * 20;
+            fat[entry..entry + 4].copy_from_slice(&0x0100_000cu32.to_be_bytes());
+            fat[entry + 4..entry + 8].copy_from_slice(&2u32.to_be_bytes());
+            fat[entry + 8..entry + 12].copy_from_slice(&(offset as u32).to_be_bytes());
+            fat[entry + 12..entry + 16].copy_from_slice(&(thin.len() as u32).to_be_bytes());
+            fat[entry + 16..entry + 20].copy_from_slice(&12u32.to_be_bytes());
+            fat[offset..offset + thin.len()].copy_from_slice(&thin);
+        }
+        let supf = supf(record);
+        let mut writer = ZipWriter::new(File::create(&input).unwrap());
+        for (name, bytes) in [
+            ("Payload/A.app/SC_Info/A.sinf", sinf.as_slice()),
+            ("Payload/A.app/SC_Info/A.supf", supf.as_slice()),
+            ("Payload/A.app/A", fat.as_slice()),
+        ] {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        let result =
+            decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), false).unwrap();
+        assert_eq!(result.encrypted_images, 2);
+        assert_eq!(result.decrypted_pages, 2);
+        let report_data: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(report_data["images"].as_array().unwrap().len(), 2);
+        for (index, offset) in [PAGE_BYTES, PAGE_BYTES * 4].into_iter().enumerate() {
+            assert_eq!(report_data["images"][index]["slice_offset"], offset);
+            assert_eq!(report_data["images"][index]["exact_mutation_scope"], true);
+        }
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        let mut decrypted = Vec::new();
+        archive
+            .by_name("Payload/A.app/A")
+            .unwrap()
+            .read_to_end(&mut decrypted)
+            .unwrap();
+        for offset in [PAGE_BYTES, PAGE_BYTES * 4] {
+            assert_eq!(&decrypted[offset + 48..offset + 52], &[0; 4]);
+            assert_eq!(
+                &decrypted[offset + PAGE_BYTES..offset + PAGE_BYTES * 2],
+                &plaintext
+            );
+        }
     }
 
     #[test]
