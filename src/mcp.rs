@@ -82,9 +82,9 @@ impl AppStoreServer {
 }
 
 fn tool_failure(name: &str, message: String) -> CallToolResult {
-    let mut result = CallToolResult::structured_error(json!({ "error": message }));
-    result.content = vec![ContentBlock::text(format!("{name} failed: {message}"))];
-    result
+    CallToolResult::error(vec![ContentBlock::text(format!(
+        "{name} failed: {message}"
+    ))])
 }
 
 fn optional_non_null<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
@@ -755,6 +755,21 @@ mod tests {
                 TOOL_SCHEMAS[tool.name.as_ref()]["outputSchema"].as_object()
             );
         }
+    }
+
+    #[test]
+    fn tool_errors_match_go_text_only_result_shape() {
+        let result = serde_json::to_value(tool_failure(
+            "search_apps",
+            "search term must not be empty".into(),
+        ))
+        .unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["content"],
+            json!([{"type":"text","text":"search_apps failed: search term must not be empty"}])
+        );
+        assert!(result.get("structuredContent").is_none());
     }
 
     #[test]
