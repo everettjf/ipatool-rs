@@ -158,6 +158,47 @@ impl Image {
         })
     }
 
+    /// Keep selected original text opcodes visible to guest code that reads
+    /// its own executable image, after the usual arm64e preparation.
+    pub fn open_preserving_instructions(
+        name: impl Into<String>,
+        input: &[u8],
+        addresses: &[u64],
+    ) -> Result<Self> {
+        let mut image = Self::open(name, input)?;
+        let original = arm64_slice(input)?;
+        for &address in addresses {
+            let &(section_start, section_offset, _) = image
+                .code_sections
+                .iter()
+                .find(|&&(start, _, size)| {
+                    address >= start
+                        && address
+                            .checked_add(4)
+                            .is_some_and(|end| end <= start.saturating_add(size))
+                        && (address - start) % 4 == 0
+                })
+                .with_context(|| format!("preserved instruction {address:#x} is outside text"))?;
+            let offset = usize::try_from(
+                section_offset
+                    .checked_add(address - section_start)
+                    .context("preserved instruction offset overflow")?,
+            )?;
+            let end = offset
+                .checked_add(4)
+                .context("preserved instruction overflow")?;
+            let source = original
+                .get(offset..end)
+                .context("preserved instruction exceeds original image")?;
+            image
+                .data
+                .get_mut(offset..end)
+                .context("preserved instruction exceeds prepared image")?
+                .copy_from_slice(source);
+        }
+        Ok(image)
+    }
+
     pub fn base(&self) -> u64 {
         self.base
     }
@@ -663,6 +704,38 @@ mod tests {
         image.data[start..start + 4].copy_from_slice(&0xce00_0000u32.to_le_bytes());
         let sites = image.compatibility_sites().unwrap();
         assert!(sites.contains(&(address, 0xce00_0000)));
+    }
+
+    #[test]
+    fn preserves_requested_arm64e_instruction_bytes_in_text() {
+        let mut binary =
+            include_bytes!("../tests/fixtures/fairplay-checkpoint-run-synthetic.macho").to_vec();
+        binary[20..24].copy_from_slice(&152u32.to_le_bytes()); // sizeofcmds
+        binary[36..40].copy_from_slice(&152u32.to_le_bytes()); // LC_SEGMENT_64 size
+        binary[96..100].copy_from_slice(&1u32.to_le_bytes()); // section count
+        let section = 104;
+        binary[section..section + 6].copy_from_slice(b"__text");
+        binary[section + 16..section + 22].copy_from_slice(b"__TEXT");
+        let address = 0x1_0000_0100u64;
+        binary[section + 32..section + 40].copy_from_slice(&address.to_le_bytes());
+        binary[section + 40..section + 48].copy_from_slice(&16u64.to_le_bytes());
+        binary[section + 48..section + 52].copy_from_slice(&0x100u32.to_le_bytes());
+        binary[section + 64..section + 68].copy_from_slice(&PURE_INSTRUCTIONS.to_le_bytes());
+        let offset = 0x100usize;
+        let original_opcode = 0xd503_211fu32;
+        binary[offset..offset + 4].copy_from_slice(&original_opcode.to_le_bytes());
+        let rewritten = Image::open("synthetic", &binary).unwrap();
+        assert_eq!(
+            &rewritten.data[offset..offset + 4],
+            &0xd503_201fu32.to_le_bytes()
+        );
+        let preserved =
+            Image::open_preserving_instructions("synthetic", &binary, &[address]).unwrap();
+        assert_eq!(
+            &preserved.data[offset..offset + 4],
+            &original_opcode.to_le_bytes()
+        );
+        assert!(Image::open_preserving_instructions("synthetic", &binary, &[address + 1]).is_err());
     }
 
     #[derive(Default)]

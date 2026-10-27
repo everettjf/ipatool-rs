@@ -40,6 +40,33 @@ pub fn needs_compat_hook(instruction: u32) -> bool {
     classify(instruction).is_some()
 }
 
+/// Execute the unsigned instruction that the image loader would have written
+/// at a preserved arm64e text site, while leaving its original bytes intact.
+pub fn emulate_preserved_pointer_auth(
+    context: &HookContext,
+    address: u64,
+    prepared: u32,
+) -> Result<()> {
+    let next = address
+        .checked_add(4)
+        .context("arm64 instruction address overflows")?;
+    match prepared {
+        0xd503_201f => context.reg_write(REG_PC, next),
+        0xd65f_03c0 => context.reg_write(REG_PC, context.reg_read(REG_LR)?),
+        _ if prepared & 0xffff_fc1f == 0xd61f_0000 => {
+            let register = (prepared >> 5) & 31;
+            context.reg_write(REG_PC, context.reg_read(general_register(register)?)?)
+        }
+        _ if prepared & 0xffff_fc1f == 0xd63f_0000 => {
+            let register = (prepared >> 5) & 31;
+            let target = context.reg_read(general_register(register)?)?;
+            context.reg_write(REG_LR, next)?;
+            context.reg_write(REG_PC, target)
+        }
+        _ => bail!("unsupported preserved arm64e instruction at {address:#x}"),
+    }
+}
+
 /// Execute a compatibility opcode from a Unicorn code hook and skip its native
 /// instruction. The hook preserves the original bytes in checkpoint memory.
 pub fn emulate_hook_instruction(
@@ -299,6 +326,44 @@ mod tests {
         assert_eq!(engine.reg_read(REG_X0 + 1).unwrap(), 7);
         assert_eq!(engine.reg_read(REG_X0 + 5).unwrap(), 9);
         assert_eq!(engine.mem_read(0x2000, 4).unwrap(), 13u32.to_le_bytes());
+    }
+
+    #[test]
+    fn preserved_pointer_auth_hook_executes_without_rewriting_guest_text() {
+        let mut engine = Engine::new().unwrap();
+        engine.mem_map(0x1000, 4096).unwrap();
+        let pac_nop = 0xd503_211fu32;
+        engine.mem_write(0x1000, &pac_nop.to_le_bytes()).unwrap();
+        engine
+            .add_code_hook(0x1000, 0x1000, move |context, address, _| {
+                emulate_preserved_pointer_auth(context, address, 0xd503_201f).unwrap();
+            })
+            .unwrap();
+        engine
+            .start_bounded(0x1000, 0x1004, Duration::from_secs(2), 2)
+            .unwrap();
+        assert_eq!(engine.reg_read(REG_PC).unwrap(), 0x1004);
+        assert_eq!(engine.mem_read(0x1000, 4).unwrap(), pac_nop.to_le_bytes());
+
+        let authenticated_call = 0xd63f_0a20u32;
+        engine
+            .mem_write(0x1004, &authenticated_call.to_le_bytes())
+            .unwrap();
+        engine.reg_write(REG_X0 + 17, 0x1010).unwrap();
+        engine
+            .add_code_hook(0x1004, 0x1004, move |context, address, _| {
+                emulate_preserved_pointer_auth(context, address, 0xd63f_0220).unwrap();
+            })
+            .unwrap();
+        engine
+            .start_bounded(0x1004, 0x1010, Duration::from_secs(2), 2)
+            .unwrap();
+        assert_eq!(engine.reg_read(REG_LR).unwrap(), 0x1008);
+        assert_eq!(engine.reg_read(REG_PC).unwrap(), 0x1010);
+        assert_eq!(
+            engine.mem_read(0x1004, 4).unwrap(),
+            authenticated_call.to_le_bytes()
+        );
     }
 
     #[test]

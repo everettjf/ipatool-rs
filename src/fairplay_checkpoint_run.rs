@@ -19,10 +19,10 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    arm64_compat::emulate_hook_instruction,
+    arm64_compat::{emulate_hook_instruction, emulate_preserved_pointer_auth},
     fairplay_checkpoint::{FairplayCheckpoint, clear_value},
     fairplay_recovery_output::write_private_binary,
-    machimage::Image,
+    machimage::{Image, without_pointer_authentication},
     store_memory::MemoryRegion,
     unicorn_runtime::{Engine, HookContext, REG_PC},
 };
@@ -538,12 +538,22 @@ pub struct LoadedFairplayd {
     pub fixups: usize,
     pub data_pages: Vec<u64>,
     pub compatibility_sites: Vec<(u64, u32)>,
+    pub preserved_text_sites: Vec<(u64, u32)>,
 }
 
 /// Load the exact arm64e image with chained rebases and deterministic external
 /// bind addresses. The caller owns the engine and can install import hooks.
 pub fn load_fairplayd(engine: &mut Engine, binary: &[u8]) -> Result<LoadedFairplayd> {
-    let mut image = Image::open("fairplayd", binary).context("parse fairplayd arm64e Mach-O")?;
+    load_fairplayd_preserving(engine, binary, &[])
+}
+
+fn load_fairplayd_preserving(
+    engine: &mut Engine,
+    binary: &[u8],
+    preserved_text: &[u64],
+) -> Result<LoadedFairplayd> {
+    let mut image = Image::open_preserving_instructions("fairplayd", binary, preserved_text)
+        .context("parse fairplayd arm64e Mach-O")?;
     let image_base = image.base();
     let fixups = image.fixup_count();
     let compatibility_sites = image.compatibility_sites()?;
@@ -586,6 +596,11 @@ pub fn load_fairplayd(engine: &mut Engine, binary: &[u8]) -> Result<LoadedFairpl
         .context("relocate fairplayd chained fixups")?;
     let regions = image.mapped_regions()?;
     image.load(engine).context("load fairplayd into Unicorn")?;
+    let mut preserved_text_sites = Vec::with_capacity(preserved_text.len());
+    for &address in preserved_text {
+        let bytes = engine.mem_read(address, 4)?;
+        preserved_text_sites.push((address, u32::from_le_bytes(bytes.as_slice().try_into()?)));
+    }
     let externals = by_name
         .into_iter()
         .map(|(name, address)| (address, name))
@@ -597,6 +612,7 @@ pub fn load_fairplayd(engine: &mut Engine, binary: &[u8]) -> Result<LoadedFairpl
         fixups,
         data_pages,
         compatibility_sites,
+        preserved_text_sites,
     })
 }
 
@@ -607,6 +623,7 @@ pub struct CheckpointRunner {
     pub start_pc: u64,
     pub modeled_imports: usize,
     pub compatibility_instruction_sites: usize,
+    pub preserved_text_instruction_sites: usize,
     external_failure: Rc<RefCell<Option<String>>>,
     allocation_state: Rc<RefCell<AllocationState>>,
     once_tokens: Rc<RefCell<BTreeSet<u64>>>,
@@ -1289,15 +1306,52 @@ fn install_modeled_external(
 
 impl CheckpointRunner {
     pub fn new(checkpoint: &FairplayCheckpoint, binary: &[u8]) -> Result<Self> {
+        Self::new_preserving_text(checkpoint, binary, &[])
+    }
+
+    pub fn new_preserving_text(
+        checkpoint: &FairplayCheckpoint,
+        binary: &[u8],
+        preserved_text: &[u64],
+    ) -> Result<Self> {
+        if preserved_text.len() > 256 {
+            bail!("too many preserved FairPlay text instructions");
+        }
+        if preserved_text
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != preserved_text.len()
+        {
+            bail!("duplicate preserved FairPlay text instruction");
+        }
         let actual_hash: [u8; 32] = Sha256::digest(binary).into();
         if actual_hash != checkpoint.binary_hash {
             bail!("fairplayd SHA-256 does not match checkpoint");
         }
         let mut engine = Engine::new().context("create FairPlay ARM64 emulator")?;
-        let image = load_fairplayd(&mut engine, binary)?;
+        let image = load_fairplayd_preserving(&mut engine, binary, preserved_text)?;
         let checkpoint_pages = checkpoint
             .restore_into(&mut engine, &image.regions)
             .context("restore FairPlay checkpoint")?;
+        let preserved_text_instruction_sites = image.preserved_text_sites.len();
+        let external_failure = Rc::new(RefCell::new(None));
+        for &(address, opcode) in &image.preserved_text_sites {
+            engine.mem_write(address, &opcode.to_le_bytes())?;
+            let prepared = without_pointer_authentication(opcode);
+            if prepared == opcode {
+                continue;
+            }
+            let failure = Rc::clone(&external_failure);
+            engine.add_code_hook(address, address, move |context, pc, _| {
+                if let Err(error) = emulate_preserved_pointer_auth(context, pc, prepared) {
+                    *failure.borrow_mut() =
+                        Some(format!("FairPlay preserved text instruction: {error:#}"));
+                    let _ = context.stop();
+                }
+            })?;
+        }
         let start_pc = checkpoint.pc()?;
         if !image.regions.iter().any(|region| {
             region.address <= start_pc
@@ -1308,7 +1362,6 @@ impl CheckpointRunner {
         }) {
             bail!("checkpoint PC is outside the fairplayd image");
         }
-        let external_failure = Rc::new(RefCell::new(None));
         let allocation_state = Rc::new(RefCell::new(AllocationState::from_checkpoint(checkpoint)?));
         {
             let failure = Rc::clone(&external_failure);
@@ -1415,6 +1468,7 @@ impl CheckpointRunner {
             start_pc,
             modeled_imports,
             compatibility_instruction_sites,
+            preserved_text_instruction_sites,
             external_failure,
             allocation_state,
             once_tokens,
@@ -2790,6 +2844,54 @@ mod tests {
         assert!(
             runner
                 .run_until_memory_read_range(0x4000, 0, Duration::from_secs(2), 10)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn preserves_selected_instruction_bytes_through_checkpoint_restore() {
+        let mut binary = SYNTHETIC_BINARY.to_vec();
+        binary[20..24].copy_from_slice(&152u32.to_le_bytes());
+        binary[36..40].copy_from_slice(&152u32.to_le_bytes());
+        binary[96..100].copy_from_slice(&1u32.to_le_bytes());
+        let section = 104;
+        binary[section..section + 6].copy_from_slice(b"__text");
+        binary[section + 16..section + 22].copy_from_slice(b"__TEXT");
+        let address = 0x1_0000_0100u64;
+        binary[section + 32..section + 40].copy_from_slice(&address.to_le_bytes());
+        binary[section + 40..section + 48].copy_from_slice(&16u64.to_le_bytes());
+        binary[section + 48..section + 52].copy_from_slice(&0x100u32.to_le_bytes());
+        binary[section + 64..section + 68].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+        let opcode = 0xd503_211fu32;
+        binary[0x100..0x104].copy_from_slice(&opcode.to_le_bytes());
+
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut root = source.clone_root().unwrap();
+        let Value::Dict(ref mut fields) = root else {
+            unreachable!();
+        };
+        fields.insert(
+            HashableValue::String("binary_sha256".into()),
+            Value::String(format!("{:x}", Sha256::digest(&binary))),
+        );
+        let serialized = serde_pickle::value_to_vec(&root, SerOptions::new()).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&serialized).unwrap();
+        let checkpoint = FairplayCheckpoint::parse_gzip(&encoder.finish().unwrap()).unwrap();
+        let mut runner =
+            CheckpointRunner::new_preserving_text(&checkpoint, &binary, &[address]).unwrap();
+        assert_eq!(runner.preserved_text_instruction_sites, 1);
+        assert_eq!(
+            runner.engine.mem_read(address, 4).unwrap(),
+            opcode.to_le_bytes()
+        );
+        runner.engine.reg_write(REG_PC, address).unwrap();
+        runner
+            .run_until(address + 4, Duration::from_secs(2), 2)
+            .unwrap();
+        assert_eq!(runner.engine.reg_read(REG_PC).unwrap(), address + 4);
+        assert!(
+            CheckpointRunner::new_preserving_text(&checkpoint, &binary, &[address, address])
                 .is_err()
         );
     }

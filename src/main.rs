@@ -275,6 +275,8 @@ enum FairplayEnrollCommand {
         mac_address_file: Option<PathBuf>,
         #[arg(long)]
         iokit15_output: Option<PathBuf>,
+        #[arg(long = "preserve-text-instruction", value_name = "ADDRESS")]
+        preserve_text_instructions: Vec<String>,
     },
     /// Export a private 26A428 oracle model from a checkpoint and memory trace.
     ExportOracleModel {
@@ -1092,6 +1094,7 @@ fn run() -> Result<()> {
                 missing_files_are_enoent,
                 mac_address_file,
                 iokit15_output,
+                preserve_text_instructions,
             } => {
                 if timeout_seconds == 0 || timeout_seconds > 3600 {
                     bail!("FairPlay timeout must be between 1 and 3600 seconds");
@@ -1131,7 +1134,12 @@ fn run() -> Result<()> {
                 }
                 let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
                 let binary_sha256 = format!("{:x}", Sha256::digest(&binary));
-                let mut runner = CheckpointRunner::new(&snapshot, &binary)?;
+                let preserved_text = preserve_text_instructions
+                    .iter()
+                    .map(|address| parse_address(address))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut runner =
+                    CheckpointRunner::new_preserving_text(&snapshot, &binary, &preserved_text)?;
                 if let Some(path) = mac_address_file {
                     let input = read_private_bytes(&path, 64)?;
                     runner.set_mac_address(parse_private_mac(&input)?);
@@ -1243,6 +1251,7 @@ fn run() -> Result<()> {
                             "external_imports": runner.image.externals.len(),
                             "modeled_imports": runner.modeled_imports,
                             "compatibility_instruction_sites": runner.compatibility_instruction_sites,
+                            "preserved_text_instruction_sites": runner.preserved_text_instruction_sites,
                             "output_checkpoint": output_checkpoint,
                             "output_pages": written_pages,
                             "memory_trace_output": memory_trace_output,
@@ -2238,6 +2247,8 @@ mod tests {
             "10000000",
             "--timeout-seconds",
             "600",
+            "--preserve-text-instruction",
+            "0x100a05900",
         ])
         .unwrap();
         match cli.command {
@@ -2248,6 +2259,7 @@ mod tests {
                         stop_memory_read_range,
                         instruction_limit,
                         timeout_seconds,
+                        preserve_text_instructions,
                         ..
                     },
             } => {
@@ -2258,6 +2270,7 @@ mod tests {
                 );
                 assert_eq!(instruction_limit, 10_000_000);
                 assert_eq!(timeout_seconds, 600);
+                assert_eq!(preserve_text_instructions, ["0x100a05900"]);
             }
             _ => panic!("unexpected command"),
         }
