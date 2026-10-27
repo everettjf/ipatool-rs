@@ -167,4 +167,98 @@ mod tests {
             assert_eq!(state.digest(), expected_digest);
         }
     }
+
+    #[test]
+    fn generated_evaluator_matches_go_across_all_fault_sites() {
+        // Produced by the original Go oracle from the public synthetic model.
+        // State hashes cover registers, flags, and every mapped memory page.
+        let vectors = include_str!("../tests/fixtures/fairplay-26b118-go-vectors.txt");
+        let model = OracleModel::parse_gzip(SYNTHETIC_MODEL).unwrap();
+        let mut state = model.state();
+        let mut normal_cases = 0;
+        let mut fault_cases = 0;
+        for line in vectors.lines().filter(|line| !line.starts_with('#')) {
+            let [
+                kind,
+                index,
+                metadata,
+                input,
+                expected_output,
+                expected_digest,
+            ] = line
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            let metadata = u32::from_str_radix(metadata, 16).unwrap();
+            let input = core::array::from_fn(|byte| {
+                u8::from_str_radix(&input[byte * 2..byte * 2 + 2], 16).unwrap()
+            });
+            match kind {
+                "normal" => normal_cases += 1,
+                "fault" => fault_cases += 1,
+                _ => panic!("unexpected Go vector kind: {kind}"),
+            }
+            let fault = fault_for_metadata(metadata).unwrap();
+            let output = evaluate_in_state(&mut state, &input, fault)
+                .unwrap_or_else(|error| panic!("Go vector {kind} {index} failed: {error:#}"));
+            let output_hex = output
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(output_hex, expected_output, "Go vector {kind} {index}");
+            assert_eq!(state.digest(), expected_digest, "Go vector {kind} {index}");
+        }
+        assert_eq!((normal_cases, fault_cases), (64, 144));
+    }
+
+    #[test]
+    fn learned_domains_match_go_except_index_after_site() {
+        let model = OracleModel::parse_gzip(include_bytes!(
+            "../tests/fixtures/fairplay-oracle-26b118-synthetic-domains.model.gz"
+        ))
+        .unwrap();
+        assert_eq!(model.domain_count(), 18);
+        let mut state = model.state();
+        let mut index_after = Vec::new();
+        for line in include_str!("../tests/fixtures/fairplay-26b118-go-vectors.txt")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let [
+                kind,
+                index,
+                metadata,
+                input,
+                expected_output,
+                expected_digest,
+            ] = line
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap();
+            let metadata = u32::from_str_radix(metadata, 16).unwrap();
+            let input = core::array::from_fn(|byte| {
+                u8::from_str_radix(&input[byte * 2..byte * 2 + 2], 16).unwrap()
+            });
+            let fault = fault_for_metadata(metadata).unwrap();
+            let output = evaluate_in_state(&mut state, &input, fault).unwrap_or_else(|error| {
+                panic!("Go vector {kind} {index} failed with learned domains: {error:#}")
+            });
+            let output_hex = output
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(output_hex, expected_output, "Go vector {kind} {index}");
+            assert_eq!(state.digest(), expected_digest, "Go vector {kind} {index}");
+            if kind == "fault" && matches!(index, "57" | "58" | "59") {
+                // Go classifies the post-lookup XOR at 0x100222c58 as an index
+                // lookup and rejects this value when a domain is present. The
+                // checked instruction geometry uses a direct XOR at this site.
+                assert_eq!(fault.kind, FaultKind::IndexAfter);
+                index_after.push(index);
+            }
+        }
+        assert_eq!(index_after, ["57", "58", "59"]);
+    }
 }
