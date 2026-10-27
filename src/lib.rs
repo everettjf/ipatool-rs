@@ -50,6 +50,7 @@ pub mod file_keychain;
 pub mod host;
 pub mod ipa_metadata;
 pub mod ipa_patch;
+mod ipa_zip_repack;
 pub mod lzbitmap;
 pub mod mac_package;
 pub mod mac_preflight;

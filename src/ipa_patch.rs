@@ -2,7 +2,7 @@
 
 use std::{
     fs::File,
-    io::{self, Read, Write},
+    io::{Read, Write},
     path::Path,
 };
 
@@ -10,6 +10,8 @@ use anyhow::{Context, Result, bail};
 use plist::Value;
 use serde_json::Value as JsonValue;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
+
+use crate::ipa_zip_repack;
 
 const MAX_PLIST: u64 = 4 * 1024 * 1024;
 
@@ -28,18 +30,10 @@ pub fn patch_ipa(
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     let output = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("create temporary IPA in {}", parent.display()))?;
-    let mut copy = output.reopen().context("open temporary IPA")?;
-    io::copy(&mut File::open(source)?, &mut copy).context("copy original IPA")?;
-    let mut writer = ZipWriter::new_append(copy).context("open IPA ZIP for patching")?;
+    let additions = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary IPA entries in {}", parent.display()))?;
+    let mut writer = ZipWriter::new(additions.reopen()?);
     if !artwork.is_empty() {
-        if archive
-            .file_names_raw()
-            .any(|name| name == b"iTunesArtwork")
-        {
-            writer
-                .hide_file("iTunesArtwork")
-                .context("replace IPA artwork entry")?;
-        }
         writer
             .start_file("iTunesArtwork", SimpleFileOptions::default())
             .context("create IPA artwork entry")?;
@@ -51,14 +45,6 @@ pub fn patch_ipa(
         .clone();
     metadata.insert("apple-id".into(), apple_id.into());
     metadata.insert("userName".into(), apple_id.into());
-    if archive
-        .file_names_raw()
-        .any(|name| name == b"iTunesMetadata.plist")
-    {
-        writer
-            .hide_file("iTunesMetadata.plist")
-            .context("replace IPA metadata entry")?;
-    }
     writer
         .start_file("iTunesMetadata.plist", SimpleFileOptions::default())
         .context("create IPA metadata entry")?;
@@ -74,16 +60,18 @@ pub fn patch_ipa(
             if data.is_empty() {
                 bail!("Store SINF entry is empty");
             }
-            if archive.file_names_raw().any(|name| name == path.as_bytes()) {
-                writer.hide_file(&path).context("replace IPA SINF entry")?;
-            }
             writer
                 .start_file(path, SimpleFileOptions::default())
                 .context("create IPA SINF entry")?;
             writer.write_all(data).context("write IPA SINF")?;
         }
     }
-    let file = writer.finish().context("finalize patched IPA ZIP")?;
+    let _ = writer
+        .finish()
+        .context("finalize IPA replacement entries")?;
+    let mut file = output.reopen().context("open temporary IPA")?;
+    ipa_zip_repack::repack(&File::open(source)?, &additions.reopen()?, &mut file)
+        .context("repack IPA ZIP")?;
     file.sync_all().context("sync patched IPA")?;
     output
         .persist(destination)
@@ -396,6 +384,143 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn repacks_deflated_entries_for_streaming_without_orphan_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.ipa");
+        let mut writer = ZipWriter::new(File::create(&input).unwrap());
+        writer
+            .start_file("Payload/App.app/Info.plist", SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(br#"<plist version="1.0"><dict><key>CFBundleExecutable</key><string>App</string></dict></plist>"#)
+            .unwrap();
+        writer
+            .start_file(
+                "Payload/App.app/App",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        writer.write_all(&vec![b'A'; 16_384]).unwrap();
+        writer
+            .start_file("iTunesMetadata.plist", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"old metadata").unwrap();
+        writer.finish().unwrap();
+
+        let output = directory.path().join("patched.ipa");
+        patch_ipa(&input, &output, &serde_json::json!({}), "account", &[], &[]).unwrap();
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        assert_eq!(archive.len(), 3);
+        let mut headers = Vec::new();
+        for index in 0..archive.len() {
+            let entry = archive.by_index(index).unwrap();
+            headers.push((
+                entry.header_start(),
+                entry.data_start().unwrap(),
+                entry.compressed_size(),
+                entry.compression(),
+                entry.central_header_start(),
+            ));
+        }
+        headers.sort_by_key(|entry| entry.0);
+        assert_eq!(headers[0].0, 0);
+        let mut file = File::open(&output).unwrap();
+        for (index, &(start, data_start, size, method, _)) in headers.iter().enumerate() {
+            file.seek(SeekFrom::Start(start + 6)).unwrap();
+            let mut flags = [0u8; 2];
+            file.read_exact(&mut flags).unwrap();
+            let uses_descriptor = u16::from_le_bytes(flags) & 8 != 0;
+            assert_eq!(uses_descriptor, method == zip::CompressionMethod::Deflated);
+            let end = data_start + size;
+            if uses_descriptor {
+                file.seek(SeekFrom::Start(end)).unwrap();
+                let mut signature = [0u8; 4];
+                file.read_exact(&mut signature).unwrap();
+                assert_eq!(signature, 0x0807_4b50u32.to_le_bytes());
+            }
+            let next = end + if uses_descriptor { 16 } else { 0 };
+            assert_eq!(next, headers.get(index + 1).map_or(headers[0].4, |h| h.0));
+        }
+        let mut executable = Vec::new();
+        archive
+            .by_name("Payload/App.app/App")
+            .unwrap()
+            .read_to_end(&mut executable)
+            .unwrap();
+        assert_eq!(executable, vec![b'A'; 16_384]);
+    }
+
+    #[test]
+    fn clears_existing_stored_descriptors_and_inlines_sizes() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.ipa");
+        let mut writer = ZipWriter::new_stream(File::create(&input).unwrap());
+        writer
+            .start_file(
+                "Payload/App.app/Info.plist",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer
+            .write_all(br#"<plist version="1.0"><dict><key>CFBundleExecutable</key><string>App</string></dict></plist>"#)
+            .unwrap();
+        writer.finish().unwrap();
+        let output = directory.path().join("patched.ipa");
+        patch_ipa(&input, &output, &serde_json::json!({}), "account", &[], &[]).unwrap();
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        let entry = archive.by_name("Payload/App.app/Info.plist").unwrap();
+        let start = entry.header_start();
+        let end = entry.data_start().unwrap() + entry.compressed_size();
+        let crc = entry.crc32();
+        let size = entry.compressed_size() as u32;
+        let mut file = File::open(&output).unwrap();
+        let mut local = [0u8; 30];
+        file.seek(SeekFrom::Start(start)).unwrap();
+        file.read_exact(&mut local).unwrap();
+        assert_eq!(u16::from_le_bytes(local[6..8].try_into().unwrap()) & 8, 0);
+        assert_eq!(u32::from_le_bytes(local[14..18].try_into().unwrap()), crc);
+        assert_eq!(u32::from_le_bytes(local[18..22].try_into().unwrap()), size);
+        assert_eq!(u32::from_le_bytes(local[22..26].try_into().unwrap()), size);
+        let mut signature = [0u8; 4];
+        file.seek(SeekFrom::Start(end)).unwrap();
+        file.read_exact(&mut signature).unwrap();
+        assert_eq!(signature, 0x0403_4b50u32.to_le_bytes());
+    }
+
+    #[test]
+    fn repacks_prefixed_archive_without_copying_prefix() {
+        let (directory, input) = source(None);
+        let prefixed = directory.path().join("prefixed.ipa");
+        let mut file = File::create(&prefixed).unwrap();
+        file.write_all(b"launcher prefix").unwrap();
+        file.write_all(&std::fs::read(&input).unwrap()).unwrap();
+        let output = directory.path().join("patched.ipa");
+        patch_ipa(
+            &prefixed,
+            &output,
+            &serde_json::json!({}),
+            "account",
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut signature = [0u8; 4];
+        File::open(&output)
+            .unwrap()
+            .read_exact(&mut signature)
+            .unwrap();
+        assert_eq!(signature, 0x0403_4b50u32.to_le_bytes());
+        let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
+        let mut executable = Vec::new();
+        archive
+            .by_name("Payload/App.app/App")
+            .unwrap()
+            .read_to_end(&mut executable)
+            .unwrap();
+        assert_eq!(executable, b"executable");
     }
 
     #[test]
