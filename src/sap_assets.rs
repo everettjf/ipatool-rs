@@ -115,6 +115,9 @@ impl SapFrameworkAssets {
 impl SapAssetBundle {
     /// Load a validated cache or download and atomically replace the pinned assets.
     pub fn load_or_download() -> Result<Self> {
+        if let Some(directory) = configured_cache_directory()? {
+            return Self::load_from(&directory).context("validate IPATOOL_SAP_CACHE_DIR assets");
+        }
         let directory = cache_directory()?;
         if let Ok(bundle) = Self::load_from(&directory) {
             return Ok(bundle);
@@ -203,8 +206,22 @@ impl SapAssetBundle {
 }
 
 pub fn cache_directory() -> Result<PathBuf> {
+    if let Some(directory) = configured_cache_directory()? {
+        return Ok(directory);
+    }
     let root = dirs::cache_dir().context("find user cache directory")?;
     Ok(root.join("ipatool").join("sap").join(CACHE_DIRECTORY))
+}
+
+fn configured_cache_directory() -> Result<Option<PathBuf>> {
+    let Some(value) = std::env::var_os("IPATOOL_SAP_CACHE_DIR") else {
+        return Ok(None);
+    };
+    let directory = PathBuf::from(value);
+    if !directory.is_absolute() {
+        bail!("IPATOOL_SAP_CACHE_DIR must be an absolute path");
+    }
+    Ok(Some(directory))
 }
 
 fn read_cache_file(path: &Path, expected_size: usize) -> Result<Vec<u8>> {

@@ -9,7 +9,7 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 
 | Area | Evidence available locally | Remaining validation |
 | --- | --- | --- |
-| Public catalog | Six platform search requests returned successfully against the public catalog, including an empty but successful Apple TV result. Catalog URL, platform, result, and visionOS parsing tests pass. | Catalog responses can change; test requested countries and apps as needed. |
+| Public catalog | Six platform search requests returned successfully against the public catalog, including an empty but successful Apple TV result. Catalog URL, platform, result, and visionOS parsing tests pass. Public search, lookup, and latest-version queries default to US without opening the keychain; an explicit `--country` selects another storefront. | Catalog responses can change; test requested countries and apps as needed. |
 | Account and Store | Native Rust login, purchase, purchase history, download-product, version selection, keychain, cookies, and request signing paths have fixture and integration tests. A download purchase retry after token expiry is covered. Cached Apple images generated authentication parameters and StoreAgent KBSync, and a live SAP setup signed a test request without an account. | Run login, 2FA, purchase, owned-app listing, version metadata, and download with a controlled account. |
 | Mobile and Mac packages | IPA ZIP framing, resume, SINF patching, metadata, macOS preflight, PKG decryption, and publish paths have offline tests. | Download and inspect real IPA and PKG outputs for each platform. |
 | FairPlay | Doctor, collection, checkpoint execution, oracle evaluation, native SIDB recovery, model construction, and IPA decryption paths have offline tests. Full public SIDB recovery matched the Go fixture in release mode. The current host's real `fairplayd` image parsed and loaded into Unicorn. The 26B118 Rust evaluator matched 208 Go vectors on the public synthetic model, covering 64 normal inputs and 48 fault sites at three XOR values. | Run private 26B118 differential checks and enrollment/decryption against paired data captured on a supported host. |
@@ -25,6 +25,7 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 - The Linux ARM64 and x86_64 release binaries booted inside QEMU with SHA-256-verified Debian netboot kernel/initramfs images. Both returned version 0.1.0, completed a live public `Apple`/US search, and served MCP over stdio with six tools and the expected invalid-search error. This checks executable startup, TLS/HTTP catalog access, and MCP transport on Linux; authenticated Store and package workflows remain untested there.
 - The pinned Apple Store guest boot and StoreAgent initialization tests passed using cached framework assets, without an account or device.
 - Twenty-four additional opt-in tests passed with locally cached assets, public endpoints, or the current host's `fairplayd`, including guest ABI and memory guards, authentication parameters, StoreAgent KBSync, public bag retrieval, live SAP setup/signing, FairPlay image loading, and hardware MAC selection. These tests do not perform an authenticated Store transaction.
+- A live non-interactive iPhone catalog search succeeded without `--country` or keychain access. `IPATOOL_SAP_CACHE_DIR` selected the four prevalidated framework files and booted the Store guest; an explicit invalid cache fails without fetching a restore image.
 - The 26B118 Go evaluator generated 208 output and full-state vectors from an account-free synthetic model; Rust matches all 208. With the domain-bearing variant, 205 cases match Go. At the post-lookup XOR site `0x100222c58`, Go classifies three cases as index-domain faults and rejects them; Rust applies the direct XOR. This known semantic difference still needs confirmation against private native capture.
 
 ## Gates before claiming full parity
@@ -40,6 +41,15 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 The current `ipatool-ios-arm64` is an `ldid`-signed iOS 15+ CLI binary for a
 jailbroken arm64 device. Copy it to the device, make it executable, and first
 run these read-only commands:
+
+Store and SAP commands need four checksum-pinned Apple framework files. A
+validated cache from the Mac can be copied to the device and selected with
+`IPATOOL_SAP_CACHE_DIR=/absolute/path/to/apple-assets-macos-27-26A434-arm64-v1`.
+That directory must contain `AppleMediaServices`, `commerce`, `CoreFP`, and
+`CoreFP.icxs`. The override validates all four files and fails immediately if
+one is missing or changed, instead of fetching the macOS restore image on the
+device. Without the override, the ordinary validated cache and download path
+remain available.
 
 ```sh
 ./ipatool-ios-arm64 --version
