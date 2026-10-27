@@ -10,7 +10,8 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::catalog::AppNotFound;
 use ipatool_rs::credentials::{
-    Account, AccountStore, configure_file_keychain, open_system_keychain,
+    Account, AccountStore, configure_apple_keychain_ui, configure_file_keychain,
+    open_system_keychain,
 };
 use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
 use ipatool_rs::fairplay_26a428;
@@ -74,6 +75,7 @@ struct Cli {
     format: Format,
     #[arg(long, global = true)]
     verbose: bool,
+    /// Disable terminal prompts and Apple Keychain authorization dialogs.
     #[arg(long, global = true)]
     non_interactive: bool,
     /// Passphrase for the encrypted file keychain on Linux or Windows.
@@ -650,6 +652,9 @@ fn run() -> Result<()> {
     configure_file_keychain(
         cli.keychain_passphrase.take(),
         !cli.non_interactive && io::stdin().is_terminal(),
+    );
+    configure_apple_keychain_ui(
+        !cli.non_interactive && !matches!(&cli.command, Command::Mcp) && io::stdin().is_terminal(),
     );
     match cli.command {
         Command::Mcp => mcp::serve()?,

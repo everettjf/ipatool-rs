@@ -10,6 +10,8 @@ use crate::file_keychain::FileKeychain;
 use crate::state::KEYCHAIN_SERVICE_NAME;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::state::prepare_state_directory_from_environment;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
 struct FileKeychainOptions {
@@ -58,7 +60,62 @@ impl<T: CredentialStore + ?Sized> CredentialStore for Box<T> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-pub struct AppleKeychain;
+pub struct AppleKeychain {
+    allow_ui: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+static APPLE_KEYCHAIN_UI_ALLOWED: AtomicBool = AtomicBool::new(true);
+
+/// Control whether Apple Keychain operations may display an authorization dialog.
+pub fn configure_apple_keychain_ui(allow_ui: bool) {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    APPLE_KEYCHAIN_UI_ALLOWED.store(allow_ui, Ordering::Relaxed);
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let _ = allow_ui;
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn apple_password_options(
+    key: &str,
+    allow_ui: bool,
+) -> security_framework::passwords::PasswordOptions {
+    use core_foundation::{base::TCFType, string::CFString};
+    use security_framework::passwords::PasswordOptions;
+    use security_framework_sys::item::kSecUseAuthenticationUI;
+
+    let mut options = PasswordOptions::new_generic_password(KEYCHAIN_SERVICE_NAME, key);
+    if !allow_ui {
+        // The sys crate omits this public Security.framework constant. Apple's
+        // SecItem API returns errSecInteractionNotAllowed when UI is required.
+        unsafe extern "C" {
+            static kSecUseAuthenticationUIFail: core_foundation::string::CFStringRef;
+        }
+        #[allow(deprecated)]
+        unsafe {
+            options.query.push((
+                CFString::wrap_under_get_rule(kSecUseAuthenticationUI),
+                CFString::wrap_under_get_rule(kSecUseAuthenticationUIFail).into_CFType(),
+            ));
+        }
+    }
+    options
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn apple_keychain_error(
+    operation: &str,
+    key: &str,
+    error: security_framework::base::Error,
+) -> anyhow::Error {
+    if error.code() == -25308 {
+        anyhow!(
+            "{operation} Apple Keychain item {key}: interactive authorization is required; approve access from an interactive ipatool account command"
+        )
+    } else {
+        anyhow!("{operation} Apple Keychain item {key}: {error}")
+    }
+}
 
 #[cfg(target_os = "macos")]
 pub type MacKeychain = AppleKeychain;
@@ -66,25 +123,28 @@ pub type MacKeychain = AppleKeychain;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 impl CredentialStore for AppleKeychain {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        use security_framework::passwords::get_generic_password;
-        match get_generic_password(KEYCHAIN_SERVICE_NAME, key) {
+        use security_framework::passwords::generic_password;
+        match generic_password(apple_password_options(key, self.allow_ui)) {
             Ok(data) => Ok(Some(data)),
             Err(error) if error.code() == -25300 => Ok(None),
-            Err(error) => Err(anyhow!("read macOS Keychain item {key}: {error}")),
+            Err(error) => Err(apple_keychain_error("read", key, error)),
         }
     }
 
     fn set(&self, key: &str, data: &[u8]) -> Result<()> {
-        security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE_NAME, key, data)
-            .with_context(|| format!("save macOS Keychain item {key}"))
+        security_framework::passwords::set_generic_password_options(
+            data,
+            apple_password_options(key, self.allow_ui),
+        )
+        .map_err(|error| apple_keychain_error("save", key, error))
     }
 
     fn remove(&self, key: &str) -> Result<bool> {
-        use security_framework::passwords::delete_generic_password;
-        match delete_generic_password(KEYCHAIN_SERVICE_NAME, key) {
+        use security_framework::passwords::delete_generic_password_options;
+        match delete_generic_password_options(apple_password_options(key, self.allow_ui)) {
             Ok(()) => Ok(true),
             Err(error) if error.code() == -25300 => Ok(false),
-            Err(error) => Err(anyhow!("remove macOS Keychain item {key}: {error}")),
+            Err(error) => Err(apple_keychain_error("remove", key, error)),
         }
     }
 }
@@ -92,7 +152,9 @@ impl CredentialStore for AppleKeychain {
 pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        Ok(Box::new(AppleKeychain))
+        Ok(Box::new(AppleKeychain {
+            allow_ui: APPLE_KEYCHAIN_UI_ALLOWED.load(Ordering::Relaxed),
+        }))
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
@@ -333,6 +395,23 @@ impl<S: CredentialStore> AccountStore<S> {
 mod tests {
     use super::*;
     use std::{collections::HashMap, sync::Mutex};
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn noninteractive_apple_password_query_forbids_authentication_ui() {
+        use core_foundation::base::TCFType;
+        use security_framework_sys::item::kSecUseAuthenticationUI;
+
+        let options = apple_password_options("account", false);
+        #[allow(deprecated)]
+        {
+            assert_eq!(apple_password_options("account", true).query.len(), 3);
+            assert_eq!(options.query.len(), 4);
+            assert_eq!(options.query[3].0.as_concrete_TypeRef(), unsafe {
+                kSecUseAuthenticationUI
+            });
+        }
+    }
 
     #[cfg(unix)]
     #[test]
