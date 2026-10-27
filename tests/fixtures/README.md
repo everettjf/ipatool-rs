@@ -13,6 +13,11 @@ special entries. It contains no account or package data.
 directory, a symlink, and a FIFO. The Go reader reports zero regular files,
 so macOS package validation rejects it. It contains no account data.
 
+`mac-xar-directory-payload-synthetic.pkg` is a 448-byte XAR with a regular
+`PackageInfo` and a timestamped directory named `Payload`. The Go reader
+exposes only `PackageInfo`, so version metadata has no payload timestamp.
+It contains no account data.
+
 `fairplay-oracle-raw-source-synthetic.model.gz` extends the account-free
 26A428 synthetic model with zero-filled pages so the six checked raw-source
 kernels can run one iteration. Expected state hashes were cross-checked with

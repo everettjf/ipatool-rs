@@ -187,7 +187,9 @@ fn read_package_version_from_path(path: &Path, bundle_id: &str) -> Result<Versio
             };
             let modified = files
                 .iter()
-                .find(|(candidate, _)| candidate == &payload)
+                .find(|(candidate, file)| {
+                    candidate == &payload && matches!(file.file_type, FileType::File)
+                })
                 .and_then(|(_, file)| file.mtime.as_deref())
                 .context("Mac package has no payload timestamp")?;
             let modified = OffsetDateTime::parse(modified, &Rfc3339)
@@ -564,6 +566,23 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("no files")
+        );
+    }
+
+    #[test]
+    fn rejects_directory_as_package_payload_timestamp_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(
+            &path,
+            include_bytes!("../tests/fixtures/mac-xar-directory-payload-synthetic.pkg"),
+        )
+        .unwrap();
+        assert!(
+            read_package_version_from_path(&path, "com.example.mac")
+                .unwrap_err()
+                .to_string()
+                .contains("no payload timestamp")
         );
     }
 
