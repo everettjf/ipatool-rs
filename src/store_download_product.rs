@@ -483,8 +483,7 @@ impl DownloadProductClient {
             Platform::Iphone
         });
         if selected_platform == Platform::Macos
-            && !software_platform.eq_ignore_ascii_case("ios")
-            && !(software_platform.is_empty() && product_type.eq_ignore_ascii_case("ios-app"))
+            && package_platform(Platform::Macos, item)? == Platform::Macos
         {
             let has_dp_info = item.sinfs.iter().any(|sinf| {
                 sinf.as_dictionary()
@@ -1554,6 +1553,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.display_version, "4.2");
+    }
+
+    #[test]
+    fn version_metadata_rejects_conflicting_mac_package_evidence() {
+        for (software_platform, sinf_key) in [("macos", "sinf"), ("ios", "dpInfo")] {
+            let body = format!(
+                "<plist version=\"1.0\"><dict><key>songList</key><array><dict>\
+                 <key>URL</key><string>https://example.test/app.ipa</string>\
+                 <key>metadata</key><dict><key>software-platform</key><string>{software_platform}</string></dict>\
+                 <key>sinfs</key><array><dict><key>{sinf_key}</key><data>AQID</data></dict></array>\
+                 </dict></array></dict></plist>"
+            );
+            let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |_| {
+                Ok(Response {
+                    status: 200,
+                    headers: Default::default(),
+                    body: body.as_bytes().to_vec(),
+                })
+            });
+            let error = client
+                .get_version_metadata_with(
+                    &account(),
+                    &app(),
+                    "101",
+                    Some(Platform::Macos),
+                    (
+                        |_| unreachable!(),
+                        |_, _| unreachable!(),
+                        |_, _| unreachable!(),
+                    ),
+                )
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("conflicting package metadata"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]
