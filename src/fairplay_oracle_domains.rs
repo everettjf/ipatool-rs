@@ -13,9 +13,11 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
+    fairplay_26a428,
     fairplay_26b118::{self, BUILD_HASH, required_index_sites},
     fairplay_checkpoint::FairplayCheckpoint,
     fairplay_checkpoint_run::CheckpointRunner,
+    fairplay_frame,
     fairplay_oracle_model::{FaultKind, OracleFault, OracleModel},
     fairplay_recovery_target::deterministic_input,
     unicorn_runtime::{Engine, HookContext, REG_PC, REG_X0},
@@ -192,6 +194,7 @@ struct ReplayRunner {
     initial_allocation_next: u64,
     block: u64,
     stop: u64,
+    stop_hits: usize,
     timeout: Duration,
     dirty: Rc<RefCell<DirtyPages>>,
     captured: Rc<RefCell<CapturedValues>>,
@@ -201,14 +204,27 @@ struct ReplayRunner {
 
 impl ReplayRunner {
     fn new(
-        mut runner: CheckpointRunner,
+        runner: CheckpointRunner,
         block: u64,
         stop: u64,
         sites: &BTreeSet<(u64, u8)>,
         fault_sites: &[OracleFault],
         timeout: Duration,
     ) -> Result<Self> {
+        Self::new_with_stop_hits(runner, block, stop, 1, sites, fault_sites, timeout)
+    }
+
+    fn new_with_stop_hits(
+        mut runner: CheckpointRunner,
+        block: u64,
+        stop: u64,
+        stop_hits: usize,
+        sites: &BTreeSet<(u64, u8)>,
+        fault_sites: &[OracleFault],
+        timeout: Duration,
+    ) -> Result<Self> {
         if timeout.is_zero()
+            || !(1..=2).contains(&stop_hits)
             || (sites.is_empty() && fault_sites.is_empty())
             || sites.len() > 64
             || fault_sites.len() > 64
@@ -291,6 +307,7 @@ impl ReplayRunner {
             initial_allocation_next,
             block,
             stop,
+            stop_hits,
             timeout,
             dirty,
             captured,
@@ -327,7 +344,7 @@ impl ReplayRunner {
         self.runner.engine.mem_write(self.block, input)?;
         let execution = self
             .runner
-            .run_until(self.stop, self.timeout, INSTRUCTION_LIMIT)
+            .run_until_hit(self.stop, self.stop_hits, self.timeout, INSTRUCTION_LIMIT)
             .and_then(|()| {
                 let bytes = self.runner.engine.mem_read(self.block, 16)?;
                 Ok(bytes.try_into().expect("read exactly one oracle block"))
@@ -462,6 +479,89 @@ pub struct DifferentialResult {
     pub output_sha256: String,
 }
 
+/// Compare the checked 26A428 Rust evaluator with native checkpoint execution.
+/// The 26A428 boundary returns to the same dispatch PC, so the second hit is
+/// the completed block. This mirrors the original Go differential harness.
+pub fn validate_26a428_model(
+    checkpoint: &FairplayCheckpoint,
+    binary: &[u8],
+    model: &OracleModel,
+    timeout: Duration,
+    normal_cases: usize,
+) -> Result<DifferentialResult> {
+    const ENTRY: u64 = 0x1002_34cdc;
+    if normal_cases > 256 {
+        bail!("26A428 differential normal case count exceeds 256");
+    }
+    if checkpoint.binary_hash != fairplay_frame::BUILD_HASH
+        || checkpoint.pc()? != ENTRY
+        || model.binary_hash != fairplay_frame::BUILD_HASH
+        || model.block_address != fairplay_26a428::BLOCK_ADDRESS
+    {
+        bail!("26A428 differential inputs do not match the checked build and entry");
+    }
+    let mut metadata = Vec::with_capacity(48 * 3);
+    let mut faults = Vec::with_capacity(48);
+    for round in [6u32, 8, 9] {
+        for byte in 0..16u32 {
+            faults.push(fairplay_26a428::fault_for_metadata(
+                round | (byte << 16) | (1 << 24),
+            )?);
+            for value in [1u32, 7, 255] {
+                metadata.push(round | (byte << 16) | (value << 24));
+            }
+        }
+    }
+    let input = checkpoint.read_block::<16>(fairplay_26a428::BLOCK_ADDRESS)?;
+    let runner = CheckpointRunner::new(checkpoint, binary)?;
+    let mut replay = ReplayRunner::new_with_stop_hits(
+        runner,
+        fairplay_26a428::BLOCK_ADDRESS,
+        ENTRY,
+        2,
+        &BTreeSet::new(),
+        &faults,
+        timeout,
+    )?;
+    let mut hash = Sha256::new();
+    let baseline = replay.run_block(&input)?;
+    if baseline != fairplay_26a428::evaluate(model, &input, u32::MAX)? {
+        bail!("26A428 Rust evaluator differs from native execution without a fault");
+    }
+    hash.update(baseline);
+    for index in 0..normal_cases {
+        let mut seed = Sha256::new();
+        seed.update(b"macOS 26A428 Go differential");
+        seed.update((index as u64).to_be_bytes());
+        let digest = seed.finalize();
+        let block: [u8; 16] = digest[..16].try_into().unwrap();
+        let native = replay
+            .run_block(&block)
+            .with_context(|| format!("native 26A428 normal case {index}"))?;
+        let rust = fairplay_26a428::evaluate(model, &block, u32::MAX)?;
+        if native != rust {
+            bail!("26A428 Rust evaluator differs from native normal case {index}");
+        }
+        hash.update(native);
+    }
+    for (index, &metadata) in metadata.iter().enumerate() {
+        let fault = fairplay_26a428::fault_for_metadata(metadata)?;
+        let native = replay
+            .run_fault_block(&input, fault, None)
+            .with_context(|| format!("native 26A428 differential case {index} ({metadata:#x})"))?;
+        let rust = fairplay_26a428::evaluate(model, &input, metadata)?;
+        if native != rust {
+            bail!("26A428 Rust evaluator differs from native case {index} ({metadata:#x})");
+        }
+        hash.update(native);
+    }
+    Ok(DifferentialResult {
+        cases: metadata.len() + normal_cases + 1,
+        domains: 0,
+        output_sha256: format!("{:x}", hash.finalize()),
+    })
+}
+
 /// Compare the checked Rust evaluator with native checkpoint execution for
 /// the original block, deterministic inputs, and every 26B118 fault site at
 /// three XOR values.
@@ -553,6 +653,31 @@ mod tests {
         include_bytes!("../tests/fixtures/fairplay-checkpoint-run-synthetic.macho");
     const CHECKPOINT: &[u8] =
         include_bytes!("../tests/fixtures/fairplay-checkpoint-run-synthetic.pkl.gz");
+
+    #[test]
+    fn replay_can_stop_on_second_entry_hit() {
+        let checkpoint = FairplayCheckpoint::parse_gzip(CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&checkpoint, BINARY).unwrap();
+        runner.engine.mem_map(0x3000, PAGE_BYTES as usize).unwrap();
+        runner.engine.mem_map(0x4000, PAGE_BYTES as usize).unwrap();
+        runner
+            .engine
+            .mem_write(0x3000, &0x1400_0000u32.to_le_bytes())
+            .unwrap(); // b 0x3000
+        runner.engine.reg_write(REG_PC, 0x3000).unwrap();
+        let mut replay = ReplayRunner::new_with_stop_hits(
+            runner,
+            0x4000,
+            0x3000,
+            2,
+            &BTreeSet::from([(0x3000, 0)]),
+            &[],
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(replay.run_block(&[0x42; 16]).unwrap(), [0x42; 16]);
+        assert_eq!(replay.runner.engine.reg_read(REG_PC).unwrap(), 0x3000);
+    }
 
     #[test]
     fn replay_restores_cpu_and_guest_memory_before_each_input() {

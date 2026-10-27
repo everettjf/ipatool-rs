@@ -11,6 +11,7 @@ use clap_complete::{Shell, generate};
 use ipatool_rs::catalog::AppNotFound;
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
+use ipatool_rs::fairplay_26a428;
 use ipatool_rs::fairplay_checkpoint::FairplayCheckpoint;
 use ipatool_rs::fairplay_checkpoint_run::{CheckpointRunner, MemoryTraceOptions, VirtualFileStat};
 use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
@@ -19,7 +20,9 @@ use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2
 use ipatool_rs::fairplay_enrollment_v3::{V3Material, build_fpsenr3};
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
 use ipatool_rs::fairplay_key::CurrentSinfModel;
-use ipatool_rs::fairplay_oracle_domains::{learn_26b118_domains, validate_26b118_model};
+use ipatool_rs::fairplay_oracle_domains::{
+    learn_26b118_domains, validate_26a428_model, validate_26b118_model,
+};
 use ipatool_rs::fairplay_oracle_export::export_checked_model;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
@@ -309,7 +312,7 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Differentially validate a private 26B118 model against checkpoint execution.
+    /// Differentially validate a private 26A428 or 26B118 model against checkpoint execution.
     ValidateOracleModel {
         #[arg(long)]
         checkpoint: PathBuf,
@@ -1447,13 +1450,29 @@ fn run() -> Result<()> {
                 let binary = read_fairplayd_binary(&fairplayd)?;
                 let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
                 let model = OracleModel::load_private(&model)?;
-                let result = validate_26b118_model(
-                    &snapshot,
-                    &binary,
-                    &model,
-                    Duration::from_secs(timeout_seconds),
-                    normal_cases,
-                )?;
+                let (build, result) = if model.block_address == fairplay_26a428::BLOCK_ADDRESS {
+                    (
+                        "26A428",
+                        validate_26a428_model(
+                            &snapshot,
+                            &binary,
+                            &model,
+                            Duration::from_secs(timeout_seconds),
+                            normal_cases,
+                        )?,
+                    )
+                } else {
+                    (
+                        "26B118",
+                        validate_26b118_model(
+                            &snapshot,
+                            &binary,
+                            &model,
+                            Duration::from_secs(timeout_seconds),
+                            normal_cases,
+                        )?,
+                    )
+                };
                 match cli.format {
                     Format::Json => println!(
                         "{}",
@@ -1463,12 +1482,13 @@ fn run() -> Result<()> {
                             "matches": result.cases,
                             "mismatches": 0,
                             "domains": result.domains,
+                            "build": build,
                             "output_sha256": result.output_sha256,
                         })
                     ),
                     Format::Text => println!(
-                        "Validated {} native 26B118 FairPlay cases against Rust ({} domains)",
-                        result.cases, result.domains
+                        "Validated {} native {} FairPlay cases against Rust ({} domains)",
+                        result.cases, build, result.domains
                     ),
                 }
             }
