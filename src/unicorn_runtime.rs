@@ -18,7 +18,7 @@ mod engine;
 mod windows_arm64;
 #[cfg(target_os = "windows")]
 mod windows_prepare;
-pub use engine::{Engine, HookContext, REG_PC, REG_X0, REG_X1};
+pub use engine::{Engine, HookContext, REG_PC, REG_X0, REG_X1, REG_X29};
 
 const VERSION: &str = "2.1.4";
 const MAX_ARTIFACT_SIZE: u64 = 64 << 20;

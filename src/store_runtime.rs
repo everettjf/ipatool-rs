@@ -26,7 +26,7 @@ use crate::{
     store_memory::{MemoryRegion, exclude_mapped_regions},
     store_profile::{self, Call, ProfileData},
     transport::{Request as HostRequest, Response as HostResponse},
-    unicorn_runtime::{Engine, HookContext, REG_PC, REG_X0},
+    unicorn_runtime::{Engine, HookContext, REG_PC, REG_X0, REG_X29},
 };
 
 const AMS_SHA256: &str = "95f4558aa2c0ccd9f96ed479e336b630b46bf4b4e0baabc1c1ac8c7d55e21ab4";
@@ -4482,7 +4482,7 @@ fn start_swift_task(
     let (task_context, entry, closure, result) =
         (task.context, task.entry, task.closure, task.result);
     let mut saved = Vec::with_capacity(15);
-    for register in [REG_SP, REG_LR, REG_X0 + 29]
+    for register in [REG_SP, REG_LR, REG_X29]
         .into_iter()
         .chain((19..=28).map(|index| REG_X0 + index))
     {

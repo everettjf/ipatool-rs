@@ -23,6 +23,7 @@ use super::UnicornLibrary;
 
 pub const REG_X0: i32 = 199;
 pub const REG_X1: i32 = 200;
+pub const REG_X29: i32 = 1;
 pub const REG_PC: i32 = 260;
 const ARM64: i32 = 2;
 const MODE_ARM: i32 = 0;
@@ -988,9 +989,14 @@ mod tests {
         engine
             .mem_write(0x1000, &[0x20, 0x00, 0x80, 0xd2, 0x00, 0x04, 0x00, 0x91])
             .unwrap();
+        engine.reg_write(REG_X29, 0x1234_5678).unwrap();
         engine
             .add_code_hook(0x1004, 0x1004, |context, _, _| {
                 assert_eq!(context.reg_read(REG_X0).unwrap(), 1);
+                assert_eq!(context.reg_read(REG_X29).unwrap(), 0x1234_5678);
+                for index in 19..=28 {
+                    assert_eq!(context.reg_read(REG_X0 + index).unwrap(), 0);
+                }
                 context.reg_write(REG_X0, 7).unwrap();
                 let vector = [0xa5; 16];
                 context.reg_write_128(REG_V0, vector).unwrap();
