@@ -247,7 +247,7 @@ fn linux_hardware_mac(root: &Path) -> Result<[u8; 6]> {
         .context("no usable network hardware MAC address")
 }
 
-#[cfg(any(target_os = "ios", test))]
+#[cfg(any(target_os = "ios", all(test, target_os = "macos")))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct IosLinkHeader {
@@ -260,7 +260,7 @@ struct IosLinkHeader {
     _selector_len: u8,
 }
 
-#[cfg(any(target_os = "ios", test))]
+#[cfg(any(target_os = "ios", all(test, target_os = "macos")))]
 fn ios_link_mac(bytes: &[u8]) -> Option<[u8; 6]> {
     if bytes.len() < std::mem::size_of::<IosLinkHeader>() {
         return None;
@@ -448,6 +448,7 @@ pub fn inspect_local_fairplay_host() -> Result<FairPlayHostDiagnostic> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn ios_link_address_checks_bounds_and_rejects_unusable_macs() {
         let mut address = vec![0u8; 17];
