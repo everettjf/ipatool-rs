@@ -16,8 +16,12 @@ use sha2::digest::DynDigest;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 
 use crate::{
-    download_file::download_file, ipa_metadata::VersionMetadata, sap_assets::SapAssetBundle,
-    store_agent::StoreAgentSession, store_download_product::DownloadItem,
+    download_file::{download_file, download_file_with_transport},
+    ipa_metadata::VersionMetadata,
+    sap_assets::SapAssetBundle,
+    store_agent::StoreAgentSession,
+    store_download_product::DownloadItem,
+    transport::Transport,
 };
 
 const MAX_TOC: u64 = 64 * 1024 * 1024;
@@ -49,10 +53,31 @@ pub fn download_mac_package(
     destination: &Path,
     hardware_id: &[u8],
 ) -> Result<()> {
+    download_mac_package_using(item, destination, hardware_id, download_file)
+}
+
+pub fn download_mac_package_with_transport(
+    item: &DownloadItem,
+    destination: &Path,
+    hardware_id: &[u8],
+    transport: &Transport,
+) -> Result<()> {
+    download_mac_package_using(item, destination, hardware_id, |url, path| {
+        download_file_with_transport(transport, url, path)
+    })
+}
+
+fn download_mac_package_using(
+    item: &DownloadItem,
+    destination: &Path,
+    hardware_id: &[u8],
+    download: impl FnOnce(&str, &Path) -> Result<u64>,
+) -> Result<()> {
     download_mac_package_with(
         item,
         destination,
         hardware_id,
+        download,
         |hardware_id, dp_info, source, target| {
             let assets = SapAssetBundle::load_or_download().context("load StoreAgent assets")?;
             let mut agent = StoreAgentSession::open(&assets, hardware_id, dp_info)
@@ -87,12 +112,32 @@ pub fn read_mac_package_version_metadata(
     hardware_id: &[u8],
     bundle_id: &str,
 ) -> Result<VersionMetadata> {
+    read_mac_package_version_metadata_using(item, hardware_id, bundle_id, download_mac_package)
+}
+
+pub fn read_mac_package_version_metadata_with_transport(
+    item: &DownloadItem,
+    hardware_id: &[u8],
+    bundle_id: &str,
+    transport: &Transport,
+) -> Result<VersionMetadata> {
+    read_mac_package_version_metadata_using(item, hardware_id, bundle_id, |item, path, hw| {
+        download_mac_package_with_transport(item, path, hw, transport)
+    })
+}
+
+fn read_mac_package_version_metadata_using(
+    item: &DownloadItem,
+    hardware_id: &[u8],
+    bundle_id: &str,
+    download: impl FnOnce(&DownloadItem, &Path, &[u8]) -> Result<()>,
+) -> Result<VersionMetadata> {
     let directory = tempfile::Builder::new()
         .prefix("ipatool-version-metadata-")
         .tempdir()
         .context("create Mac version metadata staging")?;
     let package = directory.path().join("app.pkg");
-    download_mac_package(item, &package, hardware_id)?;
+    download(item, &package, hardware_id)?;
     read_package_version_from_path(&package, bundle_id)
 }
 
@@ -185,6 +230,7 @@ fn download_mac_package_with(
     item: &DownloadItem,
     destination: &Path,
     hardware_id: &[u8],
+    download: impl FnOnce(&str, &Path) -> Result<u64>,
     decrypt: impl FnOnce(&[u8], &[u8], &Path, &Path) -> Result<()>,
 ) -> Result<()> {
     let dp_info = mac_dp_info(item)?;
@@ -196,7 +242,7 @@ fn download_mac_package_with(
     remove_if_present(&encrypted).context("prepare encrypted package staging")?;
     remove_if_present(&decrypted).context("prepare decrypted package staging")?;
     let result: Result<()> = (|| {
-        download_file(&item.url, &encrypted).context("download encrypted macOS package")?;
+        download(&item.url, &encrypted).context("download encrypted macOS package")?;
         decrypt(hardware_id, &dp_info, &encrypted, &decrypted)?;
         validate_mac_package(&decrypted).context("validate decrypted macOS package")?;
         publish_mac_package(&decrypted, destination)?;
@@ -544,6 +590,7 @@ mod tests {
             &item(url, b"session"),
             &destination,
             b"hardware",
+            download_file,
             |hardware, dp_info, source, target| {
                 assert_eq!(hardware, b"hardware");
                 assert_eq!(dp_info, b"session");
@@ -570,6 +617,7 @@ mod tests {
             &item(url, b"session"),
             &destination,
             b"hardware",
+            download_file,
             |_, _, _, target| {
                 fs::write(target, b"invalid XAR").unwrap();
                 Ok(())

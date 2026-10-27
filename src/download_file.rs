@@ -11,9 +11,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use reqwest::{
     blocking::{Client, Response},
-    header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, RANGE},
+    header::{ACCEPT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderValue, RANGE},
 };
 use url::Url;
+
+use crate::transport::Transport;
 
 static SHOW_PROGRESS: AtomicBool = AtomicBool::new(false);
 
@@ -112,10 +114,56 @@ pub fn download_file(url: &str, destination: &Path) -> Result<u64> {
     result
 }
 
+/// Download through the authenticated Store transport and its session cookies.
+pub fn download_file_with_transport(
+    transport: &Transport,
+    url: &str,
+    destination: &Path,
+) -> Result<u64> {
+    let mut progress = ProgressDisplay::new();
+    let result = download_file_with_progress(
+        url,
+        destination,
+        &mut |url, local_size| {
+            let mut headers = HeaderMap::new();
+            headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+            headers.insert(
+                RANGE,
+                HeaderValue::from_str(&format!("bytes={local_size}-"))?,
+            );
+            transport.stream_get(url, headers, None)
+        },
+        &mut |current, total| progress.update(current, total),
+    );
+    progress.finish();
+    result
+}
+
 fn download_file_with_client_progress(
     client: &Client,
     url: &str,
     destination: &Path,
+    progress: &mut impl FnMut(u64, Option<u64>),
+) -> Result<u64> {
+    download_file_with_progress(
+        url,
+        destination,
+        &mut |url, local_size| {
+            client
+                .get(url)
+                .header(ACCEPT_ENCODING, "identity")
+                .header(RANGE, format!("bytes={local_size}-"))
+                .send()
+                .context("request package download")
+        },
+        progress,
+    )
+}
+
+fn download_file_with_progress(
+    url: &str,
+    destination: &Path,
+    request: &mut impl FnMut(Url, u64) -> Result<Response>,
     progress: &mut impl FnMut(u64, Option<u64>),
 ) -> Result<u64> {
     let url = Url::parse(url).context("invalid package URL")?;
@@ -130,12 +178,7 @@ fn download_file_with_client_progress(
         .open(destination)
         .with_context(|| format!("open partial package {}", destination.display()))?;
     let local_size = file.metadata()?.len();
-    let mut response = client
-        .get(url)
-        .header(ACCEPT_ENCODING, "identity")
-        .header(RANGE, format!("bytes={local_size}-"))
-        .send()
-        .context("request package download")?;
+    let mut response = request(url, local_size)?;
     let plan = response_range(&response, local_size)?;
     let (offset, length, total) = match plan {
         RangePlan::Complete(size) => {
@@ -264,6 +307,7 @@ fn header_text(response: &Response, key: reqwest::header::HeaderName) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::Request;
     use std::{
         fs,
         io::Write,
@@ -291,6 +335,54 @@ mod tests {
             stream.write_all(reply).unwrap();
         });
         (url, captured, task)
+    }
+
+    #[test]
+    fn transfer_reuses_session_cookie_from_store_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while stream.read_exact(&mut byte).is_ok() {
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                if index == 0 {
+                    assert!(request.starts_with("GET /store "));
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: session=fixture; Path=/\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+                } else {
+                    assert!(request.starts_with("GET /app.ipa "));
+                    assert!(
+                        request
+                            .to_ascii_lowercase()
+                            .contains("cookie: session=fixture\r\n")
+                    );
+                    stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-2/3\r\nContent-Length: 3\r\nConnection: close\r\n\r\nipa").unwrap();
+                }
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let transport = Transport::with_cookies(directory.path()).unwrap();
+        let store = Url::parse(&format!("http://{address}/store")).unwrap();
+        assert_eq!(transport.send(Request::get(store)).unwrap().body, b"ok");
+        let package = directory.path().join("app.ipa");
+        assert_eq!(
+            download_file_with_transport(
+                &transport,
+                &format!("http://{address}/app.ipa"),
+                &package
+            )
+            .unwrap(),
+            3
+        );
+        server.join().unwrap();
+        assert_eq!(fs::read(package).unwrap(), b"ipa");
     }
 
     #[test]

@@ -191,6 +191,89 @@ impl Transport {
         result
     }
 
+    /// Send a Store transfer without buffering its body. Transfers share the
+    /// same in-memory cookie jar as Store requests, including session cookies.
+    pub fn stream_get(
+        &self,
+        mut url: Url,
+        headers: HeaderMap,
+        timeout: Option<Duration>,
+    ) -> Result<HttpResponse> {
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("unsupported transfer URL scheme");
+        }
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .build()
+            .context("create Store transfer client")?;
+        let mut headers = headers;
+        for redirects in 0..=10 {
+            let mut send_headers = headers.clone();
+            if !send_headers.contains_key(COOKIE)
+                && let Some(cookies) = &self.cookies
+                && let Some(cookie_header) = cookies
+                    .lock()
+                    .map_err(|_| anyhow!("cookie jar lock is poisoned"))?
+                    .header_for(&url, OffsetDateTime::now_utc())
+            {
+                send_headers.insert(
+                    COOKIE,
+                    HeaderValue::from_str(&cookie_header).context("invalid saved cookie header")?,
+                );
+            }
+            let mut builder = client.get(url.clone()).headers(send_headers);
+            if let Some(timeout) = timeout {
+                builder = builder.timeout(timeout);
+            }
+            let response = builder.send().context("Store transfer request failed")?;
+            if let Some(cookies) = &self.cookies {
+                let mut jar = cookies
+                    .lock()
+                    .map_err(|_| anyhow!("cookie jar lock is poisoned"))?;
+                let now = OffsetDateTime::now_utc();
+                for value in response.headers().get_all(SET_COOKIE).iter() {
+                    if let Ok(raw) = value.to_str() {
+                        jar.set_cookie(&url, raw, now);
+                    }
+                }
+                jar.save(now).context("failed to save transfer cookies")?;
+            }
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+            let Some(location) = response
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+            else {
+                return Ok(response);
+            };
+            if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                return Ok(response);
+            }
+            if redirects == 10 {
+                bail!("too many Store transfer redirects");
+            }
+            let next = url
+                .join(location)
+                .context("invalid Store transfer redirect")?;
+            if !matches!(next.scheme(), "http" | "https") {
+                bail!("unsupported Store transfer redirect scheme");
+            }
+            if next.origin() != url.origin() {
+                headers.remove(AUTHORIZATION);
+                headers.remove(PROXY_AUTHORIZATION);
+                headers.remove(COOKIE);
+                headers.remove(HOST);
+            }
+            url = next;
+        }
+        unreachable!("redirect limit returns before loop exhaustion")
+    }
+
     fn send_inner(&self, request: Request) -> Result<Response> {
         if let Some(cookies) = &self.cookies {
             return self.send_with_cookies(request, cookies);

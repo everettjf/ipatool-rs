@@ -23,12 +23,15 @@ use crate::{
     App, CatalogClient, Platform,
     catalog::AppNotFound,
     credentials::{Account, CredentialStore, KBSYNC_CACHE_KEY, open_system_keychain},
-    download_file::download_file,
+    download_file::{download_file, download_file_with_transport},
     download_package::{package_platform, validate_ipa_platform},
     host::hardware_mac_address,
     ipa_metadata::{self, VersionMetadata},
     ipa_patch::patch_ipa,
-    mac_package::{download_mac_package, read_mac_package_version_metadata},
+    mac_package::{
+        download_mac_package, download_mac_package_with_transport,
+        read_mac_package_version_metadata, read_mac_package_version_metadata_with_transport,
+    },
     mac_preflight,
     sap_assets::SapAssetBundle,
     state::prepare_state_directory_from_environment,
@@ -62,6 +65,7 @@ impl Error for LicenseRequired {}
 pub struct DownloadProductClient {
     hardware_id: [u8; 6],
     sender: Arc<Sender>,
+    transfer: Option<Arc<Transport>>,
     kbsync_generator: Option<Arc<KbsyncGenerator>>,
     kbsync_cache: Mutex<Option<KbsyncCacheEntry>>,
     credentials: Option<Arc<dyn CredentialStore + Send + Sync>>,
@@ -184,8 +188,10 @@ impl DownloadProductClient {
         let state_directory = prepare_state_directory_from_environment()?;
         let transport = Arc::new(Transport::with_cookies(&state_directory)?);
         let credentials = Arc::from(open_system_keychain()?);
+        let sender_transport = Arc::clone(&transport);
         Ok(
-            Self::with_sender(hardware_id, move |request| transport.send(request))
+            Self::with_sender(hardware_id, move |request| sender_transport.send(request))
+                .with_transfer_transport(transport)
                 .with_credential_store(credentials)
                 .with_kbsync_generator(|hardware, dsid| {
                     let bundle =
@@ -202,10 +208,16 @@ impl DownloadProductClient {
         Self {
             hardware_id,
             sender: Arc::new(sender),
+            transfer: None,
             kbsync_generator: None,
             kbsync_cache: Mutex::new(None),
             credentials: None,
         }
+    }
+
+    pub fn with_transfer_transport(mut self, transport: Arc<Transport>) -> Self {
+        self.transfer = Some(transport);
+        self
     }
 
     pub fn with_credential_store(
@@ -376,7 +388,16 @@ impl DownloadProductClient {
             Platform::Macos => {
                 let display_version = display_version(item);
                 let destination = package_destination(app, display_version, output, "pkg")?;
-                download_mac_package(item, &destination, &self.hardware_id)?;
+                if let Some(transport) = &self.transfer {
+                    download_mac_package_with_transport(
+                        item,
+                        &destination,
+                        &self.hardware_id,
+                        transport,
+                    )?;
+                } else {
+                    download_mac_package(item, &destination, &self.hardware_id)?;
+                }
                 Ok(destination)
             }
             _ => bail!("unexpected platform in macOS download metadata"),
@@ -398,7 +419,12 @@ impl DownloadProductClient {
         let mut temporary = destination.as_os_str().to_os_string();
         temporary.push(".tmp");
         let temporary = PathBuf::from(temporary);
-        download_file(&item.url, &temporary).context("download IPA package")?;
+        if let Some(transport) = &self.transfer {
+            download_file_with_transport(transport, &item.url, &temporary)
+        } else {
+            download_file(&item.url, &temporary)
+        }
+        .context("download IPA package")?;
         if let Err(error) =
             validate_ipa_platform(&temporary, platform).context("validate downloaded IPA platform")
         {
@@ -410,7 +436,7 @@ impl DownloadProductClient {
             }
             return Err(error);
         }
-        let artwork = fetch_artwork(&item.artwork_url)?;
+        let artwork = fetch_artwork_with_transport(&item.artwork_url, self.transfer.as_deref())?;
         patch_ipa(
             &temporary,
             &destination,
@@ -479,10 +505,36 @@ impl DownloadProductClient {
             version,
             platform,
             (
-                ipa_metadata::read_version_metadata_from_ipa,
-                mac_preflight::read_preflight_version_metadata,
+                |url| {
+                    if let Some(transport) = &self.transfer {
+                        let transport = Arc::clone(transport);
+                        ipa_metadata::read_version_metadata_with_sender(url, move |request| {
+                            transport.send(request)
+                        })
+                    } else {
+                        ipa_metadata::read_version_metadata_from_ipa(url)
+                    }
+                },
+                |url, bundle_id| {
+                    if let Some(transport) = &self.transfer {
+                        mac_preflight::read_preflight_version_metadata_with_transport(
+                            url, bundle_id, transport,
+                        )
+                    } else {
+                        mac_preflight::read_preflight_version_metadata(url, bundle_id)
+                    }
+                },
                 |item, bundle_id| {
-                    read_mac_package_version_metadata(item, &self.hardware_id, bundle_id)
+                    if let Some(transport) = &self.transfer {
+                        read_mac_package_version_metadata_with_transport(
+                            item,
+                            &self.hardware_id,
+                            bundle_id,
+                            transport,
+                        )
+                    } else {
+                        read_mac_package_version_metadata(item, &self.hardware_id, bundle_id)
+                    }
                 },
             ),
         )
@@ -1143,7 +1195,12 @@ fn safe_filename_part(value: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn fetch_artwork(url: &str) -> Result<Vec<u8>> {
+    fetch_artwork_with_transport(url, None)
+}
+
+fn fetch_artwork_with_transport(url: &str, transport: Option<&Transport>) -> Result<Vec<u8>> {
     if url.is_empty() {
         return Ok(Vec::new());
     }
@@ -1151,13 +1208,17 @@ fn fetch_artwork(url: &str) -> Result<Vec<u8>> {
     if !matches!(url.scheme(), "https" | "http") {
         bail!("Store artwork URL must use HTTP or HTTPS");
     }
-    let mut response = reqwest::blocking::Client::builder()
-        .timeout(DEFAULT_AUTHENTICATION_TIMEOUT)
-        .build()
-        .context("create artwork HTTP client")?
-        .get(url)
-        .send()
-        .context("download Store artwork")?;
+    let mut response = if let Some(transport) = transport {
+        transport.stream_get(url, HeaderMap::new(), Some(DEFAULT_AUTHENTICATION_TIMEOUT))?
+    } else {
+        reqwest::blocking::Client::builder()
+            .timeout(DEFAULT_AUTHENTICATION_TIMEOUT)
+            .build()
+            .context("create artwork HTTP client")?
+            .get(url)
+            .send()
+            .context("download Store artwork")?
+    };
     if response.status().as_u16() != 200 {
         bail!("unexpected Store artwork status: {}", response.status());
     }

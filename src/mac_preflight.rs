@@ -8,17 +8,33 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use apple_xar::reader::XarReader;
-use reqwest::redirect::Policy;
+use reqwest::{header::HeaderMap, redirect::Policy};
 use roxmltree::Document;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 
-use crate::ipa_metadata::VersionMetadata;
+use crate::{ipa_metadata::VersionMetadata, transport::Transport};
 
 const MAX_TOC_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DISTRIBUTION_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn read_preflight_version_metadata(url: &str, bundle_id: &str) -> Result<VersionMetadata> {
+    read_preflight_version_metadata_using(url, bundle_id, None)
+}
+
+pub fn read_preflight_version_metadata_with_transport(
+    url: &str,
+    bundle_id: &str,
+    transport: &Transport,
+) -> Result<VersionMetadata> {
+    read_preflight_version_metadata_using(url, bundle_id, Some(transport))
+}
+
+fn read_preflight_version_metadata_using(
+    url: &str,
+    bundle_id: &str,
+    transport: Option<&Transport>,
+) -> Result<VersionMetadata> {
     let url = Url::parse(url).context("invalid Mac preflight URL")?;
     if !matches!(url.scheme(), "http" | "https")
         || url.host_str().is_none()
@@ -28,19 +44,25 @@ pub fn read_preflight_version_metadata(url: &str, bundle_id: &str) -> Result<Ver
     {
         bail!("unsupported Mac preflight URL");
     }
-    let client = reqwest::blocking::Client::builder()
-        .redirect(Policy::custom(|attempt| {
-            if attempt.previous().len() < 10 && matches!(attempt.url().scheme(), "http" | "https") {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }))
-        .build()?;
-    let mut response = client
-        .get(url)
-        .send()
-        .context("download Mac preflight package")?;
+    let mut response = if let Some(transport) = transport {
+        transport.stream_get(url, HeaderMap::new(), None)?
+    } else {
+        let client = reqwest::blocking::Client::builder()
+            .redirect(Policy::custom(|attempt| {
+                if attempt.previous().len() < 10
+                    && matches!(attempt.url().scheme(), "http" | "https")
+                {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
+            .build()?;
+        client
+            .get(url)
+            .send()
+            .context("download Mac preflight package")?
+    };
     if !response.status().is_success() {
         bail!("Mac preflight package returned HTTP {}", response.status());
     }
