@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
@@ -27,7 +27,7 @@ pub fn product_url(app_id: i64, country: &str) -> Result<Url> {
     Ok(url)
 }
 
-pub(crate) fn serialized_server_data_bytes(body: &[u8]) -> Result<&str> {
+pub(crate) fn serialized_server_data_bytes(body: &[u8]) -> Result<Cow<'_, str>> {
     let marker = find_bytes(body, format!("id=\"{SCRIPT_ID}\"").as_bytes())
         .or_else(|| find_bytes(body, format!("id='{SCRIPT_ID}'").as_bytes()))
         .ok_or_else(|| anyhow!("serialized server data was not found"))?;
@@ -46,9 +46,10 @@ pub(crate) fn serialized_server_data_bytes(body: &[u8]) -> Result<&str> {
     let closing = find_bytes(&body[opening_end..], b"</script>")
         .map(|offset| opening_end + offset)
         .ok_or_else(|| anyhow!("serialized server data script is not closed"))?;
-    Ok(std::str::from_utf8(&body[opening_end..closing])
-        .context("serialized server data is not UTF-8")?
-        .trim())
+    Ok(match String::from_utf8_lossy(&body[opening_end..closing]) {
+        Cow::Borrowed(text) => Cow::Borrowed(text.trim()),
+        Cow::Owned(text) => Cow::Owned(text.trim().to_owned()),
+    })
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -115,7 +116,7 @@ pub fn storefront_apps(body: &str, limit: i64) -> Result<Vec<App>> {
 pub(crate) fn storefront_apps_bytes(body: &[u8], limit: i64) -> Result<Vec<App>> {
     let data = serialized_server_data_bytes(body)?;
     let page: Value =
-        serde_json::from_str(data).context("failed to decode serialized server data")?;
+        serde_json::from_str(&data).context("failed to decode serialized server data")?;
     let max_count = limit.max(0).min(MAX_RESULTS as i64) as usize;
     let mut apps = Vec::with_capacity(max_count);
     let mut seen = HashSet::new();
@@ -176,7 +177,7 @@ pub fn product_version_id(body: &str, app_id: i64) -> Result<String> {
 pub(crate) fn product_version_id_bytes(body: &[u8], app_id: i64) -> Result<String> {
     let data = serialized_server_data_bytes(body)?;
     let page: Value =
-        serde_json::from_str(data).context("failed to decode serialized server data")?;
+        serde_json::from_str(&data).context("failed to decode serialized server data")?;
     match vision_version_id(&page, app_id) {
         Some(id) if !id.is_empty() => Ok(id),
         Some(_) => bail!("visionOS purchase configuration has no external version id"),
@@ -258,5 +259,14 @@ mod tests {
         let marker = find_bytes(&invalid_script, b"\"AppSearchResult\"").unwrap();
         invalid_script[marker] = 0xff;
         assert!(product_version_id_bytes(&invalid_script, 200).is_err());
+    }
+
+    #[test]
+    fn reads_vision_json_with_invalid_utf8_in_unrelated_string() {
+        let mut body = fixture().into_bytes();
+        let note = find_bytes(&body, b"EditorialItem").unwrap();
+        body[note] = 0xff;
+        assert_eq!(product_version_id_bytes(&body, 200).unwrap(), "2000");
+        assert_eq!(storefront_apps_bytes(&body, 2).unwrap().len(), 2);
     }
 }

@@ -23,7 +23,7 @@ pub fn product_version_id(body: &str, app: &App) -> Result<String> {
 
 pub(crate) fn product_version_id_bytes(body: &[u8], app: &App) -> Result<String> {
     let data = serialized_server_data_bytes(body)?;
-    let page: Value = serde_json::from_str(data).context("failed to decode Mac product page")?;
+    let page: Value = serde_json::from_str(&data).context("failed to decode Mac product page")?;
     let mut versions = HashSet::new();
     collect_versions(&page, app, &mut versions);
     match versions.len() {
@@ -136,6 +136,17 @@ mod tests {
         let mut body = vec![0xff];
         body.extend_from_slice(page(MAC_OFFER).as_bytes());
         body.push(0xfe);
+        assert_eq!(
+            product_version_id_bytes(&body, &app()).unwrap(),
+            "876660716"
+        );
+    }
+
+    #[test]
+    fn reads_product_json_with_invalid_utf8_in_unrelated_string() {
+        let mut body = page(&format!(r#"{{"note":"bad","offer":{MAC_OFFER}}}"#)).into_bytes();
+        let note = body.windows(3).position(|part| part == b"bad").unwrap();
+        body[note] = 0xff;
         assert_eq!(
             product_version_id_bytes(&body, &app()).unwrap(),
             "876660716"
