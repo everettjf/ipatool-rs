@@ -17,8 +17,8 @@ use crate::{
     fairplay::{inspect_model_path, inspect_model_registry, parse_sinf_selector},
     fairplay_decrypt::{DecryptedSlice, decrypt_macho},
     fairplay_key::{CurrentSinfModel, missing_model_diagnostic},
-    fairplay_macho::{is_macho, parse_macho_slices},
-    fairplay_supf::Supf,
+    fairplay_macho::{is_macho, parse_macho_slices, parse_macho_slices_probe},
+    fairplay_supf::{PAGE_BYTES, Supf},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -89,8 +89,97 @@ fn find_sinf(archive: &mut ZipArchive<File>) -> Result<(HashSet<String>, Vec<u8>
 pub fn require_model_diagnostic(input: &Path) -> Result<String> {
     let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
     let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
+    preflight_encrypted_images(&mut archive)?;
     let (_, sinf) = find_sinf(&mut archive)?;
     missing_model_diagnostic(&sinf)
+}
+
+fn read_macho_probe(member: &mut ZipFile<'_, File>) -> Result<Vec<u8>> {
+    let total_size = usize::try_from(member.size()).context("Mach-O member exceeds platform")?;
+    let mut header = vec![0; total_size.min(32)];
+    member.read_exact(&mut header)?;
+    if header.len() < 4 || !is_macho(&header) {
+        return Ok(header);
+    }
+    let magic = u32::from_le_bytes(header[..4].try_into().unwrap());
+    if matches!(magic, 0xfeedface | 0xfeedfacf) {
+        let header_size = if magic == 0xfeedfacf { 32 } else { 28 };
+        if header.len() < header_size {
+            return Ok(header);
+        }
+        let command_bytes = u32::from_le_bytes(header[20..24].try_into().unwrap()) as usize;
+        let required = header_size
+            .checked_add(command_bytes)
+            .context("Mach-O load-command extent overflow")?;
+        if required > 1024 * 1024 || required > total_size {
+            bail!("Mach-O load-command extent is invalid");
+        }
+        if required > header.len() {
+            let previous = header.len();
+            header.resize(required, 0);
+            member.read_exact(&mut header[previous..])?;
+        }
+    } else if matches!(
+        u32::from_be_bytes(header[..4].try_into().unwrap()),
+        0xcafebabe | 0xcafebabf | 0xbebafeca | 0xbfbafeca
+    ) {
+        member.read_to_end(&mut header)?;
+    }
+    Ok(header)
+}
+
+fn preflight_encrypted_images(archive: &mut ZipArchive<File>) -> Result<()> {
+    let mut names = HashSet::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let member = archive.by_index(index).context("inspect IPA ZIP member")?;
+        let name = member.name()?.into_owned();
+        if !names.insert(name.clone()) {
+            bail!("IPA contains duplicate member {name}");
+        }
+    }
+    let mut images = 0usize;
+    for index in 0..archive.len() {
+        let mut member = archive.by_index(index).context("inspect IPA ZIP member")?;
+        if member.is_dir() {
+            continue;
+        }
+        let name = member.name()?.into_owned();
+        let total_size =
+            usize::try_from(member.size()).context("Mach-O member exceeds platform")?;
+        let probe = read_macho_probe(&mut member).with_context(|| format!("inspect {name}"))?;
+        drop(member);
+        if !is_macho(&probe) {
+            continue;
+        }
+        let slices = parse_macho_slices_probe(&probe, total_size)
+            .with_context(|| format!("inspect {name}"))?;
+        let encrypted: Vec<_> = slices
+            .iter()
+            .filter(|slice| slice.layout.crypt_id != 0)
+            .collect();
+        if encrypted.is_empty() {
+            continue;
+        }
+        let supf_name = supf_for(&name, &names)
+            .with_context(|| format!("encrypted Mach-O {name} has no adjacent SUPF"))?;
+        let supf = Supf::parse(&read_entry(archive, supf_name)?)
+            .with_context(|| format!("parse {supf_name}"))?;
+        for slice in encrypted {
+            let records = supf.records_for(slice.layout.cpu_type, slice.layout.cpu_subtype)?;
+            if records.len() != slice.layout.crypt_size / PAGE_BYTES {
+                bail!(
+                    "{name}: SUPF page count mismatch for architecture {:#x}/{:#x}",
+                    slice.layout.cpu_type,
+                    slice.layout.cpu_subtype
+                );
+            }
+            images += 1;
+        }
+    }
+    if images == 0 {
+        bail!("IPA contains no supported encrypted Mach-O images");
+    }
+    Ok(())
 }
 
 fn local_extra(source: &mut File, member: &ZipFile<'_, File>) -> Result<Vec<u8>> {
@@ -248,6 +337,7 @@ pub fn decrypt_ipa_with_options(
     validate_destinations(input, output, model_path, report, force)?;
     let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
     let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
+    preflight_encrypted_images(&mut archive)?;
     let mut raw_source = File::open(input).context("open IPA ZIP headers")?;
     let (names, sinf) = find_sinf(&mut archive)?;
     let key = Zeroizing::new(logical_key(model_path, &sinf)?);
@@ -708,6 +798,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("source.ipa");
         let output = directory.path().join("decrypted.ipa");
+        let (encrypted, record, _) = encrypted_fixture([0x12; 16]);
+        let supf_bytes = supf(record);
         let mut writer = ZipWriter::new(File::create(&input).unwrap());
         writer
             .start_file("Payload/A.app/SC_Info/B.sinf", SimpleFileOptions::default())
@@ -717,6 +809,14 @@ mod tests {
             .start_file("Payload/A.app/SC_Info/A.sinf", SimpleFileOptions::default())
             .unwrap();
         writer.write_all(b"second").unwrap();
+        writer
+            .start_file("Payload/A.app/SC_Info/A.supf", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&supf_bytes).unwrap();
+        writer
+            .start_file("Payload/A.app/A", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&encrypted).unwrap();
         writer.finish().unwrap();
         assert!(
             decrypt_ipa(&input, &output, directory.path())
@@ -732,11 +832,21 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("source.ipa");
         let (_, sinf) = model_and_sinf([0x12; 16]);
+        let (encrypted, record, _) = encrypted_fixture([0x12; 16]);
+        let supf_bytes = supf(record);
         let mut writer = ZipWriter::new(File::create(&input).unwrap());
         writer
             .start_file("Payload/A.app/SC_Info/A.sinf", SimpleFileOptions::default())
             .unwrap();
         writer.write_all(&sinf).unwrap();
+        writer
+            .start_file("Payload/A.app/SC_Info/A.supf", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&supf_bytes).unwrap();
+        writer
+            .start_file("Payload/A.app/A", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&encrypted).unwrap();
         writer.finish().unwrap();
         let diagnostic = require_model_diagnostic(&input).unwrap();
         let selector = parse_sinf_selector(&sinf).unwrap();
@@ -744,6 +854,44 @@ mod tests {
         assert!(diagnostic.contains(&format!("sinf_sha256={:x}", Sha256::digest(&sinf))));
         assert!(diagnostic.contains("priv_bytes="));
         assert!(diagnostic.contains("requires a private enrollment model"));
+    }
+
+    #[test]
+    fn missing_model_reports_unencrypted_ipa_before_model_requirement() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.ipa");
+        let (_, sinf) = model_and_sinf([0x12; 16]);
+        let mut writer = ZipWriter::new(File::create(&input).unwrap());
+        writer
+            .start_file("Payload/A.app/SC_Info/A.sinf", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&sinf).unwrap();
+        writer.finish().unwrap();
+        assert!(
+            require_model_diagnostic(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("no supported encrypted Mach-O images")
+        );
+    }
+
+    #[test]
+    fn missing_model_reports_missing_supf_before_model_requirement() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.ipa");
+        let (encrypted, _, _) = encrypted_fixture([0x12; 16]);
+        let mut writer = ZipWriter::new(File::create(&input).unwrap());
+        writer
+            .start_file("Payload/A.app/A", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&encrypted).unwrap();
+        writer.finish().unwrap();
+        assert!(
+            require_model_diagnostic(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("no adjacent SUPF")
+        );
     }
 
     #[test]

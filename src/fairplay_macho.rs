@@ -61,7 +61,7 @@ pub fn is_macho(bytes: &[u8]) -> bool {
         ))
 }
 
-fn parse_thin(bytes: &[u8]) -> Result<MachOLayout> {
+fn parse_thin(bytes: &[u8], total_size: usize) -> Result<MachOLayout> {
     if bytes.len() < 4 {
         bail!("Mach-O header is truncated");
     }
@@ -141,7 +141,7 @@ fn parse_thin(bytes: &[u8]) -> Result<MachOLayout> {
                     let end = offset
                         .checked_add(length)
                         .context("Mach-O instruction section range overflow")?;
-                    if end > bytes.len() {
+                    if end > total_size {
                         bail!("Mach-O instruction section exceeds file");
                     }
                     if layout.instruction_ranges.iter().any(|previous| {
@@ -201,7 +201,7 @@ fn parse_thin(bytes: &[u8]) -> Result<MachOLayout> {
         .signature_offset
         .checked_add(layout.signature_size)
         .context("Mach-O signature range overflow")?;
-    if crypt_end > bytes.len() || signature_end > bytes.len() {
+    if crypt_end > total_size || signature_end > total_size {
         bail!("Mach-O range exceeds file");
     }
     if layout.crypt_size == 0
@@ -225,7 +225,7 @@ pub fn parse_macho_slices(bytes: &[u8]) -> Result<Vec<MachOSlice>> {
             return Ok(vec![MachOSlice {
                 offset: 0,
                 size: bytes.len(),
-                layout: parse_thin(bytes)?,
+                layout: parse_thin(bytes, bytes.len())?,
             }]);
         }
         _ => {}
@@ -288,7 +288,7 @@ pub fn parse_macho_slices(bytes: &[u8]) -> Result<Vec<MachOSlice>> {
         {
             bail!("universal Mach-O architectures overlap");
         }
-        let layout = parse_thin(&bytes[offset..end])
+        let layout = parse_thin(&bytes[offset..end], size)
             .with_context(|| format!("universal Mach-O architecture {index}"))?;
         if layout.cpu_type != cpu_type || layout.cpu_subtype != cpu_subtype {
             bail!("universal Mach-O architecture {index} does not match its slice");
@@ -300,6 +300,31 @@ pub fn parse_macho_slices(bytes: &[u8]) -> Result<Vec<MachOSlice>> {
         });
     }
     Ok(slices)
+}
+
+/// Inspect a thin Mach-O from its load commands without reading encrypted pages.
+/// Universal images still require the complete member to validate every slice.
+pub fn parse_macho_slices_probe(bytes: &[u8], total_size: usize) -> Result<Vec<MachOSlice>> {
+    if bytes.len() < 4 {
+        bail!("Mach-O header is truncated");
+    }
+    if bytes.len() > total_size {
+        bail!("Mach-O probe exceeds file");
+    }
+    if matches!(
+        le32(bytes, 0),
+        MH_MAGIC32 | MH_MAGIC64 | MH_CIGAM32 | MH_CIGAM64
+    ) {
+        return Ok(vec![MachOSlice {
+            offset: 0,
+            size: total_size,
+            layout: parse_thin(bytes, total_size)?,
+        }]);
+    }
+    if bytes.len() != total_size {
+        bail!("universal Mach-O must be read completely");
+    }
+    parse_macho_slices(bytes)
 }
 
 #[cfg(test)]
@@ -343,6 +368,17 @@ mod tests {
         assert_eq!(parse_macho_slices(&fat).unwrap()[0].offset, PAGE_BYTES);
         fat[12..16].copy_from_slice(&3u32.to_be_bytes());
         assert!(parse_macho_slices(&fat).is_err());
+    }
+
+    #[test]
+    fn thin_probe_checks_ranges_against_member_size() {
+        let image = thin();
+        let probe = &image[..72];
+        let slices = parse_macho_slices_probe(probe, image.len()).unwrap();
+        assert_eq!(slices[0].size, image.len());
+        assert_eq!(slices[0].layout.crypt_size, PAGE_BYTES);
+        assert!(parse_macho_slices_probe(probe, PAGE_BYTES).is_err());
+        assert!(parse_macho_slices_probe(&probe[..64], image.len()).is_err());
     }
 
     #[test]
