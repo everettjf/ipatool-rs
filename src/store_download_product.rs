@@ -2358,6 +2358,40 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_artwork_transfer_decodes_gzip_response() {
+        use flate2::{Compression, write::GzEncoder};
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(b"fixture artwork").unwrap();
+        let compressed = encoder.finish().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/artwork", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while std::io::Read::read_exact(&mut stream, &mut byte).is_ok() {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                compressed.len()
+            )
+            .unwrap();
+            stream.write_all(&compressed).unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let transport = Transport::with_cookies(directory.path()).unwrap();
+        let artwork = fetch_artwork_with_transport(&url, Some(&transport)).unwrap();
+        server.join().unwrap();
+        assert_eq!(artwork, b"fixture artwork");
+    }
+
+    #[test]
     fn invalid_mobile_ipa_removes_partial_staging() {
         let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
         archive

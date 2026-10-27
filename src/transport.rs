@@ -220,11 +220,15 @@ impl Transport {
         if !matches!(url.scheme(), "http" | "https") {
             bail!("unsupported transfer URL scheme");
         }
-        let client = Client::builder()
-            .redirect(Policy::none())
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
+        let mut client_builder = Client::builder().redirect(Policy::none());
+        if headers.contains_key(reqwest::header::RANGE)
+            || headers
+                .get(reqwest::header::ACCEPT_ENCODING)
+                .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"identity"))
+        {
+            client_builder = client_builder.no_gzip().no_brotli().no_deflate();
+        }
+        let client = client_builder
             .build()
             .context("create Store transfer client")?;
         let mut headers = headers;
