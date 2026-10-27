@@ -2839,4 +2839,97 @@ mod tests {
         .unwrap();
         assert_eq!(sinf, [1, 2, 3]);
     }
+
+    #[test]
+    fn captures_macos_offer_ipa_without_iphone_platform_declaration() {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "Payload/App.app/Info.plist",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .write_all(br#"<plist version="1.0"><dict><key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array><key>CFBundleExecutable</key><string>App</string></dict></plist>"#)
+            .unwrap();
+        let ipa = archive.finish().unwrap().into_inner();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/app.ipa", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while std::io::Read::read_exact(&mut stream, &mut byte).is_ok() {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                ipa.len()
+            )
+            .unwrap();
+            stream.write_all(&ipa).unwrap();
+        });
+
+        let mut sinf = plist::Dictionary::new();
+        sinf.insert("sinf".into(), plist::Value::Data(vec![1, 2, 3]));
+        let mut metadata = plist::Dictionary::new();
+        metadata.insert("software-platform".into(), "ios".into());
+        metadata.insert("itemId".into(), 42i64.into());
+        metadata.insert("softwareVersionBundleId".into(), "com.example.app".into());
+        metadata.insert("softwareVersionExternalIdentifier".into(), "101".into());
+        let mut item = plist::Dictionary::new();
+        item.insert("URL".into(), url.into());
+        item.insert("sinfs".into(), plist::Value::Array(vec![sinf.into()]));
+        item.insert("metadata".into(), metadata.into());
+        let mut root = plist::Dictionary::new();
+        root.insert("keybag".into(), plist::Value::Data(vec![4, 5, 6]));
+        root.insert("songList".into(), plist::Value::Array(vec![item.into()]));
+        let mut body = Vec::new();
+        plist::to_writer_xml(&mut body, &plist::Value::Dictionary(root)).unwrap();
+
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            if request.url.path().ends_with("bag.xml") {
+                return Ok(response(serde_json::json!({"urlBag": {
+                    "volumeStoreDownloadProduct": ENT_DOWNLOAD_URL
+                }})));
+            }
+            assert_eq!(
+                request.url.as_str(),
+                format!("{ENT_DOWNLOAD_URL}?guid=000102030405")
+            );
+            Ok(Response {
+                status: 200,
+                headers: Default::default(),
+                body: body.clone(),
+            })
+        })
+        .with_kbsync_generator(|_, _| Ok(vec![7, 8, 9]));
+        let directory = tempfile::tempdir().unwrap();
+        let downloaded = client
+            .download_macos_ipa_with_capture(
+                &CatalogClient::new().unwrap(),
+                &account(),
+                &app(),
+                "101",
+                Some(directory.path()),
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(downloaded.path.extension().unwrap(), "ipa");
+        assert_eq!(downloaded.sinfs, vec![vec![1, 2, 3]]);
+        assert_eq!(downloaded.capture.keybag, [4, 5, 6]);
+        assert_eq!(downloaded.capture.kbsync, [7, 8, 9]);
+        let mut archive = zip::ZipArchive::new(fs::File::open(&downloaded.path).unwrap()).unwrap();
+        let mut patched_sinf = Vec::new();
+        std::io::Read::read_to_end(
+            &mut archive.by_name("Payload/App.app/SC_Info/App.sinf").unwrap(),
+            &mut patched_sinf,
+        )
+        .unwrap();
+        assert_eq!(patched_sinf, [1, 2, 3]);
+    }
 }
