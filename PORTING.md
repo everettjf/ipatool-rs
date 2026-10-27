@@ -20,7 +20,7 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 - `cargo test --all-targets`: 293 library tests and 32 CLI tests passed; 42 opt-in tests were skipped by the default test run.
 - `cargo clippy --all-targets -- -D warnings` passed after the current CLI and MCP changes.
 - `cargo check` passed for x86_64 Linux, x86_64 Windows GNU, Windows ARM64 GNU/LLVM, and iOS ARM64. Cross-target C dependencies required local cross compiler and archiver wrappers on this macOS host.
-- Release binaries were built for x86_64 Linux (ELF) and x86_64 Windows (PE). The iOS ARM64 static-Unicorn build has succeeded, but must be rerun after subsequent source changes before device testing.
+- Release binaries were built for macOS ARM64 (Mach-O), x86_64 Linux (ELF), x86_64 Windows (PE), and iOS ARM64 (Mach-O). The iOS binary is signed, declares iOS 15.0 as its minimum, and contains the Unicorn API symbols. None of these checks substitutes for target-system runtime testing.
 - The pinned Apple Store guest boot and StoreAgent initialization tests passed using cached framework assets, without an account or device.
 
 ## Gates before claiming full parity
