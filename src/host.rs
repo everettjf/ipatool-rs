@@ -280,6 +280,28 @@ fn ios_link_mac(bytes: &[u8]) -> Option<[u8; 6]> {
     (mac[0] & 1 == 0 && mac != [0; 6] && mac != [2, 0, 0, 0, 0, 0]).then_some(mac)
 }
 
+#[cfg(any(target_os = "ios", all(test, target_os = "macos")))]
+fn prefer_ios_mac(
+    selected: Option<(u8, [u8; 6])>,
+    interface: &[u8],
+    mac: [u8; 6],
+) -> Option<(u8, [u8; 6])> {
+    // Prefer the primary Wi-Fi interface; other link interfaces may be virtual.
+    let priority = if interface == b"en0" {
+        0
+    } else if interface.starts_with(b"en") {
+        1
+    } else {
+        2
+    };
+    let candidate = (priority, mac);
+    if selected.is_none_or(|previous| candidate < previous) {
+        Some(candidate)
+    } else {
+        selected
+    }
+}
+
 #[cfg(target_os = "ios")]
 fn ios_hardware_mac() -> Result<[u8; 6]> {
     struct InterfaceList(*mut libc::ifaddrs);
@@ -297,7 +319,7 @@ fn ios_hardware_mac() -> Result<[u8; 6]> {
     }
     let _list = InterfaceList(head);
     let mut current = head;
-    let mut selected: Option<[u8; 6]> = None;
+    let mut selected: Option<(u8, [u8; 6])> = None;
     while !current.is_null() {
         // SAFETY: current is a node in the live getifaddrs list.
         let entry = unsafe { &*current };
@@ -312,15 +334,19 @@ fn ios_hardware_mac() -> Result<[u8; 6]> {
                 let bytes =
                     unsafe { std::slice::from_raw_parts(entry.ifa_addr as *const u8, length) };
                 if let Some(mac) = ios_link_mac(bytes)
-                    && selected.is_none_or(|previous| mac < previous)
+                    && !entry.ifa_name.is_null()
                 {
-                    selected = Some(mac);
+                    // SAFETY: ifa_name belongs to the live getifaddrs entry.
+                    let interface = unsafe { std::ffi::CStr::from_ptr(entry.ifa_name) };
+                    selected = prefer_ios_mac(selected, interface.to_bytes(), mac);
                 }
             }
         }
         current = entry.ifa_next;
     }
-    selected.context("no usable iOS network hardware MAC address")
+    selected
+        .map(|(_, mac)| mac)
+        .context("no usable iOS network hardware MAC address")
 }
 
 /// Hardware identity used by the Store guest and SAP signer.
@@ -472,6 +498,18 @@ mod tests {
         address[11] = 1;
         assert_eq!(ios_link_mac(&address), None);
         assert_eq!(ios_link_mac(&address[..7]), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ios_mac_prefers_en0_over_lower_virtual_address() {
+        let virtual_mac = [0, 0, 0, 0, 0, 1];
+        let wifi_mac = [0x20, 0, 0, 0, 0, 2];
+        let selected = prefer_ios_mac(None, b"awdl0", virtual_mac);
+        let selected = prefer_ios_mac(selected, b"en1", [0x10, 0, 0, 0, 0, 2]);
+        let selected = prefer_ios_mac(selected, b"en0", wifi_mac);
+        let selected = prefer_ios_mac(selected, b"llw0", [0, 0, 0, 0, 0, 3]);
+        assert_eq!(selected.map(|(_, mac)| mac), Some(wifi_mac));
     }
 
     #[cfg(unix)]
