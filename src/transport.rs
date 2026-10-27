@@ -2,9 +2,9 @@
 
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        LazyLock, Mutex,
+        Arc, LazyLock, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -34,12 +34,30 @@ static PLIST: LazyLock<Regex> =
 static DICT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?is)<dict\b[^>]*>.*</dict>").unwrap());
 static HTML_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<[^>]*>").unwrap());
+static SHARED_COOKIES: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<SavedCookies>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub const DEFAULT_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(30);
 static VERBOSE_HTTP: AtomicBool = AtomicBool::new(false);
 
 pub fn set_verbose(enabled: bool) {
     VERBOSE_HTTP.store(enabled, Ordering::Relaxed);
+}
+
+fn shared_cookies(state_directory: &Path) -> Result<Arc<Mutex<SavedCookies>>> {
+    let key = state_directory
+        .canonicalize()
+        .unwrap_or_else(|_| state_directory.to_path_buf());
+    let mut registry = SHARED_COOKIES
+        .lock()
+        .map_err(|_| anyhow!("shared cookie registry lock is poisoned"))?;
+    registry.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+        return Ok(existing);
+    }
+    let cookies = Arc::new(Mutex::new(SavedCookies::open(state_directory)?));
+    registry.insert(key, Arc::downgrade(&cookies));
+    Ok(cookies)
 }
 
 pub struct Request {
@@ -150,7 +168,7 @@ impl Response {
 pub struct Transport {
     follow_redirects: Client,
     no_redirects: Client,
-    cookies: Option<Mutex<SavedCookies>>,
+    cookies: Option<Arc<Mutex<SavedCookies>>>,
 }
 
 impl Transport {
@@ -169,7 +187,7 @@ impl Transport {
 
     pub fn with_cookies(state_directory: &Path) -> Result<Self> {
         let mut transport = Self::new()?;
-        transport.cookies = Some(Mutex::new(SavedCookies::open(state_directory)?));
+        transport.cookies = Some(shared_cookies(state_directory)?);
         Ok(transport)
     }
 
@@ -613,6 +631,77 @@ mod tests {
                 .as_deref(),
             Some("sid=dummy-value")
         );
+    }
+
+    #[test]
+    fn separate_store_clients_share_session_cookies_only_within_state_directory() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut lines = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    lines.push(line);
+                }
+                if index == 0 {
+                    assert!(lines[0].starts_with("GET /login "));
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: session=fixture; Path=/\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+                } else {
+                    assert!(lines[0].starts_with("GET /purchase "));
+                    assert!(lines.iter().any(|line| {
+                        line.to_ascii_lowercase()
+                            .starts_with("cookie: session=fixture")
+                    }));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .unwrap();
+                }
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let separate = tempfile::tempdir().unwrap();
+        let login = Transport::with_cookies(directory.path()).unwrap();
+        let purchase = Transport::with_cookies(directory.path()).unwrap();
+        let unrelated = Transport::with_cookies(separate.path()).unwrap();
+        assert!(Arc::ptr_eq(
+            login.cookies.as_ref().unwrap(),
+            purchase.cookies.as_ref().unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            login.cookies.as_ref().unwrap(),
+            unrelated.cookies.as_ref().unwrap()
+        ));
+        login
+            .send(Request::get(
+                Url::parse(&format!("http://{address}/login")).unwrap(),
+            ))
+            .unwrap();
+        purchase
+            .send(Request::get(
+                Url::parse(&format!("http://{address}/purchase")).unwrap(),
+            ))
+            .unwrap();
+        server.join().unwrap();
+        let unrelated_cookie = unrelated
+            .cookies
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .header_for(
+                &Url::parse(&format!("http://{address}/purchase")).unwrap(),
+                OffsetDateTime::now_utc(),
+            );
+        assert!(unrelated_cookie.is_none());
     }
 
     #[test]

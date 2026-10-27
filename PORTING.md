@@ -17,7 +17,7 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 
 ## Build and test evidence
 
-- `cargo test --all-targets`: 322 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
+- `cargo test --all-targets`: 324 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
 - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` passed after the HTTP 500 redownload fallback fix.
 - Local sender fixtures confirmed that an unpinned redownload uses the Go reference's 30-second timeout, while pinned redownload and update requests retain no request timeout.
 - IPA version metadata now accepts HTTP and HTTPS byte-range URLs like the Go reader and the Rust full-package downloader; the range and archive checks remain in place.
@@ -26,6 +26,7 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 - Mac preflight packages now stream to a temporary file, like the Go downloader, without the 32 MiB archive cap or a separate whole-response timeout. A local HTTP fixture with a checksum-described 33 MiB additional resource yielded the expected version metadata.
 - Authentication `Retry-After` dates now accept the RFC 850 and ANSI C forms handled by Go's `http.ParseTime`, in addition to RFC 1123 and integer seconds; fixed-clock tests cover both two-digit year branches and the expected wait.
 - Authenticated Store transfers now reuse the Store request's in-memory cookie jar for IPA/PKG downloads, artwork, and version metadata, matching the Go transfer executor. A local HTTP fixture verifies a session cookie set by a Store request reaches a streamed package download without using an account.
+- Native Store clients opened for login, purchase, owned history, and download now share one in-memory cookie jar per state directory, as the Go appstore backend does. A local HTTP fixture verifies a session cookie from one client reaches a second client while another state directory remains isolated.
 - `cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings` passed with the Linux Secret Service backend compiled in.
 - `cargo check` passed for macOS x86_64, Linux x86_64 and ARM64, Windows x86_64 GNU and ARM64 GNU/LLVM, and iOS ARM64. Cross-target C dependencies required local cross compiler and archiver wrappers on this macOS host.
 - `cargo check --target aarch64-apple-ios` and `cargo check --target x86_64-pc-windows-gnu` passed after the output-path change. The desktop release artifacts below were built from the preceding commit; rebuild them before testing this path change on a target system.
