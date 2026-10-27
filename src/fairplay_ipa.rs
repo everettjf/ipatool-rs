@@ -73,7 +73,7 @@ fn find_sinf(archive: &mut ZipArchive<File>) -> Result<(HashSet<String>, Vec<u8>
         let entry = archive.by_index(index).context("inspect IPA ZIP member")?;
         let name = entry.name()?.into_owned();
         if !names.insert(name.clone()) {
-            bail!("IPA contains duplicate member {name}");
+            bail!("duplicate IPA member {name:?}");
         }
         if name.contains("/SC_Info/")
             && name.to_ascii_lowercase().ends_with(".sinf")
@@ -88,10 +88,46 @@ fn find_sinf(archive: &mut ZipArchive<File>) -> Result<(HashSet<String>, Vec<u8>
 
 pub fn require_model_diagnostic(input: &Path) -> Result<String> {
     let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
+    let mut directory_source = source.try_clone().context("clone IPA ZIP handle")?;
     let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
+    validate_unique_zip_members(&mut directory_source, &archive)?;
     preflight_encrypted_images(&mut archive)?;
     let (_, sinf) = find_sinf(&mut archive)?;
     missing_model_diagnostic(&sinf)
+}
+
+// zip's public file list is keyed by name and silently replaces duplicate
+// central-directory entries. Inspect the raw directory before trusting it.
+fn validate_unique_zip_members(source: &mut File, archive: &ZipArchive<File>) -> Result<()> {
+    source.seek(SeekFrom::Start(archive.central_directory_start()))?;
+    let mut names = HashSet::with_capacity(archive.len());
+    let mut count = 0usize;
+    loop {
+        let mut signature = [0u8; 4];
+        source.read_exact(&mut signature)?;
+        if signature != *b"PK\x01\x02" {
+            break;
+        }
+        let mut header = [0u8; 42];
+        source.read_exact(&mut header)?;
+        let name_len = u16::from_le_bytes(header[24..26].try_into().unwrap()) as usize;
+        let extra_len = u16::from_le_bytes(header[26..28].try_into().unwrap()) as usize;
+        let comment_len = u16::from_le_bytes(header[28..30].try_into().unwrap()) as usize;
+        let mut name = vec![0; name_len];
+        source.read_exact(&mut name)?;
+        if !names.insert(name.clone()) {
+            bail!("duplicate IPA member {:?}", String::from_utf8_lossy(&name));
+        }
+        source.seek(SeekFrom::Current((extra_len + comment_len) as i64))?;
+        count += 1;
+        if count > archive.len() {
+            bail!("IPA ZIP central directory contains duplicate or hidden members");
+        }
+    }
+    if count != archive.len() {
+        bail!("IPA ZIP central directory member count is inconsistent");
+    }
+    Ok(())
 }
 
 fn read_macho_probe(member: &mut ZipFile<'_, File>) -> Result<Vec<u8>> {
@@ -134,7 +170,7 @@ fn preflight_encrypted_images(archive: &mut ZipArchive<File>) -> Result<()> {
         let member = archive.by_index(index).context("inspect IPA ZIP member")?;
         let name = member.name()?.into_owned();
         if !names.insert(name.clone()) {
-            bail!("IPA contains duplicate member {name}");
+            bail!("duplicate IPA member {name:?}");
         }
     }
     let mut images = 0usize;
@@ -336,9 +372,10 @@ pub fn decrypt_ipa_with_options(
 ) -> Result<IpaDecryptResult> {
     validate_destinations(input, output, model_path, report, force)?;
     let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
+    let mut raw_source = source.try_clone().context("clone IPA ZIP handle")?;
     let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
+    validate_unique_zip_members(&mut raw_source, &archive)?;
     preflight_encrypted_images(&mut archive)?;
-    let mut raw_source = File::open(input).context("open IPA ZIP headers")?;
     let (names, sinf) = find_sinf(&mut archive)?;
     let key = Zeroizing::new(logical_key(model_path, &sinf)?);
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
@@ -873,6 +910,46 @@ mod tests {
                 .to_string()
                 .contains("no supported encrypted Mach-O images")
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_raw_zip_members_before_model_requirement() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.ipa");
+        let output = directory.path().join("decrypted.ipa");
+        let mut writer = ZipWriter::new(File::create(&input).unwrap());
+        for name in ["Payload/A.app/A", "Payload/A.app/B"] {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(b"data").unwrap();
+        }
+        writer.finish().unwrap();
+        let mut bytes = fs::read(&input).unwrap();
+        let old = b"Payload/A.app/B";
+        let new = b"Payload/A.app/A";
+        let mut replacements = 0;
+        for offset in 0..=bytes.len() - old.len() {
+            if &bytes[offset..offset + old.len()] == old {
+                bytes[offset..offset + old.len()].copy_from_slice(new);
+                replacements += 1;
+            }
+        }
+        assert_eq!(replacements, 2);
+        fs::write(&input, bytes).unwrap();
+        assert!(
+            require_model_diagnostic(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate IPA member \"Payload/A.app/A\"")
+        );
+        assert!(
+            decrypt_ipa(&input, &output, directory.path())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate IPA member \"Payload/A.app/A\"")
+        );
+        assert!(!output.exists());
     }
 
     #[test]
