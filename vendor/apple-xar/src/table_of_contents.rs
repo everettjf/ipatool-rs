@@ -179,7 +179,7 @@ impl Checksum {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChecksumType {
     #[serde(alias = "NONE")]

@@ -18,6 +18,11 @@ so macOS package validation rejects it. It contains no account data.
 exposes only `PackageInfo`, so version metadata has no payload timestamp.
 It contains no account data.
 
+`mac-xar-mismatched-toc-synthetic.pkg` is a 387-byte XAR with a SHA1 header
+checksum ID and a TOC that declares MD5. Its stored checksum still matches
+the SHA1 digest of the compressed TOC; Go rejects the conflicting algorithm
+declarations. It contains no account or package data.
+
 `fairplay-oracle-raw-source-synthetic.model.gz` extends the account-free
 26A428 synthetic model with zero-filled pages so the six checked raw-source
 kernels can run one iteration. Expected state hashes were cross-checked with

@@ -322,8 +322,13 @@ impl<R: Read + Seek + Sized + Debug> XarReader<R> {
     /// with a bool indicating if the checksums matched.
     pub fn verify_table_of_contents_checksum(&mut self) -> XarResult<bool> {
         let format = ChecksumType::try_from(XarChecksum::from(self.header.checksum_algorithm_id))?;
+        let (declared_format, recorded_digest) = self.checksum()?;
+        if format != declared_format {
+            return Err(Error::TableOfContentsCorrupted(
+                "header and TOC checksum types mismatch",
+            ));
+        }
         let actual_digest = self.digest_table_of_contents_with(format)?;
-        let recorded_digest = self.checksum()?.1;
 
         Ok(actual_digest == recorded_digest)
     }

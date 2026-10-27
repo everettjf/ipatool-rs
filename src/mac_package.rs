@@ -552,6 +552,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mismatched_xar_toc_checksum_style() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(
+            &path,
+            include_bytes!("../tests/fixtures/mac-xar-mismatched-toc-synthetic.pkg"),
+        )
+        .unwrap();
+        assert!(validate_mac_package(&path).is_err());
+    }
+
+    #[test]
     fn accepts_go_xar_with_extra_metadata_fields() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("app.pkg");
