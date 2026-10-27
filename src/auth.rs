@@ -101,19 +101,46 @@ pub fn phone_number_storefront(apple_id: &str) -> Option<&'static str> {
 }
 
 pub fn machine_identity(mac_address: &str) -> Result<(String, Vec<u8>)> {
-    let parts: Vec<&str> = mac_address.split([':', '-']).collect();
-    if parts.is_empty() || parts.len() > 20 || parts.iter().any(|part| part.len() != 2) {
+    let bytes = mac_address.as_bytes();
+    let (groups, group_size): (Vec<&str>, usize) =
+        if let Some(separator @ (b':' | b'-')) = bytes.get(2).copied() {
+            (mac_address.split(separator as char).collect(), 2)
+        } else if bytes.get(4) == Some(&b'.') {
+            (mac_address.split('.').collect(), 4)
+        } else {
+            if !matches!(bytes.len(), 12 | 16 | 40) {
+                bail!("invalid hardware address");
+            }
+            (
+                (0..bytes.len())
+                    .step_by(2)
+                    .map(|index| mac_address.get(index..index + 2))
+                    .collect::<Option<Vec<_>>>()
+                    .context("invalid hardware address")?,
+                2,
+            )
+        };
+    if !matches!(groups.len() * group_size / 2, 6 | 8 | 20)
+        || groups.iter().any(|group| group.len() != group_size)
+    {
         bail!("invalid hardware address");
     }
-    let bytes: Vec<u8> = parts
-        .iter()
-        .map(|part| u8::from_str_radix(part, 16).context("invalid hardware address"))
+    let machine_id: Vec<u8> = groups
+        .into_iter()
+        .flat_map(|group| group.as_bytes().as_chunks::<2>().0.iter())
+        .map(|pair| {
+            if !pair.iter().all(u8::is_ascii_hexdigit) {
+                bail!("invalid hardware address");
+            }
+            let pair = std::str::from_utf8(pair).context("invalid hardware address")?;
+            u8::from_str_radix(pair, 16).context("invalid hardware address")
+        })
         .collect::<Result<_>>()?;
-    let guid = bytes
+    let guid = machine_id
         .iter()
         .map(|byte| format!("{byte:02X}"))
         .collect::<String>();
-    Ok((guid, bytes))
+    Ok((guid, machine_id))
 }
 
 pub fn validate_auth_endpoint(url: &Url) -> Result<()> {
@@ -305,10 +332,37 @@ mod tests {
 
     #[test]
     fn machine_guid_matches_source_format() {
-        let (guid, bytes) = machine_identity("00:11:22:aa:bb:cc").unwrap();
-        assert_eq!(guid, "001122AABBCC");
-        assert_eq!(bytes, [0, 17, 34, 170, 187, 204]);
+        for address in [
+            "00:11:22:aa:bb:cc",
+            "00-11-22-aa-bb-cc",
+            "0011.22aa.bbcc",
+            "001122aabbcc",
+        ] {
+            let (guid, bytes) = machine_identity(address).unwrap();
+            assert_eq!(guid, "001122AABBCC");
+            assert_eq!(bytes, [0, 17, 34, 170, 187, 204]);
+        }
+        assert_eq!(
+            machine_identity("00:11:22:33:44:55:66:77").unwrap().0,
+            "0011223344556677"
+        );
+        assert_eq!(
+            machine_identity("00:01:02:03:04:05:06:07:08:09:0a:0b:0c:0d:0e:0f:10:11:12:13")
+                .unwrap()
+                .1
+                .len(),
+            20
+        );
         assert!(machine_identity("not-a-hardware-address").is_err());
+        for address in [
+            "00",
+            "00:11",
+            "00:11:22:33:44",
+            "00:11-22:33:44:55",
+            "+1:11:22:33:44:55",
+        ] {
+            assert!(machine_identity(address).is_err(), "{address}");
+        }
     }
 
     #[test]
