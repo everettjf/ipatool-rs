@@ -46,7 +46,6 @@ pub fn read_version_metadata_with_sender(
         if file.size() > MAX_INFO_PLIST {
             bail!("IPA Info.plist exceeds size limit");
         }
-        let modified = file.last_modified();
         let mut bytes = Vec::with_capacity(file.size() as usize);
         file.by_ref()
             .take(MAX_INFO_PLIST + 1)
@@ -55,7 +54,7 @@ pub fn read_version_metadata_with_sender(
         if bytes.len() as u64 > MAX_INFO_PLIST {
             bail!("IPA Info.plist exceeds size limit");
         }
-        return parse_info_plist(&bytes, modified);
+        return parse_info_plist(&bytes, file.extra_data_fields(), file.last_modified());
     }
     bail!("IPA has no top-level app Info.plist")
 }
@@ -68,7 +67,11 @@ fn is_main_info_plist(path: &str) -> bool {
         && parts[2] == "Info.plist"
 }
 
-fn parse_info_plist(bytes: &[u8], modified: Option<zip::DateTime>) -> Result<VersionMetadata> {
+fn parse_info_plist<'a>(
+    bytes: &[u8],
+    extra_fields: impl Iterator<Item = &'a zip::ExtraField>,
+    modified: Option<zip::DateTime>,
+) -> Result<VersionMetadata> {
     let info: Value = plist::from_bytes(bytes).context("decode IPA Info.plist")?;
     let fields = info
         .as_dictionary()
@@ -96,8 +99,8 @@ fn parse_info_plist(bytes: &[u8], modified: Option<zip::DateTime>) -> Result<Ver
     {
         parse_release_date(value)?
     } else {
-        let modified = modified.context("IPA Info.plist has no release date or ZIP timestamp")?;
-        zip_time(modified)?
+        zip_modified_time(extra_fields, modified)?
+            .context("IPA Info.plist has no release date or ZIP timestamp")?
     };
     Ok(VersionMetadata {
         display_version,
@@ -149,6 +152,59 @@ fn zip_time(modified: zip::DateTime) -> Result<OffsetDateTime> {
     let time = Time::from_hms(modified.hour(), modified.minute(), modified.second())
         .context("invalid IPA ZIP time")?;
     Ok(date.with_time(time).assume_utc())
+}
+
+fn zip_modified_time<'a>(
+    fields: impl Iterator<Item = &'a zip::ExtraField>,
+    fallback: Option<zip::DateTime>,
+) -> Result<Option<OffsetDateTime>> {
+    let mut modified = None;
+    for field in fields {
+        let timestamp = match field {
+            zip::ExtraField::ExtendedTimestamp(value) => value
+                .mod_time()
+                .and_then(|seconds| OffsetDateTime::from_unix_timestamp(i64::from(seconds)).ok()),
+            zip::ExtraField::Custom(value)
+                if matches!(value.header_id, 0x000d | 0x5855) && value.data.len() >= 8 =>
+            {
+                let seconds = u32::from_le_bytes(value.data[4..8].try_into().unwrap());
+                OffsetDateTime::from_unix_timestamp(i64::from(seconds)).ok()
+            }
+            zip::ExtraField::Custom(value) if value.header_id == 0x000a => {
+                ntfs_custom_modified_time(&value.data)
+            }
+            zip::ExtraField::Ntfs(value) => ntfs_modified_time(value.mtime()),
+            _ => None,
+        };
+        if timestamp.is_some() {
+            modified = timestamp;
+        }
+    }
+    modified.map_or_else(|| fallback.map(zip_time).transpose(), |time| Ok(Some(time)))
+}
+
+fn ntfs_modified_time(ticks: u64) -> Option<OffsetDateTime> {
+    let unix_nanos = i128::from(ticks) * 100 - 11_644_473_600i128 * 1_000_000_000;
+    OffsetDateTime::from_unix_timestamp_nanos(unix_nanos).ok()
+}
+
+fn ntfs_custom_modified_time(field: &[u8]) -> Option<OffsetDateTime> {
+    let mut attributes = field.get(4..)?;
+    let mut modified = None;
+    while attributes.len() >= 4 {
+        let tag = u16::from_le_bytes(attributes[..2].try_into().unwrap());
+        let size = u16::from_le_bytes(attributes[2..4].try_into().unwrap()) as usize;
+        attributes = &attributes[4..];
+        if size > attributes.len() {
+            break;
+        }
+        if tag == 1 && size == 24 {
+            let ticks = u64::from_le_bytes(attributes[..8].try_into().unwrap());
+            modified = ntfs_modified_time(ticks);
+        }
+        attributes = &attributes[size..];
+    }
+    modified
 }
 
 struct HttpRangeReader {
@@ -293,7 +349,10 @@ mod tests {
         io::{Cursor, Write},
         sync::atomic::{AtomicUsize, Ordering},
     };
-    use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+    use zip::{
+        CompressionMethod, ZipWriter,
+        write::{FullFileOptions, SimpleFileOptions},
+    };
 
     fn fixture_ipa(info: &[u8]) -> Vec<u8> {
         let cursor = Cursor::new(Vec::new());
@@ -313,6 +372,18 @@ mod tests {
                     .compression_method(CompressionMethod::Deflated)
                     .last_modified_time(modified),
             )
+            .unwrap();
+        archive.write_all(info).unwrap();
+        archive.finish().unwrap().into_inner()
+    }
+
+    fn fixture_ipa_with_extra_time(tag: u16, field: &[u8], info: &[u8]) -> Vec<u8> {
+        let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
+        let modified = zip::DateTime::from_date_and_time(2025, 2, 3, 4, 5, 6).unwrap();
+        let mut options = FullFileOptions::default().last_modified_time(modified);
+        options.add_extra_field(tag, field, true).unwrap();
+        archive
+            .start_file("Payload/Test.app/Info.plist", options)
             .unwrap();
         archive.write_all(info).unwrap();
         archive.finish().unwrap().into_inner()
@@ -391,6 +462,51 @@ mod tests {
         .unwrap();
         assert_eq!(metadata.display_version, "1.0");
         assert_eq!(metadata.release_date, "2025-02-03T04:05:06Z");
+    }
+
+    #[test]
+    fn prefers_central_zip_extended_timestamps_over_dos_time() {
+        let info = br#"<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>1.0</string></dict></plist>"#;
+        let seconds = 1_720_431_011u32;
+        let mut extended = vec![1];
+        extended.extend_from_slice(&seconds.to_le_bytes());
+        let mut unix = vec![0; 4];
+        unix.extend_from_slice(&seconds.to_le_bytes());
+        let ticks = (u64::from(seconds) + 11_644_473_600) * 10_000_000;
+        let mut ntfs = vec![0; 4];
+        ntfs.extend_from_slice(&1u16.to_le_bytes());
+        ntfs.extend_from_slice(&24u16.to_le_bytes());
+        ntfs.extend_from_slice(&ticks.to_le_bytes());
+        ntfs.extend_from_slice(&[0; 16]);
+        let mut ntfs_with_other_attribute = vec![0; 4];
+        ntfs_with_other_attribute.extend_from_slice(&2u16.to_le_bytes());
+        ntfs_with_other_attribute.extend_from_slice(&0u16.to_le_bytes());
+        ntfs_with_other_attribute.extend_from_slice(&ntfs[4..]);
+        for (tag, field) in [
+            (0x5455, extended.clone()),
+            (0x5855, unix),
+            (0x000a, ntfs),
+            (0x000a, ntfs_with_other_attribute),
+        ] {
+            let data = Arc::new(fixture_ipa_with_extra_time(tag, &field, info));
+            let metadata = read_version_metadata_with_sender(
+                "https://example.test/app.ipa",
+                fixture_sender(data, Arc::new(AtomicUsize::new(0))),
+            )
+            .unwrap();
+            assert_eq!(
+                metadata.release_date, "2024-07-08T09:30:11Z",
+                "tag {tag:#06x}"
+            );
+        }
+        let explicit = br#"<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>1.0</string><key>releaseDate</key><string>2023-01-02T03:04:05Z</string></dict></plist>"#;
+        let data = Arc::new(fixture_ipa_with_extra_time(0x5455, &extended, explicit));
+        let metadata = read_version_metadata_with_sender(
+            "https://example.test/app.ipa",
+            fixture_sender(data, Arc::new(AtomicUsize::new(0))),
+        )
+        .unwrap();
+        assert_eq!(metadata.release_date, "2023-01-02T03:04:05Z");
     }
 
     #[test]
