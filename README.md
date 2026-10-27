@@ -1,6 +1,6 @@
 # ipatool-rs
 
-A Rust port of the sibling `ipatool-fairplay` project. The CLI implements the Go project's command paths, including App Store account operations, package downloads, an MCP server, and FairPlay diagnostics. Full parity is still being validated; see [PORTING.md](PORTING.md) for the evidence and remaining gates.
+A Rust port of the sibling `ipatool-fairplay` project. The CLI implements the Go project's command paths, including App Store account operations, package downloads, an MCP server, and FairPlay diagnostics. Full parity is still being validated; see the [porting record](docs/PORTING.md) for evidence and the [TODO list](docs/TODO.md) for remaining work.
 
 The current delivery target is **macOS on Apple Silicon**. Work on macOS x86_64, iOS, Linux, and Windows is deferred at the user's request.
 
