@@ -198,7 +198,52 @@ fn ioreg_best_hardware_mac(data: &[u8]) -> Result<[u8; 6]> {
         .context("no usable built-in hardware MAC address in IORegistry")
 }
 
-/// Hardware identity used by the Store guest and SAP signer on macOS.
+#[cfg(any(target_os = "linux", test))]
+fn linux_hardware_mac(root: &Path) -> Result<[u8; 6]> {
+    let mut selected: Option<(u8, [u8; 6])> = None;
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("list network interfaces in {}", root.display()))?
+    {
+        let entry = entry.context("read network interface entry")?;
+        let name = entry.file_name();
+        if name == "lo" {
+            continue;
+        }
+        let path = entry.path();
+        let flags = fs::read_to_string(path.join("flags")).unwrap_or_default();
+        let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+        if flags & (libc::IFF_LOOPBACK as u32 | libc::IFF_POINTOPOINT as u32) != 0 {
+            continue;
+        }
+        let Ok(address) = fs::read_to_string(path.join("address")) else {
+            continue;
+        };
+        let bytes = address
+            .trim()
+            .split(':')
+            .map(|part| u8::from_str_radix(part, 16))
+            .collect::<Result<Vec<_>, _>>();
+        let Ok(bytes) = bytes else {
+            continue;
+        };
+        let Ok(mac) = <[u8; 6]>::try_from(bytes) else {
+            continue;
+        };
+        if mac[0] & 1 != 0 || mac == [0; 6] || mac == [2, 0, 0, 0, 0, 0] {
+            continue;
+        }
+        let priority = u8::from(!path.join("device").exists());
+        let candidate = (priority, mac);
+        if selected.is_none_or(|current| candidate < current) {
+            selected = Some(candidate);
+        }
+    }
+    selected
+        .map(|(_, mac)| mac)
+        .context("no usable network hardware MAC address")
+}
+
+/// Hardware identity used by the Store guest and SAP signer.
 pub fn hardware_mac_address() -> Result<[u8; 6]> {
     #[cfg(target_os = "macos")]
     {
@@ -211,7 +256,11 @@ pub fn hardware_mac_address() -> Result<[u8; 6]> {
         }
         ioreg_best_hardware_mac(&output.stdout)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_hardware_mac(Path::new("/sys/class/net"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         bail!("automatic Store hardware identity is not yet implemented for this platform")
     }
@@ -297,6 +346,30 @@ pub fn inspect_local_fairplay_host() -> Result<FairPlayHostDiagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_mac_prefers_physical_and_stable_address_order() {
+        let root = tempfile::tempdir().unwrap();
+        let add = |name: &str, address: &str, flags: &str, physical: bool| {
+            let path = root.path().join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("address"), address).unwrap();
+            fs::write(path.join("flags"), flags).unwrap();
+            if physical {
+                fs::create_dir(path.join("device")).unwrap();
+            }
+        };
+        add("veth0", "00:00:00:00:00:01", "0x1003", false);
+        add("eth2", "00:11:22:33:44:66", "0x1003", true);
+        add("eth1", "00:11:22:33:44:55", "0x1003", true);
+        add("lo", "00:00:00:00:00:00", "0x9", false);
+        add("point", "00:11:22:33:44:01", "0x10", true);
+        add("bad", "01:11:22:33:44:00", "0x1003", true);
+        assert_eq!(
+            linux_hardware_mac(root.path()).unwrap(),
+            [0, 0x11, 0x22, 0x33, 0x44, 0x55]
+        );
+    }
 
     #[test]
     fn selects_arm64e_slice_from_fat_archive() {
