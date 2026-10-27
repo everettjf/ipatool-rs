@@ -636,6 +636,7 @@ fn read_fairplayd_binary(path: &Path) -> Result<Vec<u8>> {
 
 fn run() -> Result<()> {
     let mut cli = Cli::parse();
+    ipatool_rs::transport::set_verbose(cli.verbose);
     configure_file_keychain(
         cli.keychain_passphrase.take(),
         !cli.non_interactive && io::stdin().is_terminal(),
@@ -2199,9 +2200,6 @@ fn run() -> Result<()> {
                 }
             }
         },
-    }
-    if cli.verbose {
-        // Accepted for CLI compatibility. HTTP diagnostics will be added with the transport port.
     }
     Ok(())
 }

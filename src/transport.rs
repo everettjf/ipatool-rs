@@ -3,8 +3,11 @@
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{LazyLock, Mutex},
-    time::Duration,
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -33,6 +36,11 @@ static DICT: LazyLock<Regex> =
 static HTML_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<[^>]*>").unwrap());
 
 pub const DEFAULT_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(30);
+static VERBOSE_HTTP: AtomicBool = AtomicBool::new(false);
+
+pub fn set_verbose(enabled: bool) {
+    VERBOSE_HTTP.store(enabled, Ordering::Relaxed);
+}
 
 pub struct Request {
     pub method: Method,
@@ -166,6 +174,24 @@ impl Transport {
     }
 
     pub fn send(&self, request: Request) -> Result<Response> {
+        let trace = VERBOSE_HTTP
+            .load(Ordering::Relaxed)
+            .then(|| (request.method.clone(), request.url.clone(), Instant::now()));
+        let result = self.send_inner(request);
+        if let Some((method, url, started)) = trace {
+            let status = result.as_ref().map_or_else(
+                |_| "error".to_owned(),
+                |response| response.status.to_string(),
+            );
+            eprintln!(
+                "{}",
+                verbose_http_line(&method, &url, &status, started.elapsed())
+            );
+        }
+        result
+    }
+
+    fn send_inner(&self, request: Request) -> Result<Response> {
         if let Some(cookies) = &self.cookies {
             return self.send_with_cookies(request, cookies);
         }
@@ -293,6 +319,17 @@ impl Transport {
     }
 }
 
+fn verbose_http_line(method: &Method, url: &Url, status: &str, elapsed: Duration) -> String {
+    format!(
+        "http {} {}://{} status={} elapsed_ms={}",
+        method,
+        url.scheme(),
+        url.host_str().unwrap_or("unknown"),
+        status,
+        elapsed.as_millis()
+    )
+}
+
 pub fn is_authentication_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 307 | 308)
 }
@@ -368,6 +405,19 @@ mod tests {
             headers: HashMap::new(),
             body: body.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn verbose_http_line_omits_url_credentials_and_request_details() {
+        let url = Url::parse(
+            "https://user:secret@buy.itunes.apple.com/private/token?password=secret#fragment",
+        )
+        .unwrap();
+        let line = verbose_http_line(&Method::POST, &url, "200", Duration::from_millis(12));
+        assert_eq!(
+            line,
+            "http POST https://buy.itunes.apple.com status=200 elapsed_ms=12"
+        );
     }
 
     #[test]
