@@ -23,7 +23,7 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 - IPA version metadata now accepts HTTP and HTTPS byte-range URLs like the Go reader and the Rust full-package downloader; the range and archive checks remain in place.
 - Mac preflight metadata also accepts HTTP and HTTPS package URLs like the Go downloader. A local HTTP fixture served a checksum-verified XAR and returned the selected Mac display version and release date.
 - Store artwork downloads now read the full response like the Go client instead of rejecting images over 32 MiB. A local HTTP fixture returned 32 MiB plus one byte and was accepted.
-- Mac preflight packages now stream to a temporary file, like the Go downloader, instead of rejecting archives over 32 MiB. A local HTTP fixture with a checksum-described 33 MiB additional resource yielded the expected version metadata.
+- Mac preflight packages now stream to a temporary file, like the Go downloader, without the 32 MiB archive cap or a separate whole-response timeout. A local HTTP fixture with a checksum-described 33 MiB additional resource yielded the expected version metadata.
 - `cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings` passed with the Linux Secret Service backend compiled in.
 - `cargo check` passed for macOS x86_64, Linux x86_64 and ARM64, Windows x86_64 GNU and ARM64 GNU/LLVM, and iOS ARM64. Cross-target C dependencies required local cross compiler and archiver wrappers on this macOS host.
 - `cargo check --target aarch64-apple-ios` and `cargo check --target x86_64-pc-windows-gnu` passed after the output-path change. The desktop release artifacts below were built from the preceding commit; rebuild them before testing this path change on a target system.

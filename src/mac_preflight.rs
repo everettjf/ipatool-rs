@@ -36,7 +36,6 @@ pub fn read_preflight_version_metadata(url: &str, bundle_id: &str) -> Result<Ver
                 attempt.stop()
             }
         }))
-        .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let mut response = client
         .get(url)
