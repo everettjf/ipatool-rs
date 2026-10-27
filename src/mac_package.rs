@@ -1,7 +1,7 @@
 //! Download, decrypt, validate, and publish macOS App Store packages.
 
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -58,7 +58,8 @@ pub fn download_mac_package(
             let mut agent = StoreAgentSession::open(&assets, hardware_id, dp_info)
                 .context("open StoreAgent package decrypter")?;
             let mut input = File::open(source).context("open encrypted macOS package")?;
-            let mut output = File::create(target).context("create decrypted package staging")?;
+            let mut output = create_private_decrypted_file(target)
+                .context("create decrypted package staging")?;
             let decrypted = agent.decrypt(&mut input, &mut output);
             let closed = agent.close();
             decrypted.context("decrypt macOS package")?;
@@ -66,6 +67,19 @@ pub fn download_mac_package(
             output.sync_all().context("sync decrypted macOS package")
         },
     )
+}
+
+fn create_private_decrypted_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("create private decrypted package {}", path.display()))
 }
 
 pub fn read_mac_package_version_metadata(
@@ -547,5 +561,20 @@ mod tests {
             .sinfs
             .extend(item(String::new(), b"second").sinfs);
         assert!(mac_dp_info(&conflicting).is_err());
+    }
+
+    #[test]
+    fn decrypted_staging_never_replaces_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("staged.pkg");
+        let mut file = create_private_decrypted_file(&path).unwrap();
+        file.write_all(b"new package").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
+        }
+        assert!(create_private_decrypted_file(&path).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"new package");
     }
 }
