@@ -271,6 +271,8 @@ enum FairplayEnrollCommand {
         capture: PathBuf,
         #[arg(long)]
         startup_profile: PathBuf,
+        #[arg(long, help = "Private verified 0x228-byte IOKit selector 0x15 output")]
+        iokit15_output: Option<PathBuf>,
         #[arg(long)]
         output: PathBuf,
         #[arg(long, default_value_t = 600)]
@@ -1285,6 +1287,7 @@ fn run() -> Result<()> {
             FairplayEnrollCommand::RecoverCapture {
                 capture,
                 startup_profile,
+                iokit15_output,
                 output,
                 timeout_seconds,
                 skip_differential,
@@ -1292,6 +1295,7 @@ fn run() -> Result<()> {
                 let result = recover_capture(RecoverCaptureOptions {
                     capture: &capture,
                     startup_profile: &startup_profile,
+                    iokit15_output: iokit15_output.as_deref(),
                     output: &output,
                     timeout: Duration::from_secs(timeout_seconds),
                     skip_differential,
@@ -2916,6 +2920,8 @@ mod tests {
             "/private/capture",
             "--startup-profile",
             "/profiles/macos26b118-startup.json.gz",
+            "--iokit15-output",
+            "/private/iokit15-output.bin",
             "--output",
             "/private/recovery",
         ])
@@ -2926,6 +2932,7 @@ mod tests {
                 command: FairplayEnrollCommand::RecoverCapture {
                     timeout_seconds: 600,
                     skip_differential: false,
+                    iokit15_output: Some(_),
                     ..
                 }
             }

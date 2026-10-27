@@ -63,6 +63,7 @@ pub struct RecoverFromSinfCopyOptions<'a> {
 pub struct RecoverCaptureOptions<'a> {
     pub capture: &'a Path,
     pub startup_profile: &'a Path,
+    pub iokit15_output: Option<&'a Path>,
     pub output: &'a Path,
     pub timeout: Duration,
     pub skip_differential: bool,
@@ -297,6 +298,9 @@ pub fn recover_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureReco
     let mut runner = CheckpointRunner::new_preserving_text(&seed, &binary, preserved_text)?;
     runner.set_missing_files_are_enoent(true);
     runner.set_mac_address(mac);
+    if let Some(path) = options.iokit15_output {
+        runner.set_iokit15_output(read_private_bytes(path, 0x228)?)?;
+    }
     add_capture_files(
         &mut runner,
         options.capture,
@@ -898,6 +902,7 @@ mod tests {
         let error = recover_capture(RecoverCaptureOptions {
             capture: &capture,
             startup_profile: &root.path().join("missing.json.gz"),
+            iokit15_output: None,
             output: &output,
             timeout: Duration::from_secs(1),
             skip_differential: true,

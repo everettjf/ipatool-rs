@@ -46,6 +46,7 @@ const MAX_CF_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const CF_STRING_TYPE_ID: u64 = 0x535452;
 const CF_BOOLEAN_TYPE_ID: u64 = 0x424f4f4c;
 const CF_DATA_TYPE_ID: u64 = 0x44415441;
+const IOKIT15_STRUCTURE_BYTES: usize = 0x228;
 const RET_X30: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
 const SYNTHETIC_ERRNO_ADDRESS: u64 = 0x7100_fff0_0000;
 const SYNTHETIC_NOOP_CALLBACK: u64 = 0x7200_0000_0000;
@@ -386,6 +387,18 @@ enum CfValue {
     String(Zeroizing<Vec<u8>>),
 }
 
+fn validate_iokit15_output(output: &[u8]) -> Result<()> {
+    if output.len() != IOKIT15_STRUCTURE_BYTES {
+        bail!("FairPlay IOKit selector 0x15 output must be 0x228 bytes");
+    }
+    let length = u32::from_le_bytes(output[0x220..0x224].try_into()?);
+    let status = u32::from_le_bytes(output[0x224..0x228].try_into()?);
+    if length > 0x200 || status != 0 {
+        bail!("FairPlay IOKit selector 0x15 output has invalid length or status");
+    }
+    Ok(())
+}
+
 impl CfValue {
     fn byte_len(&self) -> usize {
         match self {
@@ -500,9 +513,7 @@ impl DarwinState {
             let Value::Bytes(bytes) = value else {
                 bail!("FairPlay IOKit output is not bytes");
             };
-            if bytes.len() > 1024 * 1024 {
-                bail!("FairPlay IOKit output exceeds limit");
-            }
+            validate_iokit15_output(bytes)?;
             state.iokit15_output = Some(Zeroizing::new(bytes.clone()));
         }
         Ok(state)
@@ -2038,9 +2049,7 @@ impl CheckpointRunner {
     }
 
     pub fn set_iokit15_output(&mut self, output: Zeroizing<Vec<u8>>) -> Result<()> {
-        if output.len() > 1024 * 1024 {
-            bail!("FairPlay IOKit selector 0x15 output exceeds limit");
-        }
+        validate_iokit15_output(&output)?;
         self.darwin.borrow_mut().iokit15_output = Some(output);
         Ok(())
     }
@@ -2391,6 +2400,19 @@ mod tests {
         include_bytes!("../tests/fixtures/fairplay-checkpoint-run-synthetic.pkl.gz");
     const SYNTHETIC_SCHEMA1_CHECKPOINT: &[u8] =
         include_bytes!("../tests/fixtures/fairplay-checkpoint-run-schema1-synthetic.pkl.gz");
+
+    #[test]
+    fn iokit15_fixture_requires_exact_success_structure() {
+        let mut output = vec![0; IOKIT15_STRUCTURE_BYTES];
+        assert!(validate_iokit15_output(&output).is_ok());
+        output[0x220..0x224].copy_from_slice(&0x201u32.to_le_bytes());
+        assert!(validate_iokit15_output(&output).is_err());
+        output[0x220..0x224].copy_from_slice(&0x200u32.to_le_bytes());
+        output[0x224..0x228].copy_from_slice(&1u32.to_le_bytes());
+        assert!(validate_iokit15_output(&output).is_err());
+        output[0x224..0x228].fill(0);
+        assert!(validate_iokit15_output(&output[..0x227]).is_err());
+    }
 
     #[test]
     fn modeled_memory_externals_execute_in_guest_and_return_to_lr() {
@@ -3431,9 +3453,15 @@ mod tests {
         };
         prepare(&mut runner);
         runner.set_mac_address([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
-        runner
-            .set_iokit15_output(Zeroizing::new(b"test".to_vec()))
-            .unwrap();
+        assert!(
+            runner
+                .set_iokit15_output(Zeroizing::new(b"test".to_vec()))
+                .is_err()
+        );
+        let mut iokit15 = vec![0; IOKIT15_STRUCTURE_BYTES];
+        iokit15[0x20..0x24].copy_from_slice(b"test");
+        iokit15[0x220..0x224].copy_from_slice(&4u32.to_le_bytes());
+        runner.set_iokit15_output(Zeroizing::new(iokit15)).unwrap();
         assert_eq!(
             call(&mut runner, 0, "_IOMainPort", [0, 0xa000, 0, 0, 0, 0]),
             0
@@ -3517,7 +3545,7 @@ mod tests {
         );
         runner
             .engine
-            .mem_write(0xa100, &8u64.to_le_bytes())
+            .mem_write(0xa100, &(IOKIT15_STRUCTURE_BYTES as u64).to_le_bytes())
             .unwrap();
         assert_eq!(
             call(
@@ -3528,7 +3556,7 @@ mod tests {
             ),
             0
         );
-        assert_eq!(runner.engine.mem_read(0xa200, 4).unwrap(), b"test");
+        assert_eq!(runner.engine.mem_read(0xa220, 4).unwrap(), b"test");
         assert_eq!(
             call(
                 &mut runner,
