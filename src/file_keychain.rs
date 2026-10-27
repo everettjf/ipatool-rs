@@ -4,7 +4,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Read,
     num::NonZeroU32,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use aes::{
@@ -49,7 +49,7 @@ impl FileKeychain {
         })
     }
 
-    fn path(&self, key: &str) -> Result<PathBuf> {
+    fn path_for(directory: &Path, key: &str) -> Result<PathBuf> {
         if key.is_empty()
             || !key
                 .bytes()
@@ -57,7 +57,29 @@ impl FileKeychain {
         {
             bail!("invalid file keychain item name");
         }
-        Ok(self.directory.join(key))
+        Ok(directory.join(key))
+    }
+
+    fn path(&self, key: &str) -> Result<PathBuf> {
+        Self::path_for(&self.directory, key)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows", test))]
+    pub(crate) fn item_exists(directory: &Path, key: &str) -> Result<bool> {
+        let path = Self::path_for(directory, key)?;
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).context("inspect file keychain item"),
+        }
+    }
+
+    pub(crate) fn remove_item(directory: &Path, key: &str) -> Result<bool> {
+        match fs::remove_file(Self::path_for(directory, key)?) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).context("remove file keychain item"),
+        }
     }
 }
 
@@ -128,11 +150,7 @@ impl CredentialStore for FileKeychain {
     }
 
     fn remove(&self, key: &str) -> Result<bool> {
-        match fs::remove_file(self.path(key)?) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error).context("remove file keychain item"),
-        }
+        Self::remove_item(&self.directory, key)
     }
 }
 

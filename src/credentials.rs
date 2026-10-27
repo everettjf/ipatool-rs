@@ -19,6 +19,30 @@ struct FileKeychainOptions {
     interactive: bool,
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
+struct LazyFileKeychain<'a> {
+    directory: std::path::PathBuf,
+    options: &'a FileKeychainOptions,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
+impl CredentialStore for LazyFileKeychain<'_> {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if !FileKeychain::item_exists(&self.directory, key)? {
+            return Ok(None);
+        }
+        open_file_keychain(self.directory.clone(), self.options)?.get(key)
+    }
+
+    fn set(&self, key: &str, data: &[u8]) -> Result<()> {
+        open_file_keychain(self.directory.clone(), self.options)?.set(key, data)
+    }
+
+    fn remove(&self, key: &str) -> Result<bool> {
+        FileKeychain::remove_item(&self.directory, key)
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 static FILE_KEYCHAIN_OPTIONS: std::sync::OnceLock<FileKeychainOptions> = std::sync::OnceLock::new();
 
@@ -162,7 +186,7 @@ pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> 
             .get()
             .context("file keychain is not configured")?;
         let directory = prepare_state_directory_from_environment()?;
-        open_file_keychain(directory, options)
+        Ok(Box::new(LazyFileKeychain { directory, options }))
     }
     #[cfg(not(any(
         target_os = "macos",
@@ -441,6 +465,31 @@ mod tests {
             interactive: false,
         };
         assert!(open_file_keychain(directory.path().to_owned(), &missing).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_keychain_only_unlocks_when_an_item_needs_decryption_or_encryption() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = FileKeychainOptions {
+            passphrase: Mutex::new(None),
+            interactive: false,
+        };
+        let store = LazyFileKeychain {
+            directory: directory.path().to_owned(),
+            options: &options,
+        };
+        assert!(store.get(ACCOUNT_KEY).unwrap().is_none());
+        assert!(!store.remove(ACCOUNT_KEY).unwrap());
+        assert!(store.get("../account").is_err());
+        assert!(store.set(ACCOUNT_KEY, b"account").is_err());
+
+        let populated =
+            FileKeychain::new(directory.path().to_owned(), "test passphrase".into()).unwrap();
+        populated.set(ACCOUNT_KEY, b"account").unwrap();
+        assert!(store.get(ACCOUNT_KEY).is_err());
+        assert!(store.remove(ACCOUNT_KEY).unwrap());
+        assert!(store.get(ACCOUNT_KEY).unwrap().is_none());
     }
 
     #[derive(Default)]
