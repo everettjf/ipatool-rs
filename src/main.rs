@@ -136,8 +136,8 @@ enum Command {
         output: Option<PathBuf>,
         #[arg(long, default_value = "")]
         external_version_id: String,
-        #[arg(long, default_value = "iphone")]
-        platform: String,
+        #[arg(long)]
+        platform: Option<String>,
         #[arg(long)]
         purchase: bool,
         #[arg(long)]
@@ -168,8 +168,8 @@ enum Command {
         app_id: Option<i64>,
         #[arg(short = 'b', long)]
         bundle_identifier: Option<String>,
-        #[arg(long, default_value = "iphone")]
-        platform: String,
+        #[arg(long)]
+        platform: Option<String>,
     },
     /// Read one app version's display version and release date.
     GetVersionMetadata {
@@ -868,7 +868,8 @@ fn run() -> Result<()> {
             {
                 bail!("either the app ID or the bundle identifier must be specified");
             }
-            let platform = Platform::parse(&platform)?.context("platform is required")?;
+            let requested_platform = parse_platform(platform.as_deref())?;
+            let platform = requested_platform.unwrap_or(Platform::Iphone);
             let account_store = AccountStore::new(open_system_keychain()?);
             let mut account = account_store.load()?;
             let backend = DownloadProductClient::open()?;
@@ -883,7 +884,7 @@ fn run() -> Result<()> {
                 };
                 if let Some(bundle_id) = bundle_identifier.as_deref().filter(|id| !id.is_empty()) {
                     let country = country_code_from_storefront(&account.store_front)?;
-                    match catalog.lookup(None, Some(bundle_id), country, Some(platform)) {
+                    match catalog.lookup(None, Some(bundle_id), country, requested_platform) {
                         Ok(found) => app = found,
                         Err(error)
                             if app.id > 0 && error.downcast_ref::<AppNotFound>().is_some() => {}
@@ -1019,7 +1020,7 @@ fn run() -> Result<()> {
                                     &purchase_backend,
                                     account,
                                     &app,
-                                    Some(platform),
+                                    requested_platform,
                                 )
                             },
                             |account| {
@@ -1136,7 +1137,8 @@ fn run() -> Result<()> {
             {
                 bail!("either the app ID or the bundle identifier must be specified");
             }
-            let platform = Platform::parse(&platform)?.context("platform is required")?;
+            let requested_platform = parse_platform(platform.as_deref())?;
+            let platform = requested_platform.unwrap_or(Platform::Iphone);
             let account_store = AccountStore::new(open_system_keychain()?);
             let mut account = account_store.load()?;
             let backend = DownloadProductClient::open()?;
@@ -1147,7 +1149,7 @@ fn run() -> Result<()> {
                     bundle_identifier.as_deref().filter(|id| !id.is_empty())
                 {
                     let country = country_code_from_storefront(&account.store_front)?;
-                    catalog.lookup(None, Some(bundle_id), country, Some(platform))?
+                    catalog.lookup(None, Some(bundle_id), country, requested_platform)?
                 } else {
                     App {
                         id: app_id.context("app ID is required")?,
@@ -3366,6 +3368,22 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn download_and_version_list_leave_catalog_platform_unspecified() {
+        let download = Cli::try_parse_from(["ipatool", "download", "--app-id", "123"]).unwrap();
+        match download.command {
+            Command::Download { platform, .. } => assert!(platform.is_none()),
+            _ => panic!("unexpected command"),
+        }
+        let versions =
+            Cli::try_parse_from(["ipatool", "list-versions", "--app-id", "123"]).unwrap();
+        match versions.command {
+            Command::ListVersions { platform, .. } => assert!(platform.is_none()),
+            _ => panic!("unexpected command"),
+        }
+        assert_eq!(parse_platform(None).unwrap(), None);
     }
 
     #[test]
