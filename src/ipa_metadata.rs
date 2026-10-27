@@ -166,7 +166,7 @@ struct HttpRangeReader {
 impl HttpRangeReader {
     fn open(url: &str, sender: Arc<Sender>) -> Result<Self> {
         let url = Url::parse(url).context("invalid IPA download URL")?;
-        if url.scheme() != "https"
+        if !matches!(url.scheme(), "http" | "https")
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
@@ -375,6 +375,20 @@ mod tests {
     }
 
     #[test]
+    fn reads_metadata_from_http_ipa_url() {
+        let info = br#"<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>2.3.4</string></dict></plist>"#;
+        let data = Arc::new(fixture_ipa(info));
+        let served = Arc::new(AtomicUsize::new(0));
+        let metadata = read_version_metadata_with_sender(
+            "http://example.test/app.ipa",
+            fixture_sender(Arc::clone(&data), Arc::clone(&served)),
+        )
+        .unwrap();
+        assert_eq!(metadata.display_version, "2.3.4");
+        assert!(served.load(Ordering::SeqCst) < data.len());
+    }
+
+    #[test]
     fn uses_zip_timestamp_when_release_date_is_absent() {
         let info = br#"<plist version="1.0"><dict><key>bundleShortVersionString</key><string>1.0</string></dict></plist>"#;
         let data = Arc::new(fixture_ipa(info));
@@ -412,7 +426,7 @@ mod tests {
             });
         assert!(wrong_range.is_err());
         assert!(
-            read_version_metadata_with_sender("http://example.test/app.ipa", |_| unreachable!())
+            read_version_metadata_with_sender("ftp://example.test/app.ipa", |_| unreachable!())
                 .is_err()
         );
     }

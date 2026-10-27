@@ -17,9 +17,10 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 
 ## Build and test evidence
 
-- `cargo test --all-targets`: 317 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
+- `cargo test --all-targets`: 318 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
 - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` passed after the HTTP 500 redownload fallback fix.
 - Local sender fixtures confirmed that an unpinned redownload uses the Go reference's 30-second timeout, while pinned redownload and update requests retain no request timeout.
+- IPA version metadata now accepts HTTP and HTTPS byte-range URLs like the Go reader and the Rust full-package downloader; the range and archive checks remain in place.
 - `cargo clippy --target x86_64-unknown-linux-gnu --all-targets -- -D warnings` passed with the Linux Secret Service backend compiled in.
 - `cargo check` passed for macOS x86_64, Linux x86_64 and ARM64, Windows x86_64 GNU and ARM64 GNU/LLVM, and iOS ARM64. Cross-target C dependencies required local cross compiler and archiver wrappers on this macOS host.
 - `cargo check --target aarch64-apple-ios` and `cargo check --target x86_64-pc-windows-gnu` passed after the output-path change. The desktop release artifacts below were built from the preceding commit; rebuild them before testing this path change on a target system.
