@@ -247,6 +247,82 @@ fn linux_hardware_mac(root: &Path) -> Result<[u8; 6]> {
         .context("no usable network hardware MAC address")
 }
 
+#[cfg(any(target_os = "ios", test))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IosLinkHeader {
+    len: u8,
+    family: u8,
+    _index: u16,
+    _kind: u8,
+    name_len: u8,
+    address_len: u8,
+    _selector_len: u8,
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn ios_link_mac(bytes: &[u8]) -> Option<[u8; 6]> {
+    if bytes.len() < std::mem::size_of::<IosLinkHeader>() {
+        return None;
+    }
+    // SAFETY: the slice covers the fixed sockaddr_dl header.
+    let header = unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const IosLinkHeader) };
+    let offset = std::mem::offset_of!(libc::sockaddr_dl, sdl_data);
+    let start = offset + usize::from(header.name_len);
+    if i32::from(header.family) != libc::AF_LINK
+        || usize::from(header.len) != bytes.len()
+        || header.address_len != 6
+        || start + 6 > bytes.len()
+    {
+        return None;
+    }
+    let mac: [u8; 6] = bytes[start..start + 6].try_into().ok()?;
+    (mac[0] & 1 == 0 && mac != [0; 6] && mac != [2, 0, 0, 0, 0, 0]).then_some(mac)
+}
+
+#[cfg(target_os = "ios")]
+fn ios_hardware_mac() -> Result<[u8; 6]> {
+    struct InterfaceList(*mut libc::ifaddrs);
+    impl Drop for InterfaceList {
+        fn drop(&mut self) {
+            // SAFETY: getifaddrs allocated this list and it is freed exactly once.
+            unsafe { libc::freeifaddrs(self.0) };
+        }
+    }
+
+    let mut head = std::ptr::null_mut();
+    // SAFETY: getifaddrs writes an owned list pointer to head.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("list iOS network interfaces");
+    }
+    let _list = InterfaceList(head);
+    let mut current = head;
+    let mut selected: Option<[u8; 6]> = None;
+    while !current.is_null() {
+        // SAFETY: current is a node in the live getifaddrs list.
+        let entry = unsafe { &*current };
+        if entry.ifa_flags & (libc::IFF_LOOPBACK | libc::IFF_POINTOPOINT) as u32 == 0
+            && !entry.ifa_addr.is_null()
+        {
+            // SAFETY: non-null ifa_addr is owned by the live list.
+            let address = unsafe { &*entry.ifa_addr };
+            if i32::from(address.sa_family) == libc::AF_LINK {
+                let length = usize::from(address.sa_len);
+                // SAFETY: sa_len bounds the address allocation owned by getifaddrs.
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(entry.ifa_addr as *const u8, length) };
+                if let Some(mac) = ios_link_mac(bytes)
+                    && selected.is_none_or(|previous| mac < previous)
+                {
+                    selected = Some(mac);
+                }
+            }
+        }
+        current = entry.ifa_next;
+    }
+    selected.context("no usable iOS network hardware MAC address")
+}
+
 /// Hardware identity used by the Store guest and SAP signer.
 pub fn hardware_mac_address() -> Result<[u8; 6]> {
     static CACHED: OnceLock<std::result::Result<[u8; 6], String>> = OnceLock::new();
@@ -272,11 +348,20 @@ fn discover_hardware_mac() -> Result<[u8; 6]> {
     {
         linux_hardware_mac(Path::new("/sys/class/net"))
     }
+    #[cfg(target_os = "ios")]
+    {
+        ios_hardware_mac()
+    }
     #[cfg(target_os = "windows")]
     {
         crate::windows_hardware::hardware_mac_address()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "windows"
+    )))]
     {
         bail!("automatic Store hardware identity is not yet implemented for this platform")
     }
@@ -362,6 +447,31 @@ pub fn inspect_local_fairplay_host() -> Result<FairPlayHostDiagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ios_link_address_checks_bounds_and_rejects_unusable_macs() {
+        let mut address = vec![0u8; 17];
+        address[0] = 17;
+        address[1] = libc::AF_LINK as u8;
+        address[5] = 3;
+        address[6] = 6;
+        address[8..11].copy_from_slice(b"en0");
+        address[11..17].copy_from_slice(&[0, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(
+            ios_link_mac(&address),
+            Some([0, 0x11, 0x22, 0x33, 0x44, 0x55])
+        );
+
+        address[0] = 16;
+        assert_eq!(ios_link_mac(&address), None);
+        address[0] = 17;
+        address[5] = 4;
+        assert_eq!(ios_link_mac(&address), None);
+        address[5] = 3;
+        address[11] = 1;
+        assert_eq!(ios_link_mac(&address), None);
+        assert_eq!(ios_link_mac(&address[..7]), None);
+    }
 
     #[cfg(unix)]
     #[test]

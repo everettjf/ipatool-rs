@@ -6,7 +6,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(any(target_os = "linux", target_os = "windows", all(test, unix)))]
 use crate::file_keychain::FileKeychain;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::state::KEYCHAIN_SERVICE_NAME;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::state::prepare_state_directory_from_environment;
@@ -57,11 +57,14 @@ impl<T: CredentialStore + ?Sized> CredentialStore for Box<T> {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub struct MacKeychain;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub struct AppleKeychain;
 
 #[cfg(target_os = "macos")]
-impl CredentialStore for MacKeychain {
+pub type MacKeychain = AppleKeychain;
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl CredentialStore for AppleKeychain {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         use security_framework::passwords::get_generic_password;
         match get_generic_password(KEYCHAIN_SERVICE_NAME, key) {
@@ -87,9 +90,9 @@ impl CredentialStore for MacKeychain {
 }
 
 pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        Ok(Box::new(MacKeychain))
+        Ok(Box::new(AppleKeychain))
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
@@ -99,7 +102,12 @@ pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> 
         let directory = prepare_state_directory_from_environment()?;
         open_file_keychain(directory, options)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "windows"
+    )))]
     {
         bail!("system credential storage is not yet implemented for this platform")
     }
