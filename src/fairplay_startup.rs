@@ -11,7 +11,10 @@ use zeroize::Zeroizing;
 
 use crate::{
     capture::{FAIRPLAY_BUILD_26A428_HASH, FAIRPLAY_BUILD_26B118_HASH},
+    fairplay_checkpoint_run::load_fairplayd,
     fairplay_recovery_output::{read_private_bytes, write_private_binary},
+    store_memory::MemoryRegion,
+    unicorn_runtime::Engine,
 };
 
 const PROFILE_SCHEMA: &str = "ipatool-fairplay-startup-cache-v1";
@@ -40,7 +43,12 @@ fn address(value: &str) -> Result<u64> {
     Ok(u64::from_str_radix(digits, 16)?)
 }
 
-fn put_byte(pages: &mut BTreeMap<u64, Vec<u8>>, address: u64, byte: u8) -> Result<()> {
+fn put_byte(
+    pages: &mut BTreeMap<u64, Vec<u8>>,
+    address: u64,
+    byte: u8,
+    image: Option<(&Engine, &[MemoryRegion])>,
+) -> Result<()> {
     if address >= 0xf000_0000_0000_0000 {
         bail!("startup memory address is outside the guest range");
     }
@@ -48,11 +56,34 @@ fn put_byte(pages: &mut BTreeMap<u64, Vec<u8>>, address: u64, byte: u8) -> Resul
     if !pages.contains_key(&page) && pages.len() >= MAX_PAGES {
         bail!("startup profile exceeds checkpoint page limit");
     }
-    pages.entry(page).or_insert_with(|| vec![0; PAGE_BYTES])[(address - page) as usize] = byte;
+    if let std::collections::btree_map::Entry::Vacant(entry) = pages.entry(page) {
+        let original = if let Some((engine, regions)) = image {
+            if regions.iter().any(|region| {
+                region.address <= page
+                    && region.address.checked_add(region.size).is_some_and(|end| {
+                        page.checked_add(PAGE_BYTES as u64)
+                            .is_some_and(|next| next <= end)
+                    })
+            }) {
+                engine.mem_read(page, PAGE_BYTES)?
+            } else {
+                vec![0; PAGE_BYTES]
+            }
+        } else {
+            vec![0; PAGE_BYTES]
+        };
+        entry.insert(original);
+    }
+    pages.get_mut(&page).expect("inserted page")[(address - page) as usize] = byte;
     Ok(())
 }
 
-fn put_bytes(pages: &mut BTreeMap<u64, Vec<u8>>, address: u64, data: &[u8]) -> Result<()> {
+fn put_bytes(
+    pages: &mut BTreeMap<u64, Vec<u8>>,
+    address: u64,
+    data: &[u8],
+    image: Option<(&Engine, &[MemoryRegion])>,
+) -> Result<()> {
     for (offset, byte) in data.iter().copied().enumerate() {
         put_byte(
             pages,
@@ -60,6 +91,7 @@ fn put_bytes(pages: &mut BTreeMap<u64, Vec<u8>>, address: u64, data: &[u8]) -> R
                 .checked_add(offset as u64)
                 .context("startup address overflow")?,
             byte,
+            image,
         )?;
     }
     Ok(())
@@ -112,8 +144,15 @@ pub fn seed_request_checkpoint(
     }
     let profile: StartupProfile =
         serde_json::from_slice(&profile_json).context("parse FairPlay startup profile")?;
-    let (compressed, plain_bytes) =
-        encode_request_checkpoint(profile, &binary_hash, fairplayd, executable_path)?;
+    let mut engine = Engine::new().context("create FairPlay startup emulator")?;
+    let loaded = load_fairplayd(&mut engine, &binary)?;
+    let (compressed, plain_bytes) = encode_request_checkpoint(
+        profile,
+        &binary_hash,
+        fairplayd,
+        executable_path,
+        Some((&engine, &loaded.regions)),
+    )?;
     write_private_binary(output, &compressed)?;
     Ok(plain_bytes)
 }
@@ -123,6 +162,7 @@ fn encode_request_checkpoint(
     binary_hash: &str,
     fairplayd: &Path,
     executable_path: &str,
+    image: Option<(&Engine, &[MemoryRegion])>,
 ) -> Result<(Zeroizing<Vec<u8>>, usize)> {
     if profile.schema != PROFILE_SCHEMA || profile.binary_sha256 != binary_hash {
         bail!("startup profile does not match captured fairplayd");
@@ -136,12 +176,12 @@ fn encode_request_checkpoint(
             bail!("startup profile memory addresses are not strictly increasing");
         }
         previous = Some(location);
-        put_byte(&mut pages, location, byte)?;
+        put_byte(&mut pages, location, byte, image)?;
     }
     let mut path = Zeroizing::new(executable_path.as_bytes().to_vec());
     path.push(0);
-    put_bytes(&mut pages, SYNTHETIC_PATH, &path)?;
-    put_bytes(&mut pages, SYNTHETIC_AUDIT, &[0; 32])?;
+    put_bytes(&mut pages, SYNTHETIC_PATH, &path, image)?;
+    put_bytes(&mut pages, SYNTHETIC_AUDIT, &[0; 32], image)?;
     for (index, value) in [
         SYNTHETIC_OUT_172,
         0x7000_0024_0000,
@@ -156,6 +196,7 @@ fn encode_request_checkpoint(
             &mut pages,
             SYNTHETIC_SP + (index as u64) * 8,
             &value.to_le_bytes(),
+            image,
         )?;
     }
     let mut registers = BTreeMap::new();
@@ -243,6 +284,7 @@ mod tests {
             FAIRPLAY_BUILD_26B118_HASH,
             &binary,
             "/Applications/Test.app/Test",
+            None,
         )
         .unwrap();
         assert!(plain_bytes > 0);
@@ -281,7 +323,7 @@ mod tests {
             once_tokens: vec![],
         };
         assert!(
-            encode_request_checkpoint(profile, FAIRPLAY_BUILD_26B118_HASH, &binary, "test")
+            encode_request_checkpoint(profile, FAIRPLAY_BUILD_26B118_HASH, &binary, "test", None)
                 .is_err()
         );
         let profile = StartupProfile {
@@ -291,8 +333,43 @@ mod tests {
             once_tokens: vec![],
         };
         assert!(
-            encode_request_checkpoint(profile, FAIRPLAY_BUILD_26A428_HASH, &binary, "test")
+            encode_request_checkpoint(profile, FAIRPLAY_BUILD_26A428_HASH, &binary, "test", None)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn startup_overlay_preserves_unmodified_macho_page_bytes() {
+        const BINARY: &[u8] =
+            include_bytes!("../tests/fixtures/fairplay-checkpoint-run-synthetic.macho");
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("fairplayd");
+        std::fs::write(&binary, BINARY).unwrap();
+        let mut engine = Engine::new().unwrap();
+        let loaded = load_fairplayd(&mut engine, BINARY).unwrap();
+        let page = loaded.regions[0].address;
+        let original = engine.mem_read(page, PAGE_BYTES).unwrap();
+        let changed = original[8] ^ 0xff;
+        let profile = StartupProfile {
+            schema: PROFILE_SCHEMA.into(),
+            binary_sha256: FAIRPLAY_BUILD_26B118_HASH.into(),
+            memory: vec![(format!("{:#x}", page + 8), changed)],
+            once_tokens: vec![],
+        };
+        let (encoded, _) = encode_request_checkpoint(
+            profile,
+            FAIRPLAY_BUILD_26B118_HASH,
+            &binary,
+            "Test",
+            Some((&engine, &loaded.regions)),
+        )
+        .unwrap();
+        let checkpoint = FairplayCheckpoint::parse_gzip(&encoded).unwrap();
+        let mut expected = original[..16].to_vec();
+        expected[8] = changed;
+        assert_eq!(
+            checkpoint.read_block::<16>(page).unwrap().as_slice(),
+            expected
         );
     }
 }

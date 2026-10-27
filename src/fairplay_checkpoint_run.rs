@@ -42,6 +42,9 @@ const MAX_DARWIN_OBJECTS: usize = 4096;
 const RET_X30: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
 const SYNTHETIC_ERRNO_ADDRESS: u64 = 0x7100_fff0_0000;
 const SYNTHETIC_NOOP_CALLBACK: u64 = 0x7200_0000_0000;
+const SYNTHETIC_DLOPEN_HANDLE: u64 = 0x7000_3000_0000;
+const SYNTHETIC_DLSYM_BASE: u64 = 0x7000_4000_0000;
+const MAX_DYNAMIC_SYMBOLS: usize = 1024;
 const PTHREAD_ONCE_STUB: [u32; 6] = [
     0xa9bf_7bfd, // stp x29, x30, [sp, #-16]!
     0x9100_03fd, // mov x29, sp
@@ -59,6 +62,52 @@ const STATIC_ALLOCATION_STRIDE: u64 = 0x10_0000;
 
 struct HostState {
     random_state: u32,
+    dynamic_symbols: BTreeMap<u64, String>,
+}
+
+impl HostState {
+    fn from_checkpoint(checkpoint: &FairplayCheckpoint) -> Result<Self> {
+        let mut state = Self {
+            random_state: checkpoint.random_state()?,
+            dynamic_symbols: BTreeMap::new(),
+        };
+        if let Some(value) = checkpoint.optional_metadata("dynamic_symbols") {
+            let Value::Dict(symbols) = value else {
+                bail!("FairPlay dynamic symbols are not a dictionary");
+            };
+            if symbols.len() > MAX_DYNAMIC_SYMBOLS {
+                bail!("too many FairPlay dynamic symbols");
+            }
+            for (index, (key, value)) in symbols.iter().enumerate() {
+                let address = pickle_hash_u64(key)?;
+                if address != SYNTHETIC_DLSYM_BASE + index as u64 * PAGE_BYTES {
+                    bail!("FairPlay dynamic symbol address is invalid");
+                }
+                let Value::String(symbol) = value else {
+                    bail!("FairPlay dynamic symbol name is invalid");
+                };
+                if symbol.is_empty() || symbol.len() > 1024 {
+                    bail!("FairPlay dynamic symbol name is outside the bounded range");
+                }
+                state.dynamic_symbols.insert(address, symbol.clone());
+            }
+        }
+        Ok(state)
+    }
+
+    fn dynamic_symbols_snapshot(&self) -> Value {
+        Value::Dict(
+            self.dynamic_symbols
+                .iter()
+                .map(|(&address, name)| {
+                    (
+                        HashableValue::Int(address.into()),
+                        Value::String(name.clone()),
+                    )
+                })
+                .collect(),
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1101,6 +1150,30 @@ fn run_modeled_external(
                 tokens.insert(token);
             }
         }
+        "dispatch_once" => {
+            let token = guest_register(context, 0)?;
+            let block = guest_register(context, 1)?;
+            let mut tokens = once_tokens.borrow_mut();
+            if tokens.contains(&token) {
+                context.reg_write(200, SYNTHETIC_NOOP_CALLBACK)?;
+            } else {
+                let invoke = read_guest_u64(
+                    context,
+                    block
+                        .checked_add(0x10)
+                        .context("dispatch block address overflow")?,
+                )?;
+                if invoke == 0 {
+                    bail!("dispatch_once block has a null invoke");
+                }
+                if tokens.len() >= MAX_ONCE_TOKENS {
+                    bail!("FairPlay once token count exceeds limit");
+                }
+                tokens.insert(token);
+                context.reg_write(199, block)?;
+                context.reg_write(200, invoke)?;
+            }
+        }
         "arc4random" => {
             let mut state = host_state.borrow_mut();
             state.random_state = state
@@ -1119,6 +1192,53 @@ fn run_modeled_external(
             context.reg_write(199, 0)?;
         }
         "getpid" => context.reg_write(199, 1234)?,
+        "getuid" | "geteuid" | "getgid" | "getegid" => context.reg_write(199, 0)?,
+        "dlopen" => context.reg_write(199, SYNTHETIC_DLOPEN_HANDLE)?,
+        "dlsym" => {
+            let name = guest_path(context, guest_register(context, 1)?)?;
+            if name.is_empty() || name.len() > 1024 {
+                bail!("FairPlay dynamic symbol name is outside the bounded range");
+            }
+            let name = String::from_utf8(name).context("FairPlay dynamic symbol is not UTF-8")?;
+            let mut state = host_state.borrow_mut();
+            let index = state.dynamic_symbols.len();
+            if index >= MAX_DYNAMIC_SYMBOLS {
+                bail!("too many FairPlay dynamic symbols");
+            }
+            let address = SYNTHETIC_DLSYM_BASE + index as u64 * PAGE_BYTES;
+            context.mem_map(address, PAGE_BYTES as usize)?;
+            context.mem_write(address, &RET_X30)?;
+            state.dynamic_symbols.insert(address, name);
+            context.reg_write(199, address)?;
+        }
+        "dlclose" | "dlerror" => context.reg_write(199, 0)?,
+        "sysctlbyname" => {
+            let name = guest_path(context, guest_register(context, 0)?)?;
+            let output = guest_register(context, 1)?;
+            let size_pointer = guest_register(context, 2)?;
+            let capacity = if size_pointer == 0 {
+                0
+            } else {
+                read_guest_u64(context, size_pointer)?
+            };
+            if name == b"kern.hv_vmm_present" && output != 0 && capacity >= 4 {
+                context.mem_write(output, &0u32.to_le_bytes())?;
+                context.mem_write(size_pointer, &4u64.to_le_bytes())?;
+                context.reg_write(199, 0)?;
+            } else {
+                set_guest_errno(context, 2)?;
+                context.reg_write(199, 0xffff_ffff)?;
+            }
+        }
+        "vm_allocate" => {
+            let destination = guest_register(context, 1)?;
+            let size = guest_register(context, 2)?.max(0x4000);
+            let address = allocations.borrow_mut().allocate(context, size)?;
+            if destination != 0 {
+                context.mem_write(destination, &address.to_le_bytes())?;
+            }
+            context.reg_write(199, 0)?;
+        }
         "kqueue" => context.reg_write(199, 0x900)?,
         "kevent"
         | "signal"
@@ -1203,9 +1323,20 @@ fn install_modeled_external(
             | "malloc_type_calloc"
             | "free"
             | "pthread_once"
+            | "dispatch_once"
             | "arc4random"
             | "gettimeofday"
             | "getpid"
+            | "getuid"
+            | "geteuid"
+            | "getgid"
+            | "getegid"
+            | "dlopen"
+            | "dlsym"
+            | "dlclose"
+            | "dlerror"
+            | "sysctlbyname"
+            | "vm_allocate"
             | "kqueue"
             | "kevent"
             | "signal"
@@ -1271,7 +1402,7 @@ fn install_modeled_external(
     engine
         .mem_map(address, PAGE_BYTES as usize)
         .with_context(|| format!("map external {symbol} stub"))?;
-    if symbol == "pthread_once" {
+    if matches!(symbol, "pthread_once" | "dispatch_once") {
         let instructions = PTHREAD_ONCE_STUB
             .into_iter()
             .flat_map(u32::to_le_bytes)
@@ -1302,6 +1433,47 @@ fn install_modeled_external(
         }
     })?;
     Ok(true)
+}
+
+fn install_dynamic_symbol_hook(
+    engine: &mut Engine,
+    host_state: &Rc<RefCell<HostState>>,
+    failure: &Rc<RefCell<Option<String>>>,
+    source_pages: &[u64],
+) -> Result<()> {
+    let symbols = Rc::clone(host_state);
+    let failure = Rc::clone(failure);
+    engine.add_code_hook(
+        SYNTHETIC_DLSYM_BASE,
+        SYNTHETIC_DLSYM_BASE + MAX_DYNAMIC_SYMBOLS as u64 * PAGE_BYTES - 1,
+        move |context, address, _| {
+            let execution = (|| -> Result<()> {
+                if !symbols.borrow().dynamic_symbols.contains_key(&address) {
+                    bail!("unknown FairPlay dynamic symbol at {address:#x}");
+                }
+                let operation = guest_register(context, 0)? & 0xffff_ffff;
+                if operation == 10 {
+                    let destination = guest_register(context, 2)?
+                        .checked_add(8)
+                        .context("CoreKE output address overflow")?;
+                    context.mem_write(destination, &[0, 0, 0, 0, 0, 0, 0, 1])?;
+                }
+                context.reg_write(199, 0xffff_58fe)?;
+                Ok(())
+            })();
+            if let Err(error) = execution {
+                *failure.borrow_mut() = Some(format!("FairPlay CoreKE: {error:#}"));
+                let _ = context.stop();
+            }
+        },
+    )?;
+    for &address in host_state.borrow().dynamic_symbols.keys() {
+        if !source_pages.contains(&address) {
+            engine.mem_map(address, PAGE_BYTES as usize)?;
+        }
+        engine.mem_write(address, &RET_X30)?;
+    }
+    Ok(())
 }
 
 impl CheckpointRunner {
@@ -1414,12 +1586,23 @@ impl CheckpointRunner {
         let once_tokens = Rc::new(RefCell::new(
             checkpoint.once_tokens()?.into_iter().collect(),
         ));
-        let host_state = Rc::new(RefCell::new(HostState {
-            random_state: checkpoint.random_state()?,
-        }));
+        let host_state = Rc::new(RefCell::new(HostState::from_checkpoint(checkpoint)?));
         let virtual_files = Rc::new(RefCell::new(VirtualFileState::from_checkpoint(checkpoint)?));
         let darwin = Rc::new(RefCell::new(DarwinState::from_checkpoint(checkpoint)?));
         let source_pages = checkpoint.page_addresses()?;
+        if image
+            .externals
+            .values()
+            .any(|symbol| symbol.trim_start_matches('_') == "dlsym")
+            || !host_state.borrow().dynamic_symbols.is_empty()
+        {
+            install_dynamic_symbol_hook(
+                &mut engine,
+                &host_state,
+                &external_failure,
+                &source_pages,
+            )?;
+        }
         let errno_mapped = image.externals.values().any(|symbol| {
             matches!(
                 symbol.trim_start_matches('_'),
@@ -1432,16 +1615,18 @@ impl CheckpointRunner {
                     | "fstat"
                     | "read"
                     | "unlink"
+                    | "sysctlbyname"
             )
         });
         if errno_mapped && !source_pages.contains(&SYNTHETIC_ERRNO_ADDRESS) {
             engine.mem_map(SYNTHETIC_ERRNO_ADDRESS, PAGE_BYTES as usize)?;
         }
-        if image
-            .externals
-            .values()
-            .any(|symbol| symbol.trim_start_matches('_') == "pthread_once")
-        {
+        if image.externals.values().any(|symbol| {
+            matches!(
+                symbol.trim_start_matches('_'),
+                "pthread_once" | "dispatch_once"
+            )
+        }) {
             if !source_pages.contains(&SYNTHETIC_NOOP_CALLBACK) {
                 engine.mem_map(SYNTHETIC_NOOP_CALLBACK, PAGE_BYTES as usize)?;
             }
@@ -1858,6 +2043,10 @@ impl CheckpointRunner {
                 "random_state",
                 Value::I64(i64::from(self.host_state.borrow().random_state)),
             ),
+            (
+                "dynamic_symbols",
+                self.host_state.borrow().dynamic_symbols_snapshot(),
+            ),
             ("open_files", open_files),
             ("next_fd", next_fd),
             ("removed_file_suffixes", removed_file_suffixes),
@@ -1908,9 +2097,7 @@ mod tests {
             AllocationState::from_checkpoint(&source).unwrap(),
         ));
         let once_tokens = Rc::new(RefCell::new(BTreeSet::new()));
-        let host_state = Rc::new(RefCell::new(HostState {
-            random_state: source.random_state().unwrap(),
-        }));
+        let host_state = Rc::new(RefCell::new(HostState::from_checkpoint(&source).unwrap()));
         let virtual_files = Rc::new(RefCell::new(
             VirtualFileState::from_checkpoint(&source).unwrap(),
         ));
@@ -1958,6 +2145,18 @@ mod tests {
         assert_eq!(engine.reg_read(199).unwrap(), 0);
         call(&mut engine, 8, "_chkstk_darwin", [0x1234, 0, 0]);
         assert_eq!(engine.reg_read(199).unwrap(), 0x1234);
+        engine.mem_write(0x1000, b"kern.hv_vmm_present\0").unwrap();
+        engine.mem_write(0x2000, &4u64.to_le_bytes()).unwrap();
+        call(&mut engine, 10, "_sysctlbyname", [0x1000, 0x2010, 0x2000]);
+        assert_eq!(engine.reg_read(199).unwrap(), 0);
+        assert_eq!(engine.mem_read(0x2010, 4).unwrap(), [0; 4]);
+        assert_eq!(engine.mem_read(0x2000, 8).unwrap(), 4u64.to_le_bytes());
+        call(&mut engine, 11, "_getuid", [0, 0, 0]);
+        assert_eq!(engine.reg_read(199).unwrap(), 0);
+        call(&mut engine, 12, "_vm_allocate", [0, 0x2020, 8]);
+        let allocated = u64::from_le_bytes(engine.mem_read(0x2020, 8).unwrap().try_into().unwrap());
+        assert_eq!(allocated, SYNTHETIC_ALLOCATION_BASE);
+        assert_eq!(engine.reg_read(199).unwrap(), 0);
         assert!(
             !install_modeled_external(
                 &mut engine,
@@ -1991,9 +2190,7 @@ mod tests {
             AllocationState::from_checkpoint(&source).unwrap(),
         ));
         let once_tokens = Rc::new(RefCell::new(BTreeSet::new()));
-        let host_state = Rc::new(RefCell::new(HostState {
-            random_state: source.random_state().unwrap(),
-        }));
+        let host_state = Rc::new(RefCell::new(HostState::from_checkpoint(&source).unwrap()));
         let virtual_files = Rc::new(RefCell::new(
             VirtualFileState::from_checkpoint(&source).unwrap(),
         ));
@@ -2014,6 +2211,74 @@ mod tests {
         engine.reg_write(2, 0x5000).unwrap();
         let _ = engine.start_bounded(EXTERNAL_BASE, 0x5000, Duration::from_secs(2), 4);
         assert!(failure.borrow().as_ref().unwrap().contains("memset"));
+    }
+
+    #[test]
+    fn resolved_coreke_symbol_survives_checkpoint_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let binary_path = directory.path().join("fairplayd.arm64e");
+        let output_path = directory.path().join("dynamic.pkl.gz");
+        std::fs::write(&binary_path, SYNTHETIC_BINARY).unwrap();
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        runner.engine.mem_map(0x1000, PAGE_BYTES as usize).unwrap();
+        runner
+            .engine
+            .mem_write(0x1000, b"CoreKEOperation\0")
+            .unwrap();
+        install_dynamic_symbol_hook(
+            &mut runner.engine,
+            &runner.host_state,
+            &runner.external_failure,
+            &source.page_addresses().unwrap(),
+        )
+        .unwrap();
+        install_modeled_external(
+            &mut runner.engine,
+            EXTERNAL_BASE,
+            "_dlsym",
+            &runner.external_failure,
+            &runner.allocation_state,
+            &runner.once_tokens,
+            (&runner.host_state, &runner.virtual_files, &runner.darwin),
+        )
+        .unwrap();
+        runner.engine.reg_write(200, 0x1000).unwrap();
+        runner.engine.reg_write(2, 0x5000).unwrap();
+        runner
+            .engine
+            .start_bounded(EXTERNAL_BASE, 0x5000, Duration::from_secs(2), 4)
+            .unwrap();
+        assert_eq!(runner.engine.reg_read(199).unwrap(), SYNTHETIC_DLSYM_BASE);
+        runner
+            .engine
+            .reg_write(REG_PC, source.pc().unwrap())
+            .unwrap();
+        runner
+            .write_checkpoint(&source, &binary_path, &output_path)
+            .unwrap();
+
+        let reloaded = FairplayCheckpoint::load_private(&output_path).unwrap();
+        let mut resumed = CheckpointRunner::new(&reloaded, SYNTHETIC_BINARY).unwrap();
+        resumed.engine.mem_map(0x2000, PAGE_BYTES as usize).unwrap();
+        resumed.engine.reg_write(199, 10).unwrap();
+        resumed.engine.reg_write(201, 0x2000).unwrap();
+        resumed.engine.reg_write(2, 0x5000).unwrap();
+        resumed
+            .engine
+            .start_bounded(SYNTHETIC_DLSYM_BASE, 0x5000, Duration::from_secs(2), 4)
+            .unwrap();
+        assert_eq!(resumed.engine.reg_read(199).unwrap(), 0xffff_58fe);
+        assert_eq!(
+            resumed.engine.mem_read(0x2008, 8).unwrap(),
+            [0, 0, 0, 0, 0, 0, 0, 1]
+        );
     }
 
     #[test]
@@ -2257,6 +2522,63 @@ mod tests {
         replay.engine.reg_write(203, 0).unwrap();
         call(&mut replay);
         assert_eq!(replay.engine.reg_read(203).unwrap(), 0);
+    }
+
+    #[test]
+    fn dispatch_once_invokes_block_once() {
+        const STACK: u64 = 0x7300_0000_0000;
+        const BLOCK: u64 = STACK + 0x100;
+        const CALLBACK: u64 = STACK + PAGE_BYTES;
+        const RETURN: u64 = STACK + 2 * PAGE_BYTES;
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        runner.engine.mem_map(STACK, PAGE_BYTES as usize).unwrap();
+        runner
+            .engine
+            .mem_map(CALLBACK, PAGE_BYTES as usize)
+            .unwrap();
+        runner
+            .engine
+            .mem_map(SYNTHETIC_NOOP_CALLBACK, PAGE_BYTES as usize)
+            .unwrap();
+        runner
+            .engine
+            .mem_write(SYNTHETIC_NOOP_CALLBACK, &RET_X30)
+            .unwrap();
+        runner
+            .engine
+            .mem_write(BLOCK + 0x10, &CALLBACK.to_le_bytes())
+            .unwrap();
+        let callback = [0x9100_0484u32, 0xd65f_03c0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        runner.engine.mem_write(CALLBACK, &callback).unwrap();
+        install_modeled_external(
+            &mut runner.engine,
+            EXTERNAL_BASE,
+            "_dispatch_once",
+            &runner.external_failure,
+            &runner.allocation_state,
+            &runner.once_tokens,
+            (&runner.host_state, &runner.virtual_files, &runner.darwin),
+        )
+        .unwrap();
+        runner.engine.reg_write(203, 0).unwrap();
+        for _ in 0..2 {
+            runner.engine.reg_write(199, 0x1234).unwrap();
+            runner.engine.reg_write(200, BLOCK).unwrap();
+            runner.engine.reg_write(2, RETURN).unwrap();
+            runner.engine.reg_write(4, STACK + 0x800).unwrap();
+            runner
+                .engine
+                .start_bounded(EXTERNAL_BASE, RETURN, Duration::from_secs(2), 20)
+                .unwrap();
+            assert!(runner.external_failure.borrow().is_none());
+            assert_eq!(runner.engine.reg_read(199).unwrap(), 0);
+        }
+        assert_eq!(runner.engine.reg_read(203).unwrap(), 1);
+        assert!(runner.once_tokens.borrow().contains(&0x1234));
     }
 
     #[test]

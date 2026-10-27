@@ -15,8 +15,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     capture::{
-        FAIRPLAY_BUILD_26A428_HASH, FAIRPLAY_BUILD_26B118_HASH, capture_file_path,
-        load_enrollment_capture,
+        EnrollmentCaptureManifest, FAIRPLAY_BUILD_26A428_HASH, FAIRPLAY_BUILD_26B118_HASH,
+        capture_file_path, load_enrollment_capture,
     },
     fairplay_checkpoint::FairplayCheckpoint,
     fairplay_checkpoint_run::{CheckpointRunner, MemoryTraceOptions, VirtualFileStat},
@@ -32,6 +32,7 @@ use crate::{
         open_private_file, read_private_bytes, write_private_binary, write_private_model,
     },
     fairplay_recovery_target::WhiteboxTarget,
+    fairplay_startup::seed_request_checkpoint,
 };
 
 const ACCOUNT_ENTRY: u64 = 0x1005_7ae74;
@@ -54,6 +55,14 @@ pub struct RecoverFromAccountOptions<'a> {
 pub struct RecoverFromSinfCopyOptions<'a> {
     pub capture: &'a Path,
     pub sinf_copy_checkpoint: &'a Path,
+    pub output: &'a Path,
+    pub timeout: Duration,
+    pub skip_differential: bool,
+}
+
+pub struct RecoverCaptureOptions<'a> {
+    pub capture: &'a Path,
+    pub startup_profile: &'a Path,
     pub output: &'a Path,
     pub timeout: Duration,
     pub skip_differential: bool,
@@ -133,9 +142,38 @@ fn parse_private_mac(path: &Path) -> Result<[u8; 6]> {
     Ok(address)
 }
 
+fn captured_state_suffixes(relative: &str) -> Result<Vec<String>> {
+    let path = Path::new(relative);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("non-UTF-8 captured FairPlay state filename")?;
+    let parent = path.parent().context("FairPlay state file has no parent")?;
+    let parts = parent
+        .iter()
+        .filter_map(|part| part.to_str())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    Ok(if name.starts_with("SC Info.") {
+        vec![
+            format!("/var/db/fpsd/SC Info/{name}"),
+            format!("/Users/Shared/SC Info/{name}"),
+        ]
+    } else if name.starts_with("IC-Info.") && parts.iter().any(|part| part == "library") {
+        vec![format!("/Library/FairPlay/iTunes_Control/iTunes/{name}")]
+    } else if name.starts_with("IC-Info.") && parts.iter().any(|part| part == "media") {
+        vec![format!("/Media/iTunes_Control/iTunes/{name}")]
+    } else if name.starts_with("IC-Info.") {
+        vec![format!("/{name}")]
+    } else {
+        Vec::new()
+    })
+}
+
 fn add_capture_files(
     runner: &mut CheckpointRunner,
     capture: &Path,
+    manifest: &EnrollmentCaptureManifest,
     executable: &str,
     target_sinf: &str,
     fpsd_stat: Option<VirtualFileStat>,
@@ -161,24 +199,25 @@ fn add_capture_files(
     for (suffix, path) in payloads {
         runner.add_file_payload(&suffix, read_private_bytes(&path, MAX_VIRTUAL_FILE_BYTES)?)?;
     }
-    let state = capture.join("state/fpsd-sc-info");
-    if state.is_dir() {
-        let mut entries = fs::read_dir(&state)
-            .context("read captured FPSD SC Info directory")?
-            .collect::<std::io::Result<Vec<_>>>()?;
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let name = entry.file_name();
-            let name = name.to_str().context("non-UTF-8 captured FPSD filename")?;
-            if name.starts_with("SC Info.") && entry.file_type()?.is_file() {
-                let suffix = format!("/var/db/fpsd/SC Info/{name}");
-                runner.add_file_payload(
-                    &suffix,
-                    read_private_bytes(&entry.path(), MAX_VIRTUAL_FILE_BYTES)?,
-                )?;
-                if let Some(stat) = fpsd_stat {
-                    runner.add_file_stat(&suffix, stat)?;
-                }
+    let mut state_files = manifest
+        .files
+        .iter()
+        .filter(|file| file.path.starts_with("state/"))
+        .collect::<Vec<_>>();
+    state_files.sort_by(|left, right| left.path.cmp(&right.path));
+    for file in state_files {
+        let suffixes = captured_state_suffixes(&file.path)?;
+        if suffixes.is_empty() {
+            continue;
+        }
+        let data = read_private_bytes(
+            &capture_file_path(capture, &file.path)?,
+            MAX_VIRTUAL_FILE_BYTES,
+        )?;
+        for suffix in suffixes {
+            runner.add_file_payload(&suffix, Zeroizing::new(data.to_vec()))?;
+            if let Some(stat) = fpsd_stat {
+                runner.add_file_stat(&suffix, stat)?;
             }
         }
     }
@@ -204,6 +243,89 @@ fn checkpoint_stage(
     runner.run_until_hit(stage.stop, stage.hits, timeout, stage.limit)?;
     runner.write_checkpoint(source, binary_path, output)?;
     Ok(())
+}
+
+/// Start from a checked capture and a matching public startup overlay.
+/// The first stage is traced in Rust before continuing the build-specific recovery.
+pub fn recover_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureRecoveryResult> {
+    if options.timeout.is_zero() || options.timeout > Duration::from_secs(3600) {
+        bail!("recovery phase timeout must be between 1 and 3600 seconds");
+    }
+    let manifest = load_enrollment_capture(options.capture, true)?;
+    let (stop, stat, preserved_text) = match manifest.fairplayd.sha256.as_str() {
+        FAIRPLAY_BUILD_26A428_HASH => (ACCOUNT_ENTRY, None, &[][..]),
+        FAIRPLAY_BUILD_26B118_HASH => (
+            0x1005_d0374,
+            Some(VirtualFileStat {
+                mode: 0o666,
+                uid: 265,
+                gid: 265,
+            }),
+            &PRESERVED_26B118_TEXT[..],
+        ),
+        _ => bail!("capture fairplayd build has no native recovery profile"),
+    };
+    if manifest.app.selector.identifier() != manifest.app.selector_id {
+        bail!("capture selector and selector ID disagree");
+    }
+    let fairplayd = capture_file_path(options.capture, &manifest.fairplayd.path)?;
+    let binary = read_checked_fairplayd(&fairplayd, &manifest.fairplayd.sha256)?;
+    let executable = &manifest.app.executable;
+    if executable.is_empty() || executable.contains('/') || executable.contains('\\') {
+        bail!("capture executable name is invalid");
+    }
+    let executable_path = if manifest.app.executable_path.is_empty() {
+        format!("/Applications/{executable}.app/{executable}")
+    } else {
+        manifest.app.executable_path.clone()
+    };
+    let temporary =
+        tempfile::tempdir().context("create private first-stage checkpoint directory")?;
+    let seed_path = temporary.path().join("request-entry.checkpoint.pkl.gz");
+    let first_path = temporary.path().join("first-stage.checkpoint.pkl.gz");
+    eprintln!("fairplay_recovery_stage=seed-request");
+    seed_request_checkpoint(
+        options.startup_profile,
+        &fairplayd,
+        &executable_path,
+        &seed_path,
+    )?;
+    let seed = FairplayCheckpoint::load_private(&seed_path)?;
+    let mac_path = capture_file_path(options.capture, &manifest.hardware_iomac.path)?;
+    let mac = parse_private_mac(&mac_path)?;
+    eprintln!("fairplay_recovery_stage=trace-first-checkpoint");
+    let mut runner = CheckpointRunner::new_preserving_text(&seed, &binary, preserved_text)?;
+    runner.set_missing_files_are_enoent(true);
+    runner.set_mac_address(mac);
+    add_capture_files(
+        &mut runner,
+        options.capture,
+        &manifest,
+        executable,
+        &manifest.app.sinf_path,
+        stat,
+    )?;
+    runner.run_until_hit(stop, 1, options.timeout, 500_000_000)?;
+    runner.write_checkpoint(&seed, &fairplayd, &first_path)?;
+    drop(runner);
+
+    if manifest.fairplayd.sha256 == FAIRPLAY_BUILD_26A428_HASH {
+        recover_from_account(RecoverFromAccountOptions {
+            capture: options.capture,
+            account_checkpoint: &first_path,
+            output: options.output,
+            timeout: options.timeout,
+            skip_differential: options.skip_differential,
+        })
+    } else {
+        recover_from_sinf_copy(RecoverFromSinfCopyOptions {
+            capture: options.capture,
+            sinf_copy_checkpoint: &first_path,
+            output: options.output,
+            timeout: options.timeout,
+            skip_differential: options.skip_differential,
+        })
+    }
 }
 
 pub fn recover_from_account(
@@ -248,6 +370,7 @@ pub fn recover_from_account(
     add_capture_files(
         &mut runner,
         options.capture,
+        &manifest,
         &manifest.app.executable,
         target_sinf,
         None,
@@ -447,6 +570,7 @@ pub fn recover_from_sinf_copy(
     add_capture_files(
         &mut runner,
         options.capture,
+        &manifest,
         &manifest.app.executable,
         &manifest.app.sinf_path,
         Some(VirtualFileStat {
@@ -704,6 +828,30 @@ mod tests {
     }
 
     #[test]
+    fn captured_state_paths_match_original_trace_aliases() {
+        assert_eq!(
+            captured_state_suffixes("state/fpsd-sc-info/SC Info.test").unwrap(),
+            [
+                "/var/db/fpsd/SC Info/SC Info.test",
+                "/Users/Shared/SC Info/SC Info.test"
+            ]
+        );
+        assert_eq!(
+            captured_state_suffixes("state/adi/Library/IC-Info.test").unwrap(),
+            ["/Library/FairPlay/iTunes_Control/iTunes/IC-Info.test"]
+        );
+        assert_eq!(
+            captured_state_suffixes("state/adi/Media/IC-Info.test").unwrap(),
+            ["/Media/iTunes_Control/iTunes/IC-Info.test"]
+        );
+        assert!(
+            captured_state_suffixes("state/adi/unrelated")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn sinf_copy_rejects_wrong_build_before_creating_output() {
         let root = tempfile::tempdir().unwrap();
         let capture = root.path().join("capture");
@@ -728,6 +876,34 @@ mod tests {
         })
         .unwrap_err();
         assert!(format!("{error:#}").contains("checked 26B118 capture"));
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn capture_recovery_rejects_unknown_build_before_creating_output() {
+        let root = tempfile::tempdir().unwrap();
+        let capture = root.path().join("capture");
+        private_directory(&capture).unwrap();
+        let mut manifest = EnrollmentCaptureManifest {
+            schema: ENROLLMENT_CAPTURE_SCHEMA.into(),
+            ..EnrollmentCaptureManifest::default()
+        };
+        manifest.fairplayd.sha256 = "00".repeat(32);
+        fs::write(
+            capture.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let output = root.path().join("recovery");
+        let error = recover_capture(RecoverCaptureOptions {
+            capture: &capture,
+            startup_profile: &root.path().join("missing.json.gz"),
+            output: &output,
+            timeout: Duration::from_secs(1),
+            skip_differential: true,
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("no native recovery profile"));
         assert!(!output.exists());
     }
 }

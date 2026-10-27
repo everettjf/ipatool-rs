@@ -27,8 +27,8 @@ use ipatool_rs::fairplay_oracle_export::export_checked_model;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
 use ipatool_rs::fairplay_recover_capture::{
-    RecoverFromAccountOptions, RecoverFromSinfCopyOptions, recover_from_account,
-    recover_from_sinf_copy,
+    RecoverCaptureOptions, RecoverFromAccountOptions, RecoverFromSinfCopyOptions, recover_capture,
+    recover_from_account, recover_from_sinf_copy,
 };
 use ipatool_rs::fairplay_recovery;
 use ipatool_rs::fairplay_recovery_output::{
@@ -258,6 +258,19 @@ enum FairplayEnrollCommand {
         capture: PathBuf,
         #[arg(long)]
         sinf_copy_checkpoint: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 600)]
+        timeout_seconds: u64,
+        #[arg(long)]
+        skip_differential: bool,
+    },
+    /// Recover and decrypt a checked capture from a matching startup profile.
+    RecoverCapture {
+        #[arg(long)]
+        capture: PathBuf,
+        #[arg(long)]
+        startup_profile: PathBuf,
         #[arg(long)]
         output: PathBuf,
         #[arg(long, default_value_t = 600)]
@@ -1256,6 +1269,29 @@ fn run() -> Result<()> {
                 let result = recover_from_sinf_copy(RecoverFromSinfCopyOptions {
                     capture: &capture,
                     sinf_copy_checkpoint: &sinf_copy_checkpoint,
+                    output: &output,
+                    timeout: Duration::from_secs(timeout_seconds),
+                    skip_differential,
+                })?;
+                match cli.format {
+                    Format::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+                    Format::Text => println!(
+                        "Recovered FairPlay enrollment for {} and decrypted IPA to {}",
+                        result.selector,
+                        result.decrypted_ipa.display()
+                    ),
+                }
+            }
+            FairplayEnrollCommand::RecoverCapture {
+                capture,
+                startup_profile,
+                output,
+                timeout_seconds,
+                skip_differential,
+            } => {
+                let result = recover_capture(RecoverCaptureOptions {
+                    capture: &capture,
+                    startup_profile: &startup_profile,
                     output: &output,
                     timeout: Duration::from_secs(timeout_seconds),
                     skip_differential,
@@ -2862,6 +2898,32 @@ mod tests {
             cli.command,
             Command::FairplayEnroll {
                 command: FairplayEnrollCommand::RecoverFromSinfCopy {
+                    timeout_seconds: 600,
+                    skip_differential: false,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn fairplay_recover_capture_accepts_startup_profile() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "recover-capture",
+            "--capture",
+            "/private/capture",
+            "--startup-profile",
+            "/profiles/macos26b118-startup.json.gz",
+            "--output",
+            "/private/recovery",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::RecoverCapture {
                     timeout_seconds: 600,
                     skip_differential: false,
                     ..
