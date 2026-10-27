@@ -620,8 +620,15 @@ impl DownloadProductClient {
         } else {
             version.to_owned()
         };
-        let redownload =
-            self.send_request(Endpoint::Redownload, account, app, &selected_version)?;
+        let redownload = self.send_request_with_timeout(
+            Endpoint::Redownload,
+            account,
+            app,
+            &selected_version,
+            selected_version
+                .is_empty()
+                .then_some(DEFAULT_AUTHENTICATION_TIMEOUT),
+        )?;
         if platform != Platform::Visionos
             && (redownload.is_empty_or_unavailable() || redownload.is_empty_server_error())
             && !selected_version.is_empty()
@@ -895,6 +902,17 @@ impl DownloadProductClient {
         app: &App,
         version: &str,
     ) -> Result<DownloadProductResponse> {
+        self.send_request_with_timeout(endpoint, account, app, version, None)
+    }
+
+    fn send_request_with_timeout(
+        &self,
+        endpoint: Endpoint,
+        account: &Account,
+        app: &App,
+        version: &str,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<DownloadProductResponse> {
         let guid = self.guid();
         let mut url = match endpoint {
             Endpoint::Volume => volume_url(account)?,
@@ -950,7 +968,7 @@ impl DownloadProductClient {
             headers,
             body: Some(body),
             no_redirects: true,
-            timeout: None,
+            timeout,
         })
         .context("send Store download-product request")?;
         if response.status == 500 && response.body.is_empty() {
@@ -1520,7 +1538,10 @@ mod tests {
                 .body
                 .as_ref()
                 .map(|body| plist::from_bytes(body).unwrap());
-            capture.lock().unwrap().push((url.clone(), body));
+            capture
+                .lock()
+                .unwrap()
+                .push((url.clone(), body, request.timeout));
             if url.contains("volumeStoreDownloadProduct") {
                 return Ok(response(serde_json::json!({})));
             }
@@ -1551,6 +1572,8 @@ mod tests {
         assert!(calls[3].0.contains("/up/updateProduct"));
         assert_eq!(calls[0].1.as_ref().unwrap()["externalVersionId"], "101");
         assert_eq!(calls[2].1.as_ref().unwrap()["appExtVrsId"], "101");
+        assert_eq!(calls[2].2, None);
+        assert_eq!(calls[3].2, None);
     }
 
     #[test]
@@ -1603,7 +1626,10 @@ mod tests {
                 .body
                 .as_ref()
                 .map(|body| plist::from_bytes::<Value>(body).unwrap());
-            capture.lock().unwrap().push((path.clone(), body));
+            capture
+                .lock()
+                .unwrap()
+                .push((path.clone(), body, request.timeout));
             if path.ends_with("bag.xml") {
                 return Ok(response(serde_json::json!({"urlBag": {
                     "redownloadProduct": REDOWNLOAD_URL
@@ -1623,6 +1649,8 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert!(requests[2].0.ends_with("/r/redownload"));
         assert!(requests[2].1.as_ref().unwrap().get("appExtVrsId").is_none());
+        assert_eq!(requests[0].2, None);
+        assert_eq!(requests[2].2, Some(DEFAULT_AUTHENTICATION_TIMEOUT));
     }
 
     #[test]
