@@ -418,9 +418,13 @@ fn validate_range(
     let header = response
         .header("content-range")
         .context("IPA response has no Content-Range")?;
-    let value = header
-        .strip_prefix("bytes ")
+    let (unit, value) = header
+        .split_once(' ')
         .context("invalid IPA Content-Range unit")?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        bail!("invalid IPA Content-Range unit");
+    }
+    let value = value.trim_start_matches([' ', '\t']);
     let (bounds, total) = value.split_once('/').context("invalid IPA Content-Range")?;
     let (actual_start, actual_end) = bounds
         .split_once('-')
@@ -524,6 +528,20 @@ mod tests {
                 body: bytes,
             })
         }
+    }
+
+    #[test]
+    fn range_response_accepts_go_compatible_unit_case_but_checks_bounds() {
+        let response = Response {
+            status: 206,
+            headers: std::collections::HashMap::from([(
+                "content-range".into(),
+                "Bytes  0-0/10".into(),
+            )]),
+            body: vec![b'x'],
+        };
+        assert_eq!(validate_range(&response, 0, 0, None).unwrap(), 10);
+        assert!(validate_range(&response, 1, 1, None).is_err());
     }
 
     #[test]
