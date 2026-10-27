@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256, Sha512};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
+    cookies::valid_cookie_pair,
     credentials::Account,
     machimage::{Image, Memory},
     sap_assets::SapAssetBundle,
@@ -8089,7 +8090,8 @@ fn dispatch_message(
                     .properties;
                 let name = object_string_value(state, properties["name"])?;
                 let value = object_string_value(state, properties["value"])?;
-                parts.push(format!("{name}={value}"));
+                let quoted = properties.get("quoted").copied().unwrap_or(0) != 0;
+                parts.push(go_cookie_request_pair(name, value, quoted));
             }
             let mut entries = HashMap::new();
             if !parts.is_empty() {
@@ -8679,6 +8681,10 @@ fn dispatch_message(
                 let Ok(cookie) = cookie::Cookie::parse(raw) else {
                     continue;
                 };
+                if !valid_cookie_pair(cookie.name(), cookie.value_trimmed()) {
+                    continue;
+                }
+                let quoted = cookie.value() != cookie.value_trimmed();
                 let name = new_guest_object(
                     context,
                     profile,
@@ -8691,7 +8697,7 @@ fn dispatch_message(
                     profile,
                     state,
                     "NSString",
-                    StoreValue::String(cookie.value().into()),
+                    StoreValue::String(cookie.value_trimmed().into()),
                 )?;
                 let domain = cookie
                     .domain()
@@ -8740,6 +8746,7 @@ fn dispatch_message(
                         ("domain".into(), domain),
                         ("path".into(), path),
                         ("expiresDate".into(), expires),
+                        ("quoted".into(), u64::from(quoted)),
                         (
                             "isSecure".into(),
                             u64::from(cookie.secure().unwrap_or(false)),
@@ -10736,6 +10743,22 @@ fn allowed_authentication_redirect(destination: &url::Url, status: u16) -> bool 
         && destination.path().trim_end_matches('/') == "/WebObjects/MZFinance.woa/wa/authenticate"
 }
 
+fn go_cookie_request_pair(name: &str, value: &str, quoted: bool) -> String {
+    let name = name.replace(['\r', '\n'], "-");
+    let value = String::from_utf8(
+        value
+            .bytes()
+            .filter(|&byte| (0x20..0x7f).contains(&byte) && !matches!(byte, b'"' | b';' | b'\\'))
+            .collect(),
+    )
+    .expect("sanitized cookie value is ASCII");
+    if quoted || value.contains([' ', ',']) {
+        format!("{name}=\"{value}\"")
+    } else {
+        format!("{name}={value}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10782,6 +10805,24 @@ mod tests {
                 "{endpoint} status={status}"
             );
         }
+    }
+
+    #[test]
+    fn cookie_request_pair_matches_go_add_cookie_sanitization() {
+        assert_eq!(go_cookie_request_pair("plain", "abc", false), "plain=abc");
+        assert_eq!(
+            go_cookie_request_pair("spaced", "a b", false),
+            "spaced=\"a b\""
+        );
+        assert_eq!(
+            go_cookie_request_pair("comma", "a,b", false),
+            "comma=\"a,b\""
+        );
+        assert_eq!(go_cookie_request_pair("empty", "", true), "empty=\"\"");
+        assert_eq!(
+            go_cookie_request_pair("bad\nname", "a;\u{e9}b", false),
+            "bad-name=ab"
+        );
     }
 
     #[test]
@@ -12298,6 +12339,9 @@ mod tests {
             vec![
                 "token=abc; Path=/; Expires=Wed, 21 Oct 2037 07:28:00 GMT".into(),
                 "session=xyz; Path=/".into(),
+                "quoted=\"a b\"; Path=/".into(),
+                "quoted_plain=\"abc\"; Path=/".into(),
+                "invalid=\"a;b\"; Path=/".into(),
             ],
         );
         let response_cookies = runtime
@@ -12307,14 +12351,35 @@ mod tests {
                 &[headers, url],
             )
             .unwrap();
-        let (response_cookie, session_cookie) =
+        let (response_cookie, session_cookie, quoted_cookie) =
             match &runtime.state.borrow().objects[&response_cookies].value {
                 StoreValue::Addresses(items) => {
-                    assert_eq!(items.len(), 2);
-                    (items[0], items[1])
+                    assert_eq!(items.len(), 4);
+                    (items[0], items[1], items[2])
                 }
                 _ => panic!("response cookies are not an array"),
             };
+        let quoted_value = runtime.invoke(quoted_cookie, "value", &[]).unwrap();
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), quoted_value).unwrap(),
+            "a b"
+        );
+        let request_fields = runtime
+            .invoke(
+                cookie_class,
+                "requestHeaderFieldsWithCookies:",
+                &[response_cookies],
+            )
+            .unwrap();
+        let state = runtime.state.borrow();
+        let StoreValue::Entries(fields) = &state.objects[&request_fields].value else {
+            panic!("cookie request header is not a dictionary");
+        };
+        assert_eq!(
+            object_string_value(&state, fields["Cookie"]).unwrap(),
+            "token=abc; session=xyz; quoted=\"a b\"; quoted_plain=\"abc\""
+        );
+        drop(state);
         assert_eq!(
             runtime
                 .invoke(session_cookie, "isSessionOnly", &[])

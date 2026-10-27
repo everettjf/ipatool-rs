@@ -378,7 +378,7 @@ fn cookie_header_pair(entry: &Entry) -> String {
     }
 }
 
-fn valid_cookie_pair(name: &str, value: &str) -> bool {
+pub(crate) fn valid_cookie_pair(name: &str, value: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
