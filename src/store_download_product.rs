@@ -243,7 +243,7 @@ impl DownloadProductClient {
         let response = self.send_product(account, app, version, || {
             download_fallback_version(catalog, app, country, platform)
         })?;
-        let item = checked_item(&response)?;
+        let item = checked_download_item(&response)?;
         self.download_mobile_item(account, app, item, platform, output)
     }
 
@@ -265,7 +265,7 @@ impl DownloadProductClient {
         let response = self.send_product(account, app, version, || {
             download_fallback_version(catalog, app, country, platform)
         })?;
-        let item = checked_item(&response)?;
+        let item = checked_download_item(&response)?;
         self.captured_mobile_item(account, app, item, &response, platform, output)
     }
 
@@ -285,7 +285,7 @@ impl DownloadProductClient {
             version.to_owned()
         };
         let response = self.send_product(account, app, &selected, || Ok(selected.clone()))?;
-        let item = checked_item(&response)?;
+        let item = checked_download_item(&response)?;
         if package_platform(Platform::Macos, item)? != Platform::Iphone {
             bail!("FairPlay download capture requires an IPA package; the macOS offer is a PKG");
         }
@@ -346,7 +346,7 @@ impl DownloadProductClient {
             version.to_owned()
         };
         let response = self.send_product(account, app, &selected, || Ok(selected.clone()))?;
-        let item = checked_item(&response)?;
+        let item = checked_download_item(&response)?;
         match package_platform(Platform::Macos, item)? {
             Platform::Iphone => {
                 self.download_mobile_item(account, app, item, Platform::Iphone, output)
@@ -1146,6 +1146,13 @@ fn allows_unpinned_redownload(platform: Platform, error: &anyhow::Error) -> bool
     )
 }
 
+fn checked_download_item(response: &DownloadProductResponse) -> Result<&DownloadItem> {
+    if matches!(response.data.failure_type.as_str(), "1008" | "5002") {
+        return Err(PasswordTokenExpired.into());
+    }
+    checked_item(response)
+}
+
 fn checked_item(response: &DownloadProductResponse) -> Result<&DownloadItem> {
     let result = &response.data;
     if matches!(result.failure_type.as_str(), "2034" | "2042") {
@@ -1321,6 +1328,29 @@ mod tests {
                 "softwareVersionExternalIdentifiers": [100, 101]
             }}]}),
         )
+    }
+
+    #[test]
+    fn download_retries_device_verification_and_existing_license_failures() {
+        for code in ["1008", "5002"] {
+            let response = DownloadProductResponse {
+                status: 200,
+                data: DownloadProductResult {
+                    failure_type: code.into(),
+                    customer_message: String::new(),
+                    items: Vec::new(),
+                },
+                capture: None,
+            };
+            let error = checked_download_item(&response).unwrap_err();
+            assert!(error.downcast_ref::<PasswordTokenExpired>().is_some());
+            let metadata_error = checked_item(&response).unwrap_err();
+            assert!(
+                metadata_error
+                    .downcast_ref::<PasswordTokenExpired>()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
