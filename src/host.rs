@@ -210,8 +210,12 @@ fn linux_hardware_mac(root: &Path) -> Result<[u8; 6]> {
             continue;
         }
         let path = entry.path();
-        let flags = fs::read_to_string(path.join("flags")).unwrap_or_default();
-        let flags = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16).unwrap_or(0);
+        let Ok(flags) = fs::read_to_string(path.join("flags")) else {
+            continue;
+        };
+        let Ok(flags) = u32::from_str_radix(flags.trim().trim_start_matches("0x"), 16) else {
+            continue;
+        };
         if flags & (libc::IFF_LOOPBACK as u32 | libc::IFF_POINTOPOINT as u32) != 0 {
             continue;
         }

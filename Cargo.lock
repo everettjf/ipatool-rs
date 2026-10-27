@@ -1457,6 +1457,7 @@ dependencies = [
  "plist",
  "regex",
  "reqwest",
+ "ring",
  "rmcp",
  "roxmltree",
  "schemars",

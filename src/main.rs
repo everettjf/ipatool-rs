@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::catalog::AppNotFound;
-use ipatool_rs::credentials::{AccountStore, open_system_keychain};
+use ipatool_rs::credentials::{AccountStore, configure_file_keychain, open_system_keychain};
 use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
 use ipatool_rs::fairplay_26a428;
 use ipatool_rs::fairplay_checkpoint::FairplayCheckpoint;
@@ -69,6 +69,9 @@ struct Cli {
     verbose: bool,
     #[arg(long, global = true)]
     non_interactive: bool,
+    /// Passphrase for the encrypted file keychain on Linux.
+    #[arg(long, global = true)]
+    keychain_passphrase: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -601,7 +604,11 @@ fn read_fairplayd_binary(path: &Path) -> Result<Vec<u8>> {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    configure_file_keychain(
+        cli.keychain_passphrase.take(),
+        !cli.non_interactive && io::stdin().is_terminal(),
+    );
     match cli.command {
         Command::Mcp => mcp::serve()?,
         Command::Completion { shell } => {

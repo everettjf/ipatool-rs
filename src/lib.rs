@@ -46,6 +46,7 @@ pub mod fairplay_sidb;
 pub mod fairplay_startup;
 pub mod fairplay_state;
 pub mod fairplay_supf;
+pub mod file_keychain;
 pub mod host;
 pub mod ipa_metadata;
 pub mod ipa_patch;

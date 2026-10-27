@@ -4,8 +4,36 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
+use crate::file_keychain::FileKeychain;
 #[cfg(target_os = "macos")]
 use crate::state::KEYCHAIN_SERVICE_NAME;
+#[cfg(target_os = "linux")]
+use crate::state::prepare_state_directory_from_environment;
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+struct FileKeychainOptions {
+    passphrase: std::sync::Mutex<Option<Zeroizing<String>>>,
+    interactive: bool,
+}
+
+#[cfg(target_os = "linux")]
+static FILE_KEYCHAIN_OPTIONS: std::sync::OnceLock<FileKeychainOptions> = std::sync::OnceLock::new();
+
+/// Configure the Go-compatible file keychain before opening it on Linux.
+pub fn configure_file_keychain(passphrase: Option<String>, interactive: bool) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = FILE_KEYCHAIN_OPTIONS.set(FileKeychainOptions {
+            passphrase: std::sync::Mutex::new(passphrase.map(Zeroizing::new)),
+            interactive,
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (passphrase, interactive);
+    }
+}
 
 pub const ACCOUNT_KEY: &str = "account";
 pub const KBSYNC_CACHE_KEY: &str = "kbsync-v1";
@@ -63,10 +91,82 @@ pub fn open_system_keychain() -> Result<Box<dyn CredentialStore + Send + Sync>> 
     {
         Ok(Box::new(MacKeychain))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let options = FILE_KEYCHAIN_OPTIONS
+            .get()
+            .context("file keychain is not configured")?;
+        let directory = prepare_state_directory_from_environment()?;
+        open_file_keychain(directory, options)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         bail!("system credential storage is not yet implemented for this platform")
     }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn open_file_keychain(
+    directory: std::path::PathBuf,
+    options: &FileKeychainOptions,
+) -> Result<Box<dyn CredentialStore + Send + Sync>> {
+    let mut stored = options
+        .passphrase
+        .lock()
+        .map_err(|_| anyhow!("file keychain lock failed"))?;
+    if stored.is_none() {
+        if !options.interactive {
+            bail!("keychain passphrase is required; use --keychain-passphrase");
+        }
+        *stored = Some(Zeroizing::new(prompt_file_passphrase()?));
+    }
+    let passphrase = stored
+        .as_ref()
+        .expect("passphrase initialized")
+        .as_str()
+        .to_owned();
+    drop(stored);
+    Ok(Box::new(FileKeychain::new(directory, passphrase)?))
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn prompt_file_passphrase() -> Result<String> {
+    use std::io::{self, Write};
+
+    struct EchoGuard(libc::termios);
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            // SAFETY: this restores the settings read from the same terminal.
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0) };
+        }
+    }
+    // SAFETY: tcgetattr initializes the termios value before it is used.
+    let mut original: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: stdin is checked by the CLI before enabling interactive mode.
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut original) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("read terminal settings");
+    }
+    let mut hidden = original;
+    hidden.c_lflag &= !libc::ECHO;
+    eprint!("enter passphrase to unlock ipatool file keychain (separate from Apple ID password): ");
+    io::stderr().flush()?;
+    // SAFETY: hidden is derived from valid terminal settings.
+    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &hidden) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("hide keychain passphrase input");
+    }
+    let guard = EchoGuard(original);
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("read keychain passphrase")?;
+    drop(guard);
+    eprintln!();
+    let passphrase = input.trim_end_matches(['\r', '\n']).to_owned();
+    input.zeroize();
+    if passphrase.is_empty() {
+        bail!("file keychain passphrase must not be empty");
+    }
+    Ok(passphrase)
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -173,6 +273,36 @@ impl<S: CredentialStore> AccountStore<S> {
 mod tests {
     use super::*;
     use std::{collections::HashMap, sync::Mutex};
+
+    #[cfg(unix)]
+    #[test]
+    fn file_keychain_supports_account_store_without_reprompting() {
+        let directory = tempfile::tempdir().unwrap();
+        let options = FileKeychainOptions {
+            passphrase: Mutex::new(Some(Zeroizing::new("test passphrase".into()))),
+            interactive: false,
+        };
+        let store =
+            AccountStore::new(open_file_keychain(directory.path().to_owned(), &options).unwrap());
+        let mut account = Account::default();
+        account.email = "person@example.test".into();
+        account.password_token = "test token".into();
+        store.save(&account).unwrap();
+        let reopened =
+            AccountStore::new(open_file_keychain(directory.path().to_owned(), &options).unwrap());
+        assert_eq!(reopened.load().unwrap().email, account.email);
+        assert_eq!(
+            reopened.load().unwrap().password_token,
+            account.password_token
+        );
+        reopened.revoke().unwrap();
+
+        let missing = FileKeychainOptions {
+            passphrase: Mutex::new(None),
+            interactive: false,
+        };
+        assert!(open_file_keychain(directory.path().to_owned(), &missing).is_err());
+    }
 
     #[derive(Default)]
     struct MemoryStore(Mutex<HashMap<String, Vec<u8>>>);
