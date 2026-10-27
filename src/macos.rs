@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use url::Url;
 
-use crate::{App, vision::serialized_server_data};
+use crate::{App, buy_params::parse_buy_params, vision::serialized_server_data};
 
 pub fn product_url(app_id: i64, country: &str) -> Result<Url> {
     let mut url = Url::parse(&format!(
@@ -51,14 +51,8 @@ fn collect_versions(value: &Value, app: &App, versions: &mut HashSet<String>) {
                         .get("buyParams")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    let params: std::collections::HashMap<_, _> =
-                        url::form_urlencoded::parse(buy_params.as_bytes())
-                            .into_owned()
-                            .collect();
-                    if params
-                        .get("salableAdamId")
-                        .and_then(|id| id.parse::<i64>().ok())
-                        == Some(app.id)
+                    if let Ok(params) = parse_buy_params(buy_params)
+                        && params.get("salableAdamId") == Some(&app.id.to_string())
                         && let Some(version) = params.get("appExtVrsId")
                         && version.parse::<u64>().ok().is_some_and(|id| id != 0)
                     {
@@ -115,6 +109,8 @@ mod tests {
             r#"{"purchaseConfiguration":{"bundleId":"com.nebula.karing","appPlatforms":["phone"],"buyParams":"salableAdamId=6472431552&appExtVrsId=876660716"}}"#,
             r#"{"purchaseConfiguration":{"bundleId":"other","appPlatforms":["mac"],"buyParams":"salableAdamId=6472431552&appExtVrsId=876660716"}}"#,
             r#"{"purchaseConfiguration":{"bundleId":"com.nebula.karing","appPlatforms":["mac"],"buyParams":"salableAdamId=6472431552&appExtVrsId=invalid"}}"#,
+            r#"{"purchaseConfiguration":{"bundleId":"com.nebula.karing","appPlatforms":["mac"],"buyParams":"salableAdamId=6472431552&appExtVrsId=123&other=%zz"}}"#,
+            r#"{"purchaseConfiguration":{"bundleId":"com.nebula.karing","appPlatforms":["mac"],"buyParams":"salableAdamId=06472431552&appExtVrsId=876660716"}}"#,
             &format!(
                 "[{MAC_OFFER},{{\"purchaseConfiguration\":{{\"bundleId\":\"com.nebula.karing\",\"appPlatforms\":[\"mac\"],\"buyParams\":\"salableAdamId=6472431552&appExtVrsId=123\"}}}}]"
             ),

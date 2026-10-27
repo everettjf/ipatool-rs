@@ -6,7 +6,10 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use url::Url;
 
-use crate::{App, CatalogClient, Platform, catalog::validate_country, macos, vision};
+use crate::{
+    App, CatalogClient, Platform, buy_params::parse_buy_params, catalog::validate_country, macos,
+    vision,
+};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum VersionLookupNotFound {
@@ -151,10 +154,8 @@ fn mdm_version_id(value: &Value, app_id: i64) -> Result<Option<String>> {
         .get("buyParams")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let params: std::collections::HashMap<_, _> =
-        url::form_urlencoded::parse(buy_params.as_bytes())
-            .into_owned()
-            .collect();
+    let params = parse_buy_params(buy_params)
+        .map_err(|error| anyhow!("failed to parse buy params: {error}"))?;
     let id = params.get("appExtVrsId").cloned().unwrap_or_default();
     if id.is_empty() {
         bail!("platform version lookup returned no external version id");
@@ -245,6 +246,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(mdm_version_id(&data, 42).unwrap(), Some("456".into()));
+        let malformed =
+            serde_json::json!({"results": {"42": {"offers": [{"buyParams": "appExtVrsId=%zz"}]}}});
+        assert!(mdm_version_id(&malformed, 42).is_err());
+        let duplicate = serde_json::json!({"results": {"42": {"offers": [{"buyParams": "appExtVrsId=456&appExtVrsId=789"}]}}});
+        assert_eq!(mdm_version_id(&duplicate, 42).unwrap(), Some("456".into()));
         assert_eq!(mdm_version_id(&data, 43).unwrap(), None);
         assert_eq!(
             mdm_missing_reason(&data, 43),

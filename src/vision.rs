@@ -77,11 +77,8 @@ fn vision_version_id(value: &Value, app_id: i64) -> Option<String> {
                     return None;
                 }
                 let buy_params = config.get("buyParams")?.as_str()?;
-                let values: std::collections::HashMap<_, _> =
-                    url::form_urlencoded::parse(buy_params.as_bytes())
-                        .into_owned()
-                        .collect();
-                if values.get("salableAdamId")?.parse::<i64>().ok()? != app_id {
+                let values = crate::buy_params::parse_buy_params(buy_params).ok()?;
+                if values.get("salableAdamId")? != &app_id.to_string() {
                     return None;
                 }
                 Some(values.get("appExtVrsId").cloned().unwrap_or_default())
@@ -223,5 +220,15 @@ mod tests {
             product_version_id(body, 101).unwrap_err().to_string(),
             "visionOS purchase configuration was not found"
         );
+        for buy_params in [
+            "salableAdamId=100&appExtVrsId=123&other=%zz",
+            "salableAdamId=0100&appExtVrsId=123",
+        ] {
+            let body = format!(
+                "<script id=\"serialized-server-data\">{}</script>",
+                serde_json::json!({"purchaseConfiguration": {"metricsPlatformDisplayStyle": "vision", "appPlatforms": ["vision"], "buyParams": buy_params}})
+            );
+            assert!(product_version_id(&body, 100).is_err());
+        }
     }
 }
