@@ -36,12 +36,7 @@ fn read_preflight_version_metadata_using(
     transport: Option<&Transport>,
 ) -> Result<VersionMetadata> {
     let url = Url::parse(url).context("invalid Mac preflight URL")?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         bail!("unsupported Mac preflight URL");
     }
     let mut response = if let Some(transport) = transport {
@@ -367,25 +362,30 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let package = fixture_xar(DISTRIBUTION);
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 4096];
-            let read = stream.read(&mut request).unwrap();
-            assert!(request[..read].starts_with(b"GET /preflight.pkg HTTP/1.1"));
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                package.len()
-            );
-            stream.write_all(header.as_bytes()).unwrap();
-            stream.write_all(&package).unwrap();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                assert!(request[..read].starts_with(b"GET /preflight.pkg HTTP/1.1"));
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    package.len()
+                );
+                stream.write_all(header.as_bytes()).unwrap();
+                stream.write_all(&package).unwrap();
+            }
         });
-        let metadata = read_preflight_version_metadata(
-            &format!("http://{address}/preflight.pkg"),
-            "com.example.mac",
-        )
-        .unwrap();
+        let url = format!("http://user:pass@{address}/preflight.pkg#fragment");
+        let metadata = read_preflight_version_metadata(&url, "com.example.mac").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let transport = Transport::with_cookies(directory.path()).unwrap();
+        let streamed =
+            read_preflight_version_metadata_with_transport(&url, "com.example.mac", &transport)
+                .unwrap();
         server.join().unwrap();
         assert_eq!(metadata.display_version, "4.2");
         assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
+        assert_eq!(streamed, metadata);
     }
 
     #[test]

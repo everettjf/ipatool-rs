@@ -65,7 +65,6 @@ fn is_main_info_plist(path: &str) -> bool {
     parts.len() == 3
         && parts[0] == "Payload"
         && parts[1].ends_with(".app")
-        && parts[1].len() > ".app".len()
         && parts[2] == "Info.plist"
 }
 
@@ -164,12 +163,7 @@ struct HttpRangeReader {
 impl HttpRangeReader {
     fn open(url: &str, sender: Arc<Sender>) -> Result<Self> {
         let url = Url::parse(url).context("invalid IPA download URL")?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
             bail!("unsupported IPA download URL");
         }
         let probe = send_range(&sender, &url, 0, 0)?;
@@ -373,12 +367,12 @@ mod tests {
     }
 
     #[test]
-    fn reads_metadata_from_http_ipa_url() {
+    fn reads_metadata_from_http_ipa_url_with_userinfo_and_fragment() {
         let info = br#"<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>2.3.4</string></dict></plist>"#;
         let data = Arc::new(fixture_ipa(info));
         let served = Arc::new(AtomicUsize::new(0));
         let metadata = read_version_metadata_with_sender(
-            "http://example.test/app.ipa",
+            "http://user:pass@example.test/app.ipa#fragment",
             fixture_sender(Arc::clone(&data), Arc::clone(&served)),
         )
         .unwrap();
