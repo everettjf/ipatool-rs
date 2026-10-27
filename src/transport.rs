@@ -39,7 +39,15 @@ static SHARED_COOKIES: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<SavedCookies>>
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub const DEFAULT_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_STORE_RESPONSE_BODY: usize = 32 << 20;
 static VERBOSE_HTTP: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+enum BodyPolicy {
+    Unbounded,
+    Sap(usize),
+    Store(usize),
+}
 
 pub fn set_verbose(enabled: bool) {
     VERBOSE_HTTP.store(enabled, Ordering::Relaxed);
@@ -193,10 +201,19 @@ impl Transport {
     }
 
     pub fn send(&self, request: Request) -> Result<Response> {
+        self.send_with_policy(request, BodyPolicy::Unbounded)
+    }
+
+    /// Bound decoded Store API responses while retaining finance error bodies.
+    pub(crate) fn send_store(&self, request: Request) -> Result<Response> {
+        self.send_with_policy(request, BodyPolicy::Store(MAX_STORE_RESPONSE_BODY))
+    }
+
+    fn send_with_policy(&self, request: Request, policy: BodyPolicy) -> Result<Response> {
         let trace = VERBOSE_HTTP
             .load(Ordering::Relaxed)
             .then(|| (request.method.clone(), request.url.clone(), Instant::now()));
-        let result = self.send_inner(request, None);
+        let result = self.send_inner(request, policy);
         if let Some((method, url, started)) = trace {
             let status = result.as_ref().map_or_else(
                 |_| "error".to_owned(),
@@ -212,7 +229,7 @@ impl Transport {
 
     /// Share Store cookies while bounding responses from setup endpoints.
     pub(crate) fn send_bounded(&self, request: Request, max_body: usize) -> Result<Response> {
-        self.send_inner(request, Some(max_body))
+        self.send_with_policy(request, BodyPolicy::Sap(max_body))
     }
 
     /// Send a Store transfer without buffering its body. Transfers share the
@@ -302,9 +319,9 @@ impl Transport {
         unreachable!("redirect limit returns before loop exhaustion")
     }
 
-    fn send_inner(&self, request: Request, max_body: Option<usize>) -> Result<Response> {
+    fn send_inner(&self, request: Request, policy: BodyPolicy) -> Result<Response> {
         if let Some(cookies) = &self.cookies {
-            return self.send_with_cookies(request, cookies, max_body);
+            return self.send_with_cookies(request, cookies, policy);
         }
         let client = if request.no_redirects {
             &self.no_redirects
@@ -321,14 +338,14 @@ impl Transport {
             builder = builder.timeout(timeout);
         }
         let response = builder.send().context("request failed")?;
-        Self::response_from_http(response, max_body)
+        Self::response_from_http(response, policy)
     }
 
     fn send_with_cookies(
         &self,
         request: Request,
         cookies: &Mutex<SavedCookies>,
-        max_body: Option<usize>,
+        policy: BodyPolicy,
     ) -> Result<Response> {
         let mut method = request.method;
         let mut url = request.url;
@@ -378,10 +395,10 @@ impl Transport {
                 .get(LOCATION)
                 .and_then(|value| value.to_str().ok())
             else {
-                return Self::response_from_http(response, max_body);
+                return Self::response_from_http(response, policy);
             };
             if request.no_redirects || !matches!(status, 301 | 302 | 303 | 307 | 308) {
-                return Self::response_from_http(response, max_body);
+                return Self::response_from_http(response, policy);
             }
             if redirects == 10 {
                 bail!("too many HTTP redirects");
@@ -407,7 +424,7 @@ impl Transport {
         unreachable!("redirect limit returns before loop exhaustion")
     }
 
-    fn response_from_http(response: HttpResponse, max_body: Option<usize>) -> Result<Response> {
+    fn response_from_http(response: HttpResponse, policy: BodyPolicy) -> Result<Response> {
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -419,23 +436,27 @@ impl Transport {
                 )
             })
             .collect();
-        let body = if max_body.is_some() && status != 200 {
-            Vec::new()
-        } else if let Some(limit) = max_body {
-            let mut body = Vec::new();
-            response
-                .take(limit.saturating_add(1) as u64)
-                .read_to_end(&mut body)
-                .context("failed to read response body")?;
-            if body.len() > limit {
-                bail!("Apple response exceeds {limit} bytes");
+        let body = match policy {
+            BodyPolicy::Sap(_) if status != 200 => Vec::new(),
+            BodyPolicy::Sap(limit) | BodyPolicy::Store(limit) => {
+                let mut body = Vec::new();
+                response
+                    .take(limit.saturating_add(1) as u64)
+                    .read_to_end(&mut body)
+                    .context("failed to read response body")?;
+                if body.len() > limit {
+                    match policy {
+                        BodyPolicy::Store(_) => bail!("Store API response exceeds size limit"),
+                        BodyPolicy::Sap(_) => bail!("Apple response exceeds {limit} bytes"),
+                        BodyPolicy::Unbounded => unreachable!(),
+                    }
+                }
+                body
             }
-            body
-        } else {
-            response
+            BodyPolicy::Unbounded => response
                 .bytes()
                 .context("failed to read response body")?
-                .to_vec()
+                .to_vec(),
         };
         Ok(Response {
             status,
@@ -757,5 +778,43 @@ mod tests {
             saved.header_for(&url, OffsetDateTime::now_utc()).as_deref(),
             Some("auth=dummy")
         );
+    }
+
+    #[test]
+    fn store_response_limit_keeps_server_error_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for (status, body) in [("200 OK", "12345"), ("500 Error", "oops")] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let transport = Transport::new().unwrap();
+        let url = Url::parse(&format!("http://{address}/store")).unwrap();
+        let error = transport
+            .send_with_policy(Request::get(url.clone()), BodyPolicy::Store(4))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("response exceeds size limit"));
+        let response = transport
+            .send_with_policy(Request::get(url), BodyPolicy::Store(4))
+            .unwrap();
+        assert_eq!(response.status, 500);
+        assert_eq!(response.body, b"oops");
+        server.join().unwrap();
     }
 }

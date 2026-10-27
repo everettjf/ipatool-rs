@@ -53,7 +53,7 @@ impl NativeOwnedBackend {
         let state_directory = prepare_state_directory_from_environment()?;
         let transport = Arc::new(Transport::with_cookies(&state_directory)?);
         Ok(Self::with_sender(hardware_id, move |request| {
-            transport.send(request)
+            transport.send_store(request)
         }))
     }
 

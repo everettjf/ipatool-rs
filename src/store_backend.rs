@@ -63,7 +63,7 @@ impl StoreBackend {
         Self::with_sender(
             assets.apple_media_services.clone(),
             hardware_id,
-            move |request| transport.send(request),
+            move |request| transport.send_store(request),
         )
     }
 

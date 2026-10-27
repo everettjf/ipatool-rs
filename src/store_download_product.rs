@@ -189,16 +189,15 @@ impl DownloadProductClient {
         let transport = Arc::new(Transport::with_cookies(&state_directory)?);
         let credentials = Arc::from(open_system_keychain()?);
         let sender_transport = Arc::clone(&transport);
-        Ok(
-            Self::with_sender(hardware_id, move |request| sender_transport.send(request))
-                .with_transfer_transport(transport)
-                .with_credential_store(credentials)
-                .with_kbsync_generator(|hardware, dsid| {
-                    let bundle =
-                        SapAssetBundle::load_or_download().context("load StoreAgent assets")?;
-                    create_kbsync(&bundle, &hardware, dsid).context("generate download KBSync")
-                }),
-        )
+        Ok(Self::with_sender(hardware_id, move |request| {
+            sender_transport.send_store(request)
+        })
+        .with_transfer_transport(transport)
+        .with_credential_store(credentials)
+        .with_kbsync_generator(|hardware, dsid| {
+            let bundle = SapAssetBundle::load_or_download().context("load StoreAgent assets")?;
+            create_kbsync(&bundle, &hardware, dsid).context("generate download KBSync")
+        }))
     }
 
     pub fn with_sender(
