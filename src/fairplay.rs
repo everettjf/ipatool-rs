@@ -160,6 +160,28 @@ pub fn inspect_sinf(bytes: &[u8]) -> Result<SinfDiagnostic> {
     })
 }
 
+fn has_sinf_extension(name: &str) -> bool {
+    // Go's strings.ToLower uses the simple Unicode mapping: U+0130 becomes
+    // `i`, while Rust's full lowercase mapping yields `i` plus a combining dot.
+    let mut chars = name.chars().rev();
+    for expected in ['f', 'n', 'i', 's', '.'] {
+        let Some(ch) = chars.next() else {
+            return false;
+        };
+        let lower = if ch == '\u{0130}' {
+            Some('i')
+        } else {
+            let mut lower = ch.to_lowercase();
+            let first = lower.next();
+            first.filter(|_| lower.next().is_none())
+        };
+        if lower != Some(expected) {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn inspect_ipa_sinfs(path: &Path) -> Result<Vec<SinfDiagnostic>> {
     let file = fs::File::open(path).with_context(|| format!("open IPA: {}", path.display()))?;
     let mut archive = ZipArchive::new(file).context("open IPA ZIP archive")?;
@@ -167,7 +189,7 @@ pub fn inspect_ipa_sinfs(path: &Path) -> Result<Vec<SinfDiagnostic>> {
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).context("read IPA ZIP member")?;
         let name = entry.name()?.into_owned();
-        if !name.contains("/SC_Info/") || !name.to_ascii_lowercase().ends_with(".sinf") {
+        if !name.contains("/SC_Info/") || !has_sinf_extension(&name) {
             continue;
         }
         let mut bytes = Vec::new();
@@ -679,6 +701,30 @@ mod tests {
         assert_eq!(
             diagnostics[0].path.as_deref(),
             Some("Payload/A.app/SC_Info/A.sinf")
+        );
+    }
+
+    #[test]
+    fn matches_go_unicode_lowercase_for_sinf_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.ipa");
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for name in [
+            "Payload/A.app/SC_Info/A.SİNF",
+            "Payload/A.app/SC_Info/A.Si\u{307}nf",
+        ] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&sinf(SinfSelector { user: 1, key: 2 }, 440))
+                .unwrap();
+        }
+        zip.finish().unwrap();
+        let diagnostics = inspect_ipa_sinfs(&path).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].path.as_deref(),
+            Some("Payload/A.app/SC_Info/A.SİNF")
         );
     }
 
