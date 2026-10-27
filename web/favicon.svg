@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="ipatool-rs terminal icon">
+  <rect width="64" height="64" rx="10" fill="#050a06"/>
+  <rect x="3" y="3" width="58" height="58" rx="7" fill="none" stroke="#8dff9b" stroke-width="2"/>
+  <path d="m16 22 14 10-14 10" fill="none" stroke="#8dff9b" stroke-linecap="square" stroke-width="5"/>
+  <path d="M35 43h14" fill="none" stroke="#8dff9b" stroke-linecap="square" stroke-width="5"/>
+</svg>
