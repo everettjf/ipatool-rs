@@ -1113,10 +1113,11 @@ impl DownloadProductResponse {
         if self.status != 200 || !self.data.failure_type.is_empty() || !self.data.items.is_empty() {
             return false;
         }
+        if self.data.customer_message.is_empty() {
+            return true;
+        }
         let message = self.data.customer_message.trim().to_ascii_lowercase();
-        message.is_empty()
-            || message == "no longer available"
-            || message.ends_with(" no longer available")
+        message == "no longer available" || message.ends_with(" no longer available")
     }
 }
 
@@ -1530,6 +1531,21 @@ mod tests {
         }
         response.data.failure_type = "2034".into();
         assert!(validate_strict_fallback(&response, &app(), "101", "update").is_ok());
+    }
+
+    #[test]
+    fn whitespace_only_store_message_is_not_an_empty_response() {
+        let response = DownloadProductResponse {
+            status: 200,
+            data: DownloadProductResult {
+                failure_type: String::new(),
+                customer_message: "  \t  ".into(),
+                items: Vec::new(),
+            },
+            capture: None,
+            empty_http_500: false,
+        };
+        assert!(!response.is_empty_or_unavailable());
     }
 
     #[test]
