@@ -79,8 +79,7 @@ impl SavedCookies {
             .entries
             .iter()
             .filter(|entry| {
-                !entry.value.is_empty()
-                    && !entry.canonical_host.is_empty()
+                !entry.canonical_host.is_empty()
                     && jar_key(&entry.canonical_host) == jar_key(&host)
                     && valid_cookie_pair(&entry.name, &entry.value)
                     && OffsetDateTime::parse(&entry.expires, &Rfc3339)
@@ -473,6 +472,24 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn sends_unexpired_empty_value_cookie_like_go_jar() {
+        let directory = tempfile::tempdir().unwrap();
+        let url = Url::parse("https://example.test/store").unwrap();
+        let now = OffsetDateTime::parse("2026-01-01T00:00:00Z", &Rfc3339).unwrap();
+        let mut jar = SavedCookies::open(directory.path()).unwrap();
+        jar.set_cookie(&url, "empty=; Path=/; Max-Age=3600", now);
+        assert_eq!(jar.header_for(&url, now).as_deref(), Some("empty="));
+        jar.save(now).unwrap();
+        let reopened = SavedCookies::open(directory.path()).unwrap();
+        assert_eq!(reopened.header_for(&url, now).as_deref(), Some("empty="));
+        assert!(
+            reopened
+                .header_for(&url, now + time::Duration::hours(2))
+                .is_none()
+        );
     }
 
     #[test]
