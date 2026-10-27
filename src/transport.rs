@@ -96,6 +96,8 @@ pub struct Response {
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub set_cookie_headers: Vec<String>,
+    /// Go's http.Response.ContentLength: -1 when the wire length is unknown.
+    pub content_length: i64,
     pub body: Vec<u8>,
 }
 
@@ -427,6 +429,10 @@ impl Transport {
 
     fn response_from_http(response: HttpResponse, policy: BodyPolicy) -> Result<Response> {
         let status = response.status().as_u16();
+        let content_length = response
+            .content_length()
+            .and_then(|length| i64::try_from(length).ok())
+            .unwrap_or(-1);
         let set_cookie_headers = response
             .headers()
             .get_all(SET_COOKIE)
@@ -470,6 +476,7 @@ impl Transport {
             status,
             headers,
             set_cookie_headers,
+            content_length,
             body,
         })
     }
@@ -558,6 +565,7 @@ mod tests {
     fn response(status: u16, body: &str) -> Response {
         Response {
             set_cookie_headers: Vec::new(),
+            content_length: 0,
             status,
             headers: HashMap::new(),
             body: body.as_bytes().to_vec(),
@@ -657,6 +665,7 @@ mod tests {
             ))
             .unwrap();
         server.join().unwrap();
+        assert_eq!(response.content_length, 2);
         assert_eq!(
             response.set_cookie_headers,
             ["one=1; Path=/", "two=2; Path=/"]
@@ -674,6 +683,33 @@ mod tests {
             .unwrap();
         assert!(header.contains("one=1"));
         assert!(header.contains("two=2"));
+    }
+
+    #[test]
+    fn chunked_store_response_has_unknown_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nok\r\n0\r\n\r\n").unwrap();
+        });
+        let response = Transport::new()
+            .unwrap()
+            .send_store(Request::get(
+                Url::parse(&format!("http://{address}/chunked")).unwrap(),
+            ))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.body, b"ok");
+        assert_eq!(response.content_length, -1);
     }
 
     #[test]

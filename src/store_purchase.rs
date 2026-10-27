@@ -388,6 +388,7 @@ mod tests {
     fn response(body: &str) -> Response {
         Response {
             set_cookie_headers: Vec::new(),
+            content_length: 0,
             status: 200,
             headers: std::collections::HashMap::from([(
                 "content-type".into(),

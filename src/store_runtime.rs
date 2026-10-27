@@ -4570,7 +4570,10 @@ fn perform_http(
             ("allHeaderFields".into(), headers),
             ("URL".into(), request_url),
             ("MIMEType".into(), mime),
-            ("expectedContentLength".into(), response.body.len() as u64),
+            (
+                "expectedContentLength".into(),
+                response.content_length as u64,
+            ),
         ]);
     state
         .objects
@@ -12367,6 +12370,7 @@ mod tests {
             assert_eq!(request.url.as_str(), "https://buy.itunes.apple.com/request");
             Ok(HostResponse {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
                 body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
@@ -12701,6 +12705,7 @@ mod tests {
             assert_eq!(request.url.as_str(), "https://buy.itunes.apple.com/request");
             Ok(HostResponse {
                 set_cookie_headers: vec!["one=1; Path=/".into(), "two=2; Path=/".into()],
+                content_length: -1,
                 status: 200,
                 headers: HashMap::from([
                     ("content-type".into(), "application/x-apple-plist".into()),
@@ -12721,6 +12726,7 @@ mod tests {
         assert!(runtime.state.borrow().objects.values().any(|object| {
             object.class == "NSHTTPURLResponse"
                 && object.properties.get("allHeaderFields") == Some(&response_headers)
+                && object.properties.get("expectedContentLength") == Some(&u64::MAX)
         }));
         let cookies = runtime
             .invoke(
@@ -12776,6 +12782,7 @@ mod tests {
             assert_eq!(request.headers.get("x-test").unwrap(), "present, second");
             Ok(HostResponse {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: HashMap::from([(
                     "content-type".into(),
@@ -12966,6 +12973,7 @@ mod tests {
             assert_eq!(body["price"], "0");
             Ok(HostResponse {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
                 body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
@@ -13019,6 +13027,7 @@ mod tests {
         runtime.set_transport(|_| {
             Ok(HostResponse {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
                 body: br#"<plist version="1.0"><dict><key>failureType</key><string>9610</string><key>customerMessage</key><string>fixture-value</string></dict></plist>"#.to_vec(),
@@ -13081,6 +13090,7 @@ mod tests {
             assert_eq!(body["why"], "signin");
             Ok(HostResponse {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
                 body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
@@ -13138,6 +13148,7 @@ mod tests {
             assert_eq!(request.body.as_deref(), Some(b"session-id=7".as_slice()));
             Ok(HostResponse {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: HashMap::new(),
                 body: b"raw DMAP response".to_vec(),

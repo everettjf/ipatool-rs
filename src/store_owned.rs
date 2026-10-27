@@ -899,6 +899,7 @@ mod tests {
             };
             Ok(Response {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: std::collections::HashMap::new(),
                 body,
@@ -968,6 +969,7 @@ mod tests {
                 };
                 Ok(Response {
                     set_cookie_headers: Vec::new(),
+                    content_length: 0,
                     status: 200,
                     headers: std::collections::HashMap::new(),
                     body,
@@ -1030,6 +1032,7 @@ mod tests {
         };
         Ok(Response {
             set_cookie_headers: Vec::new(),
+            content_length: 0,
             status: 200,
             headers: std::collections::HashMap::new(),
             body,
@@ -1047,6 +1050,7 @@ mod tests {
             assert!(request.no_redirects);
             Ok(Response {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: std::collections::HashMap::new(),
                 body: br#"<plist version="1.0"><dict><key>urlBag</key><dict/></dict></plist>"#

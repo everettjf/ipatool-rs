@@ -1483,6 +1483,7 @@ mod tests {
         plist::to_writer_xml(&mut body, &value).unwrap();
         Response {
             set_cookie_headers: Vec::new(),
+            content_length: 0,
             status: 200,
             headers: Default::default(),
             body,
@@ -1663,6 +1664,7 @@ mod tests {
             if url.contains("/r/redownload") {
                 return Ok(Response {
                     set_cookie_headers: Vec::new(),
+                    content_length: 0,
                     status: 500,
                     headers: Default::default(),
                     body: Vec::new(),
@@ -1737,6 +1739,7 @@ mod tests {
             if path.ends_with("/r/redownload") {
                 return Ok(Response {
                     set_cookie_headers: Vec::new(),
+                    content_length: 0,
                     status: 500,
                     headers: Default::default(),
                     body: Vec::new(),
@@ -1938,6 +1941,7 @@ mod tests {
         let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| {
             Ok(Response {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: Default::default(),
                 body: br#"<plist version="1.0"><dict><key>urlBag</key><dict><key>redownloadProduct</key><string>https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/redownloadProduct</string></dict><key>unrelatedCertificate</key><data>AQID</data></dict></plist>"#.to_vec(),
@@ -1987,6 +1991,7 @@ mod tests {
         let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| {
             Ok(Response {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: Default::default(),
                 body: br#"<plist version="1.0"><dict><key>songList</key><array><dict>
@@ -2182,6 +2187,7 @@ mod tests {
             let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |_| {
                 Ok(Response {
                     set_cookie_headers: Vec::new(),
+                    content_length: 0,
                     status: 200,
                     headers: Default::default(),
                     body: body.as_bytes().to_vec(),
@@ -2213,6 +2219,7 @@ mod tests {
         let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| {
             Ok(Response {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: Default::default(),
                 body: br#"<plist version="1.0"><dict><key>songList</key><array><dict><key>URL</key><string>https://example.test/encrypted.pkg</string><key>preflightPackageURL</key><string>https://example.test/preflight.pkg</string><key>metadata</key><dict><key>software-platform</key><string>macos</string></dict><key>sinfs</key><array><dict><key>dpInfo</key><data>AQID</data></dict></array></dict></array></dict></plist>"#.to_vec(),
@@ -2740,6 +2747,7 @@ mod tests {
         let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |_| {
             Ok(Response {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: Default::default(),
                 body: body.clone(),
@@ -2822,6 +2830,7 @@ mod tests {
         let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |_| {
             Ok(Response {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: Default::default(),
                 body: plist.as_bytes().to_vec(),
@@ -2912,6 +2921,7 @@ mod tests {
             );
             Ok(Response {
                 set_cookie_headers: Vec::new(),
+                content_length: 0,
                 status: 200,
                 headers: Default::default(),
                 body: body.clone(),
