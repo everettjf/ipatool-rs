@@ -7531,6 +7531,33 @@ fn dispatch_message(
         }
     }
     match (class_method, selector) {
+        (true, "currentLocale" | "systemLocale") if class_name == "NSLocale" => {
+            let locale = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSLocale",
+                StoreValue::String("en_US".into()),
+            )?;
+            context.reg_write(REG_X0, locale)?;
+        }
+        (true, "preferredLanguages") if class_name == "NSLocale" => {
+            let language = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String("en-US".into()),
+            )?;
+            let languages = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSArray",
+                StoreValue::Addresses(vec![language]),
+            )?;
+            context.reg_write(REG_X0, languages)?;
+        }
         (false, "initWithObjectsAndKeys:") | (true, "dictionaryWithObjectsAndKeys:") => {
             let mut values = HashMap::new();
             let mut value = context.reg_read(REG_X0 + 2)?;
@@ -8943,6 +8970,18 @@ fn dispatch_message(
                 StoreValue::String(value),
             )?;
             context.reg_write(REG_X0, string)?;
+        }
+        (false, "description") if class_is_kind_of(profile, &class_name, "NSString") => {
+            context.reg_write(REG_X0, receiver)?;
+        }
+        (false, "appendString:") => {
+            let suffix = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
+            let StoreValue::String(value) = &mut state.objects.get_mut(&receiver).unwrap().value
+            else {
+                bail!("appendString: on nonstring object");
+            };
+            value.push_str(&suffix);
+            context.reg_write(REG_X0, 0)?;
         }
         (false, "componentsJoinedByString:") => {
             let separator = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
@@ -10403,6 +10442,71 @@ mod tests {
         for address in calls {
             assert_eq!(runtime.call(address, &[]).unwrap(), 123);
         }
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_mutable_string_append_and_description() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |selector: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.selector == selector)
+                .unwrap()
+                .address
+        };
+        let append = call_address("appendString:");
+        let description = call_address("description");
+        let receiver = runtime
+            .new_object("NSMutableString", StoreValue::String("Hello ".into()))
+            .unwrap();
+        let suffix = runtime
+            .new_object("NSString", StoreValue::String("世界".into()))
+            .unwrap();
+        assert_eq!(runtime.call(append, &[receiver, 0, suffix]).unwrap(), 0);
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), receiver).unwrap(),
+            "Hello 世界"
+        );
+        assert_eq!(runtime.call(description, &[suffix]).unwrap(), suffix);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_locale_methods_match_go_emulator() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |selector: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.selector == selector)
+                .unwrap()
+                .address
+        };
+        let locale_class =
+            runtime.profile.index.classes[runtime.profile.runtime.classes_by_name["NSLocale"]]
+                .address;
+        let current_locale = call_address("currentLocale");
+        let preferred_languages = call_address("preferredLanguages");
+        let locale = runtime.call(current_locale, &[locale_class]).unwrap();
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), locale).unwrap(),
+            "en_US"
+        );
+        let languages = runtime.call(preferred_languages, &[locale_class]).unwrap();
+        let state = runtime.state.borrow();
+        let StoreValue::Addresses(items) = &state.objects[&languages].value else {
+            panic!("preferredLanguages did not return an array");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(object_string_value(&state, items[0]).unwrap(), "en-US");
     }
 
     #[test]
