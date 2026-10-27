@@ -317,6 +317,9 @@ impl Transport {
                 headers.remove(COOKIE);
                 headers.remove(HOST);
             }
+            if next.host_str() != url.host_str() {
+                remove_store_account_headers(&mut headers);
+            }
             url = next;
         }
         unreachable!("redirect limit returns before loop exhaustion")
@@ -416,6 +419,9 @@ impl Transport {
                 headers.remove(COOKIE);
                 headers.remove(HOST);
             }
+            if next.host_str() != url.host_str() {
+                remove_store_account_headers(&mut headers);
+            }
             if status == 303 || (matches!(status, 301 | 302) && method == Method::POST) {
                 method = Method::GET;
                 body = None;
@@ -479,6 +485,12 @@ impl Transport {
             content_length,
             body,
         })
+    }
+}
+
+fn remove_store_account_headers(headers: &mut HeaderMap) {
+    for name in ["x-token", "x-dsid", "icloud-dsid"] {
+        headers.remove(name);
     }
 }
 
@@ -766,6 +778,53 @@ mod tests {
                 .as_deref(),
             Some("sid=dummy-value")
         );
+    }
+
+    #[test]
+    fn cross_host_redirect_drops_store_account_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut lines = Vec::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    lines.push(line.to_ascii_lowercase());
+                }
+                let has_header = |name: &str| {
+                    lines
+                        .iter()
+                        .any(|line| line.starts_with(&format!("{name}: ")))
+                };
+                assert!(has_header("x-ordinary"));
+                for name in ["x-token", "x-dsid", "icloud-dsid"] {
+                    assert_eq!(has_header(name), index < 2, "{name} on hop {index}");
+                }
+                match index {
+                    0 => stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /same\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap(),
+                    1 => stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/cross\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).unwrap(),
+                    _ => stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap(),
+                }
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let transport = Transport::with_cookies(directory.path()).unwrap();
+        let mut request =
+            Request::get(Url::parse(&format!("http://127.0.0.1:{port}/start")).unwrap());
+        for name in ["x-token", "x-dsid", "icloud-dsid", "x-ordinary"] {
+            request
+                .headers
+                .insert(name, HeaderValue::from_static("fixture"));
+        }
+        let response = transport.send_store(request).unwrap();
+        server.join().unwrap();
+        assert_eq!(response.body, b"ok");
     }
 
     #[test]
