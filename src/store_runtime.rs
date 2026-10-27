@@ -2503,6 +2503,44 @@ fn dispatch_call(
             let bundle = new_main_bundle(context, profile, state)?;
             context.reg_write(REG_X0, bundle)?;
         }
+        "CFBundleGetIdentifier" => {
+            let bundle = context.reg_read(REG_X0)?;
+            let object = state.objects.get(&bundle).context("unknown CFBundle")?;
+            if object.class != "NSBundle" {
+                bail!("CFBundle identifier receiver is not a bundle");
+            }
+            context.reg_write(
+                REG_X0,
+                object
+                    .properties
+                    .get("bundleIdentifier")
+                    .copied()
+                    .unwrap_or(0),
+            )?;
+        }
+        "CFBundleCopyBundleURL" => {
+            let bundle = context.reg_read(REG_X0)?;
+            let object = state.objects.get(&bundle).context("unknown CFBundle")?;
+            if object.class != "NSBundle" {
+                bail!("CFBundle URL receiver is not a bundle");
+            }
+            let path = object
+                .properties
+                .get("bundlePath")
+                .copied()
+                .context("CFBundle has no path")?;
+            let path = object_string_value(state, path)?;
+            let url = url::Url::from_file_path(path)
+                .map_err(|_| anyhow::anyhow!("invalid CFBundle path"))?;
+            let url = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSURL",
+                StoreValue::String(url.to_string()),
+            )?;
+            context.reg_write(REG_X0, url)?;
+        }
         "CFBundleGetInfoDictionary" => {
             context.reg_write(REG_X0, new_bundle_info(context, profile, state)?)?;
         }
@@ -9672,6 +9710,9 @@ mod tests {
                 .address
         };
         let hash_call = call_address("CC_SHA512");
+        let main_bundle_call = call_address("CFBundleGetMainBundle");
+        let identifier_call = call_address("CFBundleGetIdentifier");
+        let bundle_url_call = call_address("CFBundleCopyBundleURL");
         let info_call = call_address("CFBundleGetInfoDictionary");
         let executable_call = call_address("CFBundleCopyExecutableURL");
 
@@ -9709,6 +9750,13 @@ mod tests {
             panic!("bundle executable URL is not a string");
         };
         assert_eq!(value, "file:///ipatool");
+        drop(state);
+
+        let bundle = runtime.call(main_bundle_call, &[]).unwrap();
+        let identifier = runtime.call(identifier_call, &[bundle]).unwrap();
+        assert_eq!(runtime.export(identifier).unwrap(), "me.majd.ipatool");
+        let bundle_url = runtime.call(bundle_url_call, &[bundle]).unwrap();
+        assert_eq!(runtime.export(bundle_url).unwrap(), "file:///ipatool");
     }
 
     #[test]
@@ -9892,7 +9940,7 @@ mod tests {
     }
 
     #[test]
-    fn swift_continuation_runs_pending_http_delegate_callbacks() {
+    fn swift_continuation_and_semaphore_run_pending_http_delegate_callbacks() {
         let assets = SapAssetBundle::load_cached().unwrap();
         let mut runtime = StoreRuntime::open(&assets).unwrap();
         let request = runtime
@@ -10003,6 +10051,44 @@ mod tests {
         let state = runtime.state.borrow();
         assert_eq!(state.objects[&http_task].properties["state"], 3);
         assert!(state.pending.is_empty());
+        drop(state);
+
+        let create_semaphore = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.symbol == "dispatch_semaphore_create")
+            .unwrap()
+            .address;
+        let wait_semaphore = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.symbol == "dispatch_semaphore_wait")
+            .unwrap()
+            .address;
+        let semaphore = runtime.call(create_semaphore, &[0]).unwrap();
+        {
+            let mut state = runtime.state.borrow_mut();
+            state.current_swift_task = None;
+            state.pending.push(PendingWork::Http { task: http_task });
+        }
+        let error = runtime.call(wait_semaphore, &[semaphore, 0]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("guest semaphore remains unsignaled"),
+            "{error:#}"
+        );
+        assert!(
+            runtime
+                .state
+                .borrow()
+                .http_responses
+                .contains_key(&http_task)
+        );
     }
 
     #[test]
