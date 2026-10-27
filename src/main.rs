@@ -18,7 +18,7 @@ use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2
 use ipatool_rs::fairplay_enrollment_v3::{V3Material, build_fpsenr3};
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
 use ipatool_rs::fairplay_key::CurrentSinfModel;
-use ipatool_rs::fairplay_oracle_export::export_26a428_model;
+use ipatool_rs::fairplay_oracle_export::export_checked_model;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
 use ipatool_rs::fairplay_recovery;
@@ -278,7 +278,7 @@ enum FairplayEnrollCommand {
         #[arg(long = "preserve-text-instruction", value_name = "ADDRESS")]
         preserve_text_instructions: Vec<String>,
     },
-    /// Export a private 26A428 oracle model from a checkpoint and memory trace.
+    /// Export a private 26A428 or 26B118 oracle model from a checkpoint and memory trace.
     ExportOracleModel {
         #[arg(long)]
         checkpoint: PathBuf,
@@ -286,6 +286,11 @@ enum FairplayEnrollCommand {
         fairplayd: PathBuf,
         #[arg(long)]
         memory_trace: PathBuf,
+        #[arg(
+            long,
+            help = "Private 26B118 JSON containing all learned index domains"
+        )]
+        index_domains: Option<PathBuf>,
         #[arg(long)]
         output: PathBuf,
     },
@@ -1307,6 +1312,7 @@ fn run() -> Result<()> {
                 checkpoint,
                 fairplayd,
                 memory_trace,
+                index_domains,
                 output,
             } => {
                 const MAX_FAIRPLAYD_BYTES: u64 = 256 * 1024 * 1024;
@@ -1324,7 +1330,12 @@ fn run() -> Result<()> {
                     bail!("fairplayd exceeds size limit");
                 }
                 let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
-                let model = export_26a428_model(&snapshot, &binary, &memory_trace)?;
+                let model = export_checked_model(
+                    &snapshot,
+                    &binary,
+                    &memory_trace,
+                    index_domains.as_deref(),
+                )?;
                 write_private_binary(&output, &model.compressed)?;
                 match cli.format {
                     Format::Json => println!(
@@ -1333,6 +1344,7 @@ fn run() -> Result<()> {
                             "schema": "fairplay.oracle-export.v1",
                             "model": output,
                             "pages": model.pages,
+                            "domains": model.domains,
                             "binary_sha256": format!("{:x}", Sha256::digest(&binary)),
                         })
                     ),
@@ -2358,16 +2370,43 @@ mod tests {
                         checkpoint,
                         fairplayd,
                         memory_trace,
+                        index_domains,
                         output,
                     },
             } => {
                 assert_eq!(checkpoint, PathBuf::from("/private/oracle.pkl.gz"));
                 assert_eq!(fairplayd, PathBuf::from("/private/fairplayd"));
                 assert_eq!(memory_trace, PathBuf::from("/private/oracle-trace.json"));
+                assert!(index_domains.is_none());
                 assert_eq!(output, PathBuf::from("/private/oracle-model.gz"));
             }
             _ => panic!("unexpected command"),
         }
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "export-oracle-model",
+            "--checkpoint",
+            "/private/26b118.pkl.gz",
+            "--fairplayd",
+            "/private/fairplayd",
+            "--memory-trace",
+            "/private/oracle-trace.json",
+            "--index-domains",
+            "/private/index-domains.json",
+            "--output",
+            "/private/oracle-model.gz",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::ExportOracleModel {
+                    index_domains: Some(_),
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]
