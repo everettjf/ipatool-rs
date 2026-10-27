@@ -810,20 +810,41 @@ fn validate_destinations(
     Ok(())
 }
 
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+fn file_identity(path: &Path) -> Result<(u64, u64)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        left.dev() == right.dev() && left.ino() == right.ino()
+        let metadata = fs::metadata(path)?;
+        Ok((metadata.dev(), metadata.ino()))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = (left, right);
-        false
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+
+        let file = File::open(path)?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: file is open and info is a writable structure of the required type.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        Ok((u64::from(info.dwVolumeSerialNumber), index))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        bail!("FairPlay publication needs file identity support on this platform")
     }
 }
 
 fn publish_staged(files: &[(&tempfile::NamedTempFile, &Path)], force: bool) -> Result<()> {
+    let staged_identities = files
+        .iter()
+        .map(|(staged, _)| file_identity(staged.path()))
+        .collect::<Result<Vec<_>>>()?;
     let mut backups = Vec::with_capacity(files.len());
     for (_, destination) in files {
         if force && destination.exists() {
@@ -838,22 +859,20 @@ fn publish_staged(files: &[(&tempfile::NamedTempFile, &Path)], force: bool) -> R
             backups.push(None);
         }
     }
-    let mut published: Vec<(PathBuf, fs::Metadata)> = Vec::new();
-    for (staged, destination) in files {
+    let mut published: Vec<(PathBuf, (u64, u64))> = Vec::new();
+    for ((staged, destination), staged_identity) in files.iter().zip(staged_identities) {
         let outcome = if force {
             fs::rename(staged.path(), destination)
         } else {
             fs::hard_link(staged.path(), destination)
         };
         if let Err(error) = outcome {
-            for ((previous, published_metadata), prior_backup) in published
+            for ((previous, published_identity), prior_backup) in published
                 .iter()
                 .rev()
                 .zip(backups[..published.len()].iter().rev())
             {
-                if fs::metadata(previous)
-                    .is_ok_and(|current| same_file(&current, published_metadata))
-                {
+                if file_identity(previous).is_ok_and(|current| current == *published_identity) {
                     if let Some((_, backup_path)) = prior_backup {
                         let _ = fs::rename(backup_path, previous);
                     } else {
@@ -863,7 +882,7 @@ fn publish_staged(files: &[(&tempfile::NamedTempFile, &Path)], force: bool) -> R
             }
             return Err(error).with_context(|| format!("publish {}", destination.display()));
         }
-        published.push((destination.to_path_buf(), fs::metadata(destination)?));
+        published.push((destination.to_path_buf(), staged_identity));
     }
     Ok(())
 }
@@ -1282,12 +1301,11 @@ mod tests {
     fn forced_publication_restores_previous_output_on_failure() {
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("output.ipa");
-        let report = directory.path().join("report.json");
+        let report = directory.path().join("missing/report.json");
         fs::write(&output, b"previous").unwrap();
         let mut first = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
         first.write_all(b"replacement").unwrap();
         let second = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
-        fs::remove_file(second.path()).unwrap();
         assert!(publish_staged(&[(&first, &output), (&second, &report)], true).is_err());
         assert_eq!(fs::read(&output).unwrap(), b"previous");
         assert!(!report.exists());

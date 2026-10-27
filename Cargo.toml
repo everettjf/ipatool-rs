@@ -64,7 +64,7 @@ secret-service = { version = "5.2.0", default-features = false, features = ["rt-
 
 [target.'cfg(target_os = "windows")'.dependencies]
 time = { version = "0.3", features = ["local-offset"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_Console"] }
 sevenz-rust = { version = "0.6.1", default-features = false }
 tar = "0.4"
 
