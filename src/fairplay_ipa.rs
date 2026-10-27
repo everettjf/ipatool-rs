@@ -1,7 +1,7 @@
 //! Apply a local enrollment model to all encrypted Mach-O images in an IPA.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -14,10 +14,13 @@ use zeroize::Zeroizing;
 use zip::{ZipArchive, ZipWriter, read::ZipFile, write::FullFileOptions};
 
 use crate::{
-    fairplay::{inspect_model_path, inspect_model_registry, parse_sinf_selector},
+    fairplay::{
+        EnrollmentModelDiagnostic, inspect_model_path, inspect_model_registry, parse_sinf_selector,
+    },
     fairplay_decrypt::{DecryptedSlice, decrypt_macho},
     fairplay_key::{CurrentSinfModel, missing_model_diagnostic},
-    fairplay_macho::{is_macho, parse_macho_slices, parse_macho_slices_probe},
+    fairplay_macho::{MachOSlice, is_macho, parse_macho_slices, parse_macho_slices_probe},
+    fairplay_page::{PageKeyDeriver, app_mask_from_logical_key},
     fairplay_supf::{PAGE_BYTES, Supf},
 };
 
@@ -32,26 +35,76 @@ pub struct IpaDecryptResult {
 struct ImageReport {
     member: String,
     supf_member: String,
-    #[serde(flatten)]
-    slice: DecryptedSlice,
+    architecture: String,
+    cpu_type: u32,
+    cpu_subtype: u32,
+    slice_offset: usize,
+    slice_size: usize,
+    encrypted_sha256: String,
+    decrypted_sha256: String,
+    cryptoff: usize,
+    cryptsize: usize,
+    pages: usize,
+    first_plaintext_page_sha256: String,
+    first_page_audit: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_page_valid_arm64_words: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    first_page_instruction_words: Option<usize>,
+    first_page_structurally_plausible: bool,
+    first_page_mnemonics: Option<BTreeMap<String, usize>>,
+    ordered_page_keys_sha256: String,
+    app_mask_sha256: String,
+    code_directories: Vec<crate::fairplay_codesign::CodeDirectoryAudit>,
+    cryptid_before: u32,
+    cryptid_after: u32,
+    exact_mutation_scope: bool,
 }
 
 #[derive(Serialize)]
 struct ReportFile {
     path: String,
     sha256: String,
-    bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct OracleEvidence {
+    device_state_imported: bool,
+    fairplayd_sha256: String,
+    hardware_backend: &'static str,
+    logical_key_sha256: String,
+    model_name: String,
+    model_sha256: String,
+    model_version: u32,
+    provider_kind: &'static str,
+    provider_status: u32,
+    request_ipa_sha256: String,
+    request_selector: String,
+    request_sinf_sha256: String,
+    runtime_hardware_calls: u32,
+    selector_status: u32,
+    state_origin: &'static str,
+    status_patched: bool,
 }
 
 #[derive(Serialize)]
 struct DecryptionReport {
     schema: &'static str,
+    model_build: String,
     input: ReportFile,
     output: ReportFile,
-    encrypted_images: usize,
-    decrypted_pages: usize,
+    provider: &'static str,
+    oracle: OracleEvidence,
+    encrypted_image_count: usize,
+    decrypted_page_count: usize,
     images: Vec<ImageReport>,
     complete: bool,
+    plaintext_verified: bool,
+    signature_verified: bool,
     warnings: [&'static str; 4],
 }
 
@@ -327,7 +380,113 @@ fn supf_for<'a>(member: &str, names: &'a HashSet<String>) -> Option<&'a str> {
     None
 }
 
-fn logical_key(model_path: &Path, sinf: &[u8]) -> Result<[u8; 16]> {
+fn macho_architecture(cpu_type: u32, cpu_subtype: u32) -> String {
+    match cpu_type {
+        0x0c => match cpu_subtype & 0xff {
+            6 => "armv6".to_owned(),
+            9 => "armv7".to_owned(),
+            10 => "armv7f".to_owned(),
+            11 => "armv7s".to_owned(),
+            12 => "armv7k".to_owned(),
+            13 => "armv8".to_owned(),
+            _ => "arm".to_owned(),
+        },
+        0x0100_000c if cpu_subtype & 0xff == 2 => "arm64e".to_owned(),
+        0x0100_000c => "arm64".to_owned(),
+        0x0200_000c => "arm64_32".to_owned(),
+        _ => format!("cpu-{cpu_type:#x}"),
+    }
+}
+
+struct ImageReportContext<'a> {
+    member: &'a str,
+    supf_member: &'a str,
+    before: &'a [u8],
+    after: &'a [u8],
+    supf: &'a Supf,
+    deriver: &'a PageKeyDeriver,
+    app_mask_sha256: &'a str,
+}
+
+fn image_report(
+    context: &ImageReportContext<'_>,
+    slice: &MachOSlice,
+    decrypted: DecryptedSlice,
+) -> Result<ImageReport> {
+    let layout = &slice.layout;
+    let id = slice.offset + layout.crypt_id_offset;
+    let start = slice.offset + layout.crypt_offset;
+    let end = start + layout.crypt_size;
+    if context.before.len() != context.after.len()
+        || end > context.before.len()
+        || id + 4 > start
+        || context.before[..id] != context.after[..id]
+        || context.before[id + 4..start] != context.after[id + 4..start]
+        || context.before[end..] != context.after[end..]
+    {
+        bail!(
+            "{}: decryption escaped the FairPlay mutation range",
+            context.member
+        );
+    }
+    let cryptid_after = u32::from_le_bytes(context.after[id..id + 4].try_into().unwrap());
+    if cryptid_after != 0 {
+        bail!(
+            "{}: decrypted Mach-O still has a nonzero cryptid",
+            context.member
+        );
+    }
+    let records = context
+        .supf
+        .records_for(layout.cpu_type, layout.cpu_subtype)?;
+    let offset = (slice.offset + layout.crypt_offset) as u64;
+    let mut keys_hash = Sha256::new();
+    for record in records {
+        let key = Zeroizing::new(
+            context
+                .deriver
+                .page_key(record[..16].try_into().unwrap(), offset),
+        );
+        keys_hash.update(&key[..]);
+    }
+    let audit = decrypted.first_page_audit.as_ref();
+    Ok(ImageReport {
+        member: context.member.to_owned(),
+        supf_member: context.supf_member.to_owned(),
+        architecture: macho_architecture(layout.cpu_type, layout.cpu_subtype),
+        cpu_type: layout.cpu_type,
+        cpu_subtype: layout.cpu_subtype,
+        slice_offset: slice.offset,
+        slice_size: slice.size,
+        encrypted_sha256: decrypted.encrypted_sha256,
+        decrypted_sha256: decrypted.decrypted_sha256,
+        cryptoff: layout.crypt_offset,
+        cryptsize: layout.crypt_size,
+        pages: decrypted.pages,
+        first_plaintext_page_sha256: decrypted.first_plaintext_page_sha256,
+        first_page_audit: if audit.is_some() {
+            "arm64-instruction-decode"
+        } else {
+            "not-performed"
+        },
+        first_page_valid_arm64_words: audit
+            .map(|value| value.valid_words)
+            .filter(|value| *value != 0),
+        first_page_instruction_words: audit
+            .map(|value| value.instruction_words)
+            .filter(|value| *value != 0),
+        first_page_structurally_plausible: audit.is_some(),
+        first_page_mnemonics: audit.map(|value| value.mnemonics.clone()),
+        ordered_page_keys_sha256: format!("{:x}", keys_hash.finalize()),
+        app_mask_sha256: context.app_mask_sha256.to_owned(),
+        code_directories: decrypted.code_directories,
+        cryptid_before: layout.crypt_id,
+        cryptid_after,
+        exact_mutation_scope: true,
+    })
+}
+
+fn logical_key(model_path: &Path, sinf: &[u8]) -> Result<([u8; 16], EnrollmentModelDiagnostic)> {
     let selector = parse_sinf_selector(sinf)?;
     let registry = fs::metadata(model_path)
         .context("inspect FairPlay enrollment model path")?
@@ -354,7 +513,8 @@ fn logical_key(model_path: &Path, sinf: &[u8]) -> Result<[u8; 16]> {
     let bytes = Zeroizing::new(
         fs::read(&compatible[0].path).context("read selected FairPlay enrollment model")?,
     );
-    CurrentSinfModel::parse(&bytes)?.logical_key(sinf)
+    let key = CurrentSinfModel::parse(&bytes)?.logical_key(sinf)?;
+    Ok((key, compatible.into_iter().next().unwrap()))
 }
 
 /// Decrypt an IPA into a new file. The input is never modified. The model must
@@ -377,7 +537,12 @@ pub fn decrypt_ipa_with_options(
     validate_unique_zip_members(&mut raw_source, &archive)?;
     preflight_encrypted_images(&mut archive)?;
     let (names, sinf) = find_sinf(&mut archive)?;
-    let key = Zeroizing::new(logical_key(model_path, &sinf)?);
+    let (logical, model) = logical_key(model_path, &sinf)?;
+    let key = Zeroizing::new(logical);
+    let deriver = PageKeyDeriver::from_logical_key(*key);
+    let app_mask = Zeroizing::new(app_mask_from_logical_key(*key));
+    let app_mask_sha256 = format!("{:x}", Sha256::digest(&app_mask[..]));
+    let input_sha256 = sha256_file(input)?;
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let temporary = tempfile::NamedTempFile::new_in(parent).context("create temporary IPA")?;
@@ -457,39 +622,85 @@ pub fn decrypt_ipa_with_options(
             .with_context(|| format!("write decrypted IPA member {name}"))?;
         images += reports.len();
         pages += reports.iter().map(|report| report.pages).sum::<usize>();
-        image_reports.extend(reports.into_iter().map(|slice| ImageReport {
-            member: name.clone(),
-            supf_member: supf_name.to_owned(),
-            slice,
-        }));
+        if reports.len()
+            != slices
+                .iter()
+                .filter(|slice| slice.layout.crypt_id != 0)
+                .count()
+        {
+            bail!("{name}: encrypted slice inventory changed during decryption");
+        }
+        let encrypted_slices = slices.iter().filter(|slice| slice.layout.crypt_id != 0);
+        let context = ImageReportContext {
+            member: &name,
+            supf_member: supf_name,
+            before: &blob,
+            after: &decrypted,
+            supf: &supf,
+            deriver: &deriver,
+            app_mask_sha256: &app_mask_sha256,
+        };
+        for (slice, decrypted_report) in encrypted_slices.zip(reports) {
+            image_reports.push(image_report(&context, slice, decrypted_report)?);
+        }
     }
     if images == 0 {
         bail!("IPA contains no supported encrypted Mach-O images");
     }
     writer.finish()?.sync_all().context("sync decrypted IPA")?;
-    let output_bytes = fs::metadata(temporary.path())?.len();
     let output_sha256 = sha256_file(temporary.path())?;
     let report_stage = if let Some(report_path) = report {
+        let selector = parse_sinf_selector(&sinf)?;
+        let model_name = format!("external-current-sinf-{}", &model.sha256[..16]);
+        let provider = if model.version == 3 {
+            "current-sinf-whitebox-direct-v3"
+        } else {
+            "current-sinf-whitebox-direct-v1"
+        };
         let report_data = DecryptionReport {
             schema: "ipatool-fairplay-decryption-v1",
+            model_build: model_name.clone(),
             input: ReportFile {
-                path: input.display().to_string(),
-                sha256: sha256_file(input)?,
-                bytes: fs::metadata(input)?.len(),
+                path: fs::canonicalize(input)?.display().to_string(),
+                sha256: input_sha256.clone(),
+                bytes: Some(fs::metadata(input)?.len()),
+                mode: None,
             },
             output: ReportFile {
-                path: output.display().to_string(),
+                path: canonical_target(output)?.display().to_string(),
                 sha256: output_sha256.clone(),
-                bytes: output_bytes,
+                bytes: None,
+                mode: Some("0600"),
             },
-            encrypted_images: images,
-            decrypted_pages: pages,
+            provider,
+            oracle: OracleEvidence {
+                device_state_imported: false,
+                fairplayd_sha256: model.fairplayd_sha256,
+                hardware_backend: "none",
+                logical_key_sha256: format!("{:x}", Sha256::digest(&key[..])),
+                model_name,
+                model_sha256: model.sha256,
+                model_version: model.version,
+                provider_kind: provider,
+                provider_status: 0,
+                request_ipa_sha256: input_sha256,
+                request_selector: selector.identifier(),
+                request_sinf_sha256: format!("{:x}", Sha256::digest(&sinf)),
+                runtime_hardware_calls: 0,
+                selector_status: 0,
+                state_origin: "external-enrollment-model",
+                status_patched: false,
+            },
+            encrypted_image_count: images,
+            decrypted_page_count: pages,
             images: image_reports,
             complete: true,
+            plaintext_verified: false,
+            signature_verified: false,
             warnings: [
-                "Plaintext correctness is not authenticated by the source CodeDirectory.",
-                "Only ARM64 first pages are checked for instruction plausibility.",
-                "CodeDirectory hashes refer to encrypted pages and become stale after decryption.",
+                "Complete means every inventoried encrypted image was processed; plaintext correctness is not authenticated.",
+                "Only ARM64 first pages are checked for instruction plausibility; ARMv7 plaintext, SUPF records, and subsequent plaintext are not authenticated.",
+                "CodeDirectory checks compare encrypted bytes with embedded hashes, not an authenticated Apple signature; those hashes are stale after decryption.",
                 "Analysis IPA requires recursive re-signing before installation.",
             ],
         };
@@ -774,7 +985,35 @@ mod tests {
         let report_data: serde_json::Value =
             serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
         assert_eq!(report_data["output"]["sha256"], result.output_sha256);
+        assert_eq!(report_data["output"]["mode"], "0600");
+        assert!(report_data["output"].get("bytes").is_none());
+        assert_eq!(report_data["encrypted_image_count"], 1);
+        assert_eq!(report_data["decrypted_page_count"], 1);
+        assert_eq!(report_data["provider"], "current-sinf-whitebox-direct-v1");
+        assert_eq!(
+            report_data["oracle"]["request_selector"],
+            "00000007:00000009"
+        );
+        assert_eq!(report_data["oracle"]["model_version"], 1);
+        assert_eq!(report_data["plaintext_verified"], false);
+        assert_eq!(report_data["signature_verified"], false);
         assert_eq!(report_data["images"].as_array().unwrap().len(), 1);
+        assert_eq!(report_data["images"][0]["architecture"], "arm64e");
+        assert_eq!(report_data["images"][0]["cryptoff"], 4096);
+        assert_eq!(report_data["images"][0]["cryptsize"], 4096);
+        assert_eq!(
+            report_data["images"][0]["first_page_mnemonics"]["NOP"],
+            1024
+        );
+        assert_eq!(
+            report_data["images"][0]["ordered_page_keys_sha256"],
+            "faae625eb5ec65fddbefe83887fe0535163b7b4653a7fdf5843d39d832182f80"
+        );
+        assert_eq!(
+            report_data["images"][0]["app_mask_sha256"],
+            "c6f10e37c99d2243bf590f0f0e2beed406b0391e056d255d3c12e194135fdb01"
+        );
+        assert_eq!(report_data["images"][0]["exact_mutation_scope"], true);
         assert!(
             decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), false).is_err()
         );
@@ -986,7 +1225,7 @@ mod tests {
             fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
         }
 
-        assert_eq!(logical_key(&model_path, &sinf).unwrap(), [0x31; 16]);
+        assert_eq!(logical_key(&model_path, &sinf).unwrap().0, [0x31; 16]);
         assert!(
             logical_key(&registry, &sinf)
                 .unwrap_err()
