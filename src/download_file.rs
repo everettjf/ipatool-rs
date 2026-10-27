@@ -170,11 +170,14 @@ fn download_file_with_progress(
     if !matches!(url.scheme(), "https" | "http") {
         bail!("package URL must use HTTP or HTTPS");
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o644);
+    }
+    let mut file = options
         .open(destination)
         .with_context(|| format!("open partial package {}", destination.display()))?;
     let local_size = file.metadata()?.len();
@@ -432,6 +435,36 @@ mod tests {
         assert_eq!(download_file(&url, &path).unwrap(), 3);
         server.join().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn new_partial_download_limits_mode_and_existing_mode_survives_restart() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.tmp");
+        let (url, _, server) =
+            spawn_server(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nnew");
+        assert_eq!(download_file(&url, &path).unwrap(), 3);
+        server.join().unwrap();
+        let created_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(created_mode & 0o022, 0);
+        if std::env::var_os("IPATOOL_TEST_UMASK_ZERO").is_some() {
+            assert_eq!(created_mode, 0o644);
+        }
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let (url, _, server) = spawn_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nreplaced",
+        );
+        assert_eq!(download_file(&url, &path).unwrap(), 8);
+        server.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replaced");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
