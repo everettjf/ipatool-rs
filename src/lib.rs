@@ -74,6 +74,7 @@ pub mod sap_remote;
 pub mod sap_shims;
 pub mod sap_signer;
 pub mod sap_system_os;
+mod slash_path;
 pub mod state;
 pub mod store_agent;
 pub mod store_backend;

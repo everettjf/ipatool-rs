@@ -22,6 +22,7 @@ use crate::{
     fairplay_macho::{MachOSlice, is_macho, parse_macho_slices, parse_macho_slices_probe},
     fairplay_page::{PageKeyDeriver, app_mask_from_logical_key},
     fairplay_supf::{PAGE_BYTES, Supf},
+    slash_path::clean_slash_path,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -382,30 +383,6 @@ fn write_reencoded(
         std::io::copy(member, writer)?;
     }
     Ok(())
-}
-
-fn clean_slash_path(path: &str) -> String {
-    let absolute = path.starts_with('/');
-    let mut parts = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." if parts.last().is_some_and(|previous| *previous != "..") => {
-                parts.pop();
-            }
-            ".." if !absolute => parts.push(part),
-            ".." => {}
-            _ => parts.push(part),
-        }
-    }
-    let cleaned = parts.join("/");
-    if absolute {
-        format!("/{cleaned}")
-    } else if cleaned.is_empty() {
-        ".".to_owned()
-    } else {
-        cleaned
-    }
 }
 
 fn supf_for<'a>(member: &str, names: &'a HashSet<String>) -> Option<&'a str> {

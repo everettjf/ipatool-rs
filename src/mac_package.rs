@@ -19,6 +19,7 @@ use crate::{
     download_file::{download_file, download_file_with_transport},
     ipa_metadata::VersionMetadata,
     sap_assets::SapAssetBundle,
+    slash_path::clean_slash_path,
     store_agent::StoreAgentSession,
     store_download_product::DownloadItem,
     transport::Transport,
@@ -192,6 +193,7 @@ fn read_package_version_from_path(path: &Path, bundle_id: &str) -> Result<Versio
                 Some((directory, _)) => format!("{directory}/Payload"),
                 None => "Payload".to_owned(),
             };
+            let payload = clean_slash_path(&payload);
             let modified = files
                 .iter()
                 .find(|(candidate, file)| {
@@ -477,6 +479,16 @@ mod tests {
         compressed_info: bool,
         truncate_stream: bool,
     ) -> Vec<u8> {
+        xar_with_package_info_directory(package_info, mtime, compressed_info, truncate_stream, None)
+    }
+
+    fn xar_with_package_info_directory(
+        package_info: &str,
+        mtime: Option<&str>,
+        compressed_info: bool,
+        truncate_stream: bool,
+        info_directory: Option<&str>,
+    ) -> Vec<u8> {
         let info = package_info.as_bytes();
         let payload = b"installer payload";
         let mut stored_info = if compressed_info {
@@ -500,8 +512,16 @@ mod tests {
         let mtime = mtime
             .map(|value| format!("<mtime>{value}</mtime>"))
             .unwrap_or_default();
+        let info_open = info_directory
+            .map(|name| format!("<file id=\"4\"><type>directory</type><name>{name}</name>"))
+            .unwrap_or_default();
+        let info_close = if info_directory.is_some() {
+            "</file>"
+        } else {
+            ""
+        };
         let toc = format!(
-            "<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><creation-time>2025-01-01T00:00:00Z</creation-time><file id=\"1\"><type>directory</type><name>App.pkg</name><file id=\"2\"><type>file</type><name>PackageInfo</name><data><length>{}</length><offset>20</offset><size>{}</size><encoding style=\"{encoding}\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file><file id=\"3\"><type>file</type><name>Payload</name>{mtime}<data><length>{}</length><offset>{}</offset><size>{}</size><encoding style=\"application/octet-stream\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file></file></toc></xar>",
+            "<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><creation-time>2025-01-01T00:00:00Z</creation-time><file id=\"1\"><type>directory</type><name>App.pkg</name>{info_open}<file id=\"2\"><type>file</type><name>PackageInfo</name><data><length>{}</length><offset>20</offset><size>{}</size><encoding style=\"{encoding}\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file>{info_close}<file id=\"3\"><type>file</type><name>Payload</name>{mtime}<data><length>{}</length><offset>{}</offset><size>{}</size><encoding style=\"application/octet-stream\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file></file></toc></xar>",
             stored_info.len(),
             info.len(),
             hex(&stored_info_checksum),
@@ -744,6 +764,23 @@ mod tests {
             .unwrap();
             assert!(read_package_version_from_path(&path, "com.example.mac").is_err());
         }
+    }
+
+    #[test]
+    fn resolves_payload_after_cleaning_package_info_directory() {
+        let bytes = xar_with_package_info_directory(
+            r#"<pkg-info><bundle id="com.example.mac" CFBundleShortVersionString="4.2"/></pkg-info>"#,
+            Some("2012-07-06T09:54:33Z"),
+            false,
+            false,
+            Some("."),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(&path, bytes).unwrap();
+        let metadata = read_package_version_from_path(&path, "com.example.mac").unwrap();
+        assert_eq!(metadata.display_version, "4.2");
+        assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
     }
 
     #[test]
