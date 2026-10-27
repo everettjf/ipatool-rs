@@ -21,6 +21,7 @@ use zeroize::Zeroize;
 
 use crate::{
     App, CatalogClient, Platform,
+    catalog::AppNotFound,
     credentials::{Account, CredentialStore, KBSYNC_CACHE_KEY, open_system_keychain},
     download_file::download_file,
     download_package::{package_platform, validate_ipa_platform},
@@ -556,7 +557,11 @@ impl DownloadProductClient {
             bail!("invalid redownload endpoint in Store bag");
         }
         let selected_version = if version.is_empty() {
-            fallback_version().context("resolve version for redownload")?
+            match fallback_version() {
+                Ok(selected) => selected,
+                Err(error) if error.downcast_ref::<AppNotFound>().is_some() => String::new(),
+                Err(error) => return Err(error).context("resolve version for redownload"),
+            }
         } else {
             version.to_owned()
         };
@@ -574,6 +579,16 @@ impl DownloadProductClient {
             return Ok(update);
         }
         validate_fallback(&redownload, app, &selected_version)?;
+        if selected_version.is_empty()
+            && redownload.data.failure_type.is_empty()
+            && redownload
+                .data
+                .items
+                .first()
+                .is_none_or(|item| item.url.is_empty())
+        {
+            bail!("unpinned redownload response has no package URL");
+        }
         Ok(redownload)
     }
 
@@ -1323,6 +1338,62 @@ mod tests {
         assert!(calls[3].0.contains("/up/updateProduct"));
         assert_eq!(calls[0].1.as_ref().unwrap()["externalVersionId"], "101");
         assert_eq!(calls[2].1.as_ref().unwrap()["appExtVrsId"], "101");
+    }
+
+    #[test]
+    fn delisted_owned_app_uses_checked_unpinned_redownload() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let capture = Arc::clone(&requests);
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            let path = request.url.path().to_owned();
+            let body = request
+                .body
+                .as_ref()
+                .map(|body| plist::from_bytes::<Value>(body).unwrap());
+            capture.lock().unwrap().push((path.clone(), body));
+            if path.ends_with("bag.xml") {
+                return Ok(response(serde_json::json!({"urlBag": {
+                    "redownloadProduct": REDOWNLOAD_URL
+                }})));
+            }
+            if path.ends_with("/r/redownload") {
+                return Ok(item_response("101"));
+            }
+            Ok(response(serde_json::json!({})))
+        });
+
+        let result = client
+            .send_product(&account(), &app(), "", || Err(AppNotFound.into()))
+            .unwrap();
+        assert_eq!(result.data.items.len(), 1);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].0.ends_with("/r/redownload"));
+        assert!(requests[2].1.as_ref().unwrap().get("appExtVrsId").is_none());
+    }
+
+    #[test]
+    fn delisted_redownload_rejects_missing_package_url() {
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |request| {
+            let path = request.url.path();
+            if path.ends_with("bag.xml") {
+                return Ok(response(serde_json::json!({"urlBag": {
+                    "redownloadProduct": REDOWNLOAD_URL
+                }})));
+            }
+            if path.ends_with("/r/redownload") {
+                return Ok(response(serde_json::json!({"songList": [{"metadata": {
+                    "itemId": 42,
+                    "softwareVersionBundleId": "com.example.app"
+                }}]})));
+            }
+            Ok(response(serde_json::json!({})))
+        });
+
+        let error = client
+            .send_product(&account(), &app(), "", || Err(AppNotFound.into()))
+            .unwrap_err();
+        assert!(error.to_string().contains("no package URL"));
     }
 
     #[test]
