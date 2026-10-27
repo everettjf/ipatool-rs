@@ -28,6 +28,19 @@ const SYNTHETIC_OUT_136: u64 = 0x7000_0022_0000;
 const SYNTHETIC_OUT_172: u64 = 0x7000_0023_0000;
 const SYNTHETIC_ALLOC_BASE: u64 = 0x7000_1000_0000;
 
+/// Account-independent startup overlays for the two checked fairplayd builds.
+pub fn embedded_startup_profile(binary_sha256: &str) -> Option<&'static [u8]> {
+    match binary_sha256 {
+        FAIRPLAY_BUILD_26A428_HASH => Some(include_bytes!(
+            "../assets/fairplay-startup/macos26a428-startup.json.gz"
+        )),
+        FAIRPLAY_BUILD_26B118_HASH => Some(include_bytes!(
+            "../assets/fairplay-startup/macos26b118-startup.json.gz"
+        )),
+        _ => None,
+    }
+}
+
 #[derive(Deserialize)]
 struct StartupProfile {
     schema: String,
@@ -267,6 +280,32 @@ fn encode_request_checkpoint(
 mod tests {
     use super::*;
     use crate::fairplay_checkpoint::FairplayCheckpoint;
+
+    #[test]
+    fn embedded_profiles_match_checked_builds() {
+        for (build, digest) in [
+            (
+                FAIRPLAY_BUILD_26A428_HASH,
+                "ae76565eb5ca10301d4eec27ce109024008b9e40eac67670702043358e0bca9e",
+            ),
+            (
+                FAIRPLAY_BUILD_26B118_HASH,
+                "ed03021a3856c5bc67076cb8eb481804aa567b909c4c3ae76f1334f6157c0b43",
+            ),
+        ] {
+            let compressed = embedded_startup_profile(build).unwrap();
+            assert_eq!(format!("{:x}", Sha256::digest(compressed)), digest);
+            let mut plain = Vec::new();
+            MultiGzDecoder::new(compressed)
+                .read_to_end(&mut plain)
+                .unwrap();
+            let profile: StartupProfile = serde_json::from_slice(&plain).unwrap();
+            assert_eq!(profile.schema, PROFILE_SCHEMA);
+            assert_eq!(profile.binary_sha256, build);
+            assert!(!profile.memory.is_empty());
+        }
+        assert!(embedded_startup_profile("unknown").is_none());
+    }
 
     #[test]
     fn seed_matches_request_502_register_and_memory_contract() {

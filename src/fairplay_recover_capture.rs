@@ -32,7 +32,7 @@ use crate::{
         open_private_file, read_private_bytes, write_private_binary, write_private_model,
     },
     fairplay_recovery_target::WhiteboxTarget,
-    fairplay_startup::seed_request_checkpoint,
+    fairplay_startup::{embedded_startup_profile, seed_request_checkpoint},
 };
 
 const ACCOUNT_ENTRY: u64 = 0x1005_7ae74;
@@ -62,7 +62,7 @@ pub struct RecoverFromSinfCopyOptions<'a> {
 
 pub struct RecoverCaptureOptions<'a> {
     pub capture: &'a Path,
-    pub startup_profile: &'a Path,
+    pub startup_profile: Option<&'a Path>,
     pub iokit15_output: Option<&'a Path>,
     pub output: &'a Path,
     pub timeout: Duration,
@@ -282,15 +282,20 @@ pub fn recover_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureReco
     };
     let temporary =
         tempfile::tempdir().context("create private first-stage checkpoint directory")?;
+    let startup_profile = match options.startup_profile {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let bytes = embedded_startup_profile(&manifest.fairplayd.sha256)
+                .context("capture fairplayd has no bundled startup profile")?;
+            let path = temporary.path().join("startup-profile.json.gz");
+            fs::write(&path, bytes).context("stage bundled FairPlay startup profile")?;
+            path
+        }
+    };
     let seed_path = temporary.path().join("request-entry.checkpoint.pkl.gz");
     let first_path = temporary.path().join("first-stage.checkpoint.pkl.gz");
     eprintln!("fairplay_recovery_stage=seed-request");
-    seed_request_checkpoint(
-        options.startup_profile,
-        &fairplayd,
-        &executable_path,
-        &seed_path,
-    )?;
+    seed_request_checkpoint(&startup_profile, &fairplayd, &executable_path, &seed_path)?;
     let seed = FairplayCheckpoint::load_private(&seed_path)?;
     let mac_path = capture_file_path(options.capture, &manifest.hardware_iomac.path)?;
     let mac = parse_private_mac(&mac_path)?;
@@ -901,7 +906,7 @@ mod tests {
         let output = root.path().join("recovery");
         let error = recover_capture(RecoverCaptureOptions {
             capture: &capture,
-            startup_profile: &root.path().join("missing.json.gz"),
+            startup_profile: Some(&root.path().join("missing.json.gz")),
             iokit15_output: None,
             output: &output,
             timeout: Duration::from_secs(1),

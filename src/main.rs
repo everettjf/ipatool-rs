@@ -268,12 +268,13 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         skip_differential: bool,
     },
-    /// Recover and decrypt a checked capture from a matching startup profile.
+    /// Recover and decrypt a checked capture with its bundled startup profile.
+    #[command(name = "recover", visible_alias = "recover-capture")]
     RecoverCapture {
         #[arg(long)]
         capture: PathBuf,
         #[arg(long)]
-        startup_profile: PathBuf,
+        startup_profile: Option<PathBuf>,
         #[arg(long, help = "Private verified 0x228-byte IOKit selector 0x15 output")]
         iokit15_output: Option<PathBuf>,
         #[arg(long)]
@@ -1301,7 +1302,7 @@ fn run() -> Result<()> {
             } => {
                 let result = recover_capture(RecoverCaptureOptions {
                     capture: &capture,
-                    startup_profile: &startup_profile,
+                    startup_profile: startup_profile.as_deref(),
                     iokit15_output: iokit15_output.as_deref(),
                     output: &output,
                     timeout: Duration::from_secs(timeout_seconds),
@@ -2940,6 +2941,30 @@ mod tests {
                     timeout_seconds: 600,
                     skip_differential: false,
                     iokit15_output: Some(_),
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn fairplay_recover_uses_bundled_profile_by_default() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "recover",
+            "--capture",
+            "/private/capture",
+            "--output",
+            "/private/recovery",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::RecoverCapture {
+                    startup_profile: None,
+                    timeout_seconds: 600,
                     ..
                 }
             }
