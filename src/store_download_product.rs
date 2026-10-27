@@ -820,6 +820,7 @@ impl DownloadProductClient {
             status: response.status,
             data,
             capture,
+            empty_http_500: false,
         };
         validate_strict_fallback(&result, app, version, "ent/download")?;
         if result.data.failure_type.is_empty()
@@ -980,6 +981,7 @@ impl DownloadProductClient {
                     items: Vec::new(),
                 },
                 capture: None,
+                empty_http_500: true,
             });
         }
         let data = response
@@ -989,6 +991,7 @@ impl DownloadProductClient {
             status: response.status,
             data,
             capture: None,
+            empty_http_500: false,
         })
     }
 
@@ -1005,6 +1008,7 @@ pub struct DownloadProductResponse {
     pub status: u16,
     pub data: DownloadProductResult,
     capture: Option<FairPlayDownloadCapture>,
+    empty_http_500: bool,
 }
 
 fn response_keybag(value: &plist::Value) -> Option<Vec<u8>> {
@@ -1051,10 +1055,7 @@ fn decode_keybag(value: &plist::Value) -> Option<Vec<u8>> {
 
 impl DownloadProductResponse {
     fn is_empty_server_error(&self) -> bool {
-        self.status == 500
-            && self.data.failure_type.is_empty()
-            && self.data.customer_message.is_empty()
-            && self.data.items.is_empty()
+        self.empty_http_500
     }
 
     fn is_empty_or_unavailable(&self) -> bool {
@@ -1443,6 +1444,7 @@ mod tests {
                     items: Vec::new(),
                 },
                 capture: None,
+                empty_http_500: false,
             };
             let error = checked_download_item(&response).unwrap_err();
             assert!(error.downcast_ref::<PasswordTokenExpired>().is_some());
@@ -1461,6 +1463,7 @@ mod tests {
             status: 200,
             data: item_response("101").plist(false).unwrap(),
             capture: None,
+            empty_http_500: false,
         };
         response.data.customer_message = "Store refused this endpoint".into();
         assert!(validate_fallback(&response, &app(), "101").is_ok());
@@ -1574,6 +1577,35 @@ mod tests {
         assert_eq!(calls[2].1.as_ref().unwrap()["appExtVrsId"], "101");
         assert_eq!(calls[2].2, None);
         assert_eq!(calls[3].2, None);
+    }
+
+    #[test]
+    fn plist_http_500_does_not_trigger_update_fallback() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            let path = request.url.path().to_owned();
+            seen.lock().unwrap().push(path.clone());
+            if path.ends_with("bag.xml") {
+                return Ok(response(serde_json::json!({"urlBag": {
+                    "redownloadProduct": REDOWNLOAD_URL,
+                    "updateProduct": UPDATE_URL
+                }})));
+            }
+            if path.ends_with("/r/redownload") {
+                let mut result = response(serde_json::json!({}));
+                result.status = 500;
+                return Ok(result);
+            }
+            assert!(!path.ends_with("/up/updateProduct"));
+            Ok(response(serde_json::json!({})))
+        });
+        let error = client
+            .send_product(&account(), &app(), "101", || unreachable!())
+            .unwrap_err();
+        assert!(error.to_string().contains("no unique app item"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
     }
 
     #[test]
