@@ -336,6 +336,22 @@ fn resolve_app(
     platform: Option<Platform>,
     allow_delisted: bool,
 ) -> Result<App> {
+    resolve_app_with(
+        account,
+        input,
+        platform,
+        allow_delisted,
+        |id, bundle, country, platform| catalog.lookup(id, bundle, country, platform),
+    )
+}
+
+fn resolve_app_with(
+    account: &Account,
+    input: &AppInput,
+    platform: Option<Platform>,
+    allow_delisted: bool,
+    mut lookup: impl FnMut(Option<i64>, Option<&str>, &str, Option<Platform>) -> Result<App>,
+) -> Result<App> {
     let id = input.app_id.unwrap_or_default();
     let bundle = input
         .bundle_identifier
@@ -346,14 +362,23 @@ fn resolve_app(
         bail!("a positive app ID or bundle identifier is required");
     }
     if bundle.is_empty() {
-        return Ok(App {
+        let app = App {
             id,
             ..App::default()
-        });
+        };
+        return Ok(complete_app(app, platform, |id, lookup_platform| {
+            let country = country_code_from_storefront(&account.store_front)?;
+            lookup(Some(id), None, country, lookup_platform)
+        }));
     }
     let country = country_code_from_storefront(&account.store_front)?;
-    match catalog.lookup(None, Some(bundle), country, platform) {
-        Ok(app) => Ok(app),
+    match lookup(None, Some(bundle), country, platform) {
+        Ok(mut app) => {
+            if app.bundle_id.is_empty() {
+                app.bundle_id = bundle.to_owned();
+            }
+            Ok(app)
+        }
         Err(error) if allow_delisted && id > 0 && error.downcast_ref::<AppNotFound>().is_some() => {
             Ok(App {
                 id,
@@ -427,6 +452,73 @@ fn complete_app(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_only_mcp_requests_complete_metadata_without_requiring_catalog() {
+        let mut account = Account::default();
+        account.store_front = "143444-1,29".into();
+        let input = AppInput {
+            app_id: Some(42),
+            bundle_identifier: None,
+            platform: None,
+        };
+        let resolved = resolve_app_with(
+            &account,
+            &input,
+            Some(Platform::Macos),
+            false,
+            |id, bundle, country, platform| {
+                assert_eq!(id, Some(42));
+                assert_eq!(bundle, None);
+                assert_eq!(country, "GB");
+                assert_eq!(platform, Some(Platform::Macos));
+                Ok(App {
+                    id: 42,
+                    name: "Catalog name".into(),
+                    bundle_id: "com.example.mac".into(),
+                    version: "2.0".into(),
+                    platforms: Some(vec![Platform::Macos]),
+                    ..App::default()
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(resolved.bundle_id, "com.example.mac");
+        assert_eq!(resolved.name, "Catalog name");
+
+        let delisted = resolve_app_with(
+            &account,
+            &input,
+            Some(Platform::Macos),
+            false,
+            |_, _, _, _| Err(AppNotFound.into()),
+        )
+        .unwrap();
+        assert_eq!(delisted.id, 42);
+        assert!(delisted.bundle_id.is_empty());
+    }
+
+    #[test]
+    fn bundle_lookup_preserves_requested_identifier_when_catalog_omits_it() {
+        let mut account = Account::default();
+        account.store_front = "143441-1,29".into();
+        let input = AppInput {
+            app_id: None,
+            bundle_identifier: Some("com.example.app".into()),
+            platform: None,
+        };
+        let resolved = resolve_app_with(&account, &input, None, false, |id, bundle, country, _| {
+            assert_eq!(id, None);
+            assert_eq!(bundle, Some("com.example.app"));
+            assert_eq!(country, "US");
+            Ok(App {
+                id: 42,
+                ..App::default()
+            })
+        })
+        .unwrap();
+        assert_eq!(resolved.bundle_id, "com.example.app");
+    }
 
     #[test]
     fn purchase_metadata_fills_only_missing_fields() {
