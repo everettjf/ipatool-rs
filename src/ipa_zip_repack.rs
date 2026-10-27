@@ -9,6 +9,8 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use zip::ZipArchive;
 
+use crate::duplicate_zip;
+
 const LOCAL: u32 = 0x0403_4b50;
 const CENTRAL: u32 = 0x0201_4b50;
 const DESCRIPTOR: u32 = 0x0807_4b50;
@@ -77,11 +79,24 @@ fn copy_member(
     let entry = archive
         .by_index_raw(index)
         .context("inspect IPA ZIP member")?;
-    let name = entry.name_raw();
     let compressed = entry.compressed_size();
     let uncompressed = entry.size();
     let crc = entry.crc32();
     let data_start = entry.data_start().context("locate IPA ZIP member data")?;
+    let mut central = [0u8; 46];
+    source.seek(SeekFrom::Start(entry.central_header_start()))?;
+    source.read_exact(&mut central)?;
+    ensure!(
+        u32_at(&central, 0) == CENTRAL,
+        "invalid IPA ZIP central header"
+    );
+    let central_name_len = u16_at(&central, 28) as usize;
+    let central_extra_len = u16_at(&central, 30) as usize;
+    let comment_len = u16_at(&central, 32) as usize;
+    let mut central_metadata = vec![0; central_name_len + central_extra_len + comment_len];
+    source.read_exact(&mut central_metadata)?;
+    let name = &central_metadata[..central_name_len];
+
     let mut local = [0u8; 30];
     source.seek(SeekFrom::Start(entry.header_start()))?;
     source.read_exact(&mut local)?;
@@ -97,23 +112,6 @@ fn copy_member(
     ensure!(
         entry.header_start() + 30 + local_metadata.len() as u64 == data_start,
         "IPA ZIP data offset mismatch"
-    );
-
-    let mut central = [0u8; 46];
-    source.seek(SeekFrom::Start(entry.central_header_start()))?;
-    source.read_exact(&mut central)?;
-    ensure!(
-        u32_at(&central, 0) == CENTRAL,
-        "invalid IPA ZIP central header"
-    );
-    let central_name_len = u16_at(&central, 28) as usize;
-    let central_extra_len = u16_at(&central, 30) as usize;
-    let comment_len = u16_at(&central, 32) as usize;
-    let mut central_metadata = vec![0; central_name_len + central_extra_len + comment_len];
-    source.read_exact(&mut central_metadata)?;
-    ensure!(
-        central_metadata[..central_name_len] == *name,
-        "IPA ZIP central name mismatch"
     );
 
     let is_stored = u16_at(&central, 10) == 0 || name.ends_with(b"/");
@@ -223,14 +221,20 @@ pub(crate) fn repack(source: &File, replacements: &File, output: &mut File) -> R
     let mut replacement_file = replacements.try_clone()?;
     let mut source_archive = ZipArchive::new(source.try_clone()?)?;
     let mut replacement_archive = ZipArchive::new(replacements.try_clone()?)?;
-    let replacement_names: HashSet<Vec<u8>> = replacement_archive
-        .file_names_raw()
-        .map(ToOwned::to_owned)
-        .collect();
+    let mut replacement_names = HashSet::new();
+    for index in 0..replacement_archive.len() {
+        let entry = replacement_archive.by_index_raw(index)?;
+        replacement_names.insert(duplicate_zip::read_raw_central_name(
+            &mut replacement_file,
+            entry.central_header_start(),
+        )?);
+    }
     let mut central_records = Vec::new();
     let mut count = 0u64;
     for index in 0..source_archive.len() {
-        if replacement_names.contains(source_archive.by_index_raw(index)?.name_raw()) {
+        let central_offset = source_archive.by_index_raw(index)?.central_header_start();
+        let source_name = duplicate_zip::read_raw_central_name(&mut source_file, central_offset)?;
+        if replacement_names.contains(&source_name) {
             continue;
         }
         copy_member(
@@ -293,6 +297,51 @@ pub(crate) fn repack(source: &File, replacements: &File, output: &mut File) -> R
 mod tests {
     use super::*;
     use zip::{ZipWriter, write::SimpleFileOptions};
+
+    #[test]
+    fn repacks_and_replaces_by_raw_unicode_path_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.zip");
+        crate::duplicate_zip::write_unicode_path_fixture(&source_path, b"source");
+        for replace in [false, true] {
+            let additions_path = directory.path().join("additions.zip");
+            let mut additions = ZipWriter::new(File::create(&additions_path).unwrap());
+            if replace {
+                additions
+                    .start_file("Payload/A.app/SC_Info/A.sinf", SimpleFileOptions::default())
+                    .unwrap();
+                additions.write_all(b"replacement").unwrap();
+            }
+            additions.finish().unwrap();
+
+            let output_path = directory.path().join("output.zip");
+            repack(
+                &File::open(&source_path).unwrap(),
+                &File::open(&additions_path).unwrap(),
+                &mut File::create(&output_path).unwrap(),
+            )
+            .unwrap();
+            let mut archive = ZipArchive::new(File::open(&output_path).unwrap()).unwrap();
+            assert_eq!(archive.len(), 1);
+            let mut entry = archive.by_index(0).unwrap();
+            let mut contents = Vec::new();
+            entry.read_to_end(&mut contents).unwrap();
+            assert_eq!(
+                contents,
+                if replace {
+                    b"replacement".as_slice()
+                } else {
+                    b"source".as_slice()
+                }
+            );
+            let raw_name = duplicate_zip::read_raw_central_name(
+                &mut File::open(&output_path).unwrap(),
+                entry.central_header_start(),
+            )
+            .unwrap();
+            assert_eq!(raw_name, b"Payload/A.app/SC_Info/A.sinf");
+        }
+    }
 
     #[test]
     fn writes_zip64_offsets_and_end_record_after_sparse_prefix() {
