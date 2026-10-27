@@ -1042,6 +1042,82 @@ mod tests {
     }
 
     #[test]
+    fn decrypts_multiple_images_with_both_supf_variants() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.ipa");
+        let output = directory.path().join("decrypted.ipa");
+        let report = directory.path().join("decrypted.json");
+        let model_path = directory.path().join("model.bin");
+        let logical = [0x31; 16];
+        let (model, sinf) = model_and_sinf(logical);
+        fs::write(&model_path, model).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let (encrypted, record, plaintext) = encrypted_fixture(logical);
+        let mut unencrypted = encrypted.clone();
+        unencrypted[48..52].fill(0);
+        let mut arch = Vec::new();
+        arch.extend_from_slice(&0x0100_000cu32.to_be_bytes());
+        arch.extend_from_slice(&2u32.to_be_bytes());
+        arch.extend_from_slice(&[0; 20]);
+        arch.extend_from_slice(&1u32.to_be_bytes());
+        arch.extend_from_slice(&record);
+        let mut supf3 = vec![3, 0, 0, 0];
+        supf3.extend_from_slice(&(8u32 + arch.len() as u32).to_be_bytes());
+        supf3.extend_from_slice(&1u32.to_be_bytes());
+        supf3.extend_from_slice(&(arch.len() as u32).to_be_bytes());
+        supf3.extend_from_slice(&arch);
+        let supf5 = supf(record);
+        let mut writer = ZipWriter::new(File::create(&input).unwrap());
+        for (name, bytes) in [
+            ("Payload/A.app/SC_Info/A.sinf", sinf.as_slice()),
+            ("Payload/A.app/SC_Info/A.supf", supf5.as_slice()),
+            ("Payload/A.app/SC_Info/B.supf", supf3.as_slice()),
+            ("Payload/A.app/A", encrypted.as_slice()),
+            ("Payload/A.app/B", encrypted.as_slice()),
+            ("Payload/A.app/C", unencrypted.as_slice()),
+        ] {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        let result =
+            decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), false).unwrap();
+        assert_eq!(result.encrypted_images, 2);
+        assert_eq!(result.decrypted_pages, 2);
+        let report_data: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(report_data["encrypted_image_count"], 2);
+        assert_eq!(report_data["decrypted_page_count"], 2);
+        assert_eq!(
+            report_data["images"][1]["supf_member"],
+            "Payload/A.app/SC_Info/B.supf"
+        );
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        for name in ["Payload/A.app/A", "Payload/A.app/B"] {
+            let mut bytes = Vec::new();
+            archive
+                .by_name(name)
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            assert_eq!(&bytes[PAGE_BYTES..PAGE_BYTES * 2], &plaintext);
+        }
+        let mut unchanged = Vec::new();
+        archive
+            .by_name("Payload/A.app/C")
+            .unwrap()
+            .read_to_end(&mut unchanged)
+            .unwrap();
+        assert_eq!(unchanged, unencrypted);
+    }
+
+    #[test]
     fn publication_rolls_back_output_when_report_cannot_be_written() {
         let directory = tempfile::tempdir().unwrap();
         let first = tempfile::NamedTempFile::new_in(directory.path()).unwrap();
