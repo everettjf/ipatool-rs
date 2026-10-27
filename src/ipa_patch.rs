@@ -14,8 +14,6 @@ use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 use crate::{duplicate_zip, ipa_zip_repack};
 
-const MAX_PLIST: u64 = 4 * 1024 * 1024;
-
 /// Write a patched IPA atomically. The source stays available for a retry.
 pub fn patch_ipa(
     source: &Path,
@@ -187,18 +185,11 @@ fn sinf_paths(
 
 fn read_plist_entry(archive: &mut ZipArchive<File>, index: usize) -> Result<Value> {
     let mut entry = archive.by_index(index).context("read IPA plist entry")?;
-    if entry.size() > MAX_PLIST {
-        bail!("IPA plist exceeds size limit");
-    }
-    let mut data = Vec::with_capacity(entry.size() as usize);
+    let mut data = Vec::new();
     entry
         .by_ref()
-        .take(MAX_PLIST + 1)
         .read_to_end(&mut data)
         .context("read IPA plist")?;
-    if data.len() as u64 > MAX_PLIST {
-        bail!("IPA plist exceeds size limit");
-    }
     plist::from_bytes(&data).context("decode IPA plist")
 }
 
@@ -288,6 +279,69 @@ mod tests {
         let mut fields = plist::Dictionary::new();
         fields.insert("sinf".into(), Value::Data(b"ticket".to_vec()));
         Value::Dictionary(fields)
+    }
+
+    #[test]
+    fn patches_sinf_with_large_info_or_manifest_plist() {
+        for large_manifest in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source.ipa");
+            let mut writer = ZipWriter::new(File::create(&source).unwrap());
+            writer
+                .start_file("Payload/App.app/Info.plist", SimpleFileOptions::default())
+                .unwrap();
+            let mut info = plist::Dictionary::new();
+            info.insert("CFBundleExecutable".into(), Value::String("App".into()));
+            if !large_manifest {
+                info.insert(
+                    "LargeMetadata".into(),
+                    Value::String("x".repeat(4 * 1024 * 1024)),
+                );
+            }
+            plist::to_writer_xml(&mut writer, &Value::Dictionary(info)).unwrap();
+            if large_manifest {
+                writer
+                    .start_file(
+                        "Payload/App.app/SC_Info/Manifest.plist",
+                        SimpleFileOptions::default(),
+                    )
+                    .unwrap();
+                let mut manifest = plist::Dictionary::new();
+                manifest.insert(
+                    "SinfPaths".into(),
+                    Value::Array(vec![Value::String("SC_Info/Custom.sinf".into())]),
+                );
+                manifest.insert(
+                    "LargeMetadata".into(),
+                    Value::String("x".repeat(4 * 1024 * 1024)),
+                );
+                plist::to_writer_xml(&mut writer, &Value::Dictionary(manifest)).unwrap();
+            }
+            writer.finish().unwrap();
+            let output = directory.path().join("patched.ipa");
+            patch_ipa(
+                &source,
+                &output,
+                &metadata(serde_json::json!({})),
+                "account@example.test",
+                &[],
+                &[mobile_sinf()],
+            )
+            .unwrap();
+            let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
+            let path = if large_manifest {
+                "Payload/App.app/SC_Info/Custom.sinf"
+            } else {
+                "Payload/App.app/SC_Info/App.sinf"
+            };
+            let mut sinf = Vec::new();
+            archive
+                .by_name(path)
+                .unwrap()
+                .read_to_end(&mut sinf)
+                .unwrap();
+            assert_eq!(sinf, b"ticket");
+        }
     }
 
     fn zip_extras(path: &Path, entry_name: &str) -> (Vec<u8>, Vec<u8>) {
