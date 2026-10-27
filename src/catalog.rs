@@ -133,7 +133,9 @@ impl CatalogClient {
         if response.status == 404 {
             return Ok(None);
         }
-        response.ensure_success()?;
+        if response.status != 200 {
+            bail!("App Store returned HTTP {}", response.status);
+        }
         Ok(Some(response))
     }
 
@@ -287,6 +289,48 @@ pub fn lookup_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    #[test]
+    fn catalog_requires_http_200_but_preserves_not_found_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for (status, body) in [("201 Created", "{}"), ("404 Not Found", "")] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let client = CatalogClient::new().unwrap();
+        let url = Url::parse(&format!("http://{address}/lookup")).unwrap();
+        assert!(
+            client
+                .get_allow_not_found(url.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP 201")
+        );
+        assert!(client.get_allow_not_found(url).unwrap().is_none());
+        server.join().unwrap();
+    }
 
     #[test]
     fn search_url_preserves_platform_and_encodes_term() {
