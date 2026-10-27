@@ -5,6 +5,7 @@ use aes::{
     cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray},
 };
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::fairplay::SinfSelector;
@@ -258,6 +259,18 @@ fn sinf_private(bytes: &[u8]) -> Result<(SinfSelector, AtomSpan)> {
             key: u32::from_be_bytes(bytes[key.start..key.end].try_into().unwrap()),
         },
         unique(&fields, *b"priv")?,
+    ))
+}
+
+pub fn missing_model_diagnostic(sinf: &[u8]) -> Result<String> {
+    let (selector, private) = sinf_private(sinf)?;
+    let private = &sinf[private.start..private.end];
+    Ok(format!(
+        "FairPlay profile {} (sinf_sha256={:x} priv_bytes={} priv_sha256={:x}) requires a private enrollment model; pass --model FILE or --model DIRECTORY",
+        selector.identifier(),
+        Sha256::digest(sinf),
+        private.len(),
+        Sha256::digest(private),
     ))
 }
 

@@ -16,7 +16,7 @@ use zip::{ZipArchive, ZipWriter, read::ZipFile, write::FullFileOptions};
 use crate::{
     fairplay::{inspect_model_path, parse_sinf_selector},
     fairplay_decrypt::{DecryptedSlice, decrypt_macho},
-    fairplay_key::CurrentSinfModel,
+    fairplay_key::{CurrentSinfModel, missing_model_diagnostic},
     fairplay_macho::{is_macho, parse_macho_slices},
     fairplay_supf::Supf,
 };
@@ -64,6 +64,33 @@ fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
         .read_to_end(&mut bytes)
         .with_context(|| format!("read IPA member {name}"))?;
     Ok(bytes)
+}
+
+fn find_sinf(archive: &mut ZipArchive<File>) -> Result<(HashSet<String>, Vec<u8>)> {
+    let mut names = HashSet::with_capacity(archive.len());
+    let mut sinf_name = None;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).context("inspect IPA ZIP member")?;
+        let name = entry.name().to_owned();
+        if !names.insert(name.clone()) {
+            bail!("IPA contains duplicate member {name}");
+        }
+        if name.contains("/SC_Info/")
+            && name.to_ascii_lowercase().ends_with(".sinf")
+            && sinf_name.replace(name).is_some()
+        {
+            bail!("FairPlay decryption requires exactly one SINF");
+        }
+    }
+    let sinf_name = sinf_name.context("FairPlay decryption requires exactly one SINF")?;
+    Ok((names, read_entry(archive, &sinf_name)?))
+}
+
+pub fn require_model_diagnostic(input: &Path) -> Result<String> {
+    let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
+    let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
+    let (_, sinf) = find_sinf(&mut archive)?;
+    missing_model_diagnostic(&sinf)
 }
 
 fn local_extra(source: &mut File, member: &ZipFile<'_, File>) -> Result<Vec<u8>> {
@@ -208,23 +235,7 @@ pub fn decrypt_ipa_with_options(
     let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
     let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
     let mut raw_source = File::open(input).context("open IPA ZIP headers")?;
-    let mut names = HashSet::with_capacity(archive.len());
-    let mut sinf_name = None;
-    for index in 0..archive.len() {
-        let entry = archive.by_index(index).context("inspect IPA ZIP member")?;
-        let name = entry.name().to_owned();
-        if !names.insert(name.clone()) {
-            bail!("IPA contains duplicate member {name}");
-        }
-        if name.contains("/SC_Info/")
-            && name.to_ascii_lowercase().ends_with(".sinf")
-            && sinf_name.replace(name).is_some()
-        {
-            bail!("FairPlay decryption requires exactly one SINF");
-        }
-    }
-    let sinf_name = sinf_name.context("FairPlay decryption requires exactly one SINF")?;
-    let sinf = read_entry(&mut archive, &sinf_name)?;
+    let (names, sinf) = find_sinf(&mut archive)?;
     let key = Zeroizing::new(logical_key(model_path, &sinf)?);
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -704,5 +715,24 @@ mod tests {
                 .contains("exactly one SINF")
         );
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn missing_model_reports_the_ipa_selector_and_private_payload() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.ipa");
+        let (_, sinf) = model_and_sinf([0x12; 16]);
+        let mut writer = ZipWriter::new(File::create(&input).unwrap());
+        writer
+            .start_file("Payload/A.app/SC_Info/A.sinf", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&sinf).unwrap();
+        writer.finish().unwrap();
+        let diagnostic = require_model_diagnostic(&input).unwrap();
+        let selector = parse_sinf_selector(&sinf).unwrap();
+        assert!(diagnostic.contains(&selector.identifier()));
+        assert!(diagnostic.contains(&format!("sinf_sha256={:x}", Sha256::digest(&sinf))));
+        assert!(diagnostic.contains("priv_bytes="));
+        assert!(diagnostic.contains("requires a private enrollment model"));
     }
 }

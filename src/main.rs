@@ -18,7 +18,7 @@ use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment}
 use ipatool_rs::fairplay_download_capture::write_download_capture;
 use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2};
 use ipatool_rs::fairplay_enrollment_v3::{V3Material, build_fpsenr3};
-use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
+use ipatool_rs::fairplay_ipa::{decrypt_ipa_with_options, require_model_diagnostic};
 use ipatool_rs::fairplay_key::CurrentSinfModel;
 use ipatool_rs::fairplay_oracle_domains::{
     learn_26b118_domains, validate_26a428_model, validate_26b118_model,
@@ -200,7 +200,7 @@ enum Command {
         #[arg(long)]
         input: PathBuf,
         #[arg(long)]
-        model: PathBuf,
+        model: Option<PathBuf>,
         #[arg(long)]
         output: Option<PathBuf>,
         #[arg(long)]
@@ -802,9 +802,6 @@ fn run() -> Result<()> {
                 bail!("either the app ID or the bundle identifier must be specified");
             }
             let platform = Platform::parse(&platform)?.context("platform is required")?;
-            if fairplay_decrypt && fairplay_model.is_none() {
-                bail!("--fairplay-model is required with --fairplay-decrypt");
-            }
             let account_store = AccountStore::new(open_system_keychain()?);
             let mut account = account_store.load()?;
             let backend = DownloadProductClient::open()?;
@@ -894,6 +891,10 @@ fn run() -> Result<()> {
                                 None
                             };
                         let decrypted = if fairplay_decrypt {
+                            let model = match fairplay_model.as_deref() {
+                                Some(model) => model,
+                                None => bail!("{}", require_model_diagnostic(&path)?),
+                            };
                             let (decrypted_path, report_path) = fairplay_download_paths(
                                 &path,
                                 fairplay_output.as_deref(),
@@ -902,7 +903,7 @@ fn run() -> Result<()> {
                             decrypt_ipa_with_options(
                                 &path,
                                 &decrypted_path,
-                                fairplay_model.as_deref().expect("validated model"),
+                                model,
                                 Some(&report_path),
                                 fairplay_force,
                             )?;
@@ -1195,9 +1196,13 @@ fn run() -> Result<()> {
             {
                 bail!("FairPlay input must be an IPA file");
             }
+            let model = match model.as_deref() {
+                Some(model) => model,
+                None => bail!("{}", require_model_diagnostic(&input)?),
+            };
             let output = output.unwrap_or_else(|| input.with_extension("decrypted.ipa"));
             let report = report.unwrap_or_else(|| input.with_extension("decrypted.json"));
-            let result = decrypt_ipa_with_options(&input, &output, &model, Some(&report), force)?;
+            let result = decrypt_ipa_with_options(&input, &output, model, Some(&report), force)?;
             match cli.format {
                 Format::Json => println!("{}", serde_json::to_string_pretty(&result)?),
                 Format::Text => println!(
@@ -3046,6 +3051,18 @@ mod tests {
                     fairplay_capture_dir,
                     Some(PathBuf::from("/private/capture"))
                 );
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn fairplay_decrypt_parses_without_model_for_profile_diagnostic() {
+        let cli = Cli::try_parse_from(["ipatool", "fairplay-decrypt", "--input", "A.ipa"]).unwrap();
+        match cli.command {
+            Command::FairplayDecrypt { input, model, .. } => {
+                assert_eq!(input, PathBuf::from("A.ipa"));
+                assert!(model.is_none());
             }
             _ => panic!("unexpected command"),
         }
