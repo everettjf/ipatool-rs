@@ -16,7 +16,7 @@ use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
@@ -1553,6 +1553,20 @@ fn dispatch_call(
     }
     let symbol = call.symbol.trim_start_matches('_');
     match symbol {
+        "CC_SHA512" => {
+            let input = context.reg_read(REG_X0)?;
+            let length = context.reg_read(REG_X0 + 1)? as u32 as usize;
+            if length > HEAP_SIZE {
+                bail!("SHA-512 input exceeds runtime budget");
+            }
+            let digest = Sha512::digest(context.mem_read(input, length)?);
+            let output = match context.reg_read(REG_X0 + 2)? {
+                0 => state.allocate(64)?,
+                output => output,
+            };
+            context.mem_write(output, &digest)?;
+            context.reg_write(REG_X0, output)?;
+        }
         "res_9_ninit" => context.reg_write(REG_X0, u32::MAX as u64)?,
         "res_9_ndestroy" => {}
         "CRIsAutoSubmitEnabled"
@@ -2414,6 +2428,19 @@ fn dispatch_call(
         "CFBundleGetMainBundle" => {
             let bundle = new_main_bundle(context, profile, state)?;
             context.reg_write(REG_X0, bundle)?;
+        }
+        "CFBundleGetInfoDictionary" => {
+            context.reg_write(REG_X0, new_bundle_info(context, profile, state)?)?;
+        }
+        "CFBundleCopyExecutableURL" => {
+            let url = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSURL",
+                StoreValue::String("file:///ipatool".into()),
+            )?;
+            context.reg_write(REG_X0, url)?;
         }
         "NSUserName"
         | "NSFullUserName"
@@ -8335,29 +8362,7 @@ fn dispatch_message(
             let value = if let Some(value) = existing {
                 value
             } else {
-                let mut entries = HashMap::new();
-                for (key, value) in [
-                    ("CFBundleIdentifier", "me.majd.ipatool"),
-                    ("CFBundleVersion", "1.0"),
-                    ("CFBundleExecutable", "ipatool"),
-                    ("CFBundleName", "ipatool"),
-                ] {
-                    let value = new_guest_object(
-                        context,
-                        profile,
-                        state,
-                        "NSString",
-                        StoreValue::String(value.into()),
-                    )?;
-                    entries.insert(key.into(), value);
-                }
-                new_guest_object(
-                    context,
-                    profile,
-                    state,
-                    "NSDictionary",
-                    StoreValue::Entries(entries),
-                )?
+                new_bundle_info(context, profile, state)?
             };
             context.reg_write(REG_X0, value)?;
         }
@@ -9080,6 +9085,36 @@ fn new_main_bundle(
     Ok(bundle)
 }
 
+fn new_bundle_info(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+) -> Result<u64> {
+    let mut entries = HashMap::new();
+    for (key, value) in [
+        ("CFBundleIdentifier", "me.majd.ipatool"),
+        ("CFBundleVersion", "1.0"),
+        ("CFBundleExecutable", "ipatool"),
+        ("CFBundleName", "ipatool"),
+    ] {
+        let value = new_guest_object(
+            context,
+            profile,
+            state,
+            "NSString",
+            StoreValue::String(value.into()),
+        )?;
+        entries.insert(key.into(), value);
+    }
+    new_guest_object(
+        context,
+        profile,
+        state,
+        "NSDictionary",
+        StoreValue::Entries(entries),
+    )
+}
+
 fn random_uuid_string() -> Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).context("generate Store guest UUID")?;
@@ -9330,6 +9365,61 @@ mod tests {
         runtime.write_u64(url_value, 0x1234).unwrap();
         runtime.engine.reg_write(REG_X0 + 20, url_value).unwrap();
         assert_eq!(runtime.call(url_call, &[]).unwrap(), 0x1234);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_hashes_sha512_and_exposes_bundle_resources() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |symbol: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.symbol == symbol)
+                .unwrap()
+                .address
+        };
+        let hash_call = call_address("CC_SHA512");
+        let info_call = call_address("CFBundleGetInfoDictionary");
+        let executable_call = call_address("CFBundleCopyExecutableURL");
+
+        let input = runtime.allocate(3).unwrap();
+        runtime.engine.mem_write(input, b"abc").unwrap();
+        let digest_address = runtime.call(hash_call, &[input, 3, 0]).unwrap();
+        let digest = runtime.engine.mem_read(digest_address, 64).unwrap();
+        let digest_hex = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            digest_hex,
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+        let output = runtime.allocate(64).unwrap();
+        assert_eq!(
+            runtime.call(hash_call, &[input, 3, output]).unwrap(),
+            output
+        );
+        assert_eq!(runtime.engine.mem_read(output, 64).unwrap(), digest);
+
+        let info = runtime.call(info_call, &[0]).unwrap();
+        assert_eq!(
+            runtime.export(info).unwrap()["CFBundleIdentifier"],
+            "me.majd.ipatool"
+        );
+        assert_eq!(
+            runtime.export(info).unwrap()["CFBundleExecutable"],
+            "ipatool"
+        );
+        let executable = runtime.call(executable_call, &[0]).unwrap();
+        let state = runtime.state.borrow();
+        let StoreValue::String(value) = &state.objects[&executable].value else {
+            panic!("bundle executable URL is not a string");
+        };
+        assert_eq!(value, "file:///ipatool");
     }
 
     #[test]
