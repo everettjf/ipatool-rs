@@ -108,6 +108,7 @@ struct StoreState {
     pending: Vec<PendingWork>,
     transport: Option<Rc<dyn Fn(HostRequest) -> Result<HostResponse>>>,
     transport_authenticated: bool,
+    transport_auth_request: bool,
     transport_no_redirects: bool,
     transport_timeout: Option<Duration>,
     http_responses: HashMap<u64, HostResponse>,
@@ -475,6 +476,7 @@ impl StoreRuntime {
             pending: Vec::new(),
             transport: None,
             transport_authenticated: true,
+            transport_auth_request: false,
             transport_no_redirects: false,
             transport_timeout: None,
             http_responses: HashMap::new(),
@@ -579,6 +581,7 @@ impl StoreRuntime {
     ) {
         let mut state = self.state.borrow_mut();
         state.transport_authenticated = authenticated;
+        state.transport_auth_request = false;
         state.transport_no_redirects = no_redirects;
         state.transport_timeout = timeout;
     }
@@ -659,6 +662,7 @@ impl StoreRuntime {
     ) -> Result<HostResponse> {
         self.set_hardware_id(input.hardware_id)?;
         self.set_transport_policy(true, input.no_redirects, input.timeout);
+        self.state.borrow_mut().transport_auth_request = operation == StoreOperation::Authenticate;
 
         let mut saved = Account::default();
         let account = if let Some(dsid) = input.headers.get("X-Dsid") {
@@ -4656,7 +4660,9 @@ fn redirect_http_response(
     let destination = source_url
         .join(location)
         .context("invalid Store redirect location")?;
-    if !allowed_store_url(&destination, state.transport_authenticated) {
+    if !allowed_store_url(&destination, state.transport_authenticated)
+        || (state.transport_auth_request && !allowed_authentication_redirect(&destination, status))
+    {
         bail!("invalid Store redirect destination");
     }
     let count = state.objects[&task]
@@ -10720,9 +10726,63 @@ fn allowed_store_url(url: &url::Url, authenticated: bool) -> bool {
                 .any(|suffix| host.to_ascii_lowercase().ends_with(suffix)))
 }
 
+fn allowed_authentication_redirect(destination: &url::Url, status: u16) -> bool {
+    status != 303
+        && destination.port().is_none_or(|port| port == 443)
+        && !destination.path().contains('%')
+        && destination
+            .host_str()
+            .is_some_and(|host| host.ends_with("buy.itunes.apple.com"))
+        && destination.path().trim_end_matches('/') == "/WebObjects/MZFinance.woa/wa/authenticate"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_redirects_stay_on_the_pinned_login_endpoint() {
+        let permitted = [
+            "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate",
+            "https://p1-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate/?retry=1",
+            "https://buy.itunes.apple.com:443/WebObjects/MZFinance.woa/wa/authenticate",
+        ];
+        for endpoint in permitted {
+            let url = url::Url::parse(endpoint).unwrap();
+            assert!(allowed_store_url(&url, true));
+            assert!(allowed_authentication_redirect(&url, 302), "{endpoint}");
+        }
+        let rejected = [
+            (
+                "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate",
+                303,
+            ),
+            (
+                "https://buy.itunes.apple.com:8443/WebObjects/MZFinance.woa/wa/authenticate",
+                302,
+            ),
+            (
+                "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/%61uthenticate",
+                302,
+            ),
+            (
+                "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/purchase",
+                302,
+            ),
+            (
+                "https://static.mzstatic.com/WebObjects/MZFinance.woa/wa/authenticate",
+                302,
+            ),
+        ];
+        for (endpoint, status) in rejected {
+            let url = url::Url::parse(endpoint).unwrap();
+            assert!(allowed_store_url(&url, true));
+            assert!(
+                !allowed_authentication_redirect(&url, status),
+                "{endpoint} status={status}"
+            );
+        }
+    }
 
     #[test]
     fn guest_http_date_parser_matches_go_layout_and_tm_normalization() {
@@ -13128,6 +13188,121 @@ mod tests {
                 &mut signer,
             )
             .unwrap();
+        assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn signed_authentication_rejects_redirect_outside_login_endpoint() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        runtime.set_transport(|_| {
+            Ok(HostResponse {
+                status: 302,
+                content_length: 0,
+                set_cookie_headers: Vec::new(),
+                headers: HashMap::from([(
+                    "location".into(),
+                    "https://static.mzstatic.com/WebObjects/MZFinance.woa/wa/authenticate".into(),
+                )]),
+                body: Vec::new(),
+            })
+        });
+        let parameters = serde_json::json!({
+            "appleId": "test@example.com",
+            "password": "test"
+        });
+        let bag = plist::to_value(
+            &serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/request"}),
+        )
+        .unwrap();
+        let mut signer = |_: &[u8]| Ok(vec![1, 2, 3]);
+        let error = runtime
+            .execute_authentication(
+                StoreStandardRequest {
+                    method: "POST",
+                    url: "https://buy.itunes.apple.com/request",
+                    headers: &HeaderMap::new(),
+                    parameters: Some(&parameters),
+                    body: None,
+                    bag: Some(&bag),
+                    hardware_id: &[0, 1, 2, 3, 4, 5],
+                    raw: false,
+                    response_format: "plist",
+                    no_redirects: false,
+                    timeout: None,
+                },
+                &mut signer,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("invalid Store redirect destination"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn signed_authentication_follows_pinned_login_redirect() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = std::rc::Rc::clone(&calls);
+        runtime.set_transport(move |request| {
+            let call = seen.get();
+            seen.set(call + 1);
+            if call == 0 {
+                assert_eq!(request.url.as_str(), "https://buy.itunes.apple.com/request");
+                return Ok(HostResponse {
+                    status: 302,
+                    content_length: 0,
+                    set_cookie_headers: Vec::new(),
+                    headers: HashMap::from([(
+                        "location".into(),
+                        "/WebObjects/MZFinance.woa/wa/authenticate".into(),
+                    )]),
+                    body: Vec::new(),
+                });
+            }
+            assert_eq!(call, 1);
+            assert_eq!(
+                request.url.as_str(),
+                "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate"
+            );
+            Ok(HostResponse {
+                status: 200,
+                content_length: 0,
+                set_cookie_headers: Vec::new(),
+                headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
+                body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
+            })
+        });
+        let parameters = serde_json::json!({
+            "appleId": "test@example.com",
+            "password": "test"
+        });
+        let bag = plist::to_value(
+            &serde_json::json!({"buyProduct": "https://buy.itunes.apple.com/request"}),
+        )
+        .unwrap();
+        let mut signer = |_: &[u8]| Ok(vec![1, 2, 3]);
+        let response = runtime
+            .execute_authentication(
+                StoreStandardRequest {
+                    method: "POST",
+                    url: "https://buy.itunes.apple.com/request",
+                    headers: &HeaderMap::new(),
+                    parameters: Some(&parameters),
+                    body: None,
+                    bag: Some(&bag),
+                    hardware_id: &[0, 1, 2, 3, 4, 5],
+                    raw: false,
+                    response_format: "plist",
+                    no_redirects: false,
+                    timeout: None,
+                },
+                &mut signer,
+            )
+            .unwrap();
+        assert_eq!(calls.get(), 2);
         assert_eq!(response.status, 200);
     }
 
