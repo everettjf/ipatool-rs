@@ -9,7 +9,7 @@ use std::{
     ptr,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -488,6 +488,7 @@ impl Engine {
         let micros = u64::try_from(timeout.as_micros())
             .unwrap_or(u64::MAX)
             .max(1);
+        let started = Instant::now();
         let result = self.check(unsafe {
             (self.api.emu_start)(self.handle, begin, end, micros, instruction_limit)
         });
@@ -501,7 +502,11 @@ impl Engine {
         let mut timed_out = 0u64;
         self.check(unsafe { (self.api.query)(self.handle, QUERY_TIMEOUT, &mut timed_out) })?;
         if timed_out != 0 {
-            bail!("Unicorn emulation timed out after {timeout:?}");
+            let pc = self.reg_read(REG_PC).unwrap_or(0);
+            bail!(
+                "Unicorn emulation timed out (requested {timeout:?}, elapsed {:?}, pc={pc:#x})",
+                started.elapsed()
+            );
         }
         Ok(())
     }
