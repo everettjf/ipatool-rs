@@ -9,7 +9,7 @@ use reqwest::{
     header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::Deserialize;
-use time::{OffsetDateTime, format_description::well_known::Rfc2822};
+use time::{OffsetDateTime, PrimitiveDateTime, format_description::well_known::Rfc2822};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
@@ -466,7 +466,7 @@ fn retry_delay_at(response: &Response, retry: usize, now: OffsetDateTime) -> Res
         }
         return Ok(Duration::from_secs(seconds.max(1)));
     }
-    if let Ok(date) = OffsetDateTime::parse(value.trim(), &Rfc2822) {
+    if let Some(date) = parse_http_date(value.trim()) {
         let requested = Duration::try_from(date - now).unwrap_or(Duration::ZERO);
         if requested > Duration::from_secs(30) {
             bail!("Apple requested a wait longer than 30 seconds; try again later");
@@ -474,6 +474,43 @@ fn retry_delay_at(response: &Response, retry: usize, now: OffsetDateTime) -> Res
         return Ok(requested.max(Duration::from_secs(1)));
     }
     Ok(fallback)
+}
+
+fn parse_http_date(value: &str) -> Option<OffsetDateTime> {
+    if let Ok(date) = OffsetDateTime::parse(value, &Rfc2822) {
+        return Some(date);
+    }
+
+    // Go's http.ParseTime also accepts RFC 850 and ANSI C asctime dates.
+    if let Some((weekday, remainder)) = value.split_once(", ")
+        && let Some((date, clock)) = remainder.split_once(' ')
+    {
+        let mut parts = date.split('-');
+        if let (Some(day), Some(month), Some(short_year), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+            && short_year.len() == 2
+            && short_year.bytes().all(|byte| byte.is_ascii_digit())
+            && let Ok(year) = short_year.parse::<u16>()
+        {
+            let year = if year >= 69 { 1900 + year } else { 2000 + year };
+            let normalized = format!("{weekday}, {day}-{month}-{year} {clock}");
+            let format = time::format_description::parse_borrowed::<2>(
+                "[weekday repr:long], [day]-[month repr:short]-[year] [hour]:[minute]:[second] GMT",
+            )
+            .ok()?;
+            if let Ok(date) = PrimitiveDateTime::parse(&normalized, &format) {
+                return Some(date.assume_utc());
+            }
+        }
+    }
+
+    let format = time::format_description::parse_borrowed::<2>(
+        "[weekday repr:short] [month repr:short] [day padding:space] [hour]:[minute]:[second] [year]",
+    )
+    .ok()?;
+    PrimitiveDateTime::parse(value, &format)
+        .ok()
+        .map(PrimitiveDateTime::assume_utc)
 }
 
 #[derive(Default, Deserialize)]
@@ -711,6 +748,38 @@ mod tests {
         );
         response.headers.insert("retry-after".into(), "31".into());
         assert!(retry_delay_at(&response, 0, now).is_err());
+    }
+
+    #[test]
+    fn honors_legacy_http_retry_after_dates() {
+        let now = OffsetDateTime::parse(
+            "1994-11-06T08:49:17Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        for date in ["Sunday, 06-Nov-94 08:49:37 GMT", "Sun Nov  6 08:49:37 1994"] {
+            let mut response = fixture_response(429, "too many requests");
+            response.headers.insert("retry-after".into(), date.into());
+            assert_eq!(
+                retry_delay_at(&response, 0, now).unwrap(),
+                Duration::from_secs(20),
+                "{date}"
+            );
+        }
+        let mut response = fixture_response(429, "too many requests");
+        response.headers.insert(
+            "retry-after".into(),
+            "Saturday, 01-Jan-00 00:00:20 GMT".into(),
+        );
+        let year_2000 = OffsetDateTime::parse(
+            "2000-01-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        assert_eq!(
+            retry_delay_at(&response, 0, year_2000).unwrap(),
+            Duration::from_secs(20)
+        );
     }
 
     #[test]
