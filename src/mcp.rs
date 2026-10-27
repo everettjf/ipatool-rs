@@ -26,7 +26,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -87,58 +87,85 @@ fn tool_failure(name: &str, message: String) -> CallToolResult {
     result
 }
 
+fn optional_non_null<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SearchInput {
     /// Search term.
     term: String,
     /// Maximum results (default 5; visionOS supports up to 12).
     limit: Option<i64>,
     /// iphone, ipad, appletv, watchos, visionos, or macos.
+    #[serde(default, deserialize_with = "optional_non_null")]
     platform: Option<String>,
 }
 
 #[derive(Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AppInput {
     /// Numeric app ID; required unless bundle_identifier is supplied.
+    #[serde(default, deserialize_with = "optional_non_null")]
     app_id: Option<i64>,
     /// Bundle identifier; takes precedence over app_id when found.
+    #[serde(default, deserialize_with = "optional_non_null")]
     bundle_identifier: Option<String>,
     /// iphone, ipad, appletv, watchos, visionos, or macos.
+    #[serde(default, deserialize_with = "optional_non_null")]
     platform: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DownloadInput {
     /// Numeric app ID.
+    #[serde(default, deserialize_with = "optional_non_null")]
     app_id: Option<i64>,
     /// Bundle identifier.
+    #[serde(default, deserialize_with = "optional_non_null")]
     bundle_identifier: Option<String>,
     /// Target file or directory; defaults to the working directory.
+    #[serde(default, deserialize_with = "optional_non_null")]
     output: Option<String>,
     /// External version identifier; latest when omitted.
+    #[serde(default, deserialize_with = "optional_non_null")]
     external_version_id: Option<String>,
     /// Store platform; defaults to iphone.
+    #[serde(default, deserialize_with = "optional_non_null")]
     platform: Option<String>,
     /// Acquire a free license if required.
+    #[serde(default, deserialize_with = "optional_non_null")]
     purchase: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MetadataInput {
+    #[serde(default, deserialize_with = "optional_non_null")]
     app_id: Option<i64>,
+    #[serde(default, deserialize_with = "optional_non_null")]
     bundle_identifier: Option<String>,
+    #[serde(default, deserialize_with = "optional_non_null")]
     platform: Option<String>,
     /// Required external version identifier.
     external_version_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct PurchasesInput {
     /// Page number, starting at 1.
     page: Option<i64>,
     /// Apps per page, 1 to 100.
     max_results: Option<i64>,
     /// Optional platform filter.
+    #[serde(default, deserialize_with = "optional_non_null")]
     platform: Option<String>,
 }
 
@@ -783,5 +810,26 @@ mod tests {
             purchases_pagination(&input).unwrap_err().to_string(),
             format!("max results must be between 1 and {MAX_LIMIT}")
         );
+    }
+
+    #[test]
+    fn mcp_parameters_reject_properties_outside_the_advertised_schema() {
+        assert!(serde_json::from_value::<SearchInput>(json!({"term":"", "extra":1})).is_err());
+        assert!(
+            serde_json::from_value::<SearchInput>(json!({"term":"", "platform":null})).is_err()
+        );
+        assert!(serde_json::from_value::<SearchInput>(json!({"term":"", "limit":null})).is_ok());
+        assert!(serde_json::from_value::<AppInput>(json!({"app_id":null})).is_err());
+        assert!(
+            serde_json::from_value::<DownloadInput>(json!({"app_id":42, "output":null})).is_err()
+        );
+        assert!(
+            serde_json::from_value::<MetadataInput>(
+                json!({"external_version_id":"1", "platform":null})
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_value::<PurchasesInput>(json!({"page":null})).is_ok());
+        assert!(serde_json::from_value::<PurchasesInput>(json!({"platform":null})).is_err());
     }
 }
