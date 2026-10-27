@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use plist::Value;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
-use crate::ipa_zip_repack;
+use crate::{duplicate_zip, ipa_zip_repack};
 
 const MAX_PLIST: u64 = 4 * 1024 * 1024;
 
@@ -51,7 +51,7 @@ pub fn patch_ipa(
         .context("create IPA metadata entry")?;
     plist::to_writer_binary(&mut writer, &metadata).context("write IPA metadata")?;
     if !sinfs.is_empty() {
-        let paths = sinf_paths(&mut archive, sinfs.len())?;
+        let paths = sinf_paths(&mut archive, &mut File::open(source)?, sinfs.len())?;
         for (path, sinf) in paths.into_iter().zip(sinfs) {
             let fields = sinf
                 .as_dictionary()
@@ -114,13 +114,19 @@ fn output_file(parent: &Path, destination: &Path) -> Result<tempfile::NamedTempF
     }
 }
 
-fn sinf_paths(archive: &mut ZipArchive<File>, count: usize) -> Result<Vec<String>> {
+fn sinf_paths(
+    archive: &mut ZipArchive<File>,
+    raw_source: &mut File,
+    count: usize,
+) -> Result<Vec<String>> {
     let mut bundle = None;
     let mut info_index = None;
     let mut manifests = Vec::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index).context("inspect IPA entry")?;
-        let entry_name = entry.name()?.into_owned();
+        let raw_name =
+            duplicate_zip::read_raw_central_name(raw_source, entry.central_header_start())?;
+        let entry_name = String::from_utf8_lossy(&raw_name);
         let parts: Vec<_> = entry_name.split('/').collect();
         if parts.len() == 3
             && parts[0] == "Payload"
@@ -328,6 +334,32 @@ mod tests {
         .unwrap();
         let after = zip_extras(&destination, "Payload/App.app/App");
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn finds_original_info_plist_name_under_unicode_path_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.ipa");
+        let info = br#"<plist version="1.0"><dict><key>CFBundleExecutable</key><string>A</string></dict></plist>"#;
+        crate::duplicate_zip::write_unicode_path_member_fixture(
+            &source,
+            "Payload/A.app/Info.plist",
+            "Payload/B.app/Other.plist",
+            0xdfd6_01cb,
+            info,
+        );
+        let output = directory.path().join("patched.ipa");
+        patch_ipa(
+            &source,
+            &output,
+            &metadata(serde_json::json!({})),
+            "account@example.test",
+            &[],
+            &[mobile_sinf()],
+        )
+        .unwrap();
+        let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
+        assert!(archive.by_name("Payload/A.app/SC_Info/A.sinf").is_ok());
     }
 
     #[test]

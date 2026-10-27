@@ -48,7 +48,10 @@ pub(crate) fn read_matching_entries(
 
 /// zip's `name_raw()` can contain an Info-ZIP UnicodePath replacement. Go's
 /// archive/zip instead exposes the bytes from the central directory filename.
-pub(crate) fn read_raw_central_name(source: &mut File, offset: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_raw_central_name<R: Read + Seek>(
+    source: &mut R,
+    offset: u64,
+) -> Result<Vec<u8>> {
     source.seek(SeekFrom::Start(offset))?;
     let mut header = [0u8; 46];
     source.read_exact(&mut header)?;
@@ -111,17 +114,33 @@ pub(crate) fn replace_fixture_filename_bytes(path: &Path, from: &[u8], to: &[u8]
 
 #[cfg(test)]
 pub(crate) fn write_unicode_path_fixture(path: &Path, contents: &[u8]) {
+    write_unicode_path_member_fixture(
+        path,
+        "Payload/A.app/SC_Info/A.sinf",
+        "Payload/B.app/SC_Info/B.sinf",
+        0x55bc_8223,
+        contents,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn write_unicode_path_member_fixture(
+    path: &Path,
+    name: &str,
+    alias: &str,
+    name_crc32: u32,
+    contents: &[u8],
+) {
     use std::io::Write;
     use zip::{ZipWriter, write::FullFileOptions};
 
     let mut options = FullFileOptions::default();
-    let mut unicode_path = vec![1, 0x23, 0x82, 0xbc, 0x55]; // CRC-32 of the original name
-    unicode_path.extend_from_slice(b"Payload/B.app/SC_Info/B.sinf");
+    let mut unicode_path = vec![1];
+    unicode_path.extend_from_slice(&name_crc32.to_le_bytes());
+    unicode_path.extend_from_slice(alias.as_bytes());
     options.add_extra_field(0x7075, unicode_path, true).unwrap();
     let mut writer = ZipWriter::new(File::create(path).unwrap());
-    writer
-        .start_file("Payload/A.app/SC_Info/A.sinf", options)
-        .unwrap();
+    writer.start_file(name, options).unwrap();
     writer.write_all(contents).unwrap();
     writer.finish().unwrap();
 }

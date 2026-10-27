@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use plist::Value;
 use zip::ZipArchive;
 
-use crate::{Platform, store_download_product::DownloadItem};
+use crate::{Platform, duplicate_zip, store_download_product::DownloadItem};
 
 const MAX_INFO_PLIST: u64 = 4 * 1024 * 1024;
 
@@ -77,9 +77,12 @@ pub fn validate_ipa_platform(path: &Path, platform: Platform) -> Result<()> {
     };
     let file = File::open(path).with_context(|| format!("open IPA {}", path.display()))?;
     let mut archive = ZipArchive::new(file).context("open IPA ZIP")?;
+    let mut raw_source = File::open(path).context("open IPA ZIP filename source")?;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).context("read IPA ZIP entry")?;
-        let entry_name = entry.name()?.into_owned();
+        let raw_name =
+            duplicate_zip::read_raw_central_name(&mut raw_source, entry.central_header_start())?;
+        let entry_name = String::from_utf8_lossy(&raw_name);
         let parts: Vec<_> = entry_name.split('/').collect();
         if parts.len() != 3
             || parts[0] != "Payload"
@@ -214,6 +217,20 @@ mod tests {
         assert!(validate_ipa_platform(ipa(None).path(), Platform::Iphone).is_ok());
         assert!(validate_ipa_platform(ipa(Some(&[])).path(), Platform::Iphone).is_err());
         assert!(validate_ipa_platform(ipa(None).path(), Platform::Visionos).is_err());
+    }
+
+    #[test]
+    fn validates_original_info_plist_name_when_unicode_path_aliases_it() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let info = br#"<plist version="1.0"><dict><key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array></dict></plist>"#;
+        crate::duplicate_zip::write_unicode_path_member_fixture(
+            file.path(),
+            "Payload/A.app/Info.plist",
+            "Payload/B.app/Other.plist",
+            0xdfd6_01cb,
+            info,
+        );
+        assert!(validate_ipa_platform(file.path(), Platform::Iphone).is_ok());
     }
 
     #[test]

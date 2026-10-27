@@ -13,7 +13,10 @@ use time::{Date, Month, OffsetDateTime, Time, format_description::well_known::Rf
 use url::Url;
 use zip::ZipArchive;
 
-use crate::transport::{Request, Response, Transport};
+use crate::{
+    duplicate_zip,
+    transport::{Request, Response, Transport},
+};
 
 const CHUNK_SIZE: u64 = 256 * 1024;
 const MAX_INFO_PLIST: u64 = 4 * 1024 * 1024;
@@ -37,10 +40,13 @@ pub fn read_version_metadata_with_sender(
     sender: impl Fn(Request) -> Result<Response> + Send + Sync + 'static,
 ) -> Result<VersionMetadata> {
     let reader = HttpRangeReader::open(url, Arc::new(sender))?;
+    let mut raw_reader = reader.clone();
     let mut archive = ZipArchive::new(reader).context("open remote IPA ZIP")?;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).context("read remote IPA entry")?;
-        if !is_main_info_plist(&file.name()?) {
+        let raw_name =
+            duplicate_zip::read_raw_central_name(&mut raw_reader, file.central_header_start())?;
+        if !is_main_info_plist(&String::from_utf8_lossy(&raw_name)) {
             continue;
         }
         if file.size() > MAX_INFO_PLIST {
@@ -207,6 +213,7 @@ fn ntfs_custom_modified_time(field: &[u8]) -> Option<OffsetDateTime> {
     modified
 }
 
+#[derive(Clone)]
 struct HttpRangeReader {
     url: Url,
     sender: Arc<Sender>,
@@ -435,6 +442,22 @@ mod tests {
         assert_eq!(metadata.display_version, "2.3.4");
         assert_eq!(metadata.release_date, "2025-01-02T03:04:05Z");
         assert!(served.load(Ordering::SeqCst) < data.len() / 2);
+    }
+
+    #[test]
+    fn reads_original_info_plist_name_when_unicode_path_aliases_it() {
+        let info = br#"<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>2.3.4</string></dict></plist>"#;
+        let mut unicode_path = vec![1];
+        unicode_path.extend_from_slice(&0x8b17_b45cu32.to_le_bytes());
+        unicode_path.extend_from_slice(b"Payload/Fake.app/Other.plist");
+        let data = Arc::new(fixture_ipa_with_extra_time(0x7075, &unicode_path, info));
+        let served = Arc::new(AtomicUsize::new(0));
+        let metadata = read_version_metadata_with_sender(
+            "https://example.test/app.ipa",
+            fixture_sender(data, served),
+        )
+        .unwrap();
+        assert_eq!(metadata.display_version, "2.3.4");
     }
 
     #[test]
