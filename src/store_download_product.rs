@@ -503,6 +503,10 @@ impl DownloadProductClient {
             app,
             version,
             platform,
+            |selected_platform| {
+                let country = country_code_from_storefront(&account.store_front)?;
+                CatalogClient::new()?.latest_external_version_id(app, country, selected_platform)
+            },
             (
                 |url| {
                     if let Some(transport) = &self.transfer {
@@ -545,6 +549,7 @@ impl DownloadProductClient {
         app: &App,
         version: &str,
         platform: Option<Platform>,
+        resolve_version: impl Fn(Platform) -> Result<String>,
         readers: (
             impl FnOnce(&str) -> Result<VersionMetadata>,
             impl FnOnce(&str, &str) -> Result<VersionMetadata>,
@@ -552,15 +557,27 @@ impl DownloadProductClient {
         ),
     ) -> Result<VersionMetadata> {
         let (read_ipa, read_preflight, read_mac_package) = readers;
-        if version.is_empty() || platform == Some(Platform::Unknown) {
-            bail!("a version ID and valid platform are required");
+        if platform == Some(Platform::Unknown) {
+            bail!("a valid platform is required");
         }
+        let requested_platform = platform.unwrap_or(Platform::Iphone);
+        let selected_version = if version.is_empty() && requested_platform == Platform::Macos {
+            resolve_version(Platform::Macos).context("resolve latest macOS version for metadata")?
+        } else {
+            version.to_owned()
+        };
         let response = self.send_product_for_platform(
             account,
             app,
-            version,
-            platform.unwrap_or(Platform::Iphone),
-            || Ok(version.to_owned()),
+            &selected_version,
+            requested_platform,
+            || {
+                if selected_version.is_empty() {
+                    resolve_version(requested_platform)
+                } else {
+                    Ok(selected_version.clone())
+                }
+            },
         )?;
         let item = checked_item(&response)?;
         let software_platform = item
@@ -662,15 +679,16 @@ impl DownloadProductClient {
         if redownload_url != REDOWNLOAD_URL {
             bail!("invalid redownload endpoint in Store bag");
         }
-        let selected_version = if version.is_empty() {
-            match fallback_version() {
-                Ok(selected) => selected,
-                Err(error) if error.downcast_ref::<AppNotFound>().is_some() => String::new(),
-                Err(error) => return Err(error).context("resolve version for redownload"),
-            }
-        } else {
-            version.to_owned()
-        };
+        let selected_version =
+            if version.is_empty() && matches!(platform, Platform::Iphone | Platform::Ipad) {
+                match fallback_version() {
+                    Ok(selected) => selected,
+                    Err(error) if error.downcast_ref::<AppNotFound>().is_some() => String::new(),
+                    Err(error) => return Err(error).context("resolve version for redownload"),
+                }
+            } else {
+                version.to_owned()
+            };
         let redownload = self.send_request_with_timeout(
             Endpoint::Redownload,
             account,
@@ -1777,6 +1795,40 @@ mod tests {
     }
 
     #[test]
+    fn unpinned_non_ios_redownload_keeps_version_unselected() {
+        for platform in [Platform::Appletv, Platform::Watchos, Platform::Visionos] {
+            let versions = Arc::new(Mutex::new(Vec::new()));
+            let seen = Arc::clone(&versions);
+            let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+                let path = request.url.path();
+                if path.ends_with("bag.xml") {
+                    return Ok(response(serde_json::json!({"urlBag": {
+                        "redownloadProduct": REDOWNLOAD_URL
+                    }})));
+                }
+                let body: Value = plist::from_bytes(request.body.as_ref().unwrap()).unwrap();
+                seen.lock().unwrap().push((path.to_owned(), body));
+                if path.ends_with("/r/redownload") {
+                    return Ok(item_response("101"));
+                }
+                Ok(response(serde_json::json!({})))
+            });
+            let result = client
+                .send_product_for_platform(&account(), &app(), "", platform, || {
+                    unreachable!("an unpinned non-iOS redownload has no catalog selection")
+                })
+                .unwrap();
+            assert_eq!(result.data.items.len(), 1);
+            let versions = versions.lock().unwrap();
+            assert_eq!(versions.len(), 2);
+            assert!(versions[0].0.ends_with("volumeStoreDownloadProduct"));
+            assert!(versions[0].1.get("externalVersionId").is_none());
+            assert!(versions[1].0.ends_with("/r/redownload"));
+            assert!(versions[1].1.get("appExtVrsId").is_none());
+        }
+    }
+
+    #[test]
     fn delisted_redownload_rejects_missing_package_url() {
         let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |request| {
             let path = request.url.path();
@@ -1968,6 +2020,7 @@ mod tests {
                 &app(),
                 "101",
                 Some(Platform::Iphone),
+                |_| unreachable!("explicit version must not query catalog"),
                 (
                     |url| {
                         assert_eq!(url, "https://example.test/app.ipa");
@@ -1989,6 +2042,7 @@ mod tests {
                     &app(),
                     "101",
                     Some(Platform::Macos),
+                    |_| unreachable!("explicit version must not query catalog"),
                     (
                         |_| unreachable!(),
                         |_, _| unreachable!(),
@@ -2017,6 +2071,7 @@ mod tests {
                 },
                 "101",
                 None,
+                |_| unreachable!("explicit version must not query catalog"),
                 (
                     |_| unreachable!(),
                     |url, bundle| {
@@ -2032,6 +2087,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.display_version, "4.2");
+    }
+
+    #[test]
+    fn version_metadata_without_id_selects_mac_offer_before_store_request() {
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&lookups);
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            assert_eq!(seen.load(Ordering::SeqCst), 1);
+            let body: Value = plist::from_bytes(request.body.as_ref().unwrap()).unwrap();
+            assert_eq!(body["externalVersionId"], "777");
+            Ok(response(serde_json::json!({"songList": [{
+                "URL": "https://example.test/encrypted.pkg",
+                "preflightPackageURL": "https://example.test/preflight.pkg",
+                "metadata": {"software-platform": "macos"}
+            }]})))
+        });
+        let metadata = client
+            .get_version_metadata_with(
+                &account(),
+                &app(),
+                "",
+                Some(Platform::Macos),
+                |selected_platform| {
+                    assert_eq!(selected_platform, Platform::Macos);
+                    lookups.fetch_add(1, Ordering::SeqCst);
+                    Ok("777".into())
+                },
+                (
+                    |_| unreachable!(),
+                    |url, bundle| {
+                        assert_eq!(url, "https://example.test/preflight.pkg");
+                        assert_eq!(bundle, "com.example.app");
+                        Ok(VersionMetadata {
+                            display_version: "4.2".into(),
+                            release_date: "2012-07-06T09:54:33Z".into(),
+                        })
+                    },
+                    |_, _| unreachable!(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(metadata.display_version, "4.2");
+    }
+
+    #[test]
+    fn version_metadata_without_id_allows_unpinned_iphone_response() {
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |request| {
+            let body: Value = plist::from_bytes(request.body.as_ref().unwrap()).unwrap();
+            assert!(body.get("externalVersionId").is_none());
+            Ok(item_response("101"))
+        });
+        let metadata = client
+            .get_version_metadata_with(
+                &account(),
+                &app(),
+                "",
+                Some(Platform::Iphone),
+                |_| unreachable!("successful volumeStore response needs no catalog lookup"),
+                (
+                    |url| {
+                        assert_eq!(url, "https://example.test/app.ipa");
+                        Ok(VersionMetadata {
+                            display_version: "1.0".into(),
+                            release_date: "2025-01-01T00:00:00Z".into(),
+                        })
+                    },
+                    |_, _| unreachable!(),
+                    |_, _| unreachable!(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(metadata.display_version, "1.0");
     }
 
     #[test]
@@ -2057,6 +2185,7 @@ mod tests {
                     &app(),
                     "101",
                     Some(Platform::Macos),
+                    |_| unreachable!("explicit version must not query catalog"),
                     (
                         |_| unreachable!(),
                         |_, _| unreachable!(),
@@ -2086,6 +2215,7 @@ mod tests {
                 &app(),
                 "101",
                 Some(Platform::Macos),
+                |_| unreachable!("explicit version must not query catalog"),
                 (
                     |_| unreachable!(),
                     |_, _| unreachable!(),
