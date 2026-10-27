@@ -18,6 +18,7 @@ use crate::{
 const CERTIFICATE_KEY: &str = "sign-sap-setup-cert";
 const BUFFER_KEY: &str = "sign-sap-setup-buffer";
 const MAX_SETUP_BODY: usize = 1 << 20;
+const MAX_SETUP_REQUEST_BODY: usize = 1 << 20;
 const USER_AGENT_VALUE: &str =
     "Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6";
 
@@ -54,6 +55,13 @@ impl ReqwestSapClient {
 
 impl SapHttpClient for ReqwestSapClient {
     fn send(&self, request: SapRequest) -> Result<SapResponse> {
+        if request
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > MAX_SETUP_REQUEST_BODY)
+        {
+            bail!("Store request body exceeds {MAX_SETUP_REQUEST_BODY} bytes");
+        }
         let mut host_request = Request::get(request.url);
         host_request.method = request.method;
         host_request.timeout = Some(Duration::from_secs(30));
@@ -344,5 +352,20 @@ mod tests {
             .unwrap();
         assert_eq!(plist_bytes(&exchange.body, BUFFER_KEY).unwrap(), b"reply");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn rejects_oversized_sap_setup_request_before_network_io() {
+        let client = ReqwestSapClient {
+            transport: Transport::new().unwrap(),
+        };
+        let result = client.send(SapRequest {
+            method: Method::POST,
+            url: Url::parse("http://127.0.0.1:1/setup").unwrap(),
+            user_agent: USER_AGENT_VALUE,
+            content_type: Some("application/x-plist"),
+            body: Some(vec![0; MAX_SETUP_REQUEST_BODY + 1]),
+        });
+        assert!(result.err().unwrap().to_string().contains("body exceeds"));
     }
 }
