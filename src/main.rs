@@ -679,6 +679,15 @@ fn run() -> Result<()> {
                         ),
                     });
                     let mut auth_code = Zeroizing::new(auth_code.unwrap_or_default());
+                    const PREPARING: &str =
+                        "preparing authentication; the first login may take a few minutes";
+                    match cli.format {
+                        Format::Json => println!(
+                            "{}",
+                            serde_json::json!({ "level": "info", "message": PREPARING })
+                        ),
+                        Format::Text => println!("{PREPARING}"),
+                    }
                     let backend = NativeAuthenticationBackend::open()?;
                     let mut code_prompts = 0;
                     let account = loop {
@@ -694,7 +703,18 @@ fn run() -> Result<()> {
                         match result {
                             Ok(account) => break account,
                             Err(error) if error.downcast_ref::<AuthCodeRequired>().is_some() => {
-                                if !interactive || code_prompts == 1 {
+                                if !interactive {
+                                    const MESSAGE: &str = "2FA code is required; run the command again and supply a code using the `--auth-code` flag";
+                                    match cli.format {
+                                        Format::Json => println!(
+                                            "{}",
+                                            serde_json::json!({ "level": "info", "message": MESSAGE })
+                                        ),
+                                        Format::Text => println!("{MESSAGE}"),
+                                    }
+                                    return Ok(());
+                                }
+                                if code_prompts == 1 {
                                     return Err(
                                         error.context("supply a fresh code with --auth-code")
                                     );
