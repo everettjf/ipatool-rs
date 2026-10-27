@@ -18,6 +18,7 @@ use crate::capture::{
     EnrollmentCaptureManifest, FairPlayBuildSupport, capture_file_path, load_enrollment_capture,
     model_matches_capture_build,
 };
+use crate::duplicate_zip;
 use crate::host::{FairPlayHostDiagnostic, inspect_local_fairplay_host};
 
 const MODEL_V1_BYTES: usize = 8 + 4 + 4 + 32 + 16 + 16 + 16 * 256;
@@ -201,19 +202,29 @@ pub fn inspect_ipa_sinfs(path: &Path) -> Result<Vec<SinfDiagnostic>> {
     let file = fs::File::open(path).with_context(|| format!("open IPA: {}", path.display()))?;
     let mut archive = ZipArchive::new(file).context("open IPA ZIP archive")?;
     let mut result = Vec::new();
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).context("read IPA ZIP member")?;
-        let name = entry.name()?.into_owned();
-        if !name.contains("/SC_Info/") || !has_sinf_extension(&name) {
-            continue;
+    if archive.has_duplicate_names() {
+        for (name, bytes) in duplicate_zip::read_matching_entries(path, |name| {
+            name.contains("/SC_Info/") && has_sinf_extension(name)
+        })? {
+            let mut diagnostic = inspect_sinf(&bytes).with_context(|| format!("inspect {name}"))?;
+            diagnostic.path = Some(name);
+            result.push(diagnostic);
         }
-        let mut bytes = Vec::new();
-        entry
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("read {name}"))?;
-        let mut diagnostic = inspect_sinf(&bytes).with_context(|| format!("inspect {name}"))?;
-        diagnostic.path = Some(name);
-        result.push(diagnostic);
+    } else {
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).context("read IPA ZIP member")?;
+            let name = entry.name()?.into_owned();
+            if !name.contains("/SC_Info/") || !has_sinf_extension(&name) {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            entry
+                .read_to_end(&mut bytes)
+                .with_context(|| format!("read {name}"))?;
+            let mut diagnostic = inspect_sinf(&bytes).with_context(|| format!("inspect {name}"))?;
+            diagnostic.path = Some(name);
+            result.push(diagnostic);
+        }
     }
     if result.is_empty() {
         bail!("IPA contains no SINF files");
@@ -717,6 +728,22 @@ mod tests {
             diagnostics[0].path.as_deref(),
             Some("Payload/A.app/SC_Info/A.sinf")
         );
+    }
+
+    #[test]
+    fn inspects_duplicate_sinf_members_in_archive_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("duplicate.ipa");
+        let first = sinf(SinfSelector { user: 1, key: 2 }, 440);
+        let second = sinf(SinfSelector { user: 3, key: 4 }, 448);
+        crate::duplicate_zip::write_duplicate_sinf_fixture(&path, &first, &second);
+        let diagnostics = inspect_ipa_sinfs(&path).unwrap();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].selector.user, 1);
+        assert_eq!(diagnostics[1].selector.user, 3);
+
+        crate::duplicate_zip::write_duplicate_sinf_fixture(&path, b"bad", &second);
+        assert!(inspect_ipa_sinfs(&path).is_err());
     }
 
     #[test]

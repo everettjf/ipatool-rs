@@ -18,6 +18,7 @@ use crate::{
         CaptureApp, CaptureFile, ENROLLMENT_CAPTURE_SCHEMA, EnrollmentCaptureManifest,
         FairPlayBuildSupport, lookup_fairplay_build,
     },
+    duplicate_zip,
     fairplay::{
         SinfSelector, has_sinf_extension, is_sinf_extension_equal_fold, parse_sinf_selector,
     },
@@ -269,16 +270,26 @@ fn capture_ipa(
     executable: &str,
 ) -> Result<(CaptureFile, String, CaptureFile)> {
     let mut archive = ZipArchive::new(File::open(source)?)?;
-    let mut roots = Vec::new();
-    for index in 0..archive.len() {
-        let mut member = archive.by_index(index)?;
-        let name = member.name()?.into_owned();
-        if !name.contains("/SC_Info/") || !has_sinf_extension(&name) {
-            continue;
+    let mut sinfs = Vec::new();
+    if archive.has_duplicate_names() {
+        sinfs = duplicate_zip::read_matching_entries(source, |name| {
+            name.contains("/SC_Info/") && has_sinf_extension(name)
+        })?;
+    } else {
+        for index in 0..archive.len() {
+            let mut member = archive.by_index(index)?;
+            let name = member.name()?.into_owned();
+            if !name.contains("/SC_Info/") || !has_sinf_extension(&name) {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            member.read_to_end(&mut bytes)?;
+            sinfs.push((name, bytes));
         }
-        let mut bytes = Vec::new();
-        member.read_to_end(&mut bytes)?;
-        if parse_sinf_selector(&bytes).ok() == Some(selector) {
+    }
+    let mut roots = Vec::new();
+    for (name, bytes) in &sinfs {
+        if parse_sinf_selector(bytes).ok() == Some(selector) {
             roots.push(name.split("/SC_Info/").next().unwrap().to_owned());
         }
     }
@@ -290,11 +301,11 @@ fn capture_ipa(
         )
     })?;
     let target_name = format!("{ipa_root}/SC_Info/{executable}.sinf");
-    let mut target = Vec::new();
-    archive
-        .by_name(&target_name)
-        .with_context(|| format!("IPA member not found: {target_name}"))?
-        .read_to_end(&mut target)?;
+    let target = sinfs
+        .iter()
+        .find(|(name, _)| name == &target_name)
+        .map(|(_, data)| data.clone())
+        .with_context(|| format!("IPA member not found: {target_name}"))?;
     if parse_sinf_selector(&target)? != selector {
         bail!("IPA target SINF selector mismatch");
     }
@@ -474,12 +485,16 @@ mod tests {
         result
     }
 
-    fn sinf() -> Vec<u8> {
+    fn sinf_with_selector(selector: SinfSelector) -> Vec<u8> {
         let mut fields = Vec::new();
-        fields.extend(atom(*b"user", &7u32.to_be_bytes()));
-        fields.extend(atom(*b"key ", &9u32.to_be_bytes()));
+        fields.extend(atom(*b"user", &selector.user.to_be_bytes()));
+        fields.extend(atom(*b"key ", &selector.key.to_be_bytes()));
         fields.extend(atom(*b"priv", b"sample"));
         atom(*b"sinf", &atom(*b"schi", &fields))
+    }
+
+    fn sinf() -> Vec<u8> {
+        sinf_with_selector(SinfSelector { user: 7, key: 9 })
     }
 
     #[test]
@@ -494,6 +509,20 @@ mod tests {
         fs::remove_file(path).unwrap();
         fs::write(app.join("SC_Info/A.SİNF"), sinf()).unwrap();
         assert!(installed_sinf(&app).is_err());
+    }
+
+    #[test]
+    fn capture_ipa_uses_first_duplicate_sinf_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let ipa = directory.path().join("duplicate.ipa");
+        let first = sinf();
+        let second = sinf_with_selector(SinfSelector { user: 7, key: 10 });
+        crate::duplicate_zip::write_duplicate_sinf_fixture(&ipa, &first, &second);
+        let output = directory.path().join("capture");
+        let (_, root, _) =
+            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A").unwrap();
+        assert_eq!(root, "Payload/A.app");
+        assert_eq!(fs::read(output.join("ipa/App.sinf")).unwrap(), first);
     }
 
     #[cfg(unix)]
