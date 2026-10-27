@@ -119,6 +119,7 @@ struct StoreState {
     observers: Vec<NotificationObserver>,
     swift_tasks: HashMap<u64, SwiftTask>,
     current_swift_task: Option<u64>,
+    task_locals: TaskLocalBindings,
     swift_query_array_metadata: Option<u64>,
     associations: HashMap<(u64, u64), u64>,
 }
@@ -159,6 +160,47 @@ struct SwiftTask {
     continuation: Option<u64>,
     executor: [u64; 2],
     done: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TaskLocalBinding {
+    key: u64,
+    value: u64,
+}
+
+#[derive(Default)]
+struct TaskLocalBindings {
+    frames: HashMap<u64, Vec<TaskLocalBinding>>,
+}
+
+impl TaskLocalBindings {
+    fn get(&self, owner: u64, key: u64) -> u64 {
+        self.frames
+            .get(&owner)
+            .and_then(|bindings| bindings.iter().rev().find(|binding| binding.key == key))
+            .map_or(0, |binding| binding.value)
+    }
+
+    fn push(&mut self, owner: u64, key: u64, value: u64) {
+        self.frames
+            .entry(owner)
+            .or_default()
+            .push(TaskLocalBinding { key, value });
+    }
+
+    fn pop(&mut self, owner: u64) -> Result<()> {
+        let bindings = self
+            .frames
+            .get_mut(&owner)
+            .context("empty TaskLocal binding stack")?;
+        bindings.pop().context("empty TaskLocal binding stack")?;
+        Ok(())
+    }
+
+    fn copy_to(&mut self, source: u64, target: u64) {
+        let bindings = self.frames.get(&source).cloned().unwrap_or_default();
+        self.frames.insert(target, bindings);
+    }
 }
 
 enum PendingWork {
@@ -409,6 +451,7 @@ impl StoreRuntime {
             observers: Vec::new(),
             swift_tasks: HashMap::new(),
             current_swift_task: None,
+            task_locals: TaskLocalBindings::default(),
             swift_query_array_metadata: None,
             associations: HashMap::new(),
         }));
@@ -1548,7 +1591,43 @@ fn dispatch_call(
         "nw_activity_activate" | "nw_activity_complete" | "nw_activity_cancel" => {
             context.reg_write(REG_X0, 0)?;
         }
-        "swift_task_localValueGet" => context.reg_write(REG_X0, 0)?,
+        "swift_task_localValueGet" => {
+            let owner = state.current_swift_task.unwrap_or(0);
+            let key = context.reg_read(REG_X0)?;
+            context.reg_write(REG_X0, state.task_locals.get(owner, key))?;
+        }
+        "swift_task_localValuePush" => {
+            let key = context.reg_read(REG_X0)?;
+            let source = context.reg_read(REG_X0 + 1)?;
+            let metadata = context.reg_read(REG_X0 + 2)?;
+            let witnesses = read_guest_u64(
+                context,
+                metadata
+                    .checked_sub(8)
+                    .context("invalid TaskLocal metadata")?,
+            )?;
+            let size = read_guest_u64(context, witnesses + 64)?;
+            if size > 1 << 20 {
+                bail!("TaskLocal value exceeds budget");
+            }
+            let value = state.allocate(size)?;
+            context.mem_write(value, &context.mem_read(source, size as usize)?)?;
+            let owner = state.current_swift_task.unwrap_or(0);
+            state.task_locals.push(owner, key, value);
+            context.reg_write(REG_X0, 0)?;
+        }
+        "swift_task_localValuePop" => {
+            let owner = state.current_swift_task.unwrap_or(0);
+            state.task_locals.pop(owner)?;
+        }
+        "swift_task_localsCopyTo" => {
+            let target = context.reg_read(REG_X0)?;
+            if !state.swift_tasks.contains_key(&target) {
+                bail!("unknown task for local bindings");
+            }
+            let owner = state.current_swift_task.unwrap_or(0);
+            state.task_locals.copy_to(owner, target);
+        }
         "swift_dynamicCast" => {
             let destination = context.reg_read(REG_X0)?;
             let source = context.reg_read(REG_X0 + 1)?;
@@ -1669,6 +1748,10 @@ fn dispatch_call(
             write_guest_u64(context, handle + 0x40, result_record)?;
             let context_address = task.context;
             state.swift_tasks.insert(handle, task);
+            if flags & (1 << 10) != 0 {
+                let owner = state.current_swift_task.unwrap_or(0);
+                state.task_locals.copy_to(owner, handle);
+            }
             state.pending.push(PendingWork::SwiftTask { task: handle });
             context.reg_write(REG_X0, handle)?;
             context.reg_write(REG_X0 + 1, context_address)?;
@@ -9069,6 +9152,56 @@ fn allowed_store_url(url: &url::Url, authenticated: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_locals_shadow_pop_and_copy_to_child() {
+        let mut locals = TaskLocalBindings::default();
+        assert_eq!(locals.get(0, 7), 0);
+        assert!(locals.pop(0).is_err());
+
+        locals.push(0, 7, 100);
+        locals.push(0, 8, 200);
+        locals.push(0, 7, 300);
+        assert_eq!(locals.get(0, 7), 300);
+        assert_eq!(locals.get(0, 8), 200);
+
+        locals.copy_to(0, 42);
+        locals.pop(0).unwrap();
+        assert_eq!(locals.get(0, 7), 100);
+        assert_eq!(locals.get(42, 7), 300);
+        locals.push(42, 7, 400);
+        assert_eq!(locals.get(42, 7), 400);
+        assert_eq!(locals.get(0, 7), 100);
+        locals.pop(42).unwrap();
+        assert_eq!(locals.get(42, 7), 300);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_task_local_get_uses_current_task_binding() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let get = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.symbol.trim_start_matches('_') == "swift_task_localValueGet")
+            .unwrap()
+            .address;
+        let key = 0x1234;
+        let value = runtime.allocate(16).unwrap();
+        {
+            let mut state = runtime.state.borrow_mut();
+            state.task_locals.push(0, key, value);
+            state.task_locals.copy_to(0, 42);
+            state.current_swift_task = Some(42);
+        }
+        assert_eq!(runtime.call(get, &[key]).unwrap(), value);
+        runtime.state.borrow_mut().current_swift_task = None;
+        assert_eq!(runtime.call(get, &[key]).unwrap(), value);
+        assert_eq!(runtime.call(get, &[key + 1]).unwrap(), 0);
+    }
 
     #[test]
     fn purchase_validation_accepts_unrelated_plist_data() {
