@@ -1,53 +1,48 @@
 # ipatool-rs
 
-This repository is a Rust port of the sibling `ipatool-fairplay` Go project. The port is **in progress**; it is not yet a replacement for the Go program.
+A Rust port of the sibling `ipatool-fairplay` project. The CLI implements the Go project's command paths, including App Store account operations, package downloads, an MCP server, and FairPlay diagnostics. Full parity is still being validated; see [PORTING.md](PORTING.md) for the evidence and remaining gates.
 
-## Working commands
+The current delivery target is **macOS on Apple Silicon**. Work on macOS x86_64, iOS, Linux, and Windows is deferred at the user's request.
 
-```sh
-cargo run -- search "notes" --country US --limit 5
-cargo run -- --format json search "notes" --platform ipad
-cargo run -- lookup --app-id 497799835
-cargo run -- latest-version-id --app-id 874139669 --platform iphone
-cargo run -- fairplay-doctor --ipa /private/path/app.ipa --model /private/path/model.bin
-cargo run -- auth info
-cargo run -- auth revoke
-cargo run -- completion zsh > _ipatool
-```
-
-`search` supports iPhone, iPad, Apple TV, Apple Watch, visionOS and macOS platform aliases. It derives platforms from catalog metadata, filters Watch results, and uses the visionOS storefront when appropriate. `lookup` accepts an app ID or bundle identifier. These read-only commands use the public catalog; `--country` defaults to `US` until account storefront support is ported.
-
-`latest-version-id` resolves the current external version ID for iPhone, iPad, Apple TV, Apple Watch, or visionOS through the public platform catalog. It does not list historical versions. macOS version lookup still requires the authenticated Store and package metadata flow.
-
-On macOS, `auth info` reads the existing Go-compatible account from the system Keychain and prints only its name and email. `auth revoke` removes that account and its KBSync cache. Other credential backends and `auth login` are still pending.
-
-## Port status
-
-| Function in Go program | Rust status |
-| --- | --- |
-| Public search, including visionOS discovery | Implemented, with offline unit tests |
-| Public app lookup by ID or bundle identifier | Implemented, with offline unit tests |
-| Latest public external version ID for non-macOS platforms | Implemented, with offline unit tests; iPhone live lookup checked |
-| Shared HTTP decoding, state migration and Go-compatible cookie persistence | Implemented as library modules; local redirect/cookie transport tested, Store executor pending |
-| Authentication URL bag, endpoint validation, 2FA and phone routing helpers | Implemented as library modules; SAP signing and login execution pending |
-| FairPlay SINF, IPA SINF and enrollment model inspection | Implemented as library modules; decryption pending |
-| `fairplay-doctor` host, capture, IPA and model checks | Implemented; current macOS host output compared with Go |
-| Account inspection and revocation through macOS Keychain | Implemented with in-memory tests; existing real credentials not tested |
-| Account login and other credential backends | Pending |
-| Shell completion for implemented commands | Implemented for Bash, Zsh, Fish, PowerShell and Elvish |
-| Purchases, owned apps, version history and metadata | Pending |
-| iOS and macOS package downloads and SINF replication | Pending |
-| FairPlay enrollment, diagnostics and decryption | Pending |
-| Embedded Store profile, page checks and pinned Unicorn ARM64 engine | Profile, engine, hooks and strict memory guard implemented; Store bridge and SAP execution pending |
-| MCP server and completion | Pending |
-
-The Go source is about 88,000 lines including generated code and platform-specific implementations. The Rust port needs separate validation against the Go test suite and real account flows before it can claim feature parity. The compiled Store profile is embedded from the Go source snapshot; no account credentials or private enrollment material are embedded in this repository.
-
-## Build and test
+## Build and check
 
 ```sh
-cargo build
-cargo test
+cargo fmt --check
+cargo test --all-targets --quiet
+cargo clippy --all-targets -- -D warnings
+scripts/build-macos.sh --arm64
 ```
 
-The upstream project is MIT licensed; see `LICENSE`.
+The build script creates a signed `target/release/ipatool-macos-arm64` executable. The signature is ad hoc; it is not Apple notarization. The executable does not launch a separate Go, Python, or Swift binary. Store and SAP operations still run selected, pinned Apple framework code inside the Rust emulator.
+
+## Public catalog commands
+
+These commands do not require an Apple account:
+
+```sh
+./target/release/ipatool-macos-arm64 search ScriptWidget --platform macos --country US --limit 5
+./target/release/ipatool-macos-arm64 lookup --app-id 1555600758 --platform macos --country US
+./target/release/ipatool-macos-arm64 latest-version-id --app-id 1555600758 --platform macos --country US
+```
+
+Use `--format json` for machine-readable output. The catalog also supports iPhone, iPad, Apple TV, Apple Watch, and visionOS platforms. Public searches default to the US storefront unless `--country` is supplied.
+
+## Account and download commands
+
+Run `auth login` interactively so the Apple ID password and any verification code are entered at prompts rather than in shell history:
+
+```sh
+./target/release/ipatool-macos-arm64 auth login
+./target/release/ipatool-macos-arm64 auth info
+./target/release/ipatool-macos-arm64 list-purchases --platform macos --max-results 2
+./target/release/ipatool-macos-arm64 list-versions --app-id 1555600758 --platform macos
+./target/release/ipatool-macos-arm64 download --app-id 1555600758 --platform macos --output /tmp/ScriptWidget.pkg
+```
+
+The default macOS credential store is Apple Keychain and may require an authorization dialog. Add the global `--file-keychain` flag to each account command to use encrypted file storage with a separate passphrase prompt (for example, `ipatool --file-keychain auth login`). `IPATOOL_STATE_DIR` can point to an absolute private directory to isolate its cookies and encrypted account data from existing state. Do not put either passphrase on the command line.
+
+Native Mac App Store apps, including ScriptWidget, download as PKGs. An iPhone or iPad app made available on Apple Silicon Mac can take the separate IPA path when the Store returns a mobile package. The CLI can request an iPhone IPA through `download --platform iphone` when the account is entitled to that version; it is a separate package from the native Mac release.
+
+Other commands include `purchase`, `get-version-metadata`, `mcp`, `fairplay-doctor`, `fairplay-enroll`, `fairplay-decrypt`, and shell `completion`. Run a command with `--help` for its options. Real FairPlay enrollment and decryption require paired private data and remain unverified on this host. The available account tests cover login without a 2FA challenge, a free purchase, purchase history, version metadata, authenticated MCP listing, and real Mac PKG downloads; default Keychain authorization and token-expiry recovery still need live validation.
+
+Keep credentials, cookies, downloaded packages, and private FairPlay captures outside the repository. The project is MIT licensed; see [LICENSE](LICENSE).

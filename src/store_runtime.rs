@@ -11427,12 +11427,12 @@ mod tests {
             .new_object("NSMutableString", StoreValue::String("Hello ".into()))
             .unwrap();
         let suffix = runtime
-            .new_object("NSString", StoreValue::String("世界".into()))
+            .new_object("NSString", StoreValue::String("\u{20ac}".into()))
             .unwrap();
         assert_eq!(runtime.call(append, &[receiver, 0, suffix]).unwrap(), 0);
         assert_eq!(
             object_string_value(&runtime.state.borrow(), receiver).unwrap(),
-            "Hello 世界"
+            "Hello \u{20ac}"
         );
         assert_eq!(runtime.call(description, &[suffix]).unwrap(), suffix);
     }
@@ -11687,12 +11687,12 @@ mod tests {
             "éx"
         );
         let suffix = runtime
-            .new_object("NSString", StoreValue::String("世界".into()))
+            .new_object("NSString", StoreValue::String("\u{20ac}!".into()))
             .unwrap();
         let combined = runtime.call(append, &[string, 0, suffix]).unwrap();
         assert_eq!(
             object_string_value(&runtime.state.borrow(), combined).unwrap(),
-            "éx世界"
+            "éx\u{20ac}!"
         );
         let utf8 = runtime.call(encode, &[combined, 0, 4]).unwrap();
         let utf16 = runtime.call(encode, &[combined, 0, 10]).unwrap();
@@ -11700,7 +11700,7 @@ mod tests {
         let StoreValue::Bytes(utf8_bytes) = &state.objects[&utf8].value else {
             panic!("UTF-8 conversion did not return data");
         };
-        assert_eq!(utf8_bytes, "éx世界".as_bytes());
+        assert_eq!(utf8_bytes, "éx\u{20ac}!".as_bytes());
         let StoreValue::Bytes(utf16_bytes) = &state.objects[&utf16].value else {
             panic!("UTF-16 conversion did not return data");
         };
@@ -12647,7 +12647,8 @@ mod tests {
         let assets = SapAssetBundle::load_cached().unwrap();
         let mut runtime = StoreRuntime::open(&assets).unwrap();
         runtime.set_hardware_id(&[1, 2, 3, 4, 5, 6]).unwrap();
-        let nested = serde_json::json!({"values": [1, 2.5, true, null], "label": "测试"});
+        let nested =
+            serde_json::json!({"values": [1, 2.5, true, null], "label": "sample \u{20ac}"});
         let imported = runtime.import_json(&nested).unwrap();
         assert_eq!(runtime.export(imported).unwrap(), nested);
         assert!(!runtime.code_ranges.is_empty());
