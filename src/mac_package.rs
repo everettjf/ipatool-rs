@@ -325,7 +325,7 @@ pub fn validate_mac_package(path: &Path) -> Result<()> {
     }
     let header_size = u16::from_be_bytes(header[4..6].try_into().unwrap()) as u64;
     let compressed = u64::from_be_bytes(header[8..16].try_into().unwrap());
-    if !(28..=4096).contains(&header_size)
+    if header_size != 28
         || header_size
             .checked_add(compressed)
             .is_none_or(|end| end > size)
@@ -538,6 +538,17 @@ mod tests {
                 .to_string()
                 .contains("checksum")
         );
+    }
+
+    #[test]
+    fn rejects_extended_xar_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        let mut package = xar(b"package payload", false);
+        package[4..6].copy_from_slice(&29u16.to_be_bytes());
+        package.insert(28, 0);
+        fs::write(&path, package).unwrap();
+        assert!(validate_mac_package(&path).is_err());
     }
 
     #[test]

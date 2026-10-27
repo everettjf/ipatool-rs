@@ -69,7 +69,7 @@ fn parse_preflight_reader<R: Read + Seek + Debug>(
     }
     let header_size = u16::from_be_bytes(header[4..6].try_into().unwrap()) as u64;
     let compressed = u64::from_be_bytes(header[8..16].try_into().unwrap());
-    if !(28..=4096).contains(&header_size)
+    if header_size != 28
         || header_size
             .checked_add(compressed)
             .is_none_or(|end| end > size)
@@ -336,6 +336,14 @@ mod tests {
                 .to_string()
                 .contains("checksum mismatch")
         );
+    }
+
+    #[test]
+    fn rejects_extended_xar_header() {
+        let mut package = fixture_xar(DISTRIBUTION);
+        package[4..6].copy_from_slice(&29u16.to_be_bytes());
+        package.insert(28, 0);
+        assert!(parse_preflight_xar(&package, "com.example.mac").is_err());
     }
 
     #[test]
