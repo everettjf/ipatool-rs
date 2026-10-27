@@ -479,12 +479,12 @@ impl DownloadProductClient {
             .context("download metadata has no version identifiers")?;
         let external_version_identifiers = identifiers
             .iter()
-            .map(version_string)
-            .collect::<Result<Vec<_>>>()?;
+            .map(ipa_metadata::go_display_value)
+            .collect();
         let latest_external_version_id = item
             .metadata_field("softwareVersionExternalIdentifier")
             .context("download metadata has no latest version")
-            .and_then(version_string)?;
+            .map(ipa_metadata::go_display_value)?;
         Ok(ListVersionsOutput {
             external_version_identifiers,
             latest_external_version_id,
@@ -1230,16 +1230,6 @@ fn fetch_artwork_with_transport(url: &str, transport: Option<&Transport>) -> Res
     Ok(bytes)
 }
 
-fn version_string(value: &plist::Value) -> Result<String> {
-    match value {
-        plist::Value::String(value) => Ok(value.clone()),
-        plist::Value::Integer(value) => Ok(value.to_string()),
-        plist::Value::Real(value) => Ok(value.to_string()),
-        plist::Value::Boolean(value) => Ok(value.to_string()),
-        _ => bail!("invalid external version identifier in download metadata"),
-    }
-}
-
 fn download_fallback_version(
     catalog: &CatalogClient,
     app: &App,
@@ -1342,7 +1332,7 @@ fn validate_fallback(response: &DownloadProductResponse, app: &App, version: &st
     let id = item
         .metadata_field("itemId")
         .context("redownload response has no app ID")?;
-    if version_string(id)? != app.id.to_string() {
+    if ipa_metadata::go_display_value(id) != app.id.to_string() {
         bail!("redownload response does not match the requested app");
     }
     let bundle = item
@@ -1355,8 +1345,7 @@ fn validate_fallback(response: &DownloadProductResponse, app: &App, version: &st
     if !version.is_empty()
         && item
             .metadata_field("softwareVersionExternalIdentifier")
-            .map(version_string)
-            .transpose()?
+            .map(ipa_metadata::go_display_value)
             .as_deref()
             != Some(version)
     {
@@ -1932,6 +1921,41 @@ mod tests {
             .list_versions(&catalog, &account(), &app(), Platform::Iphone)
             .unwrap_err();
         assert!(error.downcast_ref::<PasswordTokenExpired>().is_some());
+    }
+
+    #[test]
+    fn list_versions_formats_plist_values_like_go() {
+        let catalog = CatalogClient::new().unwrap();
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| {
+            Ok(Response {
+                status: 200,
+                headers: Default::default(),
+                body: br#"<plist version="1.0"><dict><key>songList</key><array><dict>
+                    <key>metadata</key><dict>
+                    <key>softwareVersionExternalIdentifiers</key><array>
+                    <data>AQID</data><array><string>v</string><true/></array>
+                    <dict><key>id</key><integer>7</integer></dict>
+                    <date>2024-01-02T03:04:05Z</date><real>1000000</real>
+                    </array>
+                    <key>softwareVersionExternalIdentifier</key><real>1000000</real>
+                    </dict></dict></array></dict></plist>"#
+                    .to_vec(),
+            })
+        });
+        let versions = client
+            .list_versions(&catalog, &account(), &app(), Platform::Iphone)
+            .unwrap();
+        assert_eq!(
+            versions.external_version_identifiers,
+            [
+                "[1 2 3]",
+                "[v true]",
+                "map[id:7]",
+                "2024-01-02 03:04:05 +0000 UTC",
+                "1e+06"
+            ]
+        );
+        assert_eq!(versions.latest_external_version_id, "1e+06");
     }
 
     #[test]
