@@ -1792,7 +1792,7 @@ fn dispatch_call(
             if state.swift_tasks[&task].continuation != Some(continuation) {
                 bail!("awaiting unknown Swift continuation");
             }
-            poll_swift_continuation(context, state, task, continuation)?;
+            poll_swift_continuation(context, profile, state, task, continuation)?;
         }
         "swift_getDynamicType" => {
             let value = read_guest_u64(context, context.reg_read(REG_X0)?)?;
@@ -4452,18 +4452,27 @@ fn begin_callback(
     if function == 0 || arguments.len() > 8 {
         bail!("invalid Store guest callback");
     }
-    let link = context.reg_read(REG_LR)?;
-    let resume = state.allocate(16)?;
-    context.mem_write(resume, &[0xc0, 0x03, 0x5f, 0xd6])?;
-    state
-        .callbacks
-        .insert(resume, CallbackResume { link, action });
+    let resume = install_callback_resume(context, state, action)?;
     for (index, &value) in arguments.iter().enumerate() {
         context.reg_write(REG_X0 + index as i32, value)?;
     }
     context.reg_write(REG_LR, resume)?;
     context.reg_write(REG_PC, function)?;
     Ok(())
+}
+
+fn install_callback_resume(
+    context: &HookContext,
+    state: &mut StoreState,
+    action: CallbackAction,
+) -> Result<u64> {
+    let link = context.reg_read(REG_LR)?;
+    let resume = state.allocate(16)?;
+    context.mem_write(resume, &[0xc0, 0x03, 0x5f, 0xd6])?;
+    state
+        .callbacks
+        .insert(resume, CallbackResume { link, action });
+    Ok(resume)
 }
 
 fn start_swift_task(
@@ -4551,6 +4560,7 @@ fn start_notification_callback(
 
 fn poll_swift_continuation(
     context: &HookContext,
+    profile: &ProfileData,
     state: &mut StoreState,
     task: u64,
     continuation: u64,
@@ -4590,13 +4600,28 @@ fn poll_swift_continuation(
             start_swift_task(context, state, child, Some((task, continuation)))
         }
         work => {
-            let kind = match work {
-                PendingWork::Http { .. } => "http",
-                PendingWork::DeliverData { .. } => "data",
-                PendingWork::Complete { .. } => "complete",
+            // The transport helpers start guest callbacks. Route their return
+            // through this poll trampoline so the awaited continuation can
+            // process the next completion or resume once its result arrives.
+            let resume = install_callback_resume(
+                context,
+                state,
+                CallbackAction::PollSwiftContinuation {
+                    task,
+                    continuation,
+                    previous_queue: state.current_queue,
+                },
+            )?;
+            state.current_swift_task = None;
+            context.reg_write(REG_LR, resume)?;
+            match work {
+                PendingWork::Http { task } => perform_http(context, profile, state, task),
+                PendingWork::DeliverData { task } => {
+                    deliver_http_data(context, profile, state, task)
+                }
+                PendingWork::Complete { task } => complete_http_task(context, profile, state, task),
                 _ => unreachable!(),
-            };
-            bail!("Swift continuation cannot yet run pending {kind} work")
+            }
         }
     }
 }
@@ -4858,7 +4883,7 @@ fn resume_callback(
             context.reg_write(REG_X0, u64::from(poll_after.is_none()))?;
             if let Some((parent, continuation)) = poll_after {
                 state.current_swift_task = Some(parent);
-                poll_swift_continuation(context, state, parent, continuation)?;
+                poll_swift_continuation(context, profile, state, parent, continuation)?;
             } else {
                 context.reg_write(REG_PC, link)?;
             }
@@ -4872,7 +4897,7 @@ fn resume_callback(
             state.current_queue = previous_queue;
             state.current_swift_task = Some(task);
             context.reg_write(REG_LR, resume.link)?;
-            poll_swift_continuation(context, state, task, continuation)?;
+            poll_swift_continuation(context, profile, state, task, continuation)?;
             return Ok(());
         }
     }
@@ -9082,6 +9107,120 @@ mod tests {
         ] {
             assert!(!allowed_store_url(&url::Url::parse(value).unwrap(), true));
         }
+    }
+
+    #[test]
+    fn swift_continuation_runs_pending_http_delegate_callbacks() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let request = runtime
+            .new_object("AMSURLRequest", StoreValue::Empty)
+            .unwrap();
+        let url = runtime
+            .new_object(
+                "NSURL",
+                StoreValue::String("https://buy.itunes.apple.com/request".into()),
+            )
+            .unwrap();
+        let request = runtime
+            .invoke(
+                request,
+                "initWithURL:cachePolicy:timeoutInterval:",
+                &[url, 0, 0],
+            )
+            .unwrap();
+        let session = runtime.new_session().unwrap();
+        let http_task = runtime
+            .new_object("NSURLSessionDataTask", StoreValue::Empty)
+            .unwrap();
+        {
+            let mut state = runtime.state.borrow_mut();
+            state
+                .objects
+                .get_mut(&session)
+                .unwrap()
+                .properties
+                .insert("delegate".into(), session);
+            state
+                .objects
+                .get_mut(&http_task)
+                .unwrap()
+                .properties
+                .extend([
+                    ("currentRequest".into(), request),
+                    ("session".into(), session),
+                    ("state".into(), 0),
+                ]);
+            state.pending.push(PendingWork::Http { task: http_task });
+        }
+        runtime.set_transport(|request| {
+            assert_eq!(request.url.as_str(), "https://buy.itunes.apple.com/request");
+            Ok(HostResponse {
+                status: 200,
+                headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
+                body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
+            })
+        });
+        assert_eq!(runtime.state.borrow().pending.len(), 1);
+
+        let continuation = runtime.allocate(64).unwrap();
+        let swift_task = runtime.allocate(64).unwrap();
+        runtime.write_u64(continuation + 24, 0).unwrap();
+        {
+            let mut state = runtime.state.borrow_mut();
+            state.swift_tasks.insert(
+                swift_task,
+                SwiftTask {
+                    context: 0,
+                    entry: 0,
+                    closure: 0,
+                    result: 0,
+                    continuation: Some(continuation),
+                    executor: [0; 2],
+                    done: false,
+                },
+            );
+            state.current_swift_task = Some(swift_task);
+        }
+        let await_call = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.symbol.trim_start_matches('_') == "swift_continuation_await")
+            .unwrap()
+            .address;
+        // This synthetic task has no guest code to resume its continuation.
+        // Exhausting the queued work is expected after each callback phase.
+        let error = runtime.call(await_call, &[continuation]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Swift continuation has no runnable completion"),
+            "{error:#}"
+        );
+        assert!(
+            runtime
+                .state
+                .borrow()
+                .http_responses
+                .contains_key(&http_task)
+        );
+        runtime
+            .state
+            .borrow_mut()
+            .pending
+            .push(PendingWork::DeliverData { task: http_task });
+        let error = runtime.call(await_call, &[continuation]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Swift continuation has no runnable completion"),
+            "{error:#}"
+        );
+        let state = runtime.state.borrow();
+        assert_eq!(state.objects[&http_task].properties["state"], 3);
+        assert!(state.pending.is_empty());
     }
 
     #[test]
