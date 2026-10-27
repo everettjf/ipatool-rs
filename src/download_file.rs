@@ -262,9 +262,7 @@ fn response_range(response: &Response, local_size: u64) -> Result<RangePlan> {
         }),
         206 => {
             let header = header_text(response, CONTENT_RANGE)?;
-            let span = header
-                .strip_prefix("bytes ")
-                .context("invalid package Content-Range unit")?;
+            let span = content_range_value(header)?;
             let (bounds, total) = span
                 .split_once('/')
                 .context("invalid package Content-Range total")?;
@@ -288,14 +286,24 @@ fn response_range(response: &Response, local_size: u64) -> Result<RangePlan> {
             })
         }
         416 => {
-            let expected = format!("bytes */{local_size}");
-            if header_text(response, CONTENT_RANGE)? != expected {
+            let header = header_text(response, CONTENT_RANGE)?;
+            if content_range_value(header)? != format!("*/{local_size}") {
                 bail!("rejected package range does not match partial file");
             }
             Ok(RangePlan::Complete(local_size))
         }
         status => bail!("unexpected package download status: {status}"),
     }
+}
+
+fn content_range_value(header: &str) -> Result<&str> {
+    let (unit, value) = header
+        .split_once(' ')
+        .context("invalid package Content-Range unit")?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        bail!("invalid package Content-Range unit");
+    }
+    Ok(value)
 }
 
 fn header_text(response: &Response, key: reqwest::header::HeaderName) -> Result<&str> {
@@ -435,6 +443,26 @@ mod tests {
         assert_eq!(download_file(&url, &path).unwrap(), 3);
         server.join().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn accepts_case_insensitive_content_range_unit_for_resumes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.tmp");
+        fs::write(&path, b"partial").unwrap();
+        let (url, _, server) = spawn_server(
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: Bytes 7-14/15\r\nContent-Length: 8\r\nConnection: close\r\n\r\ndownload",
+        );
+        assert_eq!(download_file(&url, &path).unwrap(), 15);
+        server.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"partialdownload");
+
+        let (url, _, server) = spawn_server(
+            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: BYTES */15\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        assert_eq!(download_file(&url, &path).unwrap(), 15);
+        server.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"partialdownload");
     }
 
     #[test]
