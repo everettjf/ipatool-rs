@@ -324,6 +324,35 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Recover a 26A428 FPSENR2 model from private state and transform checkpoints.
+    RecoverStateCheckpoints {
+        #[arg(long, help = "Checkpoint containing the state source at object +0x304")]
+        state_checkpoint: PathBuf,
+        #[arg(long)]
+        source_checkpoint: PathBuf,
+        #[arg(long)]
+        transformed_checkpoint: PathBuf,
+        #[arg(long, default_value = "0x7000000fb304")]
+        state_address: String,
+        #[arg(
+            long,
+            default_value_t = 224,
+            help = "State source size: 192 or 224 bytes"
+        )]
+        state_bytes: usize,
+        #[arg(long, help = "Source address; defaults to source checkpoint x23")]
+        source_address: Option<String>,
+        #[arg(long, default_value = "0x710000014ee8")]
+        output_address: String,
+        #[arg(long)]
+        sinf: PathBuf,
+        #[arg(long)]
+        selector: String,
+        #[arg(long)]
+        slot: Option<usize>,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Recover a private AES model from a frame and embedded or supplied SIDB oracle.
     RecoverOracle {
         #[arg(long)]
@@ -1404,6 +1433,81 @@ fn run() -> Result<()> {
                     ),
                 }
             }
+            FairplayEnrollCommand::RecoverStateCheckpoints {
+                state_checkpoint,
+                source_checkpoint,
+                transformed_checkpoint,
+                state_address,
+                state_bytes,
+                source_address,
+                output_address,
+                sinf,
+                selector,
+                slot,
+                output,
+            } => {
+                if !matches!(state_bytes, 192 | 224) {
+                    bail!("state source size must be 192 or 224 bytes");
+                }
+                let state_checkpoint = FairplayCheckpoint::load_private(&state_checkpoint)?;
+                let source_checkpoint = FairplayCheckpoint::load_private(&source_checkpoint)?;
+                let transformed_checkpoint =
+                    FairplayCheckpoint::load_private(&transformed_checkpoint)?;
+                if state_checkpoint.binary_hash != source_checkpoint.binary_hash
+                    || source_checkpoint.binary_hash != transformed_checkpoint.binary_hash
+                {
+                    bail!("state and transform checkpoints have different fairplayd builds");
+                }
+                let state_address = parse_address(&state_address)?;
+                let state_source = match state_bytes {
+                    192 => {
+                        Zeroizing::new(state_checkpoint.read_block::<192>(state_address)?.to_vec())
+                    }
+                    224 => {
+                        Zeroizing::new(state_checkpoint.read_block::<224>(state_address)?.to_vec())
+                    }
+                    _ => unreachable!("validated state source size"),
+                };
+                let source_address = match source_address {
+                    Some(address) => parse_address(&address)?,
+                    None => source_checkpoint.register_u64("x23")?,
+                };
+                let source =
+                    source_checkpoint.read_block::<FIRST_TRANSFORM_BYTES>(source_address)?;
+                let encoded = transformed_checkpoint
+                    .read_block::<FIRST_TRANSFORM_BYTES>(parse_address(&output_address)?)?;
+                let selector = parse_enrollment_selector(&selector)?;
+                let sinf = read_private_bytes(&sinf, 1024 * 1024)?;
+                let enrollment = fairplay_portable::recover_enrollment_from_state(
+                    &state_source,
+                    &source,
+                    &encoded,
+                    selector,
+                    state_checkpoint.binary_hash,
+                    &sinf,
+                    slot,
+                )?;
+                write_private_binary(&output, &enrollment.model)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "fairplay.enrollment-model.v2",
+                            "output": output,
+                            "selector": selector.identifier(),
+                            "slot": enrollment.slot,
+                            "state_bytes": state_bytes,
+                            "bytes": enrollment.model.len(),
+                            "recovery_milliseconds": enrollment.recovery_milliseconds,
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Recovered private FairPlay enrollment model from checkpoints, slot {} in {}",
+                        enrollment.slot,
+                        output.display()
+                    ),
+                }
+            }
             FairplayEnrollCommand::RecoverOracle {
                 model,
                 enrollment_frame,
@@ -1959,6 +2063,41 @@ mod tests {
             cli.command,
             Command::FairplayEnroll {
                 command: FairplayEnrollCommand::RecoverState { slot: Some(8), .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn recover_state_checkpoints_accepts_private_capture_paths() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "recover-state-checkpoints",
+            "--state-checkpoint",
+            "/private/state.checkpoint.pkl.gz",
+            "--source-checkpoint",
+            "/private/source.checkpoint.pkl.gz",
+            "--transformed-checkpoint",
+            "/private/transformed.checkpoint.pkl.gz",
+            "--state-bytes",
+            "192",
+            "--sinf",
+            "/private/app.sinf",
+            "--selector",
+            "12345678:00000009",
+            "--output",
+            "/private/enrollment.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::RecoverStateCheckpoints {
+                    state_bytes: 192,
+                    source_address: None,
+                    slot: None,
+                    ..
+                }
             }
         ));
     }
