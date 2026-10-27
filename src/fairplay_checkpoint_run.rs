@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail};
 use flate2::{Compression, write::GzEncoder};
 use serde::Serialize;
 use serde_pickle::{HashableValue, SerOptions, Value};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -45,6 +46,9 @@ const SYNTHETIC_NOOP_CALLBACK: u64 = 0x7200_0000_0000;
 const SYNTHETIC_DLOPEN_HANDLE: u64 = 0x7000_3000_0000;
 const SYNTHETIC_DLSYM_BASE: u64 = 0x7000_4000_0000;
 const MAX_DYNAMIC_SYMBOLS: usize = 1024;
+const MAX_SHA1_CONTEXTS: usize = 64;
+const MAX_SHA1_INPUT_BYTES: usize = 32 * 1024 * 1024;
+const SYNTHETIC_THREAD: u64 = 0x7000_2000_0000;
 const PTHREAD_ONCE_STUB: [u32; 6] = [
     0xa9bf_7bfd, // stp x29, x30, [sp, #-16]!
     0x9100_03fd, // mov x29, sp
@@ -63,6 +67,7 @@ const STATIC_ALLOCATION_STRIDE: u64 = 0x10_0000;
 struct HostState {
     random_state: u32,
     dynamic_symbols: BTreeMap<u64, String>,
+    sha1_contexts: BTreeMap<u64, Zeroizing<Vec<u8>>>,
 }
 
 impl HostState {
@@ -70,6 +75,7 @@ impl HostState {
         let mut state = Self {
             random_state: checkpoint.random_state()?,
             dynamic_symbols: BTreeMap::new(),
+            sha1_contexts: BTreeMap::new(),
         };
         if let Some(value) = checkpoint.optional_metadata("dynamic_symbols") {
             let Value::Dict(symbols) = value else {
@@ -92,6 +98,30 @@ impl HostState {
                 state.dynamic_symbols.insert(address, symbol.clone());
             }
         }
+        if let Some(value) = checkpoint.optional_metadata("sha1_contexts") {
+            let Value::Dict(contexts) = value else {
+                bail!("FairPlay SHA-1 contexts are not a dictionary");
+            };
+            if contexts.len() > MAX_SHA1_CONTEXTS {
+                bail!("too many FairPlay SHA-1 contexts");
+            }
+            let mut total = 0usize;
+            for (key, value) in contexts {
+                let address = pickle_hash_u64(key)?;
+                let Value::Bytes(bytes) = value else {
+                    bail!("FairPlay SHA-1 context data is not bytes");
+                };
+                total = total
+                    .checked_add(bytes.len())
+                    .context("SHA-1 context size overflow")?;
+                if total > MAX_SHA1_INPUT_BYTES {
+                    bail!("FairPlay SHA-1 contexts exceed input limit");
+                }
+                state
+                    .sha1_contexts
+                    .insert(address, Zeroizing::new(bytes.clone()));
+            }
+        }
         Ok(state)
     }
 
@@ -103,6 +133,20 @@ impl HostState {
                     (
                         HashableValue::Int(address.into()),
                         Value::String(name.clone()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn sha1_contexts_snapshot(&self) -> Value {
+        Value::Dict(
+            self.sha1_contexts
+                .iter()
+                .map(|(&address, bytes)| {
+                    (
+                        HashableValue::Int(address.into()),
+                        Value::Bytes(bytes.to_vec()),
                     )
                 })
                 .collect(),
@@ -1182,6 +1226,84 @@ fn run_modeled_external(
                 .wrapping_add(1_013_904_223);
             context.reg_write(199, u64::from(state.random_state))?;
         }
+        "CC_SHA1_Init" => {
+            let address = guest_register(context, 0)?;
+            let mut state = host_state.borrow_mut();
+            if !state.sha1_contexts.contains_key(&address)
+                && state.sha1_contexts.len() >= MAX_SHA1_CONTEXTS
+            {
+                bail!("too many FairPlay SHA-1 contexts");
+            }
+            state
+                .sha1_contexts
+                .insert(address, Zeroizing::new(Vec::new()));
+            context.reg_write(199, 1)?;
+        }
+        "CC_SHA1_Update" => {
+            let address = guest_register(context, 0)?;
+            let source = guest_register(context, 1)?;
+            let length = usize::try_from(guest_register(context, 2)?)?;
+            if length > 0x1000000 {
+                bail!("FairPlay SHA-1 update input exceeds call limit");
+            }
+            let mut state = host_state.borrow_mut();
+            let total = state
+                .sha1_contexts
+                .values()
+                .try_fold(0usize, |sum, bytes| {
+                    sum.checked_add(bytes.len())
+                        .context("SHA-1 context size overflow")
+                })?;
+            if total.saturating_add(length) > MAX_SHA1_INPUT_BYTES {
+                bail!("FairPlay SHA-1 contexts exceed input limit");
+            }
+            let bytes = state
+                .sha1_contexts
+                .get_mut(&address)
+                .context("FairPlay SHA-1 update used unknown context")?;
+            let mut offset = 0usize;
+            while offset < length {
+                let count = (length - offset).min(EXTERNAL_CHUNK_BYTES);
+                let read_address = source
+                    .checked_add(offset as u64)
+                    .context("SHA-1 source address overflow")?;
+                bytes.extend_from_slice(&context.mem_read(read_address, count)?);
+                offset += count;
+            }
+            context.reg_write(199, 1)?;
+        }
+        "CC_SHA1_Final" => {
+            let destination = guest_register(context, 0)?;
+            let address = guest_register(context, 1)?;
+            let mut state = host_state.borrow_mut();
+            let bytes = state
+                .sha1_contexts
+                .remove(&address)
+                .context("FairPlay SHA-1 final used unknown context")?;
+            context.mem_write(destination, &Sha1::digest(bytes.as_slice()))?;
+            context.reg_write(199, 1)?;
+        }
+        "audit_token_to_au32" => {
+            let destination = guest_register(context, 6)?;
+            if destination != 0 {
+                context.mem_write(destination, &0u32.to_le_bytes())?;
+            }
+            context.reg_write(199, 0)?;
+        }
+        "pthread_self" => context.reg_write(199, SYNTHETIC_THREAD)?,
+        "pthread_get_qos_class_np" => {
+            context.mem_write(guest_register(context, 1)?, &0x15u32.to_le_bytes())?;
+            context.mem_write(guest_register(context, 2)?, &0u32.to_le_bytes())?;
+            context.reg_write(199, 0)?;
+        }
+        "notify_register_check" | "notify_check" => {
+            let destination = guest_register(context, 1)?;
+            if destination != 0 {
+                let value = u32::from(symbol == "notify_register_check");
+                context.mem_write(destination, &value.to_le_bytes())?;
+            }
+            context.reg_write(199, 0)?;
+        }
         "gettimeofday" => {
             let destination = guest_register(context, 0)?;
             if destination != 0 {
@@ -1192,6 +1314,17 @@ fn run_modeled_external(
             context.reg_write(199, 0)?;
         }
         "getpid" => context.reg_write(199, 1234)?,
+        "proc_pidpath" => {
+            const PROCESS_PATH: &[u8] = b"/usr/sbin/fairplayd.H2";
+            let destination = guest_register(context, 1)?;
+            let capacity = guest_register(context, 2)?;
+            if capacity < (PROCESS_PATH.len() + 1) as u64 {
+                context.reg_write(199, 0)?;
+            } else {
+                context.mem_write(destination, &[PROCESS_PATH, b"\0"].concat())?;
+                context.reg_write(199, PROCESS_PATH.len() as u64)?;
+            }
+        }
         "getuid" | "geteuid" | "getgid" | "getegid" => context.reg_write(199, 0)?,
         "dlopen" => context.reg_write(199, SYNTHETIC_DLOPEN_HANDLE)?,
         "dlsym" => {
@@ -1261,7 +1394,10 @@ fn run_modeled_external(
             context.reg_write(199, 0)?;
         }
         "chkstk_darwin" => {}
-        "error" => context.reg_write(199, SYNTHETIC_ERRNO_ADDRESS)?,
+        "error" => {
+            set_guest_errno(context, 0)?;
+            context.reg_write(199, SYNTHETIC_ERRNO_ADDRESS)?;
+        }
         "mmap" => {
             let length = guest_register(context, 1)?;
             let flags = guest_register(context, 3)?;
@@ -1325,8 +1461,17 @@ fn install_modeled_external(
             | "pthread_once"
             | "dispatch_once"
             | "arc4random"
+            | "CC_SHA1_Init"
+            | "CC_SHA1_Update"
+            | "CC_SHA1_Final"
+            | "audit_token_to_au32"
+            | "pthread_self"
+            | "pthread_get_qos_class_np"
+            | "notify_register_check"
+            | "notify_check"
             | "gettimeofday"
             | "getpid"
+            | "proc_pidpath"
             | "getuid"
             | "geteuid"
             | "getgid"
@@ -2047,6 +2192,10 @@ impl CheckpointRunner {
                 "dynamic_symbols",
                 self.host_state.borrow().dynamic_symbols_snapshot(),
             ),
+            (
+                "sha1_contexts",
+                self.host_state.borrow().sha1_contexts_snapshot(),
+            ),
             ("open_files", open_files),
             ("next_fd", next_fd),
             ("removed_file_suffixes", removed_file_suffixes),
@@ -2157,6 +2306,29 @@ mod tests {
         let allocated = u64::from_le_bytes(engine.mem_read(0x2020, 8).unwrap().try_into().unwrap());
         assert_eq!(allocated, SYNTHETIC_ALLOCATION_BASE);
         assert_eq!(engine.reg_read(199).unwrap(), 0);
+        call(&mut engine, 13, "_notify_register_check", [0, 0x2000, 0]);
+        assert_eq!(engine.mem_read(0x2000, 4).unwrap(), 1u32.to_le_bytes());
+        call(&mut engine, 14, "_notify_check", [0, 0x2000, 0]);
+        assert_eq!(engine.mem_read(0x2000, 4).unwrap(), 0u32.to_le_bytes());
+        call(&mut engine, 15, "_proc_pidpath", [1234, 0x2040, 64]);
+        assert_eq!(engine.reg_read(199).unwrap(), 22);
+        assert_eq!(
+            engine.mem_read(0x2040, 23).unwrap(),
+            b"/usr/sbin/fairplayd.H2\0"
+        );
+        call(&mut engine, 16, "_pthread_self", [0, 0, 0]);
+        assert_eq!(engine.reg_read(199).unwrap(), SYNTHETIC_THREAD);
+        call(
+            &mut engine,
+            17,
+            "_pthread_get_qos_class_np",
+            [0, 0x2000, 0x2004],
+        );
+        assert_eq!(engine.mem_read(0x2000, 4).unwrap(), 0x15u32.to_le_bytes());
+        engine.mem_write(0x2008, &1234u32.to_le_bytes()).unwrap();
+        engine.reg_write(205, 0x2008).unwrap();
+        call(&mut engine, 18, "_audit_token_to_au32", [0, 0, 0]);
+        assert_eq!(engine.mem_read(0x2008, 4).unwrap(), 0u32.to_le_bytes());
         assert!(
             !install_modeled_external(
                 &mut engine,
@@ -2278,6 +2450,90 @@ mod tests {
         assert_eq!(
             resumed.engine.mem_read(0x2008, 8).unwrap(),
             [0, 0, 0, 0, 0, 0, 0, 1]
+        );
+    }
+
+    #[test]
+    fn sha1_context_survives_checkpoint_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let binary_path = directory.path().join("fairplayd.arm64e");
+        let output_path = directory.path().join("sha1.pkl.gz");
+        std::fs::write(&binary_path, SYNTHETIC_BINARY).unwrap();
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        runner.engine.mem_map(0x2000, PAGE_BYTES as usize).unwrap();
+        runner.engine.mem_write(0x2000, b"abc").unwrap();
+        for (index, symbol) in ["_CC_SHA1_Init", "_CC_SHA1_Update"].into_iter().enumerate() {
+            install_modeled_external(
+                &mut runner.engine,
+                EXTERNAL_BASE + index as u64 * EXTERNAL_STRIDE,
+                symbol,
+                &runner.external_failure,
+                &runner.allocation_state,
+                &runner.once_tokens,
+                (&runner.host_state, &runner.virtual_files, &runner.darwin),
+            )
+            .unwrap();
+        }
+        runner.engine.reg_write(199, 0x1000).unwrap();
+        runner.engine.reg_write(2, 0x5000).unwrap();
+        runner
+            .engine
+            .start_bounded(EXTERNAL_BASE, 0x5000, Duration::from_secs(2), 4)
+            .unwrap();
+        runner.engine.reg_write(199, 0x1000).unwrap();
+        runner.engine.reg_write(200, 0x2000).unwrap();
+        runner.engine.reg_write(201, 3).unwrap();
+        runner.engine.reg_write(2, 0x5000).unwrap();
+        runner
+            .engine
+            .start_bounded(
+                EXTERNAL_BASE + EXTERNAL_STRIDE,
+                0x5000,
+                Duration::from_secs(2),
+                4,
+            )
+            .unwrap();
+        assert!(runner.external_failure.borrow().is_none());
+        runner
+            .engine
+            .reg_write(REG_PC, source.pc().unwrap())
+            .unwrap();
+        runner
+            .write_checkpoint(&source, &binary_path, &output_path)
+            .unwrap();
+
+        let reloaded = FairplayCheckpoint::load_private(&output_path).unwrap();
+        let mut resumed = CheckpointRunner::new(&reloaded, SYNTHETIC_BINARY).unwrap();
+        resumed.engine.mem_map(0x3000, PAGE_BYTES as usize).unwrap();
+        install_modeled_external(
+            &mut resumed.engine,
+            EXTERNAL_BASE,
+            "_CC_SHA1_Final",
+            &resumed.external_failure,
+            &resumed.allocation_state,
+            &resumed.once_tokens,
+            (&resumed.host_state, &resumed.virtual_files, &resumed.darwin),
+        )
+        .unwrap();
+        resumed.engine.reg_write(199, 0x3000).unwrap();
+        resumed.engine.reg_write(200, 0x1000).unwrap();
+        resumed.engine.reg_write(2, 0x5000).unwrap();
+        resumed
+            .engine
+            .start_bounded(EXTERNAL_BASE, 0x5000, Duration::from_secs(2), 4)
+            .unwrap();
+        assert!(resumed.external_failure.borrow().is_none());
+        assert_eq!(resumed.engine.reg_read(199).unwrap(), 1);
+        assert_eq!(
+            resumed.engine.mem_read(0x3000, 20).unwrap(),
+            Sha1::digest(b"abc").to_vec()
         );
     }
 
