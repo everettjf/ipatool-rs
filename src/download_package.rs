@@ -8,8 +8,6 @@ use zip::ZipArchive;
 
 use crate::{Platform, duplicate_zip, store_download_product::DownloadItem};
 
-const MAX_INFO_PLIST: u64 = 4 * 1024 * 1024;
-
 pub fn package_platform(requested: Platform, item: &DownloadItem) -> Result<Platform> {
     if requested != Platform::Macos {
         return Ok(requested);
@@ -91,18 +89,11 @@ pub fn validate_ipa_platform(path: &Path, platform: Platform) -> Result<()> {
         {
             continue;
         }
-        if entry.size() > MAX_INFO_PLIST {
-            bail!("IPA Info.plist exceeds size limit");
-        }
-        let mut data = Vec::with_capacity(entry.size() as usize);
+        let mut data = Vec::new();
         entry
             .by_ref()
-            .take(MAX_INFO_PLIST + 1)
             .read_to_end(&mut data)
             .context("read IPA Info.plist")?;
-        if data.len() as u64 > MAX_INFO_PLIST {
-            bail!("IPA Info.plist exceeds size limit");
-        }
         let info: Value = plist::from_bytes(&data).context("decode IPA Info.plist")?;
         let declared = info
             .as_dictionary()
@@ -217,6 +208,30 @@ mod tests {
         assert!(validate_ipa_platform(ipa(None).path(), Platform::Iphone).is_ok());
         assert!(validate_ipa_platform(ipa(Some(&[])).path(), Platform::Iphone).is_err());
         assert!(validate_ipa_platform(ipa(None).path(), Platform::Visionos).is_err());
+    }
+
+    #[test]
+    fn validates_large_info_plist_like_go() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut fields = plist::Dictionary::new();
+        fields.insert(
+            "CFBundleSupportedPlatforms".into(),
+            Value::Array(vec![Value::String("iPhoneOS".into())]),
+        );
+        fields.insert(
+            "LargeMetadata".into(),
+            Value::String("x".repeat(4 * 1024 * 1024)),
+        );
+        let mut data = Vec::new();
+        plist::to_writer_xml(&mut data, &Value::Dictionary(fields)).unwrap();
+        assert!(data.len() > 4 * 1024 * 1024);
+        let mut writer = ZipWriter::new(File::create(file.path()).unwrap());
+        writer
+            .start_file("Payload/App.app/Info.plist", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&data).unwrap();
+        writer.finish().unwrap();
+        assert!(validate_ipa_platform(file.path(), Platform::Iphone).is_ok());
     }
 
     #[test]
