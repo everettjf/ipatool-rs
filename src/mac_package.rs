@@ -196,11 +196,13 @@ fn read_package_version_from_path(path: &Path, bundle_id: &str) -> Result<Versio
                 .find(|(candidate, _)| candidate == &payload)
                 .and_then(|(_, file)| file.mtime.as_deref())
                 .context("Mac package has no payload timestamp")?;
-            let release_date = OffsetDateTime::parse(modified, &Rfc3339)
+            let modified = OffsetDateTime::parse(modified, &Rfc3339)
                 .context("invalid Mac package payload timestamp")?
-                .to_offset(UtcOffset::UTC)
-                .replace_nanosecond(0)?
-                .format(&Rfc3339)?;
+                .to_offset(UtcOffset::UTC);
+            if modified.unix_timestamp() <= 0 {
+                bail!("Mac package has no payload timestamp");
+            }
+            let release_date = modified.replace_nanosecond(0)?.format(&Rfc3339)?;
             result = Some(VersionMetadata {
                 display_version: display_version.to_owned(),
                 release_date,
@@ -576,6 +578,17 @@ mod tests {
         )
         .unwrap();
         assert!(read_package_version_from_path(&path, "com.example.mac").is_err());
+        for timestamp in ["1970-01-01T00:00:00Z", "1969-12-31T23:59:59Z"] {
+            fs::write(
+                &path,
+                xar_with_package_info(
+                    r#"<pkg-info><bundle id="com.example.mac" CFBundleShortVersionString="4.2"/></pkg-info>"#,
+                    Some(timestamp),
+                ),
+            )
+            .unwrap();
+            assert!(read_package_version_from_path(&path, "com.example.mac").is_err());
+        }
     }
 
     #[test]
