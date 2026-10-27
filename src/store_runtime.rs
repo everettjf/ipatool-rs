@@ -261,6 +261,10 @@ enum CallbackAction {
         previous: u64,
         value: u64,
     },
+    SemaphoreWait {
+        semaphore: u64,
+        previous_queue: u64,
+    },
     ScheduleComplete {
         task: u64,
     },
@@ -276,6 +280,7 @@ enum CallbackAction {
         previous: Option<u64>,
         saved: Vec<(i32, u64)>,
         poll_after: Option<(u64, u64)>,
+        semaphore_after: Option<u64>,
     },
     PollSwiftContinuation {
         task: u64,
@@ -1811,6 +1816,39 @@ fn dispatch_call(
             context.reg_write(REG_X0, state.allocate(size)?)?;
         }
         "swift_task_dealloc" => {}
+        "dispatch_semaphore_create" => {
+            let initial = context.reg_read(REG_X0)? as i64;
+            let semaphore = new_guest_object(
+                context,
+                profile,
+                state,
+                "HostSemaphore",
+                StoreValue::Number(initial),
+            )?;
+            context.reg_write(REG_X0, semaphore)?;
+        }
+        "dispatch_semaphore_signal" => {
+            let semaphore = context.reg_read(REG_X0)?;
+            let count = semaphore_count(state, semaphore)?;
+            *count = count.wrapping_add(1);
+            context.reg_write(REG_X0, 0)?;
+        }
+        "dispatch_semaphore_wait" => {
+            let semaphore = context.reg_read(REG_X0)?;
+            if *semaphore_count(state, semaphore)? > 0 {
+                consume_signaled_semaphore(state, semaphore)?;
+                context.reg_write(REG_X0, 0)?;
+            } else {
+                let has_pending = !state.pending.is_empty();
+                let Some(work) = take_runnable_pending(state) else {
+                    if has_pending {
+                        bail!("all pending queues are suspended");
+                    }
+                    bail!("guest waits on an unavailable host service");
+                };
+                dispatch_pending_for_semaphore(context, profile, state, semaphore, work)?;
+            }
+        }
         "dispatch_block_create" => {
             let block = context.reg_read(REG_X0 + 1)?;
             if block == 0 {
@@ -4660,6 +4698,7 @@ fn start_swift_task(
     state: &mut StoreState,
     handle: u64,
     poll_after: Option<(u64, u64)>,
+    semaphore_after: Option<u64>,
 ) -> Result<()> {
     let task = state
         .swift_tasks
@@ -4689,6 +4728,7 @@ fn start_swift_task(
                 previous,
                 saved,
                 poll_after,
+                semaphore_after,
             },
         },
     );
@@ -4738,6 +4778,87 @@ fn start_notification_callback(
     )
 }
 
+fn semaphore_count(state: &mut StoreState, address: u64) -> Result<&mut i64> {
+    let object = state
+        .objects
+        .get_mut(&address)
+        .context("unknown guest semaphore")?;
+    if object.class != "HostSemaphore" {
+        bail!("invalid guest semaphore");
+    }
+    match &mut object.value {
+        StoreValue::Number(count) => Ok(count),
+        _ => bail!("invalid guest semaphore count"),
+    }
+}
+
+fn consume_signaled_semaphore(state: &mut StoreState, address: u64) -> Result<()> {
+    let count = semaphore_count(state, address)?;
+    if *count <= 0 {
+        bail!("guest semaphore remains unsignaled");
+    }
+    *count -= 1;
+    Ok(())
+}
+
+fn take_runnable_pending(state: &mut StoreState) -> Option<PendingWork> {
+    let index = state.pending.iter().position(|work| match work {
+        PendingWork::Guest { queue, .. } => state
+            .objects
+            .get(queue)
+            .and_then(|object| object.properties.get("suspendCount"))
+            .is_none_or(|count| *count == 0),
+        _ => true,
+    })?;
+    Some(state.pending.remove(index))
+}
+
+fn dispatch_pending_for_semaphore(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    semaphore: u64,
+    work: PendingWork,
+) -> Result<()> {
+    match work {
+        PendingWork::Guest { block, queue } => {
+            let previous_queue = std::mem::replace(&mut state.current_queue, queue);
+            begin_callback(
+                context,
+                state,
+                read_guest_u64(context, block + 16)?,
+                &[block],
+                CallbackAction::SemaphoreWait {
+                    semaphore,
+                    previous_queue,
+                },
+            )
+        }
+        PendingWork::SwiftTask { task } => {
+            start_swift_task(context, state, task, None, Some(semaphore))
+        }
+        work => {
+            let resume = install_callback_resume(
+                context,
+                state,
+                CallbackAction::SemaphoreWait {
+                    semaphore,
+                    previous_queue: state.current_queue,
+                },
+            )?;
+            context.reg_write(REG_LR, resume)?;
+            match work {
+                PendingWork::Http { task } => perform_http(context, profile, state, task),
+                PendingWork::DeliverData { task } => {
+                    deliver_http_data(context, profile, state, task)
+                }
+                PendingWork::Complete { task } => complete_http_task(context, profile, state, task),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
 fn poll_swift_continuation(
     context: &HookContext,
     profile: &ProfileData,
@@ -4756,10 +4877,10 @@ fn poll_swift_continuation(
         context.reg_write(REG_PC, read_guest_u64(context, continuation + 8)?)?;
         return Ok(());
     }
-    if state.pending.is_empty() {
+    let Some(work) = take_runnable_pending(state) else {
         bail!("Swift continuation has no runnable completion");
-    }
-    match state.pending.remove(0) {
+    };
+    match work {
         PendingWork::Guest { block, queue } => {
             let previous_queue = std::mem::replace(&mut state.current_queue, queue);
             state.current_swift_task = None;
@@ -4777,7 +4898,7 @@ fn poll_swift_continuation(
         }
         PendingWork::SwiftTask { task: child } => {
             state.current_swift_task = None;
-            start_swift_task(context, state, child, Some((task, continuation)))
+            start_swift_task(context, state, child, Some((task, continuation)), None)
         }
         work => {
             // The transport helpers start guest callbacks. Route their return
@@ -5032,6 +5153,14 @@ fn resume_callback(
             state.current_queue = previous;
             context.reg_write(REG_X0, value)?;
         }
+        CallbackAction::SemaphoreWait {
+            semaphore,
+            previous_queue,
+        } => {
+            state.current_queue = previous_queue;
+            consume_signaled_semaphore(state, semaphore)?;
+            context.reg_write(REG_X0, 0)?;
+        }
         CallbackAction::CopyProperty { destination } => {
             let value = context.reg_read(REG_X0)?;
             write_guest_u64(context, destination, value)?;
@@ -5042,6 +5171,7 @@ fn resume_callback(
             previous,
             saved,
             poll_after,
+            semaphore_after,
         } => {
             let task = state
                 .swift_tasks
@@ -5060,11 +5190,17 @@ fn resume_callback(
             for (register, value) in saved {
                 context.reg_write(register, value)?;
             }
-            context.reg_write(REG_X0, u64::from(poll_after.is_none()))?;
+            context.reg_write(
+                REG_X0,
+                u64::from(poll_after.is_none() && semaphore_after.is_none()),
+            )?;
             if let Some((parent, continuation)) = poll_after {
                 state.current_swift_task = Some(parent);
                 poll_swift_continuation(context, profile, state, parent, continuation)?;
             } else {
+                if let Some(semaphore) = semaphore_after {
+                    consume_signaled_semaphore(state, semaphore)?;
+                }
                 context.reg_write(REG_PC, link)?;
             }
             return Ok(());
@@ -6584,10 +6720,10 @@ fn dispatch_message(
                 return Ok(());
             }
             "wait" | "waitUntilDate:" if class_name == "NSCondition" => {
-                if state.pending.is_empty() {
+                let Some(work) = take_runnable_pending(state) else {
                     bail!("guest condition has no runnable callback");
-                }
-                match state.pending.remove(0) {
+                };
+                match work {
                     PendingWork::Guest { block, queue } => {
                         let previous = std::mem::replace(&mut state.current_queue, queue);
                         begin_callback(
@@ -6606,7 +6742,7 @@ fn dispatch_message(
                         complete_http_task(context, profile, state, task)?
                     }
                     PendingWork::SwiftTask { task } => {
-                        start_swift_task(context, state, task, None)?
+                        start_swift_task(context, state, task, None, None)?
                     }
                 }
                 return Ok(());
@@ -9647,6 +9783,73 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_semaphore_wait_runs_runnable_callback() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |symbol: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.symbol == symbol)
+                .unwrap()
+                .address
+        };
+        let create = call_address("dispatch_semaphore_create");
+        let signal = call_address("dispatch_semaphore_signal");
+        let wait = call_address("dispatch_semaphore_wait");
+        let semaphore = runtime.call(create, &[0]).unwrap();
+        assert!(runtime.call(wait, &[semaphore, 0]).is_err());
+        assert_eq!(runtime.call(signal, &[semaphore]).unwrap(), 0);
+        assert_eq!(runtime.call(wait, &[semaphore, 0]).unwrap(), 0);
+
+        runtime.write_u64(semaphore + 16, signal).unwrap();
+        let suspended_queue = runtime.new_object("HostQueue", StoreValue::Empty).unwrap();
+        runtime
+            .state
+            .borrow_mut()
+            .objects
+            .get_mut(&suspended_queue)
+            .unwrap()
+            .properties
+            .insert("suspendCount".into(), 1);
+        runtime.state.borrow_mut().pending.push(PendingWork::Guest {
+            block: semaphore,
+            queue: suspended_queue,
+        });
+        assert!(
+            runtime
+                .call(wait, &[semaphore, 0])
+                .unwrap_err()
+                .to_string()
+                .contains("all pending queues are suspended")
+        );
+        runtime.state.borrow_mut().pending.push(PendingWork::Guest {
+            block: semaphore,
+            queue: 0,
+        });
+        assert_eq!(runtime.call(wait, &[semaphore, 0]).unwrap(), 0);
+        assert_eq!(runtime.state.borrow().pending.len(), 1);
+        runtime
+            .state
+            .borrow_mut()
+            .objects
+            .get_mut(&suspended_queue)
+            .unwrap()
+            .properties
+            .insert("suspendCount".into(), 0);
+        assert_eq!(runtime.call(wait, &[semaphore, 0]).unwrap(), 0);
+        assert!(runtime.state.borrow().pending.is_empty());
+        let state = runtime.state.borrow();
+        let StoreValue::Number(count) = state.objects[&semaphore].value else {
+            panic!("guest semaphore count is not numeric");
+        };
+        assert_eq!(count, 0);
     }
 
     #[test]
