@@ -63,8 +63,10 @@ fn adapter_candidates() -> Result<Vec<(u8, [u8; 6])>> {
                 continue;
             }
             let fallback: [u8; 6] = adapter.PhysicalAddress[..6].try_into().unwrap();
-            let mut row = MIB_IF_ROW2::default();
-            row.InterfaceLuid = adapter.Luid;
+            let mut row = MIB_IF_ROW2 {
+                InterfaceLuid: adapter.Luid,
+                ..Default::default()
+            };
             // SAFETY: GetIfEntry2 fills the initialized row for this adapter.
             let result = unsafe { GetIfEntry2(&mut row) };
             if result != 0 {

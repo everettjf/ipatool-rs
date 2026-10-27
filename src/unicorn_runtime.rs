@@ -14,6 +14,8 @@ use tempfile::NamedTempFile;
 use zip::ZipArchive;
 
 mod engine;
+#[cfg(target_os = "windows")]
+mod windows_prepare;
 pub use engine::{Engine, HookContext, REG_PC, REG_X0, REG_X1};
 
 const VERSION: &str = "2.1.4";
@@ -26,6 +28,13 @@ struct Artifact {
     library_sha256: &'static str,
     member: &'static str,
     filename: &'static str,
+    format: ArchiveFormat,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArchiveFormat {
+    Zip,
+    SevenZip,
 }
 
 pub struct UnicornLibrary {
@@ -53,8 +62,11 @@ pub fn load() -> Result<UnicornLibrary> {
         .context("failed to create Unicorn downloader")?;
     let path = ensure_library(&root, selected, &client)?;
     // The library is selected by platform and verified against the pinned digest.
+    #[cfg(not(target_os = "windows"))]
     let library = unsafe { Library::new(&path) }
         .with_context(|| format!("failed to load Unicorn library: {}", path.display()))?;
+    #[cfg(target_os = "windows")]
+    let library = windows_prepare::load(&path)?;
     let library = UnicornLibrary { library };
     let (major, minor) = library.api_version()?;
     if (major, minor) != (2, 1) {
@@ -78,6 +90,7 @@ fn artifact_for(os: &str, arch: &str, musl: bool) -> Result<Artifact> {
             library_sha256: "51c4a6f3ce22628ecd3acd1c49b921a818ffb989ca2c473134cc7eb06094f256",
             member: "unicorn/lib/libunicorn.2.dylib",
             filename: "libunicorn.2.dylib",
+            format: ArchiveFormat::Zip,
         },
         ("macos", "aarch64", _) => Artifact {
             url: "https://files.pythonhosted.org/packages/6c/ae/4943c6f8524d729ec7d5e69df6407ea05d710fe77471d91cecf3fc64eb57/unicorn-2.1.4-cp37-abi3-macosx_11_0_arm64.whl",
@@ -85,6 +98,7 @@ fn artifact_for(os: &str, arch: &str, musl: bool) -> Result<Artifact> {
             library_sha256: "7207c8e3d7a63118fb0bca73e01816797fd51b1d8a39a4cbc7abfd562ee59c85",
             member: "unicorn/lib/libunicorn.2.dylib",
             filename: "libunicorn.2.dylib",
+            format: ArchiveFormat::Zip,
         },
         ("linux", "x86_64", false) => Artifact {
             url: "https://files.pythonhosted.org/packages/e7/df/ded5e3684c2d7600b30cc8a7530277b8cb36644a1a9d34cade7ebb45604c/unicorn-2.1.4-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
@@ -92,6 +106,7 @@ fn artifact_for(os: &str, arch: &str, musl: bool) -> Result<Artifact> {
             library_sha256: "ddb196ec82b52e502c18e4a34478bf7b9f61c83c2ebaa95c74d8ded45a95da9c",
             member: "unicorn/lib/libunicorn.so.2",
             filename: "libunicorn.so.2",
+            format: ArchiveFormat::Zip,
         },
         ("linux", "aarch64", false) => Artifact {
             url: "https://files.pythonhosted.org/packages/33/9f/32d41eb942221bcf4417cdc65537fc8b3bbbd6079d6c161e621f1dd4e94a/unicorn-2.1.4-cp37-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
@@ -99,6 +114,7 @@ fn artifact_for(os: &str, arch: &str, musl: bool) -> Result<Artifact> {
             library_sha256: "a0b99458a82e268aee258205a40590411c3a9f28e42abf2942ce4e87b7d9ac65",
             member: "unicorn/lib/libunicorn.so.2",
             filename: "libunicorn.so.2",
+            format: ArchiveFormat::Zip,
         },
         ("linux", "x86_64", true) => Artifact {
             url: "https://files.pythonhosted.org/packages/ed/4b/4628ccb20eb3ad1af400de8181d1f4e5c1a3fc2affa1b3410c1b2d71af36/unicorn-2.1.4-cp37-abi3-musllinux_1_2_x86_64.whl",
@@ -106,6 +122,7 @@ fn artifact_for(os: &str, arch: &str, musl: bool) -> Result<Artifact> {
             library_sha256: "cc1a208c69b151fdd23439736b0fac9ac6e14409dae77deee900369e6daab302",
             member: "unicorn/lib/libunicorn.so.2",
             filename: "libunicorn.so.2",
+            format: ArchiveFormat::Zip,
         },
         ("linux", "aarch64", true) => Artifact {
             url: "https://files.pythonhosted.org/packages/70/38/ba5a051c844026e59ab6e0017db8cec77dbe20ab5f1d6edae1ce9d885b06/unicorn-2.1.4-cp37-abi3-musllinux_1_2_aarch64.whl",
@@ -113,6 +130,15 @@ fn artifact_for(os: &str, arch: &str, musl: bool) -> Result<Artifact> {
             library_sha256: "52179305928b32c937d2d527ad6fef9d500c6fa7cdb14bf32abf7021d67271a2",
             member: "unicorn/lib/libunicorn.so.2",
             filename: "libunicorn.so.2",
+            format: ArchiveFormat::Zip,
+        },
+        ("windows", "x86_64", _) => Artifact {
+            url: "https://github.com/unicorn-engine/unicorn/releases/download/2.1.4/windows-mingw64-shared.7z",
+            archive_sha256: "0960f938e66fa12c448742bddd2a03aa88abeeb2b3cda7156493a2da86228d3a",
+            library_sha256: "d8f9a89222ffa74493a1d47090e17f8e1db8ac171a3128c6a76a4ea09de11469",
+            member: "bin/libunicorn.dll",
+            filename: "libunicorn.dll",
+            format: ArchiveFormat::SevenZip,
         },
         _ => bail!("unsupported Unicorn runtime platform {os}/{arch}"),
     };
@@ -192,6 +218,17 @@ fn extract_library(
     archive_path: &Path,
     selected: Artifact,
 ) -> Result<NamedTempFile> {
+    match selected.format {
+        ArchiveFormat::Zip => extract_zip_library(directory, archive_path, selected),
+        ArchiveFormat::SevenZip => extract_sevenz_library(directory, archive_path, selected),
+    }
+}
+
+fn extract_zip_library(
+    directory: &Path,
+    archive_path: &Path,
+    selected: Artifact,
+) -> Result<NamedTempFile> {
     let file = File::open(archive_path).context("failed to open Unicorn archive")?;
     let mut zip = ZipArchive::new(file).context("invalid Unicorn wheel")?;
     let entry = zip
@@ -216,6 +253,58 @@ fn extract_library(
         bail!("Unicorn library has invalid size");
     }
     if format!("{:x}", hash.finalize()) != selected.library_sha256 {
+        bail!("Unicorn library failed integrity verification");
+    }
+    extracted
+        .as_file()
+        .sync_all()
+        .context("failed to sync Unicorn library")?;
+    Ok(extracted)
+}
+
+fn extract_sevenz_library(
+    directory: &Path,
+    archive_path: &Path,
+    selected: Artifact,
+) -> Result<NamedTempFile> {
+    let mut reader = sevenz_rust::SevenZReader::open(archive_path, sevenz_rust::Password::empty())
+        .context("invalid Unicorn 7z archive")?;
+    let entry = reader
+        .archive()
+        .files
+        .iter()
+        .find(|entry| entry.name() == selected.member)
+        .context("Unicorn library missing from 7z archive")?;
+    if entry.is_directory() || entry.size() > MAX_ARTIFACT_SIZE {
+        bail!("Unicorn library has invalid size or type");
+    }
+    let expected_size = entry.size();
+    let mut extracted =
+        NamedTempFile::new_in(directory).context("failed to create Unicorn library")?;
+    let mut hash = Sha256::new();
+    let mut found = false;
+    reader
+        .for_each_entries(|entry, stream| {
+            if entry.name() != selected.member {
+                return Ok(true);
+            }
+            let written = std::io::copy(
+                &mut stream.take(MAX_ARTIFACT_SIZE + 1),
+                &mut HashWriter {
+                    file: extracted.as_file_mut(),
+                    hash: &mut hash,
+                },
+            )?;
+            if written != expected_size || written > MAX_ARTIFACT_SIZE {
+                return Err(sevenz_rust::Error::other(
+                    "Unicorn library has invalid size",
+                ));
+            }
+            found = true;
+            Ok(false)
+        })
+        .context("failed to extract Unicorn library from 7z archive")?;
+    if !found || format!("{:x}", hash.finalize()) != selected.library_sha256 {
         bail!("Unicorn library failed integrity verification");
     }
     extracted
@@ -281,7 +370,9 @@ mod tests {
                 .url
                 .contains("manylinux")
         );
-        assert!(artifact_for("windows", "x86_64", false).is_err());
+        let windows = artifact_for("windows", "x86_64", false).unwrap();
+        assert_eq!(windows.format, ArchiveFormat::SevenZip);
+        assert_eq!(windows.member, "bin/libunicorn.dll");
     }
 
     #[test]
@@ -290,5 +381,16 @@ mod tests {
         let path = directory.path().join("libunicorn.2.dylib");
         fs::write(&path, b"tampered").unwrap();
         assert!(!file_matches_sha256(&path, "0").unwrap());
+    }
+
+    #[test]
+    #[ignore = "downloads the pinned Unicorn release artifact"]
+    fn extracts_checked_windows_archive() {
+        let selected = artifact_for("windows", "x86_64", false).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let client = reqwest::blocking::Client::new();
+        let archive = download_archive(directory.path(), selected, &client).unwrap();
+        let library = extract_library(directory.path(), archive.path(), selected).unwrap();
+        assert!(file_matches_sha256(library.path(), selected.library_sha256).unwrap());
     }
 }
