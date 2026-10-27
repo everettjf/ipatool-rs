@@ -227,6 +227,14 @@ pub fn write_private_binary(path: &Path, bytes: &[u8]) -> Result<()> {
     })
 }
 
+/// Atomically publish private JSON without replacing an existing report.
+pub fn write_private_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    write_private_output(path, |file| {
+        serde_json::to_writer_pretty(&mut *file, value).context("write private JSON report")?;
+        file.write_all(b"\n").context("finish private JSON report")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

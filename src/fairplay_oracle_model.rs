@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
+use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -354,17 +355,19 @@ impl<'a> OracleState<'a> {
     }
 
     pub fn output_bytes(&self, size: usize) -> Result<Vec<u8>> {
+        self.read_bytes_at(self.model.block_address, size)
+    }
+
+    pub fn read_bytes_at(&self, address: u64, size: usize) -> Result<Vec<u8>> {
         if size > 4096 {
             bail!("oracle output exceeds one page");
         }
         let mut result = vec![0u8; size];
         for (index, byte) in result.iter_mut().enumerate() {
-            let address = self
-                .model
-                .block_address
+            let current = address
                 .checked_add(index as u64)
                 .context("oracle output address overflow")?;
-            *byte = self.load(address, 1)? as u8;
+            *byte = self.load(current, 1)? as u8;
         }
         Ok(result)
     }
@@ -381,6 +384,42 @@ impl<'a> OracleState<'a> {
             left >= right,
             ((left ^ right) & (left ^ result) & 0x8000_0000) != 0,
         ];
+    }
+
+    pub fn compare64(&mut self, left: u64, right: u64) {
+        let result = left.wrapping_sub(right);
+        self.flags = [
+            result & 0x8000_0000_0000_0000 != 0,
+            result == 0,
+            left >= right,
+            ((left ^ right) & (left ^ result) & 0x8000_0000_0000_0000) != 0,
+        ];
+    }
+
+    pub fn add_with_carry(&mut self, left: u64, right: u64, carry: bool, width: u32) -> u64 {
+        let carry_value = u64::from(carry);
+        if width == 32 {
+            let wide = u64::from(left as u32) + u64::from(right as u32) + carry_value;
+            let result = wide as u32;
+            let a = left as u32;
+            let b = right as u32;
+            self.flags = [
+                result & 0x8000_0000 != 0,
+                result == 0,
+                wide >> 32 != 0,
+                (!(a ^ b) & (a ^ result) & 0x8000_0000) != 0,
+            ];
+            return u64::from(result);
+        }
+        let (partial, first_carry) = left.overflowing_add(right);
+        let (result, second_carry) = partial.overflowing_add(carry_value);
+        self.flags = [
+            result & 0x8000_0000_0000_0000 != 0,
+            result == 0,
+            first_carry || second_carry,
+            (!(left ^ right) & (left ^ result) & 0x8000_0000_0000_0000) != 0,
+        ];
+        result
     }
 
     pub fn condition(&self, name: &str) -> bool {
@@ -455,6 +494,37 @@ impl<'a> OracleState<'a> {
         }
         format!("{:x}", hash.finalize())
     }
+
+    /// Private raw-source state in the same shape as the Go recovery driver.
+    pub fn raw_source_report(&self) -> JsonValue {
+        let mut registers = serde_json::Map::new();
+        for (index, value) in self.registers.iter().enumerate() {
+            registers.insert(format!("x{index}"), json!(format!("{value:#x}")));
+        }
+        registers.insert("sp".into(), json!(format!("{:#x}", self.sp)));
+        let mut page_sha256 = serde_json::Map::new();
+        let mut dirty_page_bytes = serde_json::Map::new();
+        for (address, original) in &self.model.pages {
+            let current = self.writable.get(address).unwrap_or(original);
+            let label = format!("{address:#x}");
+            page_sha256.insert(
+                label.clone(),
+                json!(format!("{:x}", Sha256::digest(current))),
+            );
+            if self.touched.contains(address) {
+                let hex: String = current.iter().map(|byte| format!("{byte:02x}")).collect();
+                dirty_page_bytes.insert(label, json!(hex));
+            }
+        }
+        json!({
+            "schema": "ipatool-fairplay-raw-source-state-v1",
+            "registers": registers,
+            "flags": {"n": self.flags[0], "z": self.flags[1], "c": self.flags[2], "v": self.flags[3]},
+            "page_sha256": page_sha256,
+            "dirty_page_bytes": dirty_page_bytes,
+            "state_sha256": self.digest(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -503,6 +573,23 @@ mod tests {
         assert_ne!(state.digest(), initial);
         state.reset();
         assert_eq!(state.digest(), initial);
+    }
+
+    #[test]
+    fn add_with_carry_matches_arm_width_and_flags() {
+        let model = OracleModel::parse_gzip(&fixture()).unwrap();
+        let mut state = model.state();
+        assert_eq!(state.add_with_carry(u32::MAX as u64, 0, true, 32), 0);
+        assert_eq!(state.flags, [false, true, true, false]);
+        assert_eq!(state.add_with_carry(0x7fff_ffff, 1, false, 32), 0x8000_0000);
+        assert_eq!(state.flags, [true, false, false, true]);
+        assert_eq!(state.add_with_carry(u64::MAX, 0, true, 64), 0);
+        assert_eq!(state.flags, [false, true, true, false]);
+        assert_eq!(
+            state.add_with_carry(0x7fff_ffff_ffff_ffff, 1, false, 64),
+            0x8000_0000_0000_0000
+        );
+        assert_eq!(state.flags, [true, false, false, true]);
     }
 
     #[test]

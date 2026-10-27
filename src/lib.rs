@@ -32,6 +32,7 @@ pub mod fairplay_oracle_export;
 pub mod fairplay_oracle_model;
 pub mod fairplay_page;
 pub mod fairplay_portable;
+pub mod fairplay_raw_source;
 pub mod fairplay_recover_capture;
 pub mod fairplay_recovery;
 pub mod fairplay_recovery_linear;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Translate the checked straight-line 26A428 Go oracle into Rust.
+"""Translate checked straight-line FairPlay Go evaluators into Rust.
 
 This is a source-generation tool, not a runtime dependency. Pass the original
 generated_26a428.go and the Rust output path. Unsupported syntax fails closed.
@@ -52,6 +52,8 @@ class Expression:
             self.expect(")")
         elif token == "-":
             left = f"(0u64).wrapping_sub({self.parse(3)})"
+        elif token == "^":
+            left = f"(!{self.parse(3)})"
         elif token == "s.x":
             self.expect("[")
             register = self.take()
@@ -61,7 +63,11 @@ class Expression:
             left = f"s.registers[{register}]"
         elif token == "s.sp":
             left = "s.sp"
+        elif token in ("s.n", "s.z", "s.c", "s.v"):
+            left = f"s.flags[{dict(n=0, z=1, c=2, v=3)[token[2:]]}]"
         elif token.startswith('"'):
+            left = token
+        elif token in ("true", "false"):
             left = token
         elif token.startswith("0x") or token.isdecimal():
             left = f"{token}u64"
@@ -115,6 +121,12 @@ class Expression:
         if name == "signExtend32":
             arity(1)
             return f"sign_extend32({args[0]} as u32)"
+        if name == "multiplyHigh64":
+            arity(2)
+            return f"((({args[0]} as u128).wrapping_mul({args[1]} as u128) >> 64) as u64)"
+        if name == "unsignedDivide":
+            arity(3)
+            return f"unsigned_divide({args[0]}, {args[1]}, {args[2]} as u32)"
         if name == "addOffset":
             arity(2)
             return f"add_offset({args[0]}, {args[1]} as i64)"
@@ -155,6 +167,12 @@ class Expression:
         if name == "s.compare32":
             arity(2)
             return f"s.compare32({args[0]} as u32, {args[1]} as u32)"
+        if name == "s.compare64":
+            arity(2)
+            return f"s.compare64({args[0]}, {args[1]})"
+        if name == "s.addWithCarry":
+            arity(4)
+            return f"s.add_with_carry({args[0]}, {args[1]}, {args[2]}, {args[3]} as u32)"
         raise ValueError(f"unsupported generated call {name}")
 
 
@@ -166,8 +184,13 @@ def expression(source: str) -> str:
     return result
 
 
-def translate(source: str) -> str:
-    marker = "func runGenerated(s *state, selected fault) error {"
+def translate(
+    source: str,
+    go_function: str = "runGenerated",
+    rust_function: str = "run_generated",
+    generator_name: str = "scripts/port_26a428_oracle.py",
+) -> str:
+    marker = f"func {go_function}(s *state, selected fault) error {{"
     if source.count(marker) != 1:
         raise ValueError("expected one checked generated function")
     body = source.split(marker, 1)[1].splitlines()
@@ -190,6 +213,22 @@ def translate(source: str) -> str:
                 raise ValueError("unsupported generated error branch")
             index += 2
             continue
+        match = re.fullmatch(r'if _, err := runRawSourceKernelLoop\(s, "([a-z-]+)"\); err != nil \{', line)
+        if match:
+            if [value.strip() for value in body[index:index+2]] != ["return err", "}"]:
+                raise ValueError("unsupported raw source kernel loop branch")
+            index += 2
+            rendered.append(f'    run_raw_source_kernel_loop(s, "{match.group(1)}")?;')
+            continue
+        if line == "if s.x[9] == 0x1005BA520 {":
+            if [value.strip() for value in body[index:index+4]] != [
+                "if err := runRawSourceOptionalKernel(s, fault{}); err != nil {",
+                "return err", "}", "}",
+            ]:
+                raise ValueError("unsupported raw source optional branch")
+            index += 4
+            rendered.append("    if s.registers[9] == 0x1005ba520 { run_raw_source_optional_kernel(s, OracleFault::NONE)?; }")
+            continue
         match = re.fullmatch(r"if err := (s\.storeValue\(.*\)); err != nil \{", line)
         if match:
             if [value.strip() for value in body[index:index+2]] != ["return err", "}"]:
@@ -209,15 +248,24 @@ def translate(source: str) -> str:
         if match:
             rendered.append(f"    s.registers[{match.group(1)}] = {expression(match.group(2))};")
             continue
-        if line.startswith("s.afterFault(") or line.startswith("s.compare32("):
+        if line.startswith("s.afterFault(") or line.startswith("s.compare32(") or line.startswith("s.compare64("):
             rendered.append(f"    {expression(line)};")
+            continue
+        if line.startswith("_ = s.addWithCarry("):
+            rendered.append(f"    let _ = {expression(line[4:])};")
             continue
         raise ValueError(f"unsupported generated statement: {line}")
     digest = hashlib.sha256(source.encode()).hexdigest()
-    header = (f"// Generated from checked generated_26a428.go, SHA-256 {digest}.\n"
-              "// Regenerate with scripts/port_26a428_oracle.py; Rust runtime has no Go dependency.\n"
-              "#[rustfmt::skip]\n#[allow(clippy::all, unused_parens)]\n"
-              "fn run_generated(s: &mut OracleState<'_>, selected: OracleFault) -> Result<()> {\n")
+    if go_function == "runGenerated":
+        origin = "generated_26a428.go"
+        allow = "clippy::all, unused_parens"
+    else:
+        origin = f"{go_function} Go source"
+        allow = "clippy::all, unused_parens, unused_variables, dead_code"
+    header = (f"// Generated from checked {origin}, SHA-256 {digest}.\n"
+              f"// Regenerate with {generator_name}; Rust runtime has no Go dependency.\n"
+              f"#[rustfmt::skip]\n#[allow({allow})]\n"
+              f"fn {rust_function}(s: &mut OracleState<'_>, selected: OracleFault) -> Result<()> {{\n")
     return header + "\n".join(rendered) + "\n}\n"
 
 

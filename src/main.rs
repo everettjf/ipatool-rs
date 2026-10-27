@@ -26,6 +26,7 @@ use ipatool_rs::fairplay_oracle_domains::{
 use ipatool_rs::fairplay_oracle_export::export_checked_model;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
+use ipatool_rs::fairplay_raw_source::run_kernel;
 use ipatool_rs::fairplay_recover_capture::{
     RecoverCaptureOptions, RecoverFromAccountOptions, RecoverFromSinfCopyOptions, recover_capture,
     recover_from_account, recover_from_sinf_copy,
@@ -33,7 +34,7 @@ use ipatool_rs::fairplay_recover_capture::{
 use ipatool_rs::fairplay_recovery;
 use ipatool_rs::fairplay_recovery_output::{
     read_private_block, read_private_bytes, read_private_frame, read_private_model,
-    write_private_binary, write_private_model,
+    write_private_binary, write_private_json, write_private_model,
 };
 use ipatool_rs::fairplay_recovery_target::{OracleJob, OracleTarget, SidbTarget, WhiteboxTarget};
 use ipatool_rs::fairplay_startup::seed_request_checkpoint;
@@ -423,6 +424,23 @@ enum FairplayEnrollCommand {
         metadata: String,
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Run a checked 26A428 raw source kernel from a private model.
+    RawSource {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, value_parser = ["writer", "tail", "even", "odd", "digest", "cycle", "outer-primary", "outer"])]
+        kernel: String,
+        #[arg(long = "loop")]
+        loop_mode: bool,
+        #[arg(long, default_value_t = 0)]
+        iterations: usize,
+        #[arg(long)]
+        report: Option<PathBuf>,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        output_bytes: Option<usize>,
     },
     /// Recover an FPSENR2 enrollment model by testing state slots against a private SINF.
     RecoverState {
@@ -1746,6 +1764,51 @@ fn run() -> Result<()> {
                     }
                 }
             }
+            FairplayEnrollCommand::RawSource {
+                model,
+                kernel,
+                loop_mode,
+                iterations,
+                report,
+                output,
+                output_bytes,
+            } => {
+                if output.is_some() != output_bytes.is_some() {
+                    bail!("--output and --output-bytes must be supplied together");
+                }
+                let model = OracleModel::load_private(&model)?;
+                let result = run_kernel(
+                    &model,
+                    &kernel,
+                    loop_mode,
+                    iterations,
+                    report.is_some(),
+                    output_bytes,
+                )?;
+                if let (Some(path), Some(value)) = (&report, &result.report) {
+                    write_private_json(path, value)?;
+                }
+                if let (Some(path), Some(value)) = (&output, &result.output) {
+                    write_private_binary(path, value)?;
+                }
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "kernel": kernel,
+                            "iterations": result.iterations,
+                            "state_sha256": result.state_sha256,
+                            "report": report,
+                            "output": output,
+                            "output_bytes": output_bytes,
+                        })
+                    ),
+                    Format::Text => println!(
+                        "FairPlay raw source {}: {} iteration(s), state SHA-256 {}",
+                        kernel, result.iterations, result.state_sha256
+                    ),
+                }
+            }
             FairplayEnrollCommand::RecoverState {
                 state_source,
                 source_block,
@@ -2889,6 +2952,39 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn fairplay_raw_source_accepts_private_model_and_output_options() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "raw-source",
+            "--model",
+            "/private/oracle.model.gz",
+            "--kernel",
+            "outer",
+            "--loop",
+            "--report",
+            "/private/report.json",
+            "--output",
+            "/private/source.bin",
+            "--output-bytes",
+            "224",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::RawSource {
+                    kernel,
+                    loop_mode: true,
+                    iterations: 0,
+                    output_bytes: Some(224),
+                    ..
+                }
+            } if kernel == "outer"
+        ));
     }
 
     #[test]
