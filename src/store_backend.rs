@@ -103,7 +103,9 @@ impl StoreBackend {
                 headers: &headers,
                 parameters: None,
                 body: None,
-                raw: false,
+                // Apple sometimes wraps the URL bag in <Document>; preserve its
+                // bytes for the same normalization used by other bag readers.
+                raw: true,
                 response_format: "plist",
                 no_redirects: true,
                 timeout: Some(DEFAULT_AUTHENTICATION_TIMEOUT),
@@ -115,8 +117,7 @@ impl StoreBackend {
         if response.status != 200 {
             bail!("Store bag returned HTTP {}", response.status);
         }
-        let raw: plist::Value =
-            plist::from_bytes(&response.body).context("decode Store URL bag")?;
+        let raw: plist::Value = response.plist(false).context("decode Store URL bag")?;
         if raw.as_dictionary().is_none() {
             bail!("Store URL bag is not a dictionary");
         }
@@ -210,6 +211,40 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    #[ignore = "uses cached Apple framework assets and a public SAP certificate endpoint"]
+    fn fetches_sap_certificate_through_store_guest() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let transport = Arc::new(Transport::with_cookies(state.path()).unwrap());
+        let backend = StoreBackend::new(&assets, [2, 0, 0, 0, 0, 1], transport);
+        let config = backend.sap_config().unwrap();
+        let url = config.certificate_url.to_string();
+        let headers = HeaderMap::new();
+        let response = backend
+            .execute_standard(StoreBackendRequest {
+                method: "GET",
+                url: &url,
+                headers: &headers,
+                parameters: None,
+                body: None,
+                raw: false,
+                response_format: "plist",
+                no_redirects: false,
+                timeout: Some(Duration::from_secs(30)),
+            })
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let plist: plist::Value = plist::from_bytes(&response.body).unwrap();
+        assert!(
+            plist
+                .as_dictionary()
+                .and_then(|value| value.get("sign-sap-setup-cert"))
+                .and_then(plist::Value::as_data)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn loads_bag_once_and_uses_current_purchase_url() {
         let assets = SapAssetBundle::load_cached().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -227,7 +262,7 @@ mod tests {
                     return Ok(HostResponse {
                         status: 200,
                         headers: std::collections::HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
-                        body: br#"<plist version="1.0"><dict><key>urlBag</key><dict><key>buyProduct</key><string>https://buy.itunes.apple.com/stale</string></dict><key>unrelatedCertificate</key><data>AQID</data><key>unrelatedDate</key><date>2024-05-01T00:00:00Z</date></dict></plist>"#.to_vec(),
+                        body: br#"<Document><dict><key>urlBag</key><dict><key>buyProduct</key><string>https://buy.itunes.apple.com/stale</string></dict><key>unrelatedCertificate</key><data>AQID</data><key>unrelatedDate</key><date>2024-05-01T00:00:00Z</date></dict></Document>"#.to_vec(),
                     });
                 }
                 assert_eq!(request.url.as_str(), "https://buy.itunes.apple.com/request");
@@ -277,5 +312,72 @@ mod tests {
         assert!(matches!(bag["unrelatedDate"], plist::Value::Date(_)));
         assert_eq!(backend.sap_config().unwrap().version, 200);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn malformed_guest_plist_returns_framework_value_instead_of_bridge_failure() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let backend =
+            StoreBackend::with_sender(assets.apple_media_services, [0, 1, 2, 3, 4, 5], |_| {
+                Ok(HostResponse {
+                    status: 200,
+                    headers: std::collections::HashMap::from([(
+                        "content-type".into(),
+                        "application/x-apple-plist".into(),
+                    )]),
+                    body: b"<Document>not a plist</Document>".to_vec(),
+                })
+            });
+        let headers = HeaderMap::new();
+        let response = backend
+            .execute_standard(StoreBackendRequest {
+                method: "GET",
+                url: "https://init.itunes.apple.com/test",
+                headers: &headers,
+                parameters: None,
+                body: None,
+                raw: false,
+                response_format: "plist",
+                no_redirects: true,
+                timeout: Some(Duration::from_secs(30)),
+            })
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"<Document>not a plist</Document>");
+    }
+
+    #[test]
+    fn guest_decodes_json_response_with_foundation_values() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let backend =
+            StoreBackend::with_sender(assets.apple_media_services, [0, 1, 2, 3, 4, 5], |_| {
+                Ok(HostResponse {
+                    status: 200,
+                    headers: std::collections::HashMap::from([(
+                        "content-type".into(),
+                        "application/json".into(),
+                    )]),
+                    body: br#"{"data":{"items":[1,true,null],"v":1.25}}"#.to_vec(),
+                })
+            });
+        let headers = HeaderMap::new();
+        let response = backend
+            .execute_standard(StoreBackendRequest {
+                method: "GET",
+                url: "https://apps.apple.com/test",
+                headers: &headers,
+                parameters: None,
+                body: None,
+                raw: false,
+                response_format: "json",
+                no_redirects: true,
+                timeout: Some(Duration::from_secs(30)),
+            })
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"data":{"items":[1,true,null],"v":1.25}})
+        );
     }
 }

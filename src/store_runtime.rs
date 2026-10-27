@@ -6898,6 +6898,39 @@ fn dispatch_message(
         }
     }
     match (class_method, selector) {
+        (false, "initWithObjectsAndKeys:") | (true, "dictionaryWithObjectsAndKeys:") => {
+            let mut values = HashMap::new();
+            let mut value = context.reg_read(REG_X0 + 2)?;
+            let stack = context.reg_read(REG_SP)?;
+            let mut index = 0u64;
+            while value != 0 {
+                if index >= 1024 {
+                    bail!("Store dictionary varargs exceed budget");
+                }
+                let offset = index * 16;
+                let key = read_guest_u64(context, stack + offset)?;
+                values.insert(collection_key(state, key), value);
+                value = read_guest_u64(context, stack + offset + 8)?;
+                index += 1;
+            }
+            if class_method {
+                let dictionary = new_guest_object(
+                    context,
+                    profile,
+                    state,
+                    &class_name,
+                    StoreValue::Entries(values),
+                )?;
+                context.reg_write(REG_X0, dictionary)?;
+            } else {
+                state
+                    .objects
+                    .get_mut(&receiver)
+                    .expect("known dictionary")
+                    .value = StoreValue::Entries(values);
+                context.reg_write(REG_X0, receiver)?;
+            }
+        }
         (true, "defaultManager") if class_name == "NSFileManager" => {
             let manager =
                 new_guest_object(context, profile, state, "NSFileManager", StoreValue::Empty)?;
@@ -7033,6 +7066,23 @@ fn dispatch_message(
             });
             context.reg_write(REG_X0, u64::from(valid))?;
         }
+        (true, "JSONObjectWithData:options:error:") if class_name == "NSJSONSerialization" => {
+            let data = context.reg_read(REG_X0 + 2)?;
+            let StoreValue::Bytes(bytes) = &state.objects[&data].value else {
+                bail!("JSON input is not NSData");
+            };
+            match serde_json::from_slice::<Value>(bytes) {
+                Ok(parsed) => {
+                    let value = import_guest_json(context, profile, state, &parsed, 0)?;
+                    context.reg_write(REG_X0, value)?;
+                }
+                Err(_) => {
+                    let error_slot = context.reg_read(REG_X0 + 4)?;
+                    guest_parser_error(context, profile, state, error_slot)?;
+                    context.reg_write(REG_X0, 0)?;
+                }
+            }
+        }
         (true, "propertyListWithData:options:format:error:")
             if class_name == "NSPropertyListSerialization" =>
         {
@@ -7040,10 +7090,17 @@ fn dispatch_message(
             let StoreValue::Bytes(bytes) = &state.objects[&data].value else {
                 bail!("property list input is not NSData");
             };
-            let parsed: plist::Value =
-                plist::from_bytes(bytes).context("parse Store property list")?;
-            let value = import_guest_plist(context, profile, state, &parsed, 0)?;
-            context.reg_write(REG_X0, value)?;
+            match plist::from_bytes::<plist::Value>(bytes) {
+                Ok(parsed) => {
+                    let value = import_guest_plist(context, profile, state, &parsed, 0)?;
+                    context.reg_write(REG_X0, value)?;
+                }
+                Err(_) => {
+                    let error_slot = context.reg_read(REG_X0 + 5)?;
+                    guest_parser_error(context, profile, state, error_slot)?;
+                    context.reg_write(REG_X0, 0)?;
+                }
+            }
         }
         (true, "dataWithPropertyList:format:options:error:")
             if class_name == "NSPropertyListSerialization" =>
@@ -8458,6 +8515,130 @@ fn collection_key(state: &StoreState, address: u64) -> String {
         }
     }
     format!("#object:{address:x}")
+}
+
+fn guest_parser_error(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    error_slot: u64,
+) -> Result<()> {
+    if error_slot == 0 {
+        return Ok(());
+    }
+    let domain = new_guest_object(
+        context,
+        profile,
+        state,
+        "NSString",
+        StoreValue::String("NSCocoaErrorDomain".into()),
+    )?;
+    let code = new_guest_object(
+        context,
+        profile,
+        state,
+        "NSNumber",
+        StoreValue::Number(3840),
+    )?;
+    let user_info = new_guest_object(
+        context,
+        profile,
+        state,
+        "NSDictionary",
+        StoreValue::Entries(HashMap::new()),
+    )?;
+    let error = new_guest_object(
+        context,
+        profile,
+        state,
+        "NSError",
+        StoreValue::Entries(HashMap::from([
+            ("domain".into(), domain),
+            ("code".into(), code),
+            ("userInfo".into(), user_info),
+        ])),
+    )?;
+    write_guest_u64(context, error_slot, error)
+}
+
+fn import_guest_json(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    value: &Value,
+    depth: usize,
+) -> Result<u64> {
+    if depth > 32 {
+        bail!("Store Foundation import exceeds nesting limit");
+    }
+    match value {
+        Value::Null => Ok(0),
+        Value::String(value) => new_guest_object(
+            context,
+            profile,
+            state,
+            "NSString",
+            StoreValue::String(value.clone()),
+        ),
+        Value::Bool(value) => new_guest_object(
+            context,
+            profile,
+            state,
+            "NSNumber",
+            StoreValue::Boolean(*value),
+        ),
+        Value::Number(value) => {
+            let value = if let Some(integer) = value.as_i64() {
+                StoreValue::Number(integer)
+            } else if let Some(integer) = value.as_u64().filter(|value| *value <= i64::MAX as u64) {
+                StoreValue::Number(integer as i64)
+            } else {
+                StoreValue::Float(value.as_f64().context("invalid Store JSON number")?)
+            };
+            new_guest_object(context, profile, state, "NSNumber", value)
+        }
+        Value::Array(values) => {
+            if values.len() > 65_536 {
+                bail!("Store Foundation array exceeds size limit");
+            }
+            let mut imported = Vec::with_capacity(values.len());
+            for value in values {
+                imported.push(import_guest_json(
+                    context,
+                    profile,
+                    state,
+                    value,
+                    depth + 1,
+                )?);
+            }
+            new_guest_object(
+                context,
+                profile,
+                state,
+                "NSArray",
+                StoreValue::Addresses(imported),
+            )
+        }
+        Value::Object(values) => {
+            if values.len() > 65_536 {
+                bail!("Store Foundation dictionary exceeds size limit");
+            }
+            let mut imported = HashMap::with_capacity(values.len());
+            for (key, value) in values {
+                imported.insert(
+                    key.clone(),
+                    import_guest_json(context, profile, state, value, depth + 1)?,
+                );
+            }
+            new_guest_object(
+                context,
+                profile,
+                state,
+                "NSDictionary",
+                StoreValue::Entries(imported),
+            )
+        }
+    }
 }
 
 fn import_guest_plist(
