@@ -1,5 +1,7 @@
 # ipatool-rs
 
+> **An experimental Rust rewrite.** I started this project solely to use Codex quota that would otherwise go unused and to see whether Codex could rewrite these workflows in Rust. It has no other purpose. For practical use, please prefer the original [ipatool](https://github.com/majd/ipatool) and [UnfairPlay](https://github.com/DrWhax/unfairplay) projects.
+
 ## Thanks to the original projects
 
 - [ipatool](https://github.com/majd/ipatool) and its contributors for the App Store search, account, purchase, and download workflows.
