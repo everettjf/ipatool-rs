@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use plist::Value;
 use reqwest::{Method, header::HeaderValue};
 use serde::Serialize;
-use time::{Date, Month, OffsetDateTime, Time, format_description::well_known::Rfc3339};
+use time::{Date, Duration, Month, OffsetDateTime, Time, format_description::well_known::Rfc3339};
 use url::Url;
 use zip::ZipArchive;
 
@@ -43,8 +43,10 @@ pub fn read_version_metadata_with_sender(
     let mut archive = ZipArchive::new(reader).context("open remote IPA ZIP")?;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).context("read remote IPA entry")?;
-        let raw_name =
-            duplicate_zip::read_raw_central_name(&mut raw_reader, file.central_header_start())?;
+        let (raw_name, dos_date, dos_time) = duplicate_zip::read_raw_central_name_and_dos_time(
+            &mut raw_reader,
+            file.central_header_start(),
+        )?;
         if !is_main_info_plist(&String::from_utf8_lossy(&raw_name)) {
             continue;
         }
@@ -52,7 +54,7 @@ pub fn read_version_metadata_with_sender(
         file.by_ref()
             .read_to_end(&mut bytes)
             .context("read IPA Info.plist")?;
-        return parse_info_plist(&bytes, file.extra_data_fields(), file.last_modified());
+        return parse_info_plist(&bytes, file.extra_data_fields(), dos_date, dos_time);
     }
     bail!("IPA has no top-level app Info.plist")
 }
@@ -68,7 +70,8 @@ fn is_main_info_plist(path: &str) -> bool {
 fn parse_info_plist<'a>(
     bytes: &[u8],
     extra_fields: impl Iterator<Item = &'a zip::ExtraField>,
-    modified: Option<zip::DateTime>,
+    dos_date: u16,
+    dos_time: u16,
 ) -> Result<VersionMetadata> {
     let info: Value = plist::from_bytes(bytes).context("decode IPA Info.plist")?;
     let fields = info
@@ -88,8 +91,7 @@ fn parse_info_plist<'a>(
     {
         parse_release_date(value)?
     } else {
-        zip_modified_time(extra_fields, modified)?
-            .context("IPA Info.plist has no release date or ZIP timestamp")?
+        zip_modified_time(extra_fields, dos_date, dos_time)?
     };
     Ok(VersionMetadata {
         display_version,
@@ -198,19 +200,27 @@ fn parse_release_date(value: &Value) -> Result<OffsetDateTime> {
     }
 }
 
-fn zip_time(modified: zip::DateTime) -> Result<OffsetDateTime> {
-    let month = Month::try_from(modified.month()).context("invalid IPA ZIP month")?;
-    let date = Date::from_calendar_date(modified.year().into(), month, modified.day())
-        .context("invalid IPA ZIP date")?;
-    let time = Time::from_hms(modified.hour(), modified.minute(), modified.second())
-        .context("invalid IPA ZIP time")?;
-    Ok(date.with_time(time).assume_utc())
+fn go_dos_time(dos_date: u16, dos_time: u16) -> Result<OffsetDateTime> {
+    // Go's time.Date normalizes zero and out-of-range DOS fields rather than
+    // rejecting them. Its archive/zip reader applies this to every entry.
+    let year = i32::from(dos_date >> 9) + 1980;
+    let month = i32::from((dos_date >> 5) & 0xf);
+    let normalized_year = year + (month - 1).div_euclid(12);
+    let normalized_month = (month - 1).rem_euclid(12) + 1;
+    let first =
+        Date::from_calendar_date(normalized_year, Month::try_from(normalized_month as u8)?, 1)?;
+    Ok(first.with_time(Time::MIDNIGHT).assume_utc()
+        + Duration::days(i64::from(dos_date & 0x1f) - 1)
+        + Duration::hours(i64::from(dos_time >> 11))
+        + Duration::minutes(i64::from((dos_time >> 5) & 0x3f))
+        + Duration::seconds(i64::from(dos_time & 0x1f) * 2))
 }
 
 fn zip_modified_time<'a>(
     fields: impl Iterator<Item = &'a zip::ExtraField>,
-    fallback: Option<zip::DateTime>,
-) -> Result<Option<OffsetDateTime>> {
+    dos_date: u16,
+    dos_time: u16,
+) -> Result<OffsetDateTime> {
     let mut modified = None;
     for field in fields {
         let timestamp = match field {
@@ -233,7 +243,7 @@ fn zip_modified_time<'a>(
             modified = timestamp;
         }
     }
-    modified.map_or_else(|| fallback.map(zip_time).transpose(), |time| Ok(Some(time)))
+    modified.map_or_else(|| go_dos_time(dos_date, dos_time), Ok)
 }
 
 fn ntfs_modified_time(ticks: u64) -> Option<OffsetDateTime> {
@@ -594,6 +604,40 @@ mod tests {
         .unwrap();
         assert_eq!(metadata.display_version, "1.0");
         assert_eq!(metadata.release_date, "2025-02-03T04:05:06Z");
+    }
+
+    #[test]
+    fn normalizes_invalid_dos_timestamp_like_go() {
+        let info = br#"<plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>1.0</string></dict></plist>"#;
+        let mut data = fixture_ipa(info);
+        let name = b"Payload/Test.app/Info.plist";
+        let mut found = false;
+        for offset in 0..data.len() - 46 - name.len() {
+            if data[offset..offset + 4] == [0x50, 0x4b, 0x01, 0x02]
+                && &data[offset + 46..offset + 46 + name.len()] == name
+            {
+                data[offset + 12..offset + 16].fill(0);
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+        let metadata = read_version_metadata_with_sender(
+            "https://example.test/app.ipa",
+            fixture_sender(Arc::new(data), Arc::new(AtomicUsize::new(0))),
+        )
+        .unwrap();
+        assert_eq!(metadata.release_date, "1979-11-30T00:00:00Z");
+
+        let invalid_date = 2 << 5 | 31;
+        let invalid_time = 31 << 11 | 63 << 5 | 31;
+        assert_eq!(
+            go_dos_time(invalid_date, invalid_time)
+                .unwrap()
+                .format(&Rfc3339)
+                .unwrap(),
+            "1980-03-03T08:04:02Z"
+        );
     }
 
     #[test]

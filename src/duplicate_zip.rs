@@ -52,6 +52,15 @@ pub(crate) fn read_raw_central_name<R: Read + Seek>(
     source: &mut R,
     offset: u64,
 ) -> Result<Vec<u8>> {
+    Ok(read_raw_central_name_and_dos_time(source, offset)?.0)
+}
+
+/// Go's archive/zip preserves the raw DOS timestamp even when it is invalid.
+/// The zip crate drops invalid dates, so IPA metadata needs these header bytes.
+pub(crate) fn read_raw_central_name_and_dos_time<R: Read + Seek>(
+    source: &mut R,
+    offset: u64,
+) -> Result<(Vec<u8>, u16, u16)> {
     source.seek(SeekFrom::Start(offset))?;
     let mut header = [0u8; 46];
     source.read_exact(&mut header)?;
@@ -62,7 +71,9 @@ pub(crate) fn read_raw_central_name<R: Read + Seek>(
     let name_length = u16::from_le_bytes([header[28], header[29]]) as usize;
     let mut name = vec![0u8; name_length];
     source.read_exact(&mut name)?;
-    Ok(name)
+    let dos_time = u16::from_le_bytes([header[12], header[13]]);
+    let dos_date = u16::from_le_bytes([header[14], header[15]]);
+    Ok((name, dos_date, dos_time))
 }
 
 #[cfg(test)]
