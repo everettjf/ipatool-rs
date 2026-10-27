@@ -243,13 +243,14 @@ impl DownloadProductClient {
         let selected_version = select_mobile_download_version(version, platform, || {
             catalog.latest_external_version_id(app, country, platform)
         })?;
-        let response = self.send_product(account, app, &selected_version, || {
-            if platform == Platform::Appletv && selected_version.is_empty() {
-                Err(AppNotFound.into())
-            } else {
-                download_fallback_version(catalog, app, country, platform)
-            }
-        })?;
+        let response =
+            self.send_product_for_platform(account, app, &selected_version, platform, || {
+                if platform == Platform::Appletv && selected_version.is_empty() {
+                    Err(AppNotFound.into())
+                } else {
+                    download_fallback_version(catalog, app, country, platform)
+                }
+            })?;
         let item = checked_download_item(&response)?;
         self.download_mobile_item(account, app, item, platform, output)
     }
@@ -272,13 +273,14 @@ impl DownloadProductClient {
         let selected_version = select_mobile_download_version(version, platform, || {
             catalog.latest_external_version_id(app, country, platform)
         })?;
-        let response = self.send_product(account, app, &selected_version, || {
-            if platform == Platform::Appletv && selected_version.is_empty() {
-                Err(AppNotFound.into())
-            } else {
-                download_fallback_version(catalog, app, country, platform)
-            }
-        })?;
+        let response =
+            self.send_product_for_platform(account, app, &selected_version, platform, || {
+                if platform == Platform::Appletv && selected_version.is_empty() {
+                    Err(AppNotFound.into())
+                } else {
+                    download_fallback_version(catalog, app, country, platform)
+                }
+            })?;
         let item = checked_download_item(&response)?;
         self.captured_mobile_item(account, app, item, &response, platform, output)
     }
@@ -298,7 +300,10 @@ impl DownloadProductClient {
         } else {
             version.to_owned()
         };
-        let response = self.send_product(account, app, &selected, || Ok(selected.clone()))?;
+        let response =
+            self.send_product_for_platform(account, app, &selected, Platform::Macos, || {
+                Ok(selected.clone())
+            })?;
         let item = checked_download_item(&response)?;
         if package_platform(Platform::Macos, item)? != Platform::Iphone {
             bail!("FairPlay download capture requires an IPA package; the macOS offer is a PKG");
@@ -359,7 +364,10 @@ impl DownloadProductClient {
         } else {
             version.to_owned()
         };
-        let response = self.send_product(account, app, &selected, || Ok(selected.clone()))?;
+        let response =
+            self.send_product_for_platform(account, app, &selected, Platform::Macos, || {
+                Ok(selected.clone())
+            })?;
         let item = checked_download_item(&response)?;
         match package_platform(Platform::Macos, item)? {
             Platform::Iphone => {
@@ -436,7 +444,7 @@ impl DownloadProductClient {
         } else {
             String::new()
         };
-        let response = self.send_product(account, app, &version, || {
+        let response = self.send_product_for_platform(account, app, &version, platform, || {
             catalog.latest_external_version_id(app, country, platform)
         })?;
         let item = checked_item(&response)?;
@@ -496,7 +504,13 @@ impl DownloadProductClient {
         if version.is_empty() || platform == Some(Platform::Unknown) {
             bail!("a version ID and valid platform are required");
         }
-        let response = self.send_product(account, app, version, || Ok(version.to_owned()))?;
+        let response = self.send_product_for_platform(
+            account,
+            app,
+            version,
+            platform.unwrap_or(Platform::Iphone),
+            || Ok(version.to_owned()),
+        )?;
         let item = checked_item(&response)?;
         let software_platform = item
             .metadata_field("software-platform")
@@ -550,6 +564,17 @@ impl DownloadProductClient {
         version: &str,
         fallback_version: impl Fn() -> Result<String>,
     ) -> Result<DownloadProductResponse> {
+        self.send_product_for_platform(account, app, version, Platform::Iphone, fallback_version)
+    }
+
+    fn send_product_for_platform(
+        &self,
+        account: &Account,
+        app: &App,
+        version: &str,
+        platform: Platform,
+        fallback_version: impl Fn() -> Result<String>,
+    ) -> Result<DownloadProductResponse> {
         if app.id <= 0 {
             bail!("app ID is required for download metadata");
         }
@@ -597,7 +622,8 @@ impl DownloadProductClient {
         };
         let redownload =
             self.send_request(Endpoint::Redownload, account, app, &selected_version)?;
-        if (redownload.is_empty_or_unavailable() || redownload.is_empty_server_error())
+        if platform != Platform::Visionos
+            && (redownload.is_empty_or_unavailable() || redownload.is_empty_server_error())
             && !selected_version.is_empty()
             && let Some(update_url) = bag.update.as_deref()
         {
@@ -605,10 +631,14 @@ impl DownloadProductClient {
                 bail!("invalid update endpoint in Store bag");
             }
             let update = self.send_request(Endpoint::Update, account, app, &selected_version)?;
-            validate_fallback(&update, app, &selected_version)?;
+            validate_strict_fallback(&update, app, &selected_version, "update")?;
             return Ok(update);
         }
-        validate_fallback(&redownload, app, &selected_version)?;
+        if selected_version.is_empty() {
+            validate_strict_fallback(&redownload, app, &selected_version, "redownload")?;
+        } else {
+            validate_fallback(&redownload, app, &selected_version)?;
+        }
         if selected_version.is_empty()
             && redownload.data.failure_type.is_empty()
             && redownload
@@ -784,7 +814,7 @@ impl DownloadProductClient {
             data,
             capture,
         };
-        validate_fallback(&result, app, version)?;
+        validate_strict_fallback(&result, app, version, "ent/download")?;
         if result.data.failure_type.is_empty()
             && result
                 .data
@@ -1259,6 +1289,21 @@ fn validate_fallback(response: &DownloadProductResponse, app: &App, version: &st
     Ok(())
 }
 
+fn validate_strict_fallback(
+    response: &DownloadProductResponse,
+    app: &App,
+    version: &str,
+    source: &str,
+) -> Result<()> {
+    if response.data.failure_type.is_empty() && !response.data.customer_message.is_empty() {
+        bail!(
+            "received {source} error: {}",
+            response.data.customer_message
+        );
+    }
+    validate_fallback(response, app, version)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1393,6 +1438,24 @@ mod tests {
     }
 
     #[test]
+    fn strict_fallback_rejects_customer_message_even_with_an_item() {
+        let mut response = DownloadProductResponse {
+            status: 200,
+            data: item_response("101").plist(false).unwrap(),
+            capture: None,
+        };
+        response.data.customer_message = "Store refused this endpoint".into();
+        assert!(validate_fallback(&response, &app(), "101").is_ok());
+        for source in ["ent/download", "update", "redownload"] {
+            let error = validate_strict_fallback(&response, &app(), "101", source).unwrap_err();
+            assert!(error.to_string().contains(source));
+            assert!(error.to_string().contains("Store refused this endpoint"));
+        }
+        response.data.failure_type = "2034".into();
+        assert!(validate_strict_fallback(&response, &app(), "101", "update").is_ok());
+    }
+
+    #[test]
     fn volume_request_matches_pinned_store_guest() {
         let assets = SapAssetBundle::load_cached().unwrap();
         let seen_guest = Arc::new(Mutex::new(None));
@@ -1488,6 +1551,46 @@ mod tests {
         assert!(calls[3].0.contains("/up/updateProduct"));
         assert_eq!(calls[0].1.as_ref().unwrap()["externalVersionId"], "101");
         assert_eq!(calls[2].1.as_ref().unwrap()["appExtVrsId"], "101");
+    }
+
+    #[test]
+    fn visionos_does_not_use_update_product_fallback() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&paths);
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |request| {
+            let path = request.url.path().to_owned();
+            seen.lock().unwrap().push(path.clone());
+            if path.ends_with("bag.xml") {
+                return Ok(response(serde_json::json!({"urlBag": {
+                    "redownloadProduct": REDOWNLOAD_URL,
+                    "updateProduct": UPDATE_URL
+                }})));
+            }
+            if path.ends_with("/r/redownload") {
+                return Ok(Response {
+                    status: 500,
+                    headers: Default::default(),
+                    body: Vec::new(),
+                });
+            }
+            assert!(!path.ends_with("/up/updateProduct"));
+            Ok(response(serde_json::json!({})))
+        });
+        let result = client
+            .send_product_for_platform(
+                &account(),
+                &app(),
+                "101",
+                Platform::Visionos,
+                || unreachable!(),
+            )
+            .unwrap_err();
+        assert!(result.to_string().contains("no unique app item"));
+        let paths = paths.lock().unwrap();
+        assert_eq!(paths.len(), 3);
+        assert!(paths[0].ends_with("volumeStoreDownloadProduct"));
+        assert!(paths[1].ends_with("bag.xml"));
+        assert!(paths[2].ends_with("/r/redownload"));
     }
 
     #[test]
