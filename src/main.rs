@@ -320,6 +320,8 @@ enum FairplayEnrollCommand {
         model: PathBuf,
         #[arg(long, default_value_t = 2)]
         timeout_seconds: u64,
+        #[arg(long, default_value_t = 16)]
+        normal_cases: usize,
     },
     /// Transform a private 192/224-byte source with the embedded 26A428 state model.
     EvaluateState {
@@ -1438,6 +1440,7 @@ fn run() -> Result<()> {
                 fairplayd,
                 model,
                 timeout_seconds,
+                normal_cases,
             } => {
                 if !(1..=30).contains(&timeout_seconds) {
                     bail!("oracle validation timeout must be between 1 and 30 seconds");
@@ -1450,6 +1453,7 @@ fn run() -> Result<()> {
                     &binary,
                     &model,
                     Duration::from_secs(timeout_seconds),
+                    normal_cases,
                 )?;
                 match cli.format {
                     Format::Json => println!(
@@ -2667,6 +2671,7 @@ mod tests {
             Command::FairplayEnroll {
                 command: FairplayEnrollCommand::ValidateOracleModel {
                     timeout_seconds: 2,
+                    normal_cases: 16,
                     ..
                 }
             }

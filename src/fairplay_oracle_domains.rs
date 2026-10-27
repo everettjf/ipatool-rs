@@ -17,6 +17,7 @@ use crate::{
     fairplay_checkpoint::FairplayCheckpoint,
     fairplay_checkpoint_run::CheckpointRunner,
     fairplay_oracle_model::{FaultKind, OracleFault, OracleModel},
+    fairplay_recovery_target::deterministic_input,
     unicorn_runtime::{Engine, HookContext, REG_PC, REG_X0},
 };
 
@@ -462,13 +463,18 @@ pub struct DifferentialResult {
 }
 
 /// Compare the checked Rust evaluator with native checkpoint execution for
-/// one original block and every 26B118 fault site at three XOR values.
+/// the original block, deterministic inputs, and every 26B118 fault site at
+/// three XOR values.
 pub fn validate_26b118_model(
     checkpoint: &FairplayCheckpoint,
     binary: &[u8],
     model: &OracleModel,
     timeout: Duration,
+    normal_cases: usize,
 ) -> Result<DifferentialResult> {
+    if normal_cases > 256 {
+        bail!("26B118 differential normal case count exceeds 256");
+    }
     if checkpoint.binary_hash != BUILD_HASH
         || checkpoint.pc()? != ENTRY
         || model.binary_hash != BUILD_HASH
@@ -504,6 +510,17 @@ pub fn validate_26b118_model(
         bail!("26B118 Rust evaluator differs from native execution without a fault");
     }
     hash.update(baseline);
+    for index in 0..normal_cases {
+        let block = deterministic_input(index as u32);
+        let native = replay
+            .run_block(&block)
+            .with_context(|| format!("native 26B118 normal case {index}"))?;
+        let rust = fairplay_26b118::evaluate(model, &block, u32::MAX)?;
+        if native != rust {
+            bail!("26B118 Rust evaluator differs from native normal case {index}");
+        }
+        hash.update(native);
+    }
     for (index, &metadata) in metadata.iter().enumerate() {
         let fault = fairplay_26b118::fault_for_metadata(metadata)?;
         let domain = match fault.kind {
@@ -522,7 +539,7 @@ pub fn validate_26b118_model(
         hash.update(native);
     }
     Ok(DifferentialResult {
-        cases: metadata.len() + 1,
+        cases: metadata.len() + normal_cases + 1,
         domains: required.len(),
         output_sha256: format!("{:x}", hash.finalize()),
     })
