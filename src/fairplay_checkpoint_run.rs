@@ -40,6 +40,12 @@ const MAX_VIRTUAL_FILE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_VIRTUAL_FILES: usize = 1024;
 const DARWIN_STAT_BYTES: usize = 144;
 const MAX_DARWIN_OBJECTS: usize = 4096;
+const MAX_CF_DATA_BYTES: usize = 1024 * 1024;
+const MAX_CF_STRING_BYTES: usize = 64 * 1024;
+const MAX_CF_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const CF_STRING_TYPE_ID: u64 = 0x535452;
+const CF_BOOLEAN_TYPE_ID: u64 = 0x424f4f4c;
+const CF_DATA_TYPE_ID: u64 = 0x44415441;
 const RET_X30: [u8; 4] = 0xd65f_03c0u32.to_le_bytes();
 const SYNTHETIC_ERRNO_ADDRESS: u64 = 0x7100_fff0_0000;
 const SYNTHETIC_NOOP_CALLBACK: u64 = 0x7200_0000_0000;
@@ -377,6 +383,16 @@ impl VirtualFileState {
 enum CfValue {
     Boolean(bool),
     Data(Zeroizing<Vec<u8>>),
+    String(Zeroizing<Vec<u8>>),
+}
+
+impl CfValue {
+    fn byte_len(&self) -> usize {
+        match self {
+            Self::Boolean(_) => 0,
+            Self::Data(bytes) | Self::String(bytes) => bytes.len(),
+        }
+    }
 }
 
 struct DarwinState {
@@ -459,15 +475,25 @@ impl DarwinState {
         if values.len() > MAX_DARWIN_OBJECTS {
             bail!("too many FairPlay CF values");
         }
+        let mut total_cf_bytes = 0usize;
         for (key, value) in values {
             let handle = pickle_hash_u64(key)?;
             let value = match value {
                 Value::Bool(value) => CfValue::Boolean(*value),
-                Value::Bytes(bytes) if bytes.len() <= 4096 => {
+                Value::Bytes(bytes) if bytes.len() <= MAX_CF_DATA_BYTES => {
                     CfValue::Data(Zeroizing::new(bytes.clone()))
+                }
+                Value::String(value) if value.len() <= MAX_CF_STRING_BYTES => {
+                    CfValue::String(Zeroizing::new(value.as_bytes().to_vec()))
                 }
                 _ => bail!("invalid FairPlay CF value"),
             };
+            total_cf_bytes = total_cf_bytes
+                .checked_add(value.byte_len())
+                .context("FairPlay CF value size overflow")?;
+            if total_cf_bytes > MAX_CF_TOTAL_BYTES {
+                bail!("FairPlay CF values exceed total size limit");
+            }
             state.cf_values.insert(handle, value);
         }
         if let Some(value) = fields.get(&HashableValue::String("iokit15_output".into())) {
@@ -487,6 +513,30 @@ impl DarwinState {
         *value = value
             .checked_add(increment)
             .context("FairPlay handle overflow")?;
+        Ok(handle)
+    }
+
+    fn insert_cf_value(
+        &mut self,
+        context: &HookContext,
+        allocations: &Rc<RefCell<AllocationState>>,
+        value: CfValue,
+    ) -> Result<u64> {
+        if self.cf_values.len() >= MAX_DARWIN_OBJECTS {
+            bail!("too many FairPlay CF values");
+        }
+        let total = self
+            .cf_values
+            .values()
+            .try_fold(value.byte_len(), |sum, entry| {
+                sum.checked_add(entry.byte_len())
+                    .context("FairPlay CF value size overflow")
+            })?;
+        if total > MAX_CF_TOTAL_BYTES {
+            bail!("FairPlay CF values exceed total size limit");
+        }
+        let handle = allocations.borrow_mut().allocate(context, 1)?;
+        self.cf_values.insert(handle, value);
         Ok(handle)
     }
 
@@ -529,6 +579,9 @@ impl DarwinState {
                         let value = match value {
                             CfValue::Boolean(value) => Value::Bool(*value),
                             CfValue::Data(bytes) => Value::Bytes(bytes.to_vec()),
+                            CfValue::String(bytes) => {
+                                Value::String(String::from_utf8_lossy(bytes).into_owned())
+                            }
                         };
                         (HashableValue::Int(handle.into()), value)
                     })
@@ -999,19 +1052,101 @@ fn run_darwin_external(
                 b"IOMACAddress" => CfValue::Data(Zeroizing::new(state.mac_address.to_vec())),
                 _ => bail!("unmodeled FairPlay IORegistry property"),
             };
-            if state.cf_values.len() >= MAX_DARWIN_OBJECTS {
-                bail!("too many FairPlay CF values");
-            }
-            let handle = allocations.borrow_mut().allocate(context, 1)?;
-            state.cf_values.insert(handle, value);
+            let handle = state.insert_cf_value(context, allocations, value)?;
             context.reg_write(199, handle)?;
         }
+        "CFStringGetSystemEncoding" => context.reg_write(199, 0)?,
+        "CFStringCreateWithCString" | "CFStringCreateWithCStringNoCopy" => {
+            let input = guest_path(context, guest_register(context, 1)?)?;
+            if input.len() > MAX_CF_STRING_BYTES {
+                bail!("FairPlay CF string exceeds size limit");
+            }
+            let value = String::from_utf8_lossy(&input).into_owned().into_bytes();
+            let handle = state.insert_cf_value(
+                context,
+                allocations,
+                CfValue::String(Zeroizing::new(value)),
+            )?;
+            context.reg_write(199, handle)?;
+        }
+        "CFStringGetLength" => {
+            let Some(CfValue::String(value)) = state.cf_values.get(&guest_register(context, 0)?)
+            else {
+                bail!("FairPlay CF value is not a string");
+            };
+            context.reg_write(199, value.len() as u64)?;
+        }
+        "CFStringGetCString" => {
+            let value = state.cf_values.get(&guest_register(context, 0)?);
+            let capacity = guest_register(context, 2)?;
+            if let Some(CfValue::String(value)) = value {
+                if capacity > value.len() as u64 {
+                    context.mem_write(guest_register(context, 1)?, value)?;
+                    let terminator = guest_register(context, 1)?
+                        .checked_add(value.len() as u64)
+                        .context("CF string destination overflow")?;
+                    context.mem_write(terminator, &[0])?;
+                    context.reg_write(199, 1)?;
+                } else {
+                    context.reg_write(199, 0)?;
+                }
+            } else {
+                context.reg_write(199, 0)?;
+            }
+        }
+        "CFStringGetMaximumSizeForEncoding" => {
+            let length = guest_register(context, 0)?;
+            context.reg_write(
+                199,
+                length.checked_mul(4).context("CF string size overflow")?,
+            )?;
+        }
+        "CFGetTypeID" => {
+            let id = match state.cf_values.get(&guest_register(context, 0)?) {
+                Some(CfValue::String(_)) => CF_STRING_TYPE_ID,
+                Some(CfValue::Boolean(_)) => CF_BOOLEAN_TYPE_ID,
+                Some(CfValue::Data(_)) => CF_DATA_TYPE_ID,
+                None => bail!("FairPlay CF type query used unknown object"),
+            };
+            context.reg_write(199, id)?;
+        }
+        "CFStringGetTypeID" => context.reg_write(199, CF_STRING_TYPE_ID)?,
+        "CFBooleanGetTypeID" => context.reg_write(199, CF_BOOLEAN_TYPE_ID)?,
+        "CFDataGetTypeID" => context.reg_write(199, CF_DATA_TYPE_ID)?,
         "CFBooleanGetValue" => {
             let handle = guest_register(context, 0)?;
             let Some(CfValue::Boolean(value)) = state.cf_values.get(&handle) else {
                 bail!("FairPlay CF value is not a boolean");
             };
             context.reg_write(199, u64::from(*value))?;
+        }
+        "CFDataCreate" => {
+            let source = guest_register(context, 1)?;
+            let length = usize::try_from(guest_register(context, 2)?)?;
+            if length > MAX_CF_DATA_BYTES {
+                bail!("FairPlay CF data exceeds size limit");
+            }
+            let bytes = Zeroizing::new(context.mem_read(source, length)?);
+            let handle = state.insert_cf_value(context, allocations, CfValue::Data(bytes))?;
+            context.reg_write(199, handle)?;
+        }
+        "CFDataGetLength" => {
+            let Some(CfValue::Data(data)) = state.cf_values.get(&guest_register(context, 0)?)
+            else {
+                bail!("FairPlay CF value is not data");
+            };
+            context.reg_write(199, data.len() as u64)?;
+        }
+        "CFDataGetBytePtr" => {
+            let Some(CfValue::Data(data)) = state.cf_values.get(&guest_register(context, 0)?)
+            else {
+                bail!("FairPlay CF value is not data");
+            };
+            let address = allocations
+                .borrow_mut()
+                .allocate(context, data.len() as u64)?;
+            context.mem_write(address, data)?;
+            context.reg_write(199, address)?;
         }
         "CFDataGetBytes" => {
             let handle = guest_register(context, 0)?;
@@ -1111,7 +1246,20 @@ fn run_modeled_external(
         | "IOServiceOpen"
         | "IORegistryEntryGetParentEntry"
         | "IORegistryEntryCreateCFProperty"
+        | "CFStringGetSystemEncoding"
+        | "CFStringCreateWithCString"
+        | "CFStringCreateWithCStringNoCopy"
+        | "CFStringGetLength"
+        | "CFStringGetCString"
+        | "CFStringGetMaximumSizeForEncoding"
+        | "CFGetTypeID"
+        | "CFStringGetTypeID"
+        | "CFBooleanGetTypeID"
+        | "CFDataGetTypeID"
         | "CFBooleanGetValue"
+        | "CFDataCreate"
+        | "CFDataGetLength"
+        | "CFDataGetBytePtr"
         | "CFDataGetBytes"
         | "CFRelease"
         | "IOConnectCallStructMethod"
@@ -1394,10 +1542,7 @@ fn run_modeled_external(
             context.reg_write(199, 0)?;
         }
         "chkstk_darwin" => {}
-        "error" => {
-            set_guest_errno(context, 0)?;
-            context.reg_write(199, SYNTHETIC_ERRNO_ADDRESS)?;
-        }
+        "error" => context.reg_write(199, SYNTHETIC_ERRNO_ADDRESS)?,
         "mmap" => {
             let length = guest_register(context, 1)?;
             let flags = guest_register(context, 3)?;
@@ -1521,7 +1666,20 @@ fn install_modeled_external(
             | "IOServiceOpen"
             | "IORegistryEntryGetParentEntry"
             | "IORegistryEntryCreateCFProperty"
+            | "CFStringGetSystemEncoding"
+            | "CFStringCreateWithCString"
+            | "CFStringCreateWithCStringNoCopy"
+            | "CFStringGetLength"
+            | "CFStringGetCString"
+            | "CFStringGetMaximumSizeForEncoding"
+            | "CFGetTypeID"
+            | "CFStringGetTypeID"
+            | "CFBooleanGetTypeID"
+            | "CFDataGetTypeID"
             | "CFBooleanGetValue"
+            | "CFDataCreate"
+            | "CFDataGetLength"
+            | "CFDataGetBytePtr"
             | "CFDataGetBytes"
             | "CFRelease"
             | "IOConnectCallStructMethod"
@@ -2535,6 +2693,125 @@ mod tests {
             resumed.engine.mem_read(0x3000, 20).unwrap(),
             Sha1::digest(b"abc").to_vec()
         );
+    }
+
+    #[test]
+    fn core_foundation_values_survive_checkpoint_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let binary_path = directory.path().join("fairplayd.arm64e");
+        let output_path = directory.path().join("cf-values.pkl.gz");
+        std::fs::write(&binary_path, SYNTHETIC_BINARY).unwrap();
+        let source = FairplayCheckpoint::parse_gzip(SYNTHETIC_CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&source, SYNTHETIC_BINARY).unwrap();
+        runner.engine.mem_map(0x1000, PAGE_BYTES as usize).unwrap();
+        runner.engine.mem_write(0x1000, b"FairPlay\0").unwrap();
+        runner.engine.mem_write(0x1010, b"data").unwrap();
+        for (index, symbol) in ["_CFStringCreateWithCString", "_CFDataCreate"]
+            .into_iter()
+            .enumerate()
+        {
+            install_modeled_external(
+                &mut runner.engine,
+                EXTERNAL_BASE + index as u64 * EXTERNAL_STRIDE,
+                symbol,
+                &runner.external_failure,
+                &runner.allocation_state,
+                &runner.once_tokens,
+                (&runner.host_state, &runner.virtual_files, &runner.darwin),
+            )
+            .unwrap();
+        }
+        runner.engine.reg_write(200, 0x1000).unwrap();
+        runner.engine.reg_write(2, 0x5000).unwrap();
+        runner
+            .engine
+            .start_bounded(EXTERNAL_BASE, 0x5000, Duration::from_secs(2), 4)
+            .unwrap();
+        let string_handle = runner.engine.reg_read(199).unwrap();
+        runner.engine.reg_write(200, 0x1010).unwrap();
+        runner.engine.reg_write(201, 4).unwrap();
+        runner.engine.reg_write(2, 0x5000).unwrap();
+        runner
+            .engine
+            .start_bounded(
+                EXTERNAL_BASE + EXTERNAL_STRIDE,
+                0x5000,
+                Duration::from_secs(2),
+                4,
+            )
+            .unwrap();
+        let data_handle = runner.engine.reg_read(199).unwrap();
+        assert!(runner.external_failure.borrow().is_none());
+        runner
+            .engine
+            .reg_write(REG_PC, source.pc().unwrap())
+            .unwrap();
+        runner
+            .write_checkpoint(&source, &binary_path, &output_path)
+            .unwrap();
+
+        let reloaded = FairplayCheckpoint::load_private(&output_path).unwrap();
+        let mut resumed = CheckpointRunner::new(&reloaded, SYNTHETIC_BINARY).unwrap();
+        resumed.engine.mem_map(0x2000, PAGE_BYTES as usize).unwrap();
+        for (index, symbol) in [
+            "_CFGetTypeID",
+            "_CFStringGetCString",
+            "_CFDataGetBytes",
+            "_CFDataGetLength",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            install_modeled_external(
+                &mut resumed.engine,
+                EXTERNAL_BASE + index as u64 * EXTERNAL_STRIDE,
+                symbol,
+                &resumed.external_failure,
+                &resumed.allocation_state,
+                &resumed.once_tokens,
+                (&resumed.host_state, &resumed.virtual_files, &resumed.darwin),
+            )
+            .unwrap();
+        }
+        let call = |runner: &mut CheckpointRunner, index: u64, args: [u64; 4]| {
+            for (register, value) in args.into_iter().enumerate() {
+                runner
+                    .engine
+                    .reg_write(199 + register as i32, value)
+                    .unwrap();
+            }
+            runner.engine.reg_write(2, 0x5000).unwrap();
+            runner
+                .engine
+                .start_bounded(
+                    EXTERNAL_BASE + index * EXTERNAL_STRIDE,
+                    0x5000,
+                    Duration::from_secs(2),
+                    4,
+                )
+                .unwrap();
+            assert!(runner.external_failure.borrow().is_none());
+            runner.engine.reg_read(199).unwrap()
+        };
+        assert_eq!(
+            call(&mut resumed, 0, [string_handle, 0, 0, 0]),
+            CF_STRING_TYPE_ID
+        );
+        assert_eq!(
+            call(&mut resumed, 0, [data_handle, 0, 0, 0]),
+            CF_DATA_TYPE_ID
+        );
+        assert_eq!(call(&mut resumed, 1, [string_handle, 0x2000, 16, 0]), 1);
+        assert_eq!(resumed.engine.mem_read(0x2000, 9).unwrap(), b"FairPlay\0");
+        assert_eq!(call(&mut resumed, 3, [data_handle, 0, 0, 0]), 4);
+        call(&mut resumed, 2, [data_handle, 0, 4, 0x2010]);
+        assert_eq!(resumed.engine.mem_read(0x2010, 4).unwrap(), b"data");
     }
 
     #[test]
