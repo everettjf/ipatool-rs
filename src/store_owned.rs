@@ -388,7 +388,7 @@ fn resolve_timezone_label(value: Option<&str>) -> String {
     }
     #[cfg(unix)]
     {
-        use std::{io::Read, path::Path};
+        use std::path::Path;
 
         let path = if value.starts_with('/') {
             Path::new(value).to_path_buf()
@@ -398,12 +398,7 @@ fn resolve_timezone_label(value: Option<&str>) -> String {
             }
             Path::new("/usr/share/zoneinfo").join(value)
         };
-        let mut magic = [0u8; 4];
-        if std::fs::File::open(path)
-            .and_then(|mut file| file.read_exact(&mut magic))
-            .is_err()
-            || &magic != b"TZif"
-        {
+        if !valid_tzfile(&path) {
             return "UTC".into();
         }
         if value == "/etc/localtime" {
@@ -411,6 +406,96 @@ fn resolve_timezone_label(value: Option<&str>) -> String {
         }
     }
     value.into()
+}
+
+#[cfg(unix)]
+fn valid_tzfile(path: &std::path::Path) -> bool {
+    use std::io::Read;
+
+    // Go's zoneinfo loader rejects files larger than 10 MiB.
+    const MAX_TZFILE_SIZE: u64 = 10 * 1024 * 1024;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file
+        .metadata()
+        .is_ok_and(|info| info.len() > MAX_TZFILE_SIZE)
+    {
+        return false;
+    }
+    let mut bytes = Vec::new();
+    if file
+        .by_ref()
+        .take(MAX_TZFILE_SIZE + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 > MAX_TZFILE_SIZE
+    {
+        return false;
+    }
+    valid_tzif_bytes(&bytes)
+}
+
+#[cfg(unix)]
+fn valid_tzif_bytes(bytes: &[u8]) -> bool {
+    fn header(bytes: &[u8], start: usize) -> Option<([usize; 6], u8)> {
+        let raw = bytes.get(start..start.checked_add(44)?)?;
+        if &raw[..4] != b"TZif" || !matches!(raw[4], 0 | b'2' | b'3') {
+            return None;
+        }
+        let counts = std::array::from_fn(|index| {
+            u32::from_be_bytes(raw[20 + index * 4..24 + index * 4].try_into().unwrap()) as usize
+        });
+        Some((counts, raw[4]))
+    }
+
+    fn block(
+        bytes: &[u8],
+        start: usize,
+        counts: [usize; 6],
+        width: usize,
+        check_entries: bool,
+    ) -> Option<usize> {
+        let [utc_local, std_wall, leaps, transitions, zones, chars] = counts;
+        let time_end = start.checked_add(transitions.checked_mul(width)?)?;
+        let index_end = time_end.checked_add(transitions)?;
+        let zone_end = index_end.checked_add(zones.checked_mul(6)?)?;
+        let char_end = zone_end.checked_add(chars)?;
+        let leap_end = char_end.checked_add(leaps.checked_mul(width.checked_add(4)?)?)?;
+        let end = leap_end.checked_add(std_wall)?.checked_add(utc_local)?;
+        bytes.get(start..end)?;
+        if check_entries {
+            if zones == 0 || chars == 0 {
+                return None;
+            }
+            if bytes[index_end..zone_end]
+                .as_chunks::<6>()
+                .0
+                .iter()
+                .any(|zone| usize::from(zone[5]) >= chars)
+                || bytes[time_end..index_end]
+                    .iter()
+                    .any(|index| usize::from(*index) >= zones)
+            {
+                return None;
+            }
+        }
+        Some(end)
+    }
+
+    let Some((counts, version)) = header(bytes, 0) else {
+        return false;
+    };
+    let Some(first_end) = block(bytes, 44, counts, 4, version == 0) else {
+        return false;
+    };
+    if version == 0 {
+        return true;
+    }
+    let Some((counts, _)) = header(bytes, first_end) else {
+        return false;
+    };
+    block(bytes, first_end + 44, counts, 8, true).is_some()
 }
 
 fn items_body(session: u32, revision: u32, now: OffsetDateTime) -> Result<Vec<u8>> {
@@ -641,6 +726,24 @@ mod tests {
             "America/Los_Angeles"
         );
         assert_eq!(resolve_timezone_label(Some(":/etc/localtime")), "Local");
+
+        let directory = tempfile::tempdir().unwrap();
+        let invalid = directory.path().join("broken-tzfile");
+        std::fs::write(&invalid, b"TZif").unwrap();
+        assert_eq!(resolve_timezone_label(invalid.to_str()), "UTC");
+        assert!(!valid_tzif_bytes(b"TZif"));
+
+        let mut tzif = vec![0u8; 54];
+        tzif[..4].copy_from_slice(b"TZif");
+        tzif[36..40].copy_from_slice(&1u32.to_be_bytes());
+        tzif[40..44].copy_from_slice(&4u32.to_be_bytes());
+        tzif[50..54].copy_from_slice(b"UTC\0");
+        assert!(valid_tzif_bytes(&tzif));
+        tzif[49] = 4;
+        assert!(!valid_tzif_bytes(&tzif));
+        assert!(valid_tzfile(std::path::Path::new(
+            "/usr/share/zoneinfo/America/Los_Angeles"
+        )));
     }
 
     #[derive(Debug, PartialEq)]
