@@ -19,12 +19,16 @@ pub(crate) const BUILD_HASH: [u8; 32] = [
 
 include!("fairplay_26b118_faults.rs");
 
+// The round-7 w9 site is an index-after fault: it XORs the register at the
+// following instruction and does not have a 256-value encoded index domain.
+pub(crate) const INDEX_AFTER_PC: u64 = 0x1002_22c58;
+
 pub(crate) fn required_index_sites() -> BTreeSet<(u64, u8)> {
     ROUND6
         .iter()
         .chain(ROUND7.iter())
         .chain(ROUND8.iter())
-        .filter(|site| site.kind == FaultKind::Index)
+        .filter(|site| site.kind == FaultKind::Index && site.pc != INDEX_AFTER_PC)
         .map(|site| (site.pc, site.register))
         .collect()
 }
@@ -85,6 +89,12 @@ mod tests {
 
     #[test]
     fn fault_map_preserves_go_round_mapping_and_geometry() {
+        assert_eq!(required_index_sites().len(), 17);
+        assert!(!required_index_sites().contains(&(INDEX_AFTER_PC, 9)));
+        assert_eq!(
+            fault_for_metadata(0x0103_0008).unwrap().kind,
+            FaultKind::IndexAfter
+        );
         assert_eq!(fault_for_metadata(0xffff).unwrap(), OracleFault::NONE);
         let round6 = fault_for_metadata(0x0100_0006).unwrap();
         assert_eq!(

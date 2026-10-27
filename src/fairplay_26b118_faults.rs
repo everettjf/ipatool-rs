@@ -23,7 +23,7 @@ const ROUND7: [OracleFault; 16] = [
     OracleFault { pc: 0x100222dbc, register: 7, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
     OracleFault { pc: 0x100222d90, register: 3, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
     OracleFault { pc: 0x100222dec, register: 24, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
-    OracleFault { pc: 0x100222c58, register: 9, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222c58, register: 9, shift: 0, value: 0, kind: FaultKind::IndexAfter, restore: false, table_bytes: 0x400, entry_bytes: 4 },
     OracleFault { pc: 0x100222d8c, register: 15, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
     OracleFault { pc: 0x100222d20, register: 19, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
     OracleFault { pc: 0x100222d84, register: 8, shift: 0, value: 0, kind: FaultKind::Pointer, restore: false, table_bytes: 0x400, entry_bytes: 4 },

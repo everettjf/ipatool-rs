@@ -104,7 +104,7 @@ pub fn export_26a428_model(
     )
 }
 
-/// The checked 26B118 oracle additionally needs all eighteen learned index domains.
+/// The checked 26B118 oracle additionally needs all seventeen learned index domains.
 /// The private JSON has `binary_sha256` and a `domains` array. Each domain has
 /// `pc` (hex string), `register` (0..30), and 256 ordered hex-string `values`.
 /// Values are the register contents observed before the indexed load.
@@ -379,7 +379,7 @@ mod tests {
                 .collect(),
         };
         let domains = validate_26b118_domains(make_report(), &HASH_26B118).unwrap();
-        assert_eq!(domains.len(), 18);
+        assert_eq!(domains.len(), 17);
         assert_eq!(domains[&(0x1002_22ab0, 14)][255], 255);
 
         let mut incomplete = make_report();

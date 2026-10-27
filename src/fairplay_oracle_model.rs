@@ -225,6 +225,7 @@ pub struct OracleState<'a> {
 pub enum FaultKind {
     None,
     Index,
+    IndexAfter,
     Pointer,
 }
 
@@ -414,6 +415,9 @@ impl<'a> OracleState<'a> {
                     (old as u32 ^ (selected.value as u32).wrapping_shl(selected.shift as u32))
                         as u64
                 }
+            }
+            FaultKind::IndexAfter => {
+                (old as u32 ^ (selected.value as u32).wrapping_shl(selected.shift as u32)) as u64
             }
             FaultKind::Pointer => {
                 let table = selected.table_bytes as u64;

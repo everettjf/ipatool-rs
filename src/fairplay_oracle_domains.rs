@@ -13,9 +13,10 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
-    fairplay_26b118::{BUILD_HASH, required_index_sites},
+    fairplay_26b118::{self, BUILD_HASH, required_index_sites},
     fairplay_checkpoint::FairplayCheckpoint,
     fairplay_checkpoint_run::CheckpointRunner,
+    fairplay_oracle_model::{FaultKind, OracleFault, OracleModel},
     unicorn_runtime::{Engine, HookContext, REG_PC, REG_X0},
 };
 
@@ -83,6 +84,78 @@ impl CpuSnapshot {
 type DirtyPages = BTreeMap<u64, Zeroizing<Vec<u8>>>;
 type CapturedValues = BTreeMap<(u64, u8), BTreeSet<u64>>;
 
+#[derive(Default)]
+struct FaultProbe {
+    fault: Option<OracleFault>,
+    domain: Option<Zeroizing<[u64; 256]>>,
+    applied: bool,
+    restore: Option<(u64, i32, u64)>,
+}
+
+fn apply_fault_probe(context: &HookContext, pc: u64, probe: &mut FaultProbe) -> Result<()> {
+    if let Some((restore_pc, register, value)) = probe.restore
+        && pc == restore_pc
+    {
+        context.reg_write(register, value)?;
+        probe.restore = None;
+    }
+    let Some(fault) = probe.fault else {
+        return Ok(());
+    };
+    if probe.applied || pc != fault.pc {
+        return Ok(());
+    }
+    let register = register_id(fault.register as usize);
+    let raw = context.reg_read(register)?;
+    let (original, altered) = match fault.kind {
+        FaultKind::Index => {
+            let original = raw as u32 as u64;
+            let domain = probe.domain.as_ref().context("index fault has no domain")?;
+            let position = domain
+                .binary_search(&original)
+                .map_err(|_| anyhow::anyhow!("index value {original:#x} is outside its domain"))?;
+            (original, domain[position ^ fault.value as usize])
+        }
+        FaultKind::IndexAfter => {
+            let original = raw as u32 as u64;
+            let altered =
+                (original as u32 ^ (fault.value as u32).wrapping_shl(fault.shift as u32)) as u64;
+            (original, altered)
+        }
+        FaultKind::Pointer => {
+            let table_bytes = u64::from(fault.table_bytes);
+            let entry_bytes = u64::from(fault.entry_bytes);
+            if !table_bytes.is_power_of_two() || entry_bytes == 0 {
+                bail!("invalid pointer fault table geometry");
+            }
+            let table_base = raw & !(table_bytes - 1);
+            let offset = raw - table_base;
+            if offset >= table_bytes || offset % entry_bytes != 0 {
+                bail!("pointer fault value {raw:#x} is outside its table");
+            }
+            let position = offset / entry_bytes;
+            if position >= 256 {
+                bail!("pointer fault position is outside the byte domain");
+            }
+            let altered = table_base
+                .checked_add((position ^ u64::from(fault.value)) * entry_bytes)
+                .context("pointer fault address overflow")?;
+            (raw, altered)
+        }
+        FaultKind::None => bail!("cannot inject an empty oracle fault"),
+    };
+    context.reg_write(register, altered)?;
+    if fault.restore {
+        probe.restore = Some((
+            pc.checked_add(4).context("fault PC overflow")?,
+            register,
+            original,
+        ));
+    }
+    probe.applied = true;
+    Ok(())
+}
+
 fn record_original_pages(
     context: &HookContext,
     address: u64,
@@ -121,6 +194,7 @@ struct ReplayRunner {
     timeout: Duration,
     dirty: Rc<RefCell<DirtyPages>>,
     captured: Rc<RefCell<CapturedValues>>,
+    fault_probe: Rc<RefCell<FaultProbe>>,
     hook_error: Rc<RefCell<Option<String>>>,
 }
 
@@ -130,9 +204,14 @@ impl ReplayRunner {
         block: u64,
         stop: u64,
         sites: &BTreeSet<(u64, u8)>,
+        fault_sites: &[OracleFault],
         timeout: Duration,
     ) -> Result<Self> {
-        if timeout.is_zero() || sites.is_empty() || sites.len() > 64 {
+        if timeout.is_zero()
+            || (sites.is_empty() && fault_sites.is_empty())
+            || sites.len() > 64
+            || fault_sites.len() > 64
+        {
             bail!("oracle replay configuration is invalid");
         }
         let cpu = CpuSnapshot::capture(&runner.engine)?;
@@ -145,6 +224,7 @@ impl ReplayRunner {
                 .map(|site| (site, BTreeSet::new()))
                 .collect::<CapturedValues>(),
         ));
+        let fault_probe = Rc::new(RefCell::new(FaultProbe::default()));
         let hook_error = Rc::new(RefCell::new(None));
         {
             let dirty = Rc::clone(&dirty);
@@ -181,6 +261,29 @@ impl ReplayRunner {
                 }
             })?;
         }
+        let mut fault_pcs = BTreeSet::new();
+        for fault in fault_sites {
+            if fault.kind == FaultKind::None || fault.register >= 31 {
+                bail!("oracle fault site is invalid");
+            }
+            fault_pcs.insert(fault.pc);
+            if fault.restore {
+                fault_pcs.insert(fault.pc.checked_add(4).context("fault PC overflow")?);
+            }
+        }
+        for pc in fault_pcs {
+            let probe = Rc::clone(&fault_probe);
+            let failure = Rc::clone(&hook_error);
+            runner
+                .engine
+                .add_code_hook(pc, pc, move |context, address, _| {
+                    if let Err(error) = apply_fault_probe(context, address, &mut probe.borrow_mut())
+                    {
+                        *failure.borrow_mut() = Some(format!("inject oracle fault: {error:#}"));
+                        let _ = context.stop();
+                    }
+                })?;
+        }
         Ok(Self {
             runner,
             cpu,
@@ -190,6 +293,7 @@ impl ReplayRunner {
             timeout,
             dirty,
             captured,
+            fault_probe,
             hook_error,
         })
     }
@@ -208,7 +312,7 @@ impl ReplayRunner {
         Ok(())
     }
 
-    fn run_block(&mut self, input: &[u8; 16]) -> Result<()> {
+    fn run_block(&mut self, input: &[u8; 16]) -> Result<[u8; 16]> {
         let first = self.block & !(PAGE_BYTES - 1);
         let last = self
             .block
@@ -222,15 +326,43 @@ impl ReplayRunner {
         self.runner.engine.mem_write(self.block, input)?;
         let execution = self
             .runner
-            .run_until(self.stop, self.timeout, INSTRUCTION_LIMIT);
+            .run_until(self.stop, self.timeout, INSTRUCTION_LIMIT)
+            .and_then(|()| {
+                let bytes = self.runner.engine.mem_read(self.block, 16)?;
+                Ok(bytes.try_into().expect("read exactly one oracle block"))
+            });
         let hook_error = self.hook_error.borrow_mut().take();
+        let fault_applied = {
+            let probe = self.fault_probe.borrow();
+            probe.fault.is_none() || probe.applied
+        };
         let restoration = self.restore();
         if let Some(error) = hook_error {
             bail!("{error}");
         }
-        execution?;
+        let output = execution?;
         restoration?;
-        Ok(())
+        if !fault_applied {
+            bail!("oracle execution did not reach the requested fault site");
+        }
+        Ok(output)
+    }
+
+    fn run_fault_block(
+        &mut self,
+        input: &[u8; 16],
+        fault: OracleFault,
+        domain: Option<&[u64; 256]>,
+    ) -> Result<[u8; 16]> {
+        *self.fault_probe.borrow_mut() = FaultProbe {
+            fault: Some(fault),
+            domain: domain.map(|values| Zeroizing::new(*values)),
+            applied: false,
+            restore: None,
+        };
+        let result = self.run_block(input);
+        *self.fault_probe.borrow_mut() = FaultProbe::default();
+        result
     }
 
     fn domains_complete(&self) -> bool {
@@ -276,7 +408,7 @@ pub fn learn_26b118_domains(
     }
     let runner = CheckpointRunner::new(checkpoint, binary)?;
     let sites = required_index_sites();
-    let mut replay = ReplayRunner::new(runner, BLOCK, STOP, &sites, timeout)?;
+    let mut replay = ReplayRunner::new(runner, BLOCK, STOP, &sites, &[], timeout)?;
     let mut inputs = 0;
     for index in 0..maximum_inputs {
         let mut hash = Sha256::new();
@@ -323,6 +455,79 @@ pub fn learn_26b118_domains(
     })
 }
 
+pub struct DifferentialResult {
+    pub cases: usize,
+    pub domains: usize,
+    pub output_sha256: String,
+}
+
+/// Compare the checked Rust evaluator with native checkpoint execution for
+/// one original block and every 26B118 fault site at three XOR values.
+pub fn validate_26b118_model(
+    checkpoint: &FairplayCheckpoint,
+    binary: &[u8],
+    model: &OracleModel,
+    timeout: Duration,
+) -> Result<DifferentialResult> {
+    if checkpoint.binary_hash != BUILD_HASH
+        || checkpoint.pc()? != ENTRY
+        || model.binary_hash != BUILD_HASH
+        || model.block_address != BLOCK
+    {
+        bail!("26B118 differential inputs do not match the checked build and entry");
+    }
+    let required = required_index_sites();
+    if model.domain_count() != required.len()
+        || required
+            .iter()
+            .any(|&(pc, register)| model.domain(pc, register).is_none())
+    {
+        bail!("26B118 differential requires all seventeen learned index domains");
+    }
+    let mut metadata = Vec::with_capacity(48 * 3);
+    let mut faults = Vec::with_capacity(48);
+    for round in [6u32, 8, 9] {
+        for byte in 0..16u32 {
+            let first = round | (byte << 16) | (1 << 24);
+            faults.push(fairplay_26b118::fault_for_metadata(first)?);
+            for value in [1u32, 7, 255] {
+                metadata.push(round | (byte << 16) | (value << 24));
+            }
+        }
+    }
+    let input = checkpoint.read_block::<16>(BLOCK)?;
+    let runner = CheckpointRunner::new(checkpoint, binary)?;
+    let mut replay = ReplayRunner::new(runner, BLOCK, STOP, &BTreeSet::new(), &faults, timeout)?;
+    let mut hash = Sha256::new();
+    let baseline = replay.run_block(&input)?;
+    if baseline != fairplay_26b118::evaluate(model, &input, u32::MAX)? {
+        bail!("26B118 Rust evaluator differs from native execution without a fault");
+    }
+    hash.update(baseline);
+    for (index, &metadata) in metadata.iter().enumerate() {
+        let fault = fairplay_26b118::fault_for_metadata(metadata)?;
+        let domain = match fault.kind {
+            FaultKind::Index => model.domain(fault.pc, fault.register),
+            FaultKind::IndexAfter => None,
+            FaultKind::Pointer => None,
+            FaultKind::None => bail!("differential case has no fault"),
+        };
+        let native = replay
+            .run_fault_block(&input, fault, domain)
+            .with_context(|| format!("native 26B118 differential case {index} ({metadata:#x})"))?;
+        let rust = fairplay_26b118::evaluate(model, &input, metadata)?;
+        if native != rust {
+            bail!("26B118 Rust evaluator differs from native case {index} ({metadata:#x})");
+        }
+        hash.update(native);
+    }
+    Ok(DifferentialResult {
+        cases: metadata.len() + 1,
+        domains: required.len(),
+        output_sha256: format!("{:x}", hash.finalize()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +562,7 @@ mod tests {
             0x4000,
             0x300c,
             &BTreeSet::from([(0x3004, 0)]),
+            &[],
             Duration::from_secs(2),
         )
         .unwrap();
@@ -368,6 +574,101 @@ mod tests {
         assert_eq!(values.len(), 2);
         assert!(values.contains(&0x0101_0101));
         assert!(values.contains(&0x0202_0202));
+        assert_eq!(replay.runner.engine.mem_read(0x4000, 16).unwrap(), [0; 16]);
+    }
+
+    #[test]
+    fn replay_injects_index_fault_and_restores_register_when_requested() {
+        let checkpoint = FairplayCheckpoint::parse_gzip(CHECKPOINT).unwrap();
+        let mut runner = CheckpointRunner::new(&checkpoint, BINARY).unwrap();
+        runner.engine.mem_map(0x3000, PAGE_BYTES as usize).unwrap();
+        runner.engine.mem_map(0x4000, PAGE_BYTES as usize).unwrap();
+        runner
+            .engine
+            .mem_write(0x3000, &0xf940_0020u32.to_le_bytes())
+            .unwrap();
+        runner
+            .engine
+            .mem_write(0x3004, &0x9100_0400u32.to_le_bytes())
+            .unwrap();
+        runner
+            .engine
+            .mem_write(0x3008, &0xf900_0420u32.to_le_bytes())
+            .unwrap();
+        runner.engine.reg_write(REG_PC, 0x3000).unwrap();
+        runner.engine.reg_write(REG_X0 + 1, 0x4000).unwrap();
+        let fault = OracleFault {
+            pc: 0x3004,
+            register: 0,
+            shift: 0,
+            value: 7,
+            kind: FaultKind::Index,
+            restore: true,
+            table_bytes: 0,
+            entry_bytes: 0,
+        };
+        let mut replay = ReplayRunner::new(
+            runner,
+            0x4000,
+            0x300c,
+            &BTreeSet::new(),
+            &[fault],
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let domain = std::array::from_fn(|index| 0x0101_0100 + index as u64);
+        let without_restore = replay
+            .run_fault_block(
+                &[1; 16],
+                OracleFault {
+                    restore: false,
+                    ..fault
+                },
+                Some(&domain),
+            )
+            .unwrap();
+        assert_eq!(&without_restore[8..], &[7, 1, 1, 1, 0, 0, 0, 0]);
+        let with_restore = replay
+            .run_fault_block(&[1; 16], fault, Some(&domain))
+            .unwrap();
+        assert_eq!(&with_restore[8..], &[1, 1, 1, 1, 0, 0, 0, 0]);
+        let pointer_fault = OracleFault {
+            kind: FaultKind::Pointer,
+            table_bytes: 0x400,
+            entry_bytes: 4,
+            ..fault
+        };
+        let mut pointer_input = [0u8; 16];
+        pointer_input[..8].copy_from_slice(&0x4004u64.to_le_bytes());
+        let pointer_output = replay
+            .run_fault_block(&pointer_input, pointer_fault, None)
+            .unwrap();
+        assert_eq!(&pointer_output[8..], &0x4004u64.to_le_bytes());
+        let pointer_output = replay
+            .run_fault_block(
+                &pointer_input,
+                OracleFault {
+                    restore: false,
+                    ..pointer_fault
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(&pointer_output[8..], &0x4019u64.to_le_bytes());
+        let after_output = replay
+            .run_fault_block(
+                &[1; 16],
+                OracleFault {
+                    kind: FaultKind::IndexAfter,
+                    shift: 8,
+                    restore: false,
+                    ..fault
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(&after_output[8..], &0x0101_0602u64.to_le_bytes());
+        assert_eq!(replay.runner.engine.reg_read(REG_PC).unwrap(), 0x3000);
         assert_eq!(replay.runner.engine.mem_read(0x4000, 16).unwrap(), [0; 16]);
     }
 }

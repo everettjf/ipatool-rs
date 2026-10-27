@@ -20,7 +20,7 @@ use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2
 use ipatool_rs::fairplay_enrollment_v3::{V3Material, build_fpsenr3};
 use ipatool_rs::fairplay_ipa::decrypt_ipa_with_options;
 use ipatool_rs::fairplay_key::CurrentSinfModel;
-use ipatool_rs::fairplay_oracle_domains::learn_26b118_domains;
+use ipatool_rs::fairplay_oracle_domains::{learn_26b118_domains, validate_26b118_model};
 use ipatool_rs::fairplay_oracle_export::export_checked_model;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
@@ -309,6 +309,17 @@ enum FairplayEnrollCommand {
         timeout_seconds: u64,
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Differentially validate a private 26B118 model against checkpoint execution.
+    ValidateOracleModel {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long)]
+        fairplayd: PathBuf,
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, default_value_t = 2)]
+        timeout_seconds: u64,
     },
     /// Transform a private 192/224-byte source with the embedded 26A428 state model.
     EvaluateState {
@@ -1419,6 +1430,42 @@ fn run() -> Result<()> {
                         result.domains,
                         result.inputs,
                         output.display()
+                    ),
+                }
+            }
+            FairplayEnrollCommand::ValidateOracleModel {
+                checkpoint,
+                fairplayd,
+                model,
+                timeout_seconds,
+            } => {
+                if !(1..=30).contains(&timeout_seconds) {
+                    bail!("oracle validation timeout must be between 1 and 30 seconds");
+                }
+                let binary = read_fairplayd_binary(&fairplayd)?;
+                let snapshot = FairplayCheckpoint::load_private(&checkpoint)?;
+                let model = OracleModel::load_private(&model)?;
+                let result = validate_26b118_model(
+                    &snapshot,
+                    &binary,
+                    &model,
+                    Duration::from_secs(timeout_seconds),
+                )?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "schema": "fairplay.oracle-differential.v1",
+                            "cases": result.cases,
+                            "matches": result.cases,
+                            "mismatches": 0,
+                            "domains": result.domains,
+                            "output_sha256": result.output_sha256,
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Validated {} native 26B118 FairPlay cases against Rust ({} domains)",
+                        result.cases, result.domains
                     ),
                 }
             }
@@ -2599,6 +2646,31 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn fairplay_oracle_validation_accepts_private_capture_paths() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "validate-oracle-model",
+            "--checkpoint",
+            "/private/26b118.pkl.gz",
+            "--fairplayd",
+            "/private/fairplayd",
+            "--model",
+            "/private/oracle-model.gz",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::ValidateOracleModel {
+                    timeout_seconds: 2,
+                    ..
+                }
+            }
+        ));
     }
 
     #[test]
