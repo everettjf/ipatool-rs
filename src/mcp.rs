@@ -1,7 +1,10 @@
 //! Non-interactive App Store MCP server. Store calls are synchronous and share
 //! account/cache state, so each invocation runs behind a single async gate.
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, LazyLock},
+};
 
 use anyhow::{Context, Result, bail};
 use ipatool_rs::catalog::AppNotFound;
@@ -17,13 +20,35 @@ use ipatool_rs::{App, CatalogClient, Platform};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
+    model::{
+        CallToolResult, ContentBlock, Implementation, JsonObject, ServerCapabilities, ServerConfig,
+    },
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+
+// These public MCP contracts are captured from the Go reference server. Keep
+// the advertised schemas aligned with its wire format, including output types.
+static TOOL_SCHEMAS: LazyLock<Value> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("mcp_schemas.json"))
+        .expect("checked-in MCP schemas must be valid JSON")
+});
+
+fn tool_schema(name: &str, direction: &str) -> Arc<JsonObject> {
+    Arc::new(
+        TOOL_SCHEMAS[name][direction]
+            .as_object()
+            .unwrap_or_else(|| panic!("missing {direction} for MCP tool {name}"))
+            .clone(),
+    )
+}
+
+fn platform_value(platform: Option<Platform>) -> Value {
+    platform.map_or_else(|| json!(""), |platform| json!(platform))
+}
 
 #[derive(Clone)]
 struct AppStoreServer {
@@ -110,9 +135,9 @@ struct MetadataInput {
 #[derive(Deserialize, JsonSchema)]
 struct PurchasesInput {
     /// Page number, starting at 1.
-    page: Option<usize>,
+    page: Option<i64>,
     /// Apps per page, 1 to 100.
-    max_results: Option<usize>,
+    max_results: Option<i64>,
     /// Optional platform filter.
     platform: Option<String>,
 }
@@ -122,6 +147,8 @@ impl AppStoreServer {
     #[tool(
         name = "search_apps",
         description = "Search for apps on the App Store.",
+        input_schema = tool_schema("search_apps", "inputSchema"),
+        output_schema = tool_schema("search_apps", "outputSchema"),
         annotations(read_only_hint = true, idempotent_hint = false)
     )]
     async fn search_apps(&self, Parameters(input): Parameters<SearchInput>) -> CallToolResult {
@@ -133,7 +160,7 @@ impl AppStoreServer {
             with_account(|account| {
                 let country = country_code_from_storefront(&account.store_front)?;
                 let result = CatalogClient::new()?.search(&input.term, country, limit, platform)?;
-                Ok(json!({"term": input.term, "limit": limit, "platform": platform, "count": result.count,
+                Ok(json!({"term": input.term, "limit": limit, "platform": platform_value(platform), "count": result.count,
                     "apps": result.apps.iter().map(app_value).collect::<Vec<_>>() }))
             })
         }).await
@@ -142,16 +169,19 @@ impl AppStoreServer {
     #[tool(
         name = "list_app_versions",
         description = "List available external version identifiers for an app.",
+        input_schema = tool_schema("list_app_versions", "inputSchema"),
+        output_schema = tool_schema("list_app_versions", "outputSchema"),
         annotations(read_only_hint = true, idempotent_hint = false)
     )]
     async fn list_app_versions(&self, Parameters(input): Parameters<AppInput>) -> CallToolResult {
         self.run("list_app_versions", move || {
-            let platform = parse_platform(input.platform.as_deref())?.unwrap_or(Platform::Iphone);
+            let requested_platform = validate_app_input(&input)?;
+            let effective_platform = requested_platform.unwrap_or(Platform::Iphone);
             with_account(|account| {
                 let catalog = CatalogClient::new()?;
-                let app = resolve_app(&catalog, account, &input, Some(platform), false)?;
-                let out = DownloadProductClient::open()?.list_versions(&catalog, account, &app, platform)?;
-                Ok(json!({"app_id": app.id, "bundle_identifier": app.bundle_id, "platform": platform,
+                let app = resolve_app(&catalog, account, &input, requested_platform, false)?;
+                let out = DownloadProductClient::open()?.list_versions(&catalog, account, &app, effective_platform)?;
+                Ok(json!({"app_id": app.id, "bundle_identifier": app.bundle_id, "platform": platform_value(requested_platform),
                     "app": app_value(&app), "externalVersionIdentifiers": out.external_version_identifiers,
                     "latestExternalVersionID": out.latest_external_version_id, "bundleID": app.bundle_id, "success": true}))
             })
@@ -160,7 +190,9 @@ impl AppStoreServer {
 
     #[tool(
         name = "get_version_metadata",
-        description = "Get a display version and release date for an external version ID.",
+        description = "Retrieve the display version and release date for a specific external version identifier of an app.",
+        input_schema = tool_schema("get_version_metadata", "inputSchema"),
+        output_schema = tool_schema("get_version_metadata", "outputSchema"),
         annotations(read_only_hint = true, idempotent_hint = false)
     )]
     async fn get_version_metadata(
@@ -168,14 +200,14 @@ impl AppStoreServer {
         Parameters(input): Parameters<MetadataInput>,
     ) -> CallToolResult {
         self.run("get_version_metadata", move || {
-            if input.external_version_id.trim().is_empty() { bail!("external version identifier must not be empty"); }
             let app_input = AppInput { app_id: input.app_id, bundle_identifier: input.bundle_identifier, platform: input.platform };
-            let platform = parse_platform(app_input.platform.as_deref())?;
+            let platform = validate_app_input(&app_input)?;
+            if input.external_version_id.trim().is_empty() { bail!("external version identifier must not be empty"); }
             with_account(|account| {
                 let catalog = CatalogClient::new()?;
                 let app = resolve_app(&catalog, account, &app_input, platform, false)?;
                 let out = DownloadProductClient::open()?.get_version_metadata(account, &app, &input.external_version_id, platform)?;
-                Ok(json!({"app_id": app.id, "bundle_identifier": app.bundle_id, "platform": platform,
+                Ok(json!({"app_id": app.id, "bundle_identifier": app.bundle_id, "platform": platform_value(platform),
                     "app": app_value(&app), "external_version_id": input.external_version_id,
                     "displayVersion": out.display_version, "releaseDate": out.release_date, "success": true}))
             })
@@ -185,6 +217,8 @@ impl AppStoreServer {
     #[tool(
         name = "list_purchases",
         description = "List apps owned by the authenticated account, with pagination.",
+        input_schema = tool_schema("list_purchases", "inputSchema"),
+        output_schema = tool_schema("list_purchases", "outputSchema"),
         annotations(read_only_hint = true, idempotent_hint = false)
     )]
     async fn list_purchases(
@@ -192,11 +226,7 @@ impl AppStoreServer {
         Parameters(input): Parameters<PurchasesInput>,
     ) -> CallToolResult {
         self.run("list_purchases", move || {
-            let page = input.page.unwrap_or(1);
-            let limit = input.max_results.unwrap_or(DEFAULT_LIMIT);
-            if page == 0 || limit == 0 || limit > MAX_LIMIT {
-                bail!("page must be positive and max results must be between 1 and {MAX_LIMIT}");
-            }
+            let (page, limit) = purchases_pagination(&input)?;
             let platform = parse_platform(input.platform.as_deref())?;
             with_account(|account| {
                 let out = store_owned::owned_apps(
@@ -221,7 +251,7 @@ impl AppStoreServer {
                     .collect::<Vec<_>>();
                 Ok(
                     json!({"count": out.count, "totalCount": out.total_count, "page": out.page,
-                    "max_results": limit, "platform": platform,
+                    "max_results": limit, "platform": platform_value(platform),
                     "apps": apps.iter().map(app_value).collect::<Vec<_>>() }),
                 )
             })
@@ -231,18 +261,20 @@ impl AppStoreServer {
 
     #[tool(
         name = "purchase_app",
-        description = "Acquire a license for a free app; paid apps are unsupported.",
+        description = "Obtain a license for a free app. Paid apps are not supported.",
+        input_schema = tool_schema("purchase_app", "inputSchema"),
+        output_schema = tool_schema("purchase_app", "outputSchema"),
         annotations(read_only_hint = false, idempotent_hint = false)
     )]
     async fn purchase_app(&self, Parameters(input): Parameters<AppInput>) -> CallToolResult {
         self.run("purchase_app", move || {
-            let platform = parse_platform(input.platform.as_deref())?;
+            let platform = validate_app_input(&input)?;
             with_account(|account| {
                 let app = resolve_app(&CatalogClient::new()?, account, &input, platform, false)?;
                 let result = store_purchase::purchase(&NativePurchaseBackend::open()?, account, &app, platform);
                 let already_owned = result.as_ref().err().is_some_and(|e| e.downcast_ref::<LicenseAlreadyExists>().is_some());
                 if !already_owned { result?; }
-                Ok(json!({"app_id": app.id, "bundle_identifier": app.bundle_id, "platform": platform,
+                Ok(json!({"app_id": app.id, "bundle_identifier": app.bundle_id, "platform": platform_value(platform),
                     "app": app_value(&app), "alreadyOwned": already_owned, "success": true}))
             })
         }).await
@@ -250,31 +282,34 @@ impl AppStoreServer {
 
     #[tool(
         name = "download_app",
-        description = "Download an app package; optionally acquire a free license.",
+        description = "Download an app package to the local filesystem. Optionally acquire a free license if purchase is true.",
+        input_schema = tool_schema("download_app", "inputSchema"),
+        output_schema = tool_schema("download_app", "outputSchema"),
         annotations(read_only_hint = false, idempotent_hint = false)
     )]
     async fn download_app(&self, Parameters(input): Parameters<DownloadInput>) -> CallToolResult {
         self.run("download_app", move || {
             let app_input = AppInput { app_id: input.app_id, bundle_identifier: input.bundle_identifier.clone(), platform: input.platform.clone() };
-            let platform = parse_platform(input.platform.as_deref())?.unwrap_or(Platform::Iphone);
+            let requested_platform = validate_app_input(&app_input)?;
+            let effective_platform = requested_platform.unwrap_or(Platform::Iphone);
             let version = input.external_version_id.unwrap_or_default();
             let output = input.output.map(PathBuf::from);
             let purchase = input.purchase.unwrap_or(false);
             let mut purchased = false;
             with_account(|account| {
                 let catalog = CatalogClient::new()?;
-                let app = resolve_app(&catalog, account, &app_input, Some(platform), true)?;
+                let app = resolve_app(&catalog, account, &app_input, requested_platform, true)?;
                 let client = DownloadProductClient::open()?;
                 let download = || {
-                    if platform == Platform::Macos {
+                    if effective_platform == Platform::Macos {
                         client.download_macos(&catalog, account, &app, &version, output.as_deref())
                     } else {
-                        client.download_ipa(&catalog, account, &app, &version, platform, output.as_deref())
+                        client.download_ipa(&catalog, account, &app, &version, effective_platform, output.as_deref())
                     }
                 };
                 let path = match download() {
                     Err(error) if purchase && !purchased && error.downcast_ref::<LicenseRequired>().is_some() => {
-                        match store_purchase::purchase(&NativePurchaseBackend::open()?, account, &app, Some(platform)) {
+                        match store_purchase::purchase(&NativePurchaseBackend::open()?, account, &app, requested_platform) {
                             Ok(()) => {},
                             Err(error) if error.downcast_ref::<LicenseAlreadyExists>().is_some() => {},
                             Err(error) => return Err(error),
@@ -284,7 +319,7 @@ impl AppStoreServer {
                     }
                     result => result?,
                 };
-                Ok(json!({"app_id": app.id, "bundle_identifier": app.bundle_id, "platform": platform,
+                Ok(json!({"app_id": app.id, "bundle_identifier": app.bundle_id, "platform": platform_value(requested_platform),
                     "app": app_value(&app), "output": path, "external_version_id": version,
                     "purchase": purchase, "purchased": purchased, "success": true}))
             })
@@ -297,7 +332,7 @@ impl ServerHandler for AppStoreServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("ipatool", env!("CARGO_PKG_VERSION")))
-            .with_instructions("Use the existing ipatool account. For authentication, run 'ipatool auth login' outside MCP. Purchases support free apps only.")
+            .with_instructions("Use the existing ipatool account. If authentication is required, ask the user to run ipatool auth login outside MCP. Purchases support free apps only.")
     }
 }
 
@@ -341,6 +376,27 @@ fn parse_platform(value: Option<&str>) -> Result<Option<Platform>> {
     Platform::parse(value.unwrap_or_default())
 }
 
+fn validate_app_input(input: &AppInput) -> Result<Option<Platform>> {
+    let id = input.app_id.unwrap_or_default();
+    let bundle = input.bundle_identifier.as_deref().unwrap_or_default();
+    if id < 0 || (id == 0 && bundle.trim().is_empty()) {
+        bail!("a positive app ID or a bundle identifier must be specified");
+    }
+    parse_platform(input.platform.as_deref())
+}
+
+fn purchases_pagination(input: &PurchasesInput) -> Result<(usize, usize)> {
+    let page = input.page.unwrap_or(1);
+    let limit = input.max_results.unwrap_or(DEFAULT_LIMIT as i64);
+    if page < 1 {
+        bail!("page must be greater than 0");
+    }
+    if limit < 1 || limit > MAX_LIMIT as i64 {
+        bail!("max results must be between 1 and {MAX_LIMIT}");
+    }
+    Ok((page.try_into()?, limit.try_into()?))
+}
+
 fn resolve_app(
     catalog: &CatalogClient,
     account: &Account,
@@ -371,7 +427,7 @@ fn resolve_app_with(
         .unwrap_or_default()
         .trim();
     if id < 0 || (id == 0 && bundle.is_empty()) {
-        bail!("a positive app ID or bundle identifier is required");
+        bail!("a positive app ID or a bundle identifier must be specified");
     }
     if bundle.is_empty() {
         let app = App {
@@ -660,6 +716,72 @@ mod tests {
                 tool.input_schema.get("type").and_then(Value::as_str),
                 Some("object")
             );
+            assert_eq!(
+                tool.input_schema.as_ref(),
+                TOOL_SCHEMAS[tool.name.as_ref()]["inputSchema"]
+                    .as_object()
+                    .unwrap()
+            );
+            assert_eq!(
+                tool.output_schema.as_deref(),
+                TOOL_SCHEMAS[tool.name.as_ref()]["outputSchema"].as_object()
+            );
         }
+    }
+
+    #[test]
+    fn unspecified_platform_is_an_empty_mcp_string() {
+        assert_eq!(platform_value(None), json!(""));
+        assert_eq!(platform_value(Some(Platform::Iphone)), json!("iphone"));
+    }
+
+    #[test]
+    fn app_input_is_checked_before_account_access() {
+        let missing = AppInput {
+            app_id: None,
+            bundle_identifier: None,
+            platform: None,
+        };
+        assert_eq!(
+            validate_app_input(&missing).unwrap_err().to_string(),
+            "a positive app ID or a bundle identifier must be specified"
+        );
+        let invalid_platform = AppInput {
+            app_id: Some(42),
+            platform: Some("android".into()),
+            ..missing.clone()
+        };
+        assert!(
+            validate_app_input(&invalid_platform)
+                .unwrap_err()
+                .to_string()
+                .contains("invalid platform")
+        );
+        let default_platform = AppInput {
+            app_id: Some(42),
+            ..missing
+        };
+        assert_eq!(validate_app_input(&default_platform).unwrap(), None);
+    }
+
+    #[test]
+    fn purchase_pagination_rejects_invalid_values_before_account_access() {
+        let mut input = PurchasesInput {
+            page: None,
+            max_results: None,
+            platform: None,
+        };
+        assert_eq!(purchases_pagination(&input).unwrap(), (1, DEFAULT_LIMIT));
+        input.page = Some(-1);
+        assert_eq!(
+            purchases_pagination(&input).unwrap_err().to_string(),
+            "page must be greater than 0"
+        );
+        input.page = Some(1);
+        input.max_results = Some(MAX_LIMIT as i64 + 1);
+        assert_eq!(
+            purchases_pagination(&input).unwrap_err().to_string(),
+            format!("max results must be between 1 and {MAX_LIMIT}")
+        );
     }
 }

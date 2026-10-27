@@ -1,0 +1,640 @@
+{
+  "download_app": {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "app_id": {
+          "description": "Numeric app ID; required unless bundle_identifier is provided",
+          "type": "integer"
+        },
+        "bundle_identifier": {
+          "description": "Bundle identifier; overrides app_id when found",
+          "type": "string"
+        },
+        "external_version_id": {
+          "description": "External version identifier; defaults to the latest version",
+          "type": "string"
+        },
+        "output": {
+          "description": "Destination file or directory; defaults to the server's working directory",
+          "type": "string"
+        },
+        "platform": {
+          "description": "iphone (ios), ipad (ipados), appletv (tvos), watchos, visionos, or macos; uses the CLI default when omitted",
+          "type": "string"
+        },
+        "purchase": {
+          "description": "Acquire a free license if needed; defaults to false",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "app": {
+          "additionalProperties": false,
+          "properties": {
+            "bundleId": {
+              "type": "string"
+            },
+            "platforms": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "null",
+                "array"
+              ]
+            },
+            "price": {
+              "type": "number"
+            },
+            "purchaseDate": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "trackId": {
+              "type": "integer"
+            },
+            "trackName": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "trackId",
+            "bundleId",
+            "trackName",
+            "version",
+            "price",
+            "purchaseDate",
+            "platforms"
+          ],
+          "type": "object"
+        },
+        "app_id": {
+          "type": "integer"
+        },
+        "bundle_identifier": {
+          "type": "string"
+        },
+        "external_version_id": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "purchase": {
+          "type": "boolean"
+        },
+        "purchased": {
+          "type": "boolean"
+        },
+        "success": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "app_id",
+        "bundle_identifier",
+        "platform",
+        "app",
+        "output",
+        "external_version_id",
+        "purchase",
+        "purchased",
+        "success"
+      ],
+      "type": "object"
+    }
+  },
+  "get_version_metadata": {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "app_id": {
+          "description": "Numeric app ID; required unless bundle_identifier is provided",
+          "type": "integer"
+        },
+        "bundle_identifier": {
+          "description": "Bundle identifier; overrides app_id when found",
+          "type": "string"
+        },
+        "external_version_id": {
+          "description": "External version identifier of the target app (required)",
+          "type": "string"
+        },
+        "platform": {
+          "description": "iphone (ios), ipad (ipados), appletv (tvos), watchos, visionos, or macos; uses the CLI default when omitted",
+          "type": "string"
+        }
+      },
+      "required": [
+        "external_version_id"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "app": {
+          "additionalProperties": false,
+          "properties": {
+            "bundleId": {
+              "type": "string"
+            },
+            "platforms": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "null",
+                "array"
+              ]
+            },
+            "price": {
+              "type": "number"
+            },
+            "purchaseDate": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "trackId": {
+              "type": "integer"
+            },
+            "trackName": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "trackId",
+            "bundleId",
+            "trackName",
+            "version",
+            "price",
+            "purchaseDate",
+            "platforms"
+          ],
+          "type": "object"
+        },
+        "app_id": {
+          "type": "integer"
+        },
+        "bundle_identifier": {
+          "type": "string"
+        },
+        "displayVersion": {
+          "description": "Display version of the requested external version identifier",
+          "type": "string"
+        },
+        "external_version_id": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "releaseDate": {
+          "type": "string"
+        },
+        "success": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "app_id",
+        "bundle_identifier",
+        "platform",
+        "app",
+        "external_version_id",
+        "displayVersion",
+        "releaseDate",
+        "success"
+      ],
+      "type": "object"
+    }
+  },
+  "list_app_versions": {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "app_id": {
+          "description": "Numeric app ID; required unless bundle_identifier is provided",
+          "type": "integer"
+        },
+        "bundle_identifier": {
+          "description": "Bundle identifier; overrides app_id when found",
+          "type": "string"
+        },
+        "platform": {
+          "description": "iphone (ios), ipad (ipados), appletv (tvos), watchos, visionos, or macos; uses the CLI default when omitted",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "app": {
+          "additionalProperties": false,
+          "properties": {
+            "bundleId": {
+              "type": "string"
+            },
+            "platforms": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "null",
+                "array"
+              ]
+            },
+            "price": {
+              "type": "number"
+            },
+            "purchaseDate": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "trackId": {
+              "type": "integer"
+            },
+            "trackName": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "trackId",
+            "bundleId",
+            "trackName",
+            "version",
+            "price",
+            "purchaseDate",
+            "platforms"
+          ],
+          "type": "object"
+        },
+        "app_id": {
+          "type": "integer"
+        },
+        "bundleID": {
+          "type": "string"
+        },
+        "bundle_identifier": {
+          "type": "string"
+        },
+        "externalVersionIdentifiers": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "latestExternalVersionID": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "success": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "app_id",
+        "bundle_identifier",
+        "platform",
+        "app",
+        "externalVersionIdentifiers",
+        "latestExternalVersionID",
+        "bundleID",
+        "success"
+      ],
+      "type": "object"
+    }
+  },
+  "list_purchases": {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "max_results": {
+          "description": "Apps per page from 1 to 100; defaults to 10",
+          "type": [
+            "null",
+            "integer"
+          ]
+        },
+        "page": {
+          "description": "Page number starting at 1; defaults to 1",
+          "type": [
+            "null",
+            "integer"
+          ]
+        },
+        "platform": {
+          "description": "iphone (ios), ipad (ipados), appletv (tvos), visionos, or macos; defaults to all platforms",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "apps": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "bundleId": {
+                "type": "string"
+              },
+              "platforms": {
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "price": {
+                "type": "number"
+              },
+              "purchaseDate": {
+                "type": [
+                  "null",
+                  "string"
+                ]
+              },
+              "trackId": {
+                "type": "integer"
+              },
+              "trackName": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "trackId",
+              "bundleId",
+              "trackName",
+              "version",
+              "price",
+              "purchaseDate",
+              "platforms"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "count": {
+          "type": "integer"
+        },
+        "max_results": {
+          "type": "integer"
+        },
+        "page": {
+          "type": "integer"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "totalCount": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count",
+        "totalCount",
+        "page",
+        "max_results",
+        "platform",
+        "apps"
+      ],
+      "type": "object"
+    }
+  },
+  "purchase_app": {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "app_id": {
+          "description": "Numeric app ID; required unless bundle_identifier is provided",
+          "type": "integer"
+        },
+        "bundle_identifier": {
+          "description": "Bundle identifier; overrides app_id when found",
+          "type": "string"
+        },
+        "platform": {
+          "description": "iphone (ios), ipad (ipados), appletv (tvos), watchos, visionos, or macos; uses the CLI default when omitted",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "alreadyOwned": {
+          "type": "boolean"
+        },
+        "app": {
+          "additionalProperties": false,
+          "properties": {
+            "bundleId": {
+              "type": "string"
+            },
+            "platforms": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "null",
+                "array"
+              ]
+            },
+            "price": {
+              "type": "number"
+            },
+            "purchaseDate": {
+              "type": [
+                "null",
+                "string"
+              ]
+            },
+            "trackId": {
+              "type": "integer"
+            },
+            "trackName": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "trackId",
+            "bundleId",
+            "trackName",
+            "version",
+            "price",
+            "purchaseDate",
+            "platforms"
+          ],
+          "type": "object"
+        },
+        "app_id": {
+          "type": "integer"
+        },
+        "bundle_identifier": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "success": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "app_id",
+        "bundle_identifier",
+        "platform",
+        "app",
+        "alreadyOwned",
+        "success"
+      ],
+      "type": "object"
+    }
+  },
+  "search_apps": {
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "description": "Maximum results; defaults to 5. visionOS supports up to 12.",
+          "type": [
+            "null",
+            "integer"
+          ]
+        },
+        "platform": {
+          "description": "iphone (ios), ipad (ipados), appletv (tvos), watchos, visionos, or macos; defaults to iOS and iPadOS",
+          "type": "string"
+        },
+        "term": {
+          "description": "Search term",
+          "type": "string"
+        }
+      },
+      "required": [
+        "term"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "apps": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "bundleId": {
+                "type": "string"
+              },
+              "platforms": {
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "null",
+                  "array"
+                ]
+              },
+              "price": {
+                "type": "number"
+              },
+              "purchaseDate": {
+                "type": [
+                  "null",
+                  "string"
+                ]
+              },
+              "trackId": {
+                "type": "integer"
+              },
+              "trackName": {
+                "type": "string"
+              },
+              "version": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "trackId",
+              "bundleId",
+              "trackName",
+              "version",
+              "price",
+              "purchaseDate",
+              "platforms"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "count": {
+          "type": "integer"
+        },
+        "limit": {
+          "type": "integer"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "term": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "term",
+        "limit",
+        "platform",
+        "count",
+        "apps"
+      ],
+      "type": "object"
+    }
+  }
+}
