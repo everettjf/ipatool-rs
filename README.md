@@ -46,3 +46,7 @@ Native Mac App Store apps, including ScriptWidget, download as PKGs. An iPhone o
 Other commands include `purchase`, `get-version-metadata`, `mcp`, `fairplay-doctor`, `fairplay-enroll`, `fairplay-decrypt`, and shell `completion`. Run a command with `--help` for its options. Real FairPlay enrollment and decryption require paired private data and remain unverified on this host. The available account tests cover login without a 2FA challenge, a free purchase, purchase history, version metadata, authenticated MCP listing, and real Mac PKG downloads; default Keychain authorization and token-expiry recovery still need live validation.
 
 Keep credentials, cookies, downloaded packages, and private FairPlay captures outside the repository. The project is MIT licensed; see [LICENSE](LICENSE).
+
+## Acknowledgments
+
+Thanks to [@majd](https://github.com/majd) and the contributors to [ipatool](https://github.com/majd/ipatool) for the original project that made this Rust port possible.
