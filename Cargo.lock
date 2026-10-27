@@ -155,8 +155,6 @@ dependencies = [
 [[package]]
 name = "apple-xar"
 version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9631e781df71ebd049d7b4988cdae88712324cb20eb127fd79026bc8f1335d93"
 dependencies = [
  "base64 0.22.1",
  "bzip2",

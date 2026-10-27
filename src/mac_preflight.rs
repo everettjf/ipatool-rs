@@ -15,8 +15,6 @@ use url::Url;
 
 use crate::{ipa_metadata::VersionMetadata, transport::Transport};
 
-const MAX_TOC_BYTES: u64 = 16 * 1024 * 1024;
-
 pub fn read_preflight_version_metadata(url: &str, bundle_id: &str) -> Result<VersionMetadata> {
     read_preflight_version_metadata_using(url, bundle_id, None)
 }
@@ -85,10 +83,7 @@ fn parse_preflight_reader<R: Read + Seek + Debug>(
     }
     let header_size = u16::from_be_bytes(header[4..6].try_into().unwrap()) as u64;
     let compressed = u64::from_be_bytes(header[8..16].try_into().unwrap());
-    let uncompressed = u64::from_be_bytes(header[16..24].try_into().unwrap());
     if !(28..=4096).contains(&header_size)
-        || compressed > MAX_TOC_BYTES
-        || uncompressed > MAX_TOC_BYTES
         || header_size
             .checked_add(compressed)
             .is_none_or(|end| end > size)
@@ -270,6 +265,14 @@ mod tests {
     }
 
     fn fixture_xar_with_extra(distribution: &str, extra_size: usize) -> Vec<u8> {
+        fixture_xar_with_padding(distribution, extra_size, 0)
+    }
+
+    fn fixture_xar_with_padding(
+        distribution: &str,
+        extra_size: usize,
+        toc_padding: usize,
+    ) -> Vec<u8> {
         let checksum = ChecksumType::Sha1
             .digest_data(distribution.as_bytes())
             .unwrap();
@@ -296,8 +299,13 @@ mod tests {
                 20 + distribution.len()
             )
         };
+        let comment = if toc_padding == 0 {
+            String::new()
+        } else {
+            format!("<!--{}-->", "x".repeat(toc_padding))
+        };
         let toc = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?><xar><toc><checksum style="sha1"><offset>0</offset><size>20</size></checksum><creation-time>2023-01-04T22:53:15</creation-time>{entry}{extra_entry}</toc></xar>"#
+            r#"<?xml version="1.0" encoding="UTF-8"?><xar><toc><checksum style="sha1"><offset>0</offset><size>20</size></checksum><creation-time>2023-01-04T22:53:15</creation-time>{entry}{extra_entry}{comment}</toc></xar>"#
         );
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(toc.as_bytes()).unwrap();
@@ -344,6 +352,16 @@ mod tests {
         );
         assert!(distribution.len() > 4 * 1024 * 1024);
         let metadata = parse_preflight_xar(&fixture_xar(&distribution), "com.example.mac").unwrap();
+        assert_eq!(metadata.display_version, "4.2");
+        assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
+    }
+
+    #[test]
+    fn reads_preflight_toc_larger_than_sixteen_megabytes() {
+        let package = fixture_xar_with_padding(DISTRIBUTION, 0, 17 * 1024 * 1024);
+        let uncompressed = u64::from_be_bytes(package[16..24].try_into().unwrap());
+        assert!(uncompressed > 16 * 1024 * 1024);
+        let metadata = parse_preflight_xar(&package, "com.example.mac").unwrap();
         assert_eq!(metadata.display_version, "4.2");
         assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
     }

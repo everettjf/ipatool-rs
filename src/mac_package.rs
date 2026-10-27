@@ -24,8 +24,6 @@ use crate::{
     transport::Transport,
 };
 
-const MAX_TOC: u64 = 64 * 1024 * 1024;
-
 pub fn mac_dp_info(item: &DownloadItem) -> Result<Vec<u8>> {
     let mut result: Option<&[u8]> = None;
     for sinf in &item.sinfs {
@@ -325,10 +323,7 @@ pub fn validate_mac_package(path: &Path) -> Result<()> {
     }
     let header_size = u16::from_be_bytes(header[4..6].try_into().unwrap()) as u64;
     let compressed = u64::from_be_bytes(header[8..16].try_into().unwrap());
-    let uncompressed = u64::from_be_bytes(header[16..24].try_into().unwrap());
     if !(28..=4096).contains(&header_size)
-        || compressed > MAX_TOC
-        || uncompressed > MAX_TOC
         || header_size
             .checked_add(compressed)
             .is_none_or(|end| end > size)
@@ -415,11 +410,20 @@ mod tests {
     }
 
     fn xar(payload: &[u8], corrupt: bool) -> Vec<u8> {
+        xar_with_toc_padding(payload, corrupt, 0)
+    }
+
+    fn xar_with_toc_padding(payload: &[u8], corrupt: bool, toc_padding: usize) -> Vec<u8> {
         let checksum = sha1::Sha1::digest(payload);
         let bad = [0xff; 20];
         let stored = if corrupt { &bad[..] } else { &checksum[..] };
+        let comment = if toc_padding == 0 {
+            String::new()
+        } else {
+            format!("<!--{}-->", "x".repeat(toc_padding))
+        };
         let toc = format!(
-            "<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><creation-time>2025-01-01T00:00:00Z</creation-time><file id=\"1\"><type>file</type><name>Payload</name><data><length>{}</length><offset>20</offset><size>{}</size><encoding style=\"application/octet-stream\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file></toc></xar>",
+            "<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><creation-time>2025-01-01T00:00:00Z</creation-time><file id=\"1\"><type>file</type><name>Payload</name><data><length>{}</length><offset>20</offset><size>{}</size><encoding style=\"application/octet-stream\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file>{comment}</toc></xar>",
             payload.len(),
             payload.len(),
             hex(stored),
@@ -529,6 +533,27 @@ mod tests {
                 .to_string()
                 .contains("checksum")
         );
+    }
+
+    #[test]
+    fn validates_toc_larger_than_sixty_four_megabytes() {
+        let package = xar_with_toc_padding(b"package payload", false, 65 * 1024 * 1024);
+        let uncompressed = u64::from_be_bytes(package[16..24].try_into().unwrap());
+        assert!(uncompressed > 64 * 1024 * 1024);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(&path, package).unwrap();
+        validate_mac_package(&path).unwrap();
+    }
+
+    #[test]
+    fn ignores_inflated_toc_size_hint_when_parsing_actual_stream() {
+        let mut package = xar(b"package payload", false);
+        package[16..24].copy_from_slice(&u64::MAX.to_be_bytes());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(&path, package).unwrap();
+        validate_mac_package(&path).unwrap();
     }
 
     #[test]
