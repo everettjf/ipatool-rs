@@ -108,7 +108,7 @@ impl SavedCookies {
         Some(
             selected
                 .iter()
-                .map(|entry| format!("{}={}", entry.name, entry.value))
+                .map(|entry| cookie_header_pair(entry))
                 .collect::<Vec<_>>()
                 .join("; "),
         )
@@ -126,7 +126,7 @@ impl SavedCookies {
         let Ok(cookie) = Cookie::parse(raw.to_owned()) else {
             return;
         };
-        if !valid_cookie_pair(cookie.name(), cookie.value()) {
+        if !valid_cookie_pair(cookie.name(), cookie.value_trimmed()) {
             return;
         }
         let domain = match cookie.domain() {
@@ -175,7 +175,7 @@ impl SavedCookies {
             value: if expires <= now {
                 String::new()
             } else {
-                cookie.value().to_owned()
+                cookie.value_trimmed().to_owned()
             },
             domain,
             path,
@@ -253,10 +253,11 @@ fn read_entries(path: &Path) -> Result<Vec<Entry>> {
             match serde_json::from_slice::<Vec<Entry>>(&bytes) {
                 Ok(entries) => {
                     let mut merged = Vec::new();
-                    for entry in entries
+                    for mut entry in entries
                         .into_iter()
                         .filter(|entry| !entry.canonical_host.is_empty())
                     {
+                        normalize_legacy_quoted_value(&mut entry);
                         merge_entry(&mut merged, entry);
                     }
                     Ok(merged)
@@ -273,6 +274,22 @@ fn read_entries(path: &Path) -> Result<Vec<Entry>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
     }
+}
+
+fn normalize_legacy_quoted_value(entry: &mut Entry) {
+    let Some(value) = entry
+        .value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return;
+    };
+    if !valid_cookie_pair(&entry.name, value) {
+        return;
+    }
+    let normalized = value.to_owned();
+    let mut previous = std::mem::replace(&mut entry.value, normalized);
+    previous.zeroize();
 }
 
 fn same_cookie(left: &Entry, right: &Entry) -> bool {
@@ -352,14 +369,39 @@ fn path_matches(cookie_path: &str, request_path: &str) -> bool {
                 || request_path.as_bytes().get(cookie_path.len()) == Some(&b'/')))
 }
 
+fn cookie_header_pair(entry: &Entry) -> String {
+    if entry.value.contains([' ', ',']) {
+        format!("{}=\"{}\"", entry.name, entry.value)
+    } else {
+        format!("{}={}", entry.name, entry.value)
+    }
+}
+
 fn valid_cookie_pair(name: &str, value: &str) -> bool {
     !name.is_empty()
-        && !name
-            .bytes()
-            .any(|byte| !(0x21..=0x7e).contains(&byte) || matches!(byte, b'=' | b';'))
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
         && !value
             .bytes()
-            .any(|byte| !(0x21..=0x7e).contains(&byte) || byte == b';')
+            .any(|byte| !(0x20..=0x7e).contains(&byte) || matches!(byte, b'"' | b';' | b'\\'))
 }
 
 #[cfg(test)]
@@ -489,6 +531,43 @@ mod tests {
             reopened
                 .header_for(&url, now + time::Duration::hours(2))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn quotes_cookie_values_like_go_after_parsing_and_reload() {
+        assert!(valid_cookie_pair("good_name", "a b"));
+        assert!(!valid_cookie_pair("bad,name", "value"));
+        let directory = tempfile::tempdir().unwrap();
+        let url = Url::parse("https://example.test/store").unwrap();
+        let now = OffsetDateTime::parse("2026-01-01T00:00:00Z", &Rfc3339).unwrap();
+        let mut jar = SavedCookies::open(directory.path()).unwrap();
+        for raw in [
+            "simple=\"abc\"; Path=/; Max-Age=3600",
+            "spaced=\"a b\"; Path=/; Max-Age=3600",
+            "comma=\"a,b\"; Path=/; Max-Age=3600",
+            "plain=a b; Path=/; Max-Age=3600",
+        ] {
+            jar.set_cookie(&url, raw, now);
+        }
+        let expected = "comma=\"a,b\"; plain=\"a b\"; simple=abc; spaced=\"a b\"";
+        assert_eq!(jar.header_for(&url, now).as_deref(), Some(expected));
+        jar.save(now).unwrap();
+        let reopened = SavedCookies::open(directory.path()).unwrap();
+        assert_eq!(reopened.header_for(&url, now).as_deref(), Some(expected));
+
+        let path = directory.path().join(COOKIE_JAR_FILE_NAME);
+        let saved = fs::read_to_string(&path).unwrap();
+        let legacy = saved.replace("\"Value\":\"abc\"", "\"Value\":\"\\\"abc\\\"\"");
+        assert_ne!(saved, legacy);
+        fs::write(&path, legacy).unwrap();
+        let mut migrated = SavedCookies::open(directory.path()).unwrap();
+        assert_eq!(migrated.header_for(&url, now).as_deref(), Some(expected));
+        migrated.save(now).unwrap();
+        assert!(
+            !fs::read_to_string(path)
+                .unwrap()
+                .contains("\"Value\":\"\\\"abc\\\"\"")
         );
     }
 
