@@ -386,7 +386,7 @@ impl DownloadProductClient {
             }
             Platform::Macos => {
                 let display_version = display_version(item);
-                let destination = package_destination(app, display_version, output, "pkg")?;
+                let destination = package_destination(app, &display_version, output, "pkg")?;
                 if let Some(transport) = &self.transfer {
                     download_mac_package_with_transport(
                         item,
@@ -414,7 +414,7 @@ impl DownloadProductClient {
         if item.url.is_empty() {
             bail!("App Store download response has no IPA URL");
         }
-        let destination = package_destination(app, display_version(item), output, "ipa")?;
+        let destination = package_destination(app, &display_version(item), output, "ipa")?;
         let mut temporary = destination.as_os_str().to_os_string();
         temporary.push(".tmp");
         let temporary = PathBuf::from(temporary);
@@ -1139,11 +1139,15 @@ fn volume_url(account: &Account) -> Result<Url> {
     Url::parse(&format!("https://{host}{VOLUME_PATH}")).context("invalid Store volume URL")
 }
 
-fn display_version(item: &DownloadItem) -> &str {
-    item.metadata_field("bundleShortVersionString")
-        .and_then(plist::Value::as_string)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown")
+fn display_version(item: &DownloadItem) -> String {
+    match item.metadata_field("bundleShortVersionString") {
+        None => "unknown".into(),
+        Some(plist::Value::String(value)) => value.clone(),
+        Some(plist::Value::Integer(value)) => value.to_string(),
+        Some(plist::Value::Real(value)) => value.to_string(),
+        Some(plist::Value::Boolean(value)) => value.to_string(),
+        Some(_) => "unknown".into(),
+    }
 }
 
 fn package_destination(
@@ -1546,6 +1550,30 @@ mod tests {
             empty_http_500: false,
         };
         assert!(!response.is_empty_or_unavailable());
+    }
+
+    #[test]
+    fn download_filename_version_preserves_present_empty_and_numeric_metadata() {
+        let mut item = DownloadItem {
+            url: String::new(),
+            preflight_package_url: String::new(),
+            artwork_url: String::new(),
+            sinfs: Vec::new(),
+            metadata: empty_metadata(),
+        };
+        assert_eq!(display_version(&item), "unknown");
+        for (value, expected) in [
+            (plist::Value::String(String::new()), ""),
+            (plist::Value::Integer(42.into()), "42"),
+            (plist::Value::Real(2.5), "2.5"),
+            (plist::Value::Boolean(true), "true"),
+        ] {
+            item.metadata
+                .as_dictionary_mut()
+                .unwrap()
+                .insert("bundleShortVersionString".into(), value);
+            assert_eq!(display_version(&item), expected);
+        }
     }
 
     #[test]
