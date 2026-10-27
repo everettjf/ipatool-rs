@@ -855,6 +855,43 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_mac_download_preserves_existing_package_and_cleans_stages() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/app.pkg", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while stream.read_exact(&mut byte).is_ok() {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\nConnection: close\r\n\r\npartial",
+                )
+                .unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("app.pkg");
+        fs::write(&destination, b"previous package").unwrap();
+        let result = download_mac_package_with(
+            &item(url, b"session"),
+            &destination,
+            b"hardware",
+            download_file,
+            |_, _, _, _| panic!("decryption must not run after an incomplete transfer"),
+        );
+        server.join().unwrap();
+        assert!(result.is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"previous package");
+        assert!(!suffixed(&destination, ".ipatool-encrypted").exists());
+        assert!(!suffixed(&destination, ".ipatool-decrypted").exists());
+    }
+
+    #[test]
     fn publish_failure_restores_existing_package_without_replacing_prior_backup() {
         let directory = tempfile::tempdir().unwrap();
         let destination = directory.path().join("app.pkg");

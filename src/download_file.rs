@@ -524,4 +524,42 @@ mod tests {
         server.join().unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"partialdow");
     }
+
+    #[test]
+    fn retries_an_interrupted_transfer_from_the_saved_offset() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/app.ipa", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while stream.read_exact(&mut byte).is_ok() {
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                if attempt == 0 {
+                    assert!(request.contains("range: bytes=0-\r\n"));
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\npart")
+                        .unwrap();
+                } else {
+                    assert!(request.contains("range: bytes=4-\r\n"));
+                    stream
+                        .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-9/10\r\nContent-Length: 6\r\nConnection: close\r\n\r\nialipa")
+                        .unwrap();
+                }
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.tmp");
+        assert!(download_file(&url, &path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"part");
+        assert_eq!(download_file(&url, &path).unwrap(), 10);
+        server.join().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"partialipa");
+    }
 }
