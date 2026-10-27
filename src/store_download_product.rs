@@ -1039,7 +1039,7 @@ impl DownloadProductClient {
             url,
             headers,
             body: Some(body),
-            no_redirects: true,
+            no_redirects: false,
             timeout,
         })
         .context("send Store download-product request")?;
@@ -1394,7 +1394,7 @@ mod tests {
     use super::*;
     use std::{
         collections::HashMap,
-        io::{Cursor, Write},
+        io::{BufRead, BufReader, Cursor, Write},
         net::TcpListener,
         sync::atomic::{AtomicUsize, Ordering},
         thread,
@@ -1640,8 +1640,69 @@ mod tests {
         assert_eq!(native.url, guest.url);
         assert_eq!(native.headers, guest.headers);
         assert_eq!(native.body, guest.body);
-        assert_eq!(native.no_redirects, guest.no_redirects);
+        // The guest handles redirects itself; its underlying transport disables them.
+        assert!(!native.no_redirects);
+        assert!(guest.no_redirects);
         assert_eq!(native.timeout, guest.timeout);
+    }
+
+    #[test]
+    fn volume_download_follows_pod_redirect() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut body = Vec::new();
+        plist::to_writer_xml(
+            &mut body,
+            &serde_json::json!({"songList": [{"URL": "https://example.test/app.ipa", "metadata": {
+                "itemId": 42, "softwareVersionBundleId": "com.example.app",
+                "softwareVersionExternalIdentifier": "101"
+            }}]}),
+        )
+        .unwrap();
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                reader.read_line(&mut first).unwrap();
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length: ")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request_body = vec![0u8; length];
+                reader.read_exact(&mut request_body).unwrap();
+                if index == 0 {
+                    assert!(first.starts_with("POST /volume "));
+                    assert!(!request_body.is_empty());
+                    stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /pod\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    assert!(first.starts_with("GET /pod "));
+                    assert!(request_body.is_empty());
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/x-apple-plist\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let transport = Transport::with_cookies(directory.path()).unwrap();
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |mut request| {
+            request.url = Url::parse(&format!("http://127.0.0.1:{port}/volume"))?;
+            transport.send(request)
+        });
+        let result = client
+            .send_product(&account(), &app(), "101", || unreachable!())
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(result.status, 200);
+        assert_eq!(result.data.items.len(), 1);
     }
 
     #[test]

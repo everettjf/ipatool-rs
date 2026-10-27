@@ -413,6 +413,9 @@ impl Transport {
             if !matches!(next.scheme(), "http" | "https") {
                 bail!("unsupported redirect scheme");
             }
+            if matches!(policy, BodyPolicy::Store(_)) && !allowed_store_api_redirect(&next) {
+                bail!("invalid Store redirect destination");
+            }
             if next.origin() != url.origin() {
                 headers.remove(AUTHORIZATION);
                 headers.remove(PROXY_AUTHORIZATION);
@@ -492,6 +495,23 @@ fn remove_store_account_headers(headers: &mut HeaderMap) {
     for name in ["x-token", "x-dsid", "icloud-dsid"] {
         headers.remove(name);
     }
+}
+
+fn allowed_store_api_redirect(url: &Url) -> bool {
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    url.host_str().is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        host == "apple.com"
+            || [".apple.com", ".mzstatic.com", ".cdn-apple.com"]
+                .iter()
+                .any(|suffix| host.ends_with(suffix))
+    })
 }
 
 fn verbose_http_line(method: &Method, url: &Url, status: &str, elapsed: Duration) -> String {
@@ -822,9 +842,56 @@ mod tests {
                 .headers
                 .insert(name, HeaderValue::from_static("fixture"));
         }
-        let response = transport.send_store(request).unwrap();
+        let response = transport.send(request).unwrap();
         server.join().unwrap();
         assert_eq!(response.body, b"ok");
+    }
+
+    #[test]
+    fn store_api_redirects_require_apple_https() {
+        for allowed in [
+            "https://buy.itunes.apple.com/next",
+            "https://s.mzstatic.com/next",
+            "https://assets.cdn-apple.com/next",
+        ] {
+            assert!(allowed_store_api_redirect(&Url::parse(allowed).unwrap()));
+        }
+        for rejected in [
+            "http://buy.itunes.apple.com/next",
+            "https://example.com/next",
+            "https://user:password@buy.itunes.apple.com/next",
+            "https://buy.itunes.apple.com/next#fragment",
+        ] {
+            assert!(!allowed_store_api_redirect(&Url::parse(rejected).unwrap()));
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://example.com/next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let transport = Transport::with_cookies(directory.path()).unwrap();
+        let error = transport
+            .send_store(Request::get(
+                Url::parse(&format!("http://{address}/store")).unwrap(),
+            ))
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid Store redirect destination")
+        );
     }
 
     #[test]
