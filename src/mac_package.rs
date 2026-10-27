@@ -207,10 +207,18 @@ fn download_mac_package_with(
     })();
     let cleanup_encrypted = remove_if_present(&encrypted);
     let cleanup_decrypted = remove_if_present(&decrypted);
-    result?;
-    cleanup_encrypted.context("clean encrypted package staging")?;
-    cleanup_decrypted.context("clean decrypted package staging")?;
-    Ok(())
+    match result {
+        Ok(()) => Ok(()),
+        Err(mut error) => {
+            if let Err(cleanup) = cleanup_encrypted {
+                error = error.context(format!("clean encrypted package staging: {cleanup:#}"));
+            }
+            if let Err(cleanup) = cleanup_decrypted {
+                error = error.context(format!("clean decrypted package staging: {cleanup:#}"));
+            }
+            Err(error)
+        }
+    }
 }
 
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {
@@ -227,12 +235,20 @@ fn remove_if_present(path: &Path) -> Result<()> {
     }
 }
 
+fn file_exists_for_publish(path: &Path) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
 fn publish_mac_package(staged: &Path, destination: &Path) -> Result<()> {
-    let backup = if destination.exists() {
+    let backup = if file_exists_for_publish(destination)? {
         let base = suffixed(destination, ".ipatool-backup");
         let mut candidate = base.clone();
         for index in 1.. {
-            if !candidate.exists() {
+            if !file_exists_for_publish(&candidate)? {
                 break;
             }
             candidate = suffixed(&base, &format!(".{index}"));
@@ -243,10 +259,23 @@ fn publish_mac_package(staged: &Path, destination: &Path) -> Result<()> {
         None
     };
     if let Err(error) = fs::rename(staged, destination) {
-        if let Some(backup) = &backup {
-            fs::rename(backup, destination).context("restore existing macOS package")?;
+        let publish_error = anyhow::Error::new(error).context("publish macOS package");
+        let mut rollback_errors = Vec::new();
+        if let Err(error) = remove_if_present(destination) {
+            rollback_errors.push(format!("remove partial package: {error:#}"));
         }
-        return Err(error).context("publish macOS package");
+        if let Some(backup) = &backup
+            && let Err(error) =
+                fs::rename(backup, destination).context("restore existing macOS package")
+        {
+            rollback_errors.push(format!("restore backup: {error:#}"));
+        }
+        if !rollback_errors.is_empty() {
+            return Err(
+                publish_error.context(format!("rollback failed: {}", rollback_errors.join("; ")))
+            );
+        }
+        return Err(publish_error);
     }
     if let Some(backup) = backup {
         let _ = remove_if_present(&backup);
@@ -551,6 +580,22 @@ mod tests {
         assert_eq!(fs::read(&destination).unwrap(), b"previous package");
         assert!(!suffixed(&destination, ".ipatool-encrypted").exists());
         assert!(!suffixed(&destination, ".ipatool-decrypted").exists());
+    }
+
+    #[test]
+    fn publish_failure_restores_existing_package_without_replacing_prior_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("app.pkg");
+        let prior_backup = suffixed(&destination, ".ipatool-backup");
+        let next_backup = suffixed(&prior_backup, ".1");
+        fs::write(&destination, b"previous package").unwrap();
+        fs::write(&prior_backup, b"older backup").unwrap();
+        let missing_staging = directory.path().join("missing-staging.pkg");
+        let error = publish_mac_package(&missing_staging, &destination).unwrap_err();
+        assert!(error.to_string().contains("publish macOS package"));
+        assert_eq!(fs::read(&destination).unwrap(), b"previous package");
+        assert_eq!(fs::read(&prior_backup).unwrap(), b"older backup");
+        assert!(!next_backup.exists());
     }
 
     #[test]

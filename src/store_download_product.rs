@@ -377,7 +377,17 @@ impl DownloadProductClient {
         temporary.push(".tmp");
         let temporary = PathBuf::from(temporary);
         download_file(&item.url, &temporary).context("download IPA package")?;
-        validate_ipa_platform(&temporary, platform).context("validate downloaded IPA platform")?;
+        if let Err(error) =
+            validate_ipa_platform(&temporary, platform).context("validate downloaded IPA platform")
+        {
+            if let Err(cleanup) = fs::remove_file(&temporary) {
+                return Err(error.context(format!(
+                    "failed to remove invalid IPA {}: {cleanup}",
+                    temporary.display()
+                )));
+            }
+            return Err(error);
+        }
         let artwork = fetch_artwork(&item.artwork_url)?;
         patch_ipa(
             &temporary,
@@ -1947,6 +1957,72 @@ mod tests {
                 .unwrap();
             assert!(client.cached_kbsync(123456, "000102030405").is_none());
         }
+    }
+
+    #[test]
+    fn invalid_mobile_ipa_removes_partial_staging() {
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        archive
+            .start_file(
+                "Payload/App.app/Info.plist",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive
+            .write_all(br#"<plist version="1.0"><dict><key>CFBundleSupportedPlatforms</key><array><string>WatchOS</string></array></dict></plist>"#)
+            .unwrap();
+        let ipa = archive.finish().unwrap().into_inner();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/app.ipa", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while std::io::Read::read_exact(&mut stream, &mut byte).is_ok() {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                ipa.len()
+            )
+            .unwrap();
+            stream.write_all(&ipa).unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("failed.ipa");
+        let temporary = directory.path().join("failed.ipa.tmp");
+        fs::write(&temporary, b"stale partial").unwrap();
+        let item = DownloadItem {
+            url,
+            preflight_package_url: String::new(),
+            artwork_url: String::new(),
+            sinfs: Vec::new(),
+            metadata: plist::Value::Dictionary(plist::Dictionary::new()),
+        };
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| {
+            panic!("product request must not run during package validation")
+        });
+        let error = client
+            .download_mobile_item(
+                &account(),
+                &app(),
+                &item,
+                Platform::Iphone,
+                Some(&destination),
+            )
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("validate downloaded IPA platform")
+        );
+        assert!(!temporary.exists());
+        assert!(!destination.exists());
     }
 
     #[test]
