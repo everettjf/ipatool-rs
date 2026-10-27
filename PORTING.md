@@ -266,7 +266,7 @@ The 2026-10-27 help-only audit compared long flags on the root command, `auth` a
 
 ## Gates before claiming full parity
 
-1. For the current macOS scope, complete the authenticated cases not covered by the controlled-account runs above: a 2FA challenge, token-expiry retries, Mac IPA/SINF, and default Keychain authorization in a local user session. Both the Go reference and Rust Store guests reject Swift's preawaited continuation flag; determine whether these workflows reach it, and implement its immediate-suspension semantics if they do. Do not commit credentials, cookies, captures, or private models.
+1. For the current macOS scope, complete the authenticated cases not covered by the controlled-account runs above: a 2FA challenge, token-expiry retries, and default Keychain authorization in a local user session. If an iPhone/iPad app offered on Apple Silicon Mac returns an IPA, also validate that separate IPA/SINF branch; it is not a requirement for native Mac PKG apps such as ScriptWidget. Both the Go reference and Rust Store guests reject Swift's preawaited continuation flag; determine whether these workflows reach it, and implement its immediate-suspension semantics if they do. Do not commit credentials, cookies, captures, or private models.
 2. Validate private FairPlay enrollment and real IPA decryption using paired data on a supported macOS host. The present `fairplayd` slice is supported, but private state is not accessible to the current unprivileged process. Public fixtures cannot prove these paths. Also run the 26B118 oracle/model differential if paired 26B118 data becomes available.
 3. Record any discovered macOS differences, fix them in Rust, rerun the relevant verification, and commit each fix.
 4. If the deferred targets are resumed, run the final iOS ARM64 binary on an iOS 15+ compatible device, exercise authenticated Store and package workflows on Linux, and run the x86_64 and ARM64 Windows binaries on target systems. QEMU Linux smoke runs do not validate account storage or real downloads.
@@ -305,8 +305,11 @@ from existing state. Keep that directory outside the repository.
 file /tmp/ipatool-macos-test.download
 ```
 
-The download response may select an IPA rather than a PKG for some Mac apps;
-inspect the resulting file before interpreting it as one format. Keep
+Native macOS App Store apps are distributed as PKGs. An iPhone/iPad app made
+available on Apple Silicon Mac is a different Store offer; if its response
+contains mobile package metadata, the Rust downloader selects the IPA path.
+ScriptWidget's observed Mac offer is a PKG, so it cannot exercise that path.
+Inspect an unfamiliar downloaded file before interpreting its format. Keep
 credentials, cookies, downloaded packages, and private FairPlay material out
 of the repository. A failing command and redacted error output are sufficient
 to continue the parity work.
