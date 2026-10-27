@@ -23,6 +23,11 @@ checksum ID and a TOC that declares MD5. Its stored checksum still matches
 the SHA1 digest of the compressed TOC; Go rejects the conflicting algorithm
 declarations. It contains no account or package data.
 
+`mac-xar-invalid-extracted-synthetic.pkg` is a 384-byte XAR with a valid
+archived payload checksum but a non-hexadecimal extracted checksum (`gg`).
+The Go reader rejects this file record while opening the archive. It contains
+no account or package data.
+
 `fairplay-oracle-raw-source-synthetic.model.gz` extends the account-free
 26A428 synthetic model with zero-filled pages so the six checked raw-source
 kernels can run one iteration. Expected state hashes were cross-checked with

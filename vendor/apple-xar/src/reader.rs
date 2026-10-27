@@ -5,7 +5,7 @@
 use {
     crate::{
         format::{XarChecksum, XarHeader},
-        table_of_contents::{ChecksumType, File, FileType, SignatureStyle, TableOfContents},
+        table_of_contents::{ChecksumType, File, FileChecksum, FileType, SignatureStyle, TableOfContents},
         Error, XarResult,
     },
     scroll::IOread,
@@ -61,6 +61,7 @@ impl<R: Read + Seek + Sized + Debug> XarReader<R> {
         let heap_start_offset = reader.stream_position()?;
 
         let toc = TableOfContents::from_reader(std::io::Cursor::new(toc_data))?;
+        validate_file_metadata(&toc.files)?;
 
         Ok(Self {
             reader,
@@ -402,4 +403,30 @@ impl<R: Read + Seek + Sized + Debug> XarReader<R> {
 
         Ok(checked)
     }
+}
+
+fn validate_file_metadata(files: &[File]) -> XarResult<()> {
+    for file in files {
+        match file.file_type {
+            FileType::File => {
+                let data = file.data.as_ref().ok_or(Error::FileNoData)?;
+                validate_file_checksum(&data.archived_checksum)?;
+                validate_file_checksum(&data.extracted_checksum)?;
+            }
+            FileType::Directory => validate_file_metadata(&file.files)?,
+            FileType::HardLink | FileType::Link | FileType::Other => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_file_checksum(checksum: &FileChecksum) -> XarResult<()> {
+    if matches!(checksum.style, ChecksumType::None) {
+        return Err(Error::Unsupported("file checksum type none"));
+    }
+    let digest = checksum.checksum.as_bytes();
+    if digest.len() % 2 != 0 || !digest.iter().all(u8::is_ascii_hexdigit) {
+        return Err(Error::BadChecksum("invalid file checksum hex"));
+    }
+    Ok(())
 }
