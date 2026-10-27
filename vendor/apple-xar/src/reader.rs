@@ -41,9 +41,15 @@ impl<R: Read + Seek + Sized + Debug> XarReader<R> {
     /// Construct a new XAR reader from a stream reader.
     pub fn new(mut reader: R) -> XarResult<Self> {
         let header = reader.ioread_with::<XarHeader>(scroll::BE)?;
-
-        let mut header_extra = vec![0u8; header.size as usize - 28];
-        reader.read_exact(&mut header_extra)?;
+        if header.magic != u32::from_be_bytes(*b"xar!") {
+            return Err(Error::TableOfContentsCorrupted("invalid XAR magic"));
+        }
+        if header.version != 1 {
+            return Err(Error::TableOfContentsCorrupted("unsupported XAR version"));
+        }
+        if header.size != 28 {
+            return Err(Error::TableOfContentsCorrupted("invalid XAR header size"));
+        }
 
         // Following the header is a zlib compressed table of contents.
         // Unfortunately, serde_xml_rs takes ownership of the reader and doesn't

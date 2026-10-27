@@ -347,6 +347,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsupported_xar_version() {
+        let mut package = fixture_xar(DISTRIBUTION);
+        package[6..8].copy_from_slice(&2u16.to_be_bytes());
+        assert!(parse_preflight_xar(&package, "com.example.mac").is_err());
+    }
+
+    #[test]
     fn ignores_directory_named_distribution() {
         let package = fixture_xar_with_toc_entry(
             DISTRIBUTION,

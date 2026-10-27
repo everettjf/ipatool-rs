@@ -552,6 +552,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unsupported_xar_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        let mut package = xar(b"package payload", false);
+        package[6..8].copy_from_slice(&2u16.to_be_bytes());
+        fs::write(&path, package).unwrap();
+        assert!(validate_mac_package(&path).is_err());
+    }
+
+    #[test]
     fn rejects_mismatched_xar_toc_checksum_style() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("app.pkg");
