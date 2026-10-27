@@ -331,6 +331,7 @@ fn inspect_model_path_with_rules(
     if result.is_empty() {
         return Err(anyhow!("model directory contains no .bin models"));
     }
+    result.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(result)
 }
 
@@ -706,6 +707,32 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
             assert!(inspect_enrollment_model(&path).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_directory_diagnostics_are_sorted_by_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        for (name, user) in [("z.bin", 2), ("a.bin", 1)] {
+            let path = directory.path().join(name);
+            fs::write(&path, model(SinfSelector { user, key: 3 })).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let names: Vec<_> = inspect_model_registry(directory.path())
+            .unwrap()
+            .into_iter()
+            .map(|diagnostic| {
+                Path::new(&diagnostic.path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, ["a.bin", "z.bin"]);
     }
 
     #[cfg(unix)]
