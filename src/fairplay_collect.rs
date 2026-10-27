@@ -270,6 +270,7 @@ fn capture_ipa(
     executable: &str,
 ) -> Result<(CaptureFile, String, CaptureFile)> {
     let mut archive = ZipArchive::new(File::open(source)?)?;
+    let mut raw_source = File::open(source)?;
     let mut sinfs = Vec::new();
     if archive.has_duplicate_names() {
         sinfs = duplicate_zip::read_matching_entries(source, |name| {
@@ -278,7 +279,11 @@ fn capture_ipa(
     } else {
         for index in 0..archive.len() {
             let mut member = archive.by_index(index)?;
-            let name = member.name()?.into_owned();
+            let raw_name = duplicate_zip::read_raw_central_name(
+                &mut raw_source,
+                member.central_header_start(),
+            )?;
+            let name = String::from_utf8_lossy(&raw_name).into_owned();
             if !name.contains("/SC_Info/") || !has_sinf_extension(&name) {
                 continue;
             }
@@ -518,6 +523,39 @@ mod tests {
         let first = sinf();
         let second = sinf_with_selector(SinfSelector { user: 7, key: 10 });
         crate::duplicate_zip::write_duplicate_sinf_fixture(&ipa, &first, &second);
+        let output = directory.path().join("capture");
+        let (_, root, _) =
+            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A").unwrap();
+        assert_eq!(root, "Payload/A.app");
+        assert_eq!(fs::read(output.join("ipa/App.sinf")).unwrap(), first);
+    }
+
+    #[test]
+    fn capture_ipa_accepts_non_utf8_root_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let ipa = directory.path().join("non-utf8.ipa");
+        let first = sinf();
+        let mut zip = ZipWriter::new(File::create(&ipa).unwrap());
+        zip.start_file("Payload/A.app/SC_Info/A.sinf", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&first).unwrap();
+        zip.finish().unwrap();
+        crate::duplicate_zip::replace_fixture_filename_bytes(&ipa, b"A.app/", b"\x82.app/");
+
+        let output = directory.path().join("capture");
+        let (_, root, _) =
+            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A").unwrap();
+        assert_eq!(root, "Payload/\u{fffd}.app");
+        assert_eq!(fs::read(output.join("ipa/App.sinf")).unwrap(), first);
+    }
+
+    #[test]
+    fn capture_ipa_ignores_unicode_path_extra_field() {
+        let directory = tempfile::tempdir().unwrap();
+        let ipa = directory.path().join("unicode-path.ipa");
+        let first = sinf();
+        crate::duplicate_zip::write_unicode_path_fixture(&ipa, &first);
+
         let output = directory.path().join("capture");
         let (_, root, _) =
             capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A").unwrap();

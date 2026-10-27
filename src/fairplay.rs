@@ -201,6 +201,7 @@ pub(crate) fn is_sinf_extension_equal_fold(extension: &str) -> bool {
 pub fn inspect_ipa_sinfs(path: &Path) -> Result<Vec<SinfDiagnostic>> {
     let file = fs::File::open(path).with_context(|| format!("open IPA: {}", path.display()))?;
     let mut archive = ZipArchive::new(file).context("open IPA ZIP archive")?;
+    let mut raw_source = fs::File::open(path).context("open IPA for ZIP filename inspection")?;
     let mut result = Vec::new();
     if archive.has_duplicate_names() {
         for (name, bytes) in duplicate_zip::read_matching_entries(path, |name| {
@@ -213,7 +214,11 @@ pub fn inspect_ipa_sinfs(path: &Path) -> Result<Vec<SinfDiagnostic>> {
     } else {
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index).context("read IPA ZIP member")?;
-            let name = entry.name()?.into_owned();
+            let raw_name = duplicate_zip::read_raw_central_name(
+                &mut raw_source,
+                entry.central_header_start(),
+            )?;
+            let name = String::from_utf8_lossy(&raw_name).into_owned();
             if !name.contains("/SC_Info/") || !has_sinf_extension(&name) {
                 continue;
             }
@@ -744,6 +749,45 @@ mod tests {
 
         crate::duplicate_zip::write_duplicate_sinf_fixture(&path, b"bad", &second);
         assert!(inspect_ipa_sinfs(&path).is_err());
+    }
+
+    #[test]
+    fn reports_non_utf8_zip_name_like_go() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("non-utf8.ipa");
+        let file = fs::File::create(&path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "Payload/A.app/SC_Info/A.sinf",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(&sinf(SinfSelector { user: 1, key: 2 }, 448))
+            .unwrap();
+        zip.finish().unwrap();
+        crate::duplicate_zip::replace_fixture_filename_bytes(&path, b"/A.sinf", b"/\x82.sinf");
+
+        let diagnostics = inspect_ipa_sinfs(&path).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].path.as_deref(),
+            Some("Payload/A.app/SC_Info/\u{fffd}.sinf")
+        );
+    }
+
+    #[test]
+    fn ignores_unicode_path_extra_field_like_go() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unicode-path.ipa");
+        let bytes = sinf(SinfSelector { user: 1, key: 2 }, 448);
+        crate::duplicate_zip::write_unicode_path_fixture(&path, &bytes);
+
+        let diagnostics = inspect_ipa_sinfs(&path).unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].path.as_deref(),
+            Some("Payload/A.app/SC_Info/A.sinf")
+        );
     }
 
     #[test]

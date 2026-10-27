@@ -1,8 +1,12 @@
-//! Read ZIP members in central-directory order when duplicate names are present.
+//! Read ZIP members and preserve central-directory filename bytes as Go does.
 
-use std::{fs::File, io::BufReader, path::Path};
+use std::{
+    fs::File,
+    io::{BufReader, Read, Seek, SeekFrom},
+    path::Path,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use async_zip::base::read::seek::ZipFileReader;
 use futures_util::io::AllowStdIo;
 
@@ -18,9 +22,13 @@ pub(crate) fn read_matching_entries(
             .context("open IPA ZIP archive with duplicate names")?;
         let mut entries = Vec::new();
         for index in 0..reader.file().entries().len() {
-            let name =
-                String::from_utf8_lossy(reader.file().entries()[index].filename().as_bytes())
-                    .into_owned();
+            let filename = reader.file().entries()[index].filename();
+            let name = String::from_utf8_lossy(
+                filename
+                    .alternative()
+                    .unwrap_or_else(|| filename.as_bytes()),
+            )
+            .into_owned();
             if !include(&name) {
                 continue;
             }
@@ -36,6 +44,22 @@ pub(crate) fn read_matching_entries(
         }
         Ok(entries)
     })
+}
+
+/// zip's `name_raw()` can contain an Info-ZIP UnicodePath replacement. Go's
+/// archive/zip instead exposes the bytes from the central directory filename.
+pub(crate) fn read_raw_central_name(source: &mut File, offset: u64) -> Result<Vec<u8>> {
+    source.seek(SeekFrom::Start(offset))?;
+    let mut header = [0u8; 46];
+    source.read_exact(&mut header)?;
+    ensure!(
+        header[..4] == [0x50, 0x4b, 0x01, 0x02],
+        "invalid IPA ZIP central header"
+    );
+    let name_length = u16::from_le_bytes([header[28], header[29]]) as usize;
+    let mut name = vec![0u8; name_length];
+    source.read_exact(&mut name)?;
+    Ok(name)
 }
 
 #[cfg(test)]
@@ -66,4 +90,38 @@ pub(crate) fn write_duplicate_sinf_fixture(path: &Path, first: &[u8], second: &[
     }
     assert_eq!(replaced, 2);
     fs::write(path, bytes).unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn replace_fixture_filename_bytes(path: &Path, from: &[u8], to: &[u8]) {
+    use std::fs;
+
+    assert_eq!(from.len(), to.len());
+    let mut bytes = fs::read(path).unwrap();
+    let mut replaced = 0;
+    for offset in 0..=bytes.len() - from.len() {
+        if &bytes[offset..offset + from.len()] == from {
+            bytes[offset..offset + to.len()].copy_from_slice(to);
+            replaced += 1;
+        }
+    }
+    assert_eq!(replaced, 2); // local and central directory names
+    fs::write(path, bytes).unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn write_unicode_path_fixture(path: &Path, contents: &[u8]) {
+    use std::io::Write;
+    use zip::{ZipWriter, write::FullFileOptions};
+
+    let mut options = FullFileOptions::default();
+    let mut unicode_path = vec![1, 0x23, 0x82, 0xbc, 0x55]; // CRC-32 of the original name
+    unicode_path.extend_from_slice(b"Payload/B.app/SC_Info/B.sinf");
+    options.add_extra_field(0x7075, unicode_path, true).unwrap();
+    let mut writer = ZipWriter::new(File::create(path).unwrap());
+    writer
+        .start_file("Payload/A.app/SC_Info/A.sinf", options)
+        .unwrap();
+    writer.write_all(contents).unwrap();
+    writer.finish().unwrap();
 }
