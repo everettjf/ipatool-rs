@@ -42,7 +42,7 @@ pub fn read_version_metadata_with_sender(
     let mut archive = ZipArchive::new(reader).context("open remote IPA ZIP")?;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).context("read remote IPA entry")?;
-        if !is_main_info_plist(file.name()) {
+        if !is_main_info_plist(&file.name()?) {
             continue;
         }
         if file.size() > MAX_INFO_PLIST {

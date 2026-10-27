@@ -71,7 +71,7 @@ fn find_sinf(archive: &mut ZipArchive<File>) -> Result<(HashSet<String>, Vec<u8>
     let mut sinf_name = None;
     for index in 0..archive.len() {
         let entry = archive.by_index(index).context("inspect IPA ZIP member")?;
-        let name = entry.name().to_owned();
+        let name = entry.name()?.into_owned();
         if !names.insert(name.clone()) {
             bail!("IPA contains duplicate member {name}");
         }
@@ -108,7 +108,11 @@ fn local_extra(source: &mut File, member: &ZipFile<'_, File>) -> Result<Vec<u8>>
     Ok(extra)
 }
 
-fn add_extra_fields(options: &mut FullFileOptions<'_>, extra: &[u8], central: bool) -> Result<()> {
+fn add_extra_fields(
+    options: &mut FullFileOptions<'_, '_>,
+    extra: &[u8],
+    central: bool,
+) -> Result<()> {
     let mut cursor = 0;
     while cursor < extra.len() {
         if extra.len() - cursor < 4 {
@@ -120,7 +124,7 @@ fn add_extra_fields(options: &mut FullFileOptions<'_>, extra: &[u8], central: bo
         if length > extra.len() - cursor {
             bail!("IPA ZIP extra field has invalid length");
         }
-        options.add_extra_data(id, extra[cursor..cursor + length].into(), central)?;
+        options.add_extra_field(id, &extra[cursor..cursor + length], central)?;
         cursor += length;
     }
     Ok(())
@@ -151,7 +155,7 @@ fn full_options(
     member: &ZipFile<'_, File>,
     local: &[u8],
     central: &[u8],
-) -> Result<FullFileOptions<'static>> {
+) -> Result<FullFileOptions<'static, 'static>> {
     let mut options = FullFileOptions::default()
         .compression_method(member.compression())
         .unix_permissions(member.unix_mode().unwrap_or(0o644))
@@ -175,7 +179,7 @@ fn write_reencoded(
     prefix: &[u8],
     rest: Option<&[u8]>,
 ) -> Result<()> {
-    let name = member.name().to_owned();
+    let name = member.name()?.into_owned();
     let options = full_options(member, local, central)?;
     writer.start_file(name, options)?;
     writer.write_all(prefix)?;
@@ -246,7 +250,7 @@ pub fn decrypt_ipa_with_options(
     let mut image_reports = Vec::new();
     for index in 0..archive.len() {
         let mut member = archive.by_index(index).context("read IPA member")?;
-        let name = member.name().to_owned();
+        let name = member.name()?.into_owned();
         let local = local_extra(&mut raw_source, &member)?;
         let central = member.extra_data().unwrap_or_default().to_vec();
         let has_extra = !local.is_empty() || !central.is_empty();
@@ -614,12 +618,8 @@ mod tests {
         ] {
             if name == "Payload/A.app/A" || name == "Payload/A.app/Info.plist" {
                 let mut extra = FullFileOptions::default();
-                extra
-                    .add_extra_data(0xcafe, Box::new([1, 2, 3]), false)
-                    .unwrap();
-                extra
-                    .add_extra_data(0xbeef, Box::new([4, 5, 6]), true)
-                    .unwrap();
+                extra.add_extra_field(0xcafe, [1, 2, 3], false).unwrap();
+                extra.add_extra_field(0xbeef, [4, 5, 6], true).unwrap();
                 writer.start_file(name, extra).unwrap();
             } else {
                 writer.start_file(name, options).unwrap();

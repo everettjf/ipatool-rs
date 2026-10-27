@@ -81,7 +81,8 @@ pub fn validate_ipa_platform(path: &Path, platform: Platform) -> Result<()> {
     let mut archive = ZipArchive::new(file).context("open IPA ZIP")?;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).context("read IPA ZIP entry")?;
-        let parts: Vec<_> = entry.name().split('/').collect();
+        let entry_name = entry.name()?.into_owned();
+        let parts: Vec<_> = entry_name.split('/').collect();
         if parts.len() != 3
             || parts[0] != "Payload"
             || !parts[1].ends_with(".app")

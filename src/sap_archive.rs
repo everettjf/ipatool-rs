@@ -75,7 +75,9 @@ fn pinned_entry<R: Read + Seek>(
         );
     }
     Ok(ArchiveEntry {
-        offset: file.data_start(),
+        offset: file
+            .data_start()
+            .context("restore member data offset is unavailable")?,
         size: spec.size,
     })
 }

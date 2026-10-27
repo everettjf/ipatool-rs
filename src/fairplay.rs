@@ -166,7 +166,7 @@ pub fn inspect_ipa_sinfs(path: &Path) -> Result<Vec<SinfDiagnostic>> {
     let mut result = Vec::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).context("read IPA ZIP member")?;
-        let name = entry.name().to_owned();
+        let name = entry.name()?.into_owned();
         if !name.contains("/SC_Info/") || !name.to_ascii_lowercase().ends_with(".sinf") {
             continue;
         }

@@ -264,7 +264,7 @@ fn capture_ipa(
     let mut roots = Vec::new();
     for index in 0..archive.len() {
         let mut member = archive.by_index(index)?;
-        let name = member.name().to_owned();
+        let name = member.name()?.into_owned();
         if !name.contains("/SC_Info/") || !name.to_ascii_lowercase().ends_with(".sinf") {
             continue;
         }

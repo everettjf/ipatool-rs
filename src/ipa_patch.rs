@@ -32,6 +32,14 @@ pub fn patch_ipa(
     io::copy(&mut File::open(source)?, &mut copy).context("copy original IPA")?;
     let mut writer = ZipWriter::new_append(copy).context("open IPA ZIP for patching")?;
     if !artwork.is_empty() {
+        if archive
+            .file_names_raw()
+            .any(|name| name == b"iTunesArtwork")
+        {
+            writer
+                .hide_file("iTunesArtwork")
+                .context("replace IPA artwork entry")?;
+        }
         writer
             .start_file("iTunesArtwork", SimpleFileOptions::default())
             .context("create IPA artwork entry")?;
@@ -43,6 +51,14 @@ pub fn patch_ipa(
         .clone();
     metadata.insert("apple-id".into(), apple_id.into());
     metadata.insert("userName".into(), apple_id.into());
+    if archive
+        .file_names_raw()
+        .any(|name| name == b"iTunesMetadata.plist")
+    {
+        writer
+            .hide_file("iTunesMetadata.plist")
+            .context("replace IPA metadata entry")?;
+    }
     writer
         .start_file("iTunesMetadata.plist", SimpleFileOptions::default())
         .context("create IPA metadata entry")?;
@@ -57,6 +73,9 @@ pub fn patch_ipa(
                 .context("Store SINF entry has no data")?;
             if data.is_empty() {
                 bail!("Store SINF entry is empty");
+            }
+            if archive.file_names_raw().any(|name| name == path.as_bytes()) {
+                writer.hide_file(&path).context("replace IPA SINF entry")?;
             }
             writer
                 .start_file(path, SimpleFileOptions::default())
@@ -78,7 +97,8 @@ fn sinf_paths(archive: &mut ZipArchive<File>, count: usize) -> Result<Vec<String
     let mut manifest_index = None;
     for index in 0..archive.len() {
         let entry = archive.by_index(index).context("inspect IPA entry")?;
-        let parts: Vec<_> = entry.name().split('/').collect();
+        let entry_name = entry.name()?.into_owned();
+        let parts: Vec<_> = entry_name.split('/').collect();
         if parts.len() == 3
             && parts[0] == "Payload"
             && parts[1].ends_with(".app")
@@ -215,12 +235,8 @@ mod tests {
         let source = directory.path().join("source.ipa");
         let mut writer = ZipWriter::new(File::create(&source).unwrap());
         let mut options = zip::write::FullFileOptions::default();
-        options
-            .add_extra_data(0xcafe, Box::new([1, 2, 3]), false)
-            .unwrap();
-        options
-            .add_extra_data(0xbeef, Box::new([4, 5, 6]), true)
-            .unwrap();
+        options.add_extra_field(0xcafe, [1, 2, 3], false).unwrap();
+        options.add_extra_field(0xbeef, [4, 5, 6], true).unwrap();
         writer.start_file("Payload/App.app/App", options).unwrap();
         writer.write_all(b"executable").unwrap();
         writer.finish().unwrap();
@@ -291,6 +307,95 @@ mod tests {
             .read_to_end(&mut sinf)
             .unwrap();
         assert_eq!(sinf, b"ticket");
+    }
+
+    #[test]
+    fn replaces_existing_store_metadata() {
+        let (directory, input) = source(None);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut writer = ZipWriter::new_append(file).unwrap();
+        writer
+            .start_file("iTunesMetadata.plist", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"old metadata").unwrap();
+        writer.finish().unwrap();
+        let output = directory.path().join("patched.ipa");
+        patch_ipa(
+            &input,
+            &output,
+            &serde_json::json!({}),
+            "new@example.com",
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
+        let mut metadata = Vec::new();
+        archive
+            .by_name("iTunesMetadata.plist")
+            .unwrap()
+            .read_to_end(&mut metadata)
+            .unwrap();
+        let plist = plist::from_bytes::<Value>(&metadata).unwrap();
+        assert_eq!(
+            plist.as_dictionary().unwrap()["apple-id"].as_string(),
+            Some("new@example.com")
+        );
+    }
+
+    #[test]
+    fn replaces_existing_artwork_and_sinf() {
+        let (directory, input) = source(None);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut writer = ZipWriter::new_append(file).unwrap();
+        for (name, bytes) in [
+            ("iTunesArtwork", b"old artwork".as_slice()),
+            ("Payload/App.app/SC_Info/App.sinf", b"old ticket".as_slice()),
+        ] {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        let output = directory.path().join("patched.ipa");
+        patch_ipa(
+            &input,
+            &output,
+            &serde_json::json!({}),
+            "new@example.com",
+            b"new artwork",
+            &[mobile_sinf()],
+        )
+        .unwrap();
+        let mut archive = ZipArchive::new(File::open(output).unwrap()).unwrap();
+        for (name, expected) in [
+            ("iTunesArtwork", b"new artwork".as_slice()),
+            ("Payload/App.app/SC_Info/App.sinf", b"ticket".as_slice()),
+        ] {
+            let mut actual = Vec::new();
+            archive
+                .by_name(name)
+                .unwrap()
+                .read_to_end(&mut actual)
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                archive
+                    .file_names_raw()
+                    .filter(|candidate| *candidate == name.as_bytes())
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
