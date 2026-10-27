@@ -15,14 +15,12 @@ pub fn package_platform(requested: Platform, item: &DownloadItem) -> Result<Plat
         return Ok(requested);
     }
     let software_platform = item
-        .metadata
-        .get("software-platform")
-        .and_then(serde_json::Value::as_str)
+        .metadata_field("software-platform")
+        .and_then(Value::as_string)
         .unwrap_or_default();
     let product_type = item
-        .metadata
-        .get("product-type")
-        .and_then(serde_json::Value::as_str)
+        .metadata_field("product-type")
+        .and_then(Value::as_string)
         .unwrap_or_default();
     let (mobile_metadata, mac_metadata) = if software_platform.is_empty() {
         (
@@ -135,7 +133,7 @@ mod tests {
             preflight_package_url: String::new(),
             artwork_url: String::new(),
             sinfs,
-            metadata,
+            metadata: serde_json::from_value(metadata).unwrap(),
         }
     }
 

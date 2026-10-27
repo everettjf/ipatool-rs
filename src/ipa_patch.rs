@@ -8,7 +8,6 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use plist::Value;
-use serde_json::Value as JsonValue;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 use crate::ipa_zip_repack;
@@ -19,7 +18,7 @@ const MAX_PLIST: u64 = 4 * 1024 * 1024;
 pub fn patch_ipa(
     source: &Path,
     destination: &Path,
-    metadata: &JsonValue,
+    metadata: &Value,
     apple_id: &str,
     artwork: &[u8],
     sinfs: &[Value],
@@ -40,11 +39,11 @@ pub fn patch_ipa(
         writer.write_all(artwork).context("write IPA artwork")?;
     }
     let mut metadata = metadata
-        .as_object()
+        .as_dictionary()
         .context("Store IPA metadata is not a dictionary")?
         .clone();
-    metadata.insert("apple-id".into(), apple_id.into());
-    metadata.insert("userName".into(), apple_id.into());
+    metadata.insert("apple-id".into(), Value::String(apple_id.to_owned()));
+    metadata.insert("userName".into(), Value::String(apple_id.to_owned()));
     writer
         .start_file("iTunesMetadata.plist", SimpleFileOptions::default())
         .context("create IPA metadata entry")?;
@@ -166,6 +165,10 @@ mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom};
 
+    fn metadata(value: serde_json::Value) -> Value {
+        serde_json::from_value(value).unwrap()
+    }
+
     fn source(manifest: Option<&str>) -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("source.ipa");
@@ -236,7 +239,7 @@ mod tests {
         patch_ipa(
             &source,
             &destination,
-            &serde_json::json!({}),
+            &metadata(serde_json::json!({})),
             "account",
             &[],
             &[],
@@ -253,7 +256,7 @@ mod tests {
         patch_ipa(
             &input,
             &output,
-            &serde_json::json!({"itemId": 42}),
+            &metadata(serde_json::json!({"itemId": 42})),
             "person@example.test",
             b"artwork",
             &[mobile_sinf()],
@@ -316,7 +319,7 @@ mod tests {
         patch_ipa(
             &input,
             &output,
-            &serde_json::json!({}),
+            &metadata(serde_json::json!({})),
             "new@example.com",
             &[],
             &[],
@@ -359,7 +362,7 @@ mod tests {
         patch_ipa(
             &input,
             &output,
-            &serde_json::json!({}),
+            &metadata(serde_json::json!({})),
             "new@example.com",
             b"new artwork",
             &[mobile_sinf()],
@@ -412,7 +415,15 @@ mod tests {
         writer.finish().unwrap();
 
         let output = directory.path().join("patched.ipa");
-        patch_ipa(&input, &output, &serde_json::json!({}), "account", &[], &[]).unwrap();
+        patch_ipa(
+            &input,
+            &output,
+            &metadata(serde_json::json!({})),
+            "account",
+            &[],
+            &[],
+        )
+        .unwrap();
         let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
         assert_eq!(archive.len(), 3);
         let mut headers = Vec::new();
@@ -470,7 +481,15 @@ mod tests {
             .unwrap();
         writer.finish().unwrap();
         let output = directory.path().join("patched.ipa");
-        patch_ipa(&input, &output, &serde_json::json!({}), "account", &[], &[]).unwrap();
+        patch_ipa(
+            &input,
+            &output,
+            &metadata(serde_json::json!({})),
+            "account",
+            &[],
+            &[],
+        )
+        .unwrap();
         let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
         let entry = archive.by_name("Payload/App.app/Info.plist").unwrap();
         let start = entry.header_start();
@@ -502,7 +521,7 @@ mod tests {
         patch_ipa(
             &prefixed,
             &output,
-            &serde_json::json!({}),
+            &metadata(serde_json::json!({})),
             "account",
             &[],
             &[],
@@ -590,7 +609,7 @@ mod tests {
         patch_ipa(
             &zip64_input,
             &output,
-            &serde_json::json!({}),
+            &metadata(serde_json::json!({})),
             "account",
             &[],
             &[],
@@ -617,7 +636,7 @@ mod tests {
         patch_ipa(
             &input,
             &output,
-            &serde_json::json!({}),
+            &metadata(serde_json::json!({})),
             "account",
             &[],
             &[mobile_sinf()],
@@ -632,7 +651,7 @@ mod tests {
             patch_ipa(
                 &unsafe_input,
                 &bad_output,
-                &serde_json::json!({}),
+                &metadata(serde_json::json!({})),
                 "account",
                 &[],
                 &[mobile_sinf()]
@@ -652,7 +671,7 @@ mod tests {
             patch_ipa(
                 &input,
                 &output,
-                &serde_json::json!({}),
+                &metadata(serde_json::json!({})),
                 "account",
                 &[],
                 &[Value::Dictionary(fields)],
@@ -673,7 +692,7 @@ mod tests {
         patch_ipa(
             &input,
             &output,
-            &serde_json::json!({}),
+            &metadata(serde_json::json!({})),
             "account",
             &[],
             &[Value::Dictionary(plist::Dictionary::new())],
@@ -713,7 +732,7 @@ mod tests {
         patch_ipa(
             &input,
             &output,
-            &serde_json::json!({}),
+            &metadata(serde_json::json!({})),
             "account",
             &[],
             &[mobile_sinf()],

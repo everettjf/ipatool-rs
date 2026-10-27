@@ -431,7 +431,7 @@ mod tests {
             preflight_package_url: String::new(),
             artwork_url: String::new(),
             sinfs: vec![plist::Value::Dictionary(fields)],
-            metadata: serde_json::json!({}),
+            metadata: plist::Value::Dictionary(plist::Dictionary::new()),
         }
     }
 

@@ -149,8 +149,18 @@ pub struct DownloadItem {
     pub artwork_url: String,
     #[serde(default)]
     pub sinfs: Vec<plist::Value>,
-    #[serde(default)]
-    pub metadata: Value,
+    #[serde(default = "empty_metadata")]
+    pub metadata: plist::Value,
+}
+
+fn empty_metadata() -> plist::Value {
+    plist::Value::Dictionary(plist::Dictionary::new())
+}
+
+impl DownloadItem {
+    pub(crate) fn metadata_field(&self, key: &str) -> Option<&plist::Value> {
+        self.metadata.as_dictionary()?.get(key)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -406,17 +416,16 @@ impl DownloadProductClient {
             catalog.latest_external_version_id(app, country, platform)
         })?;
         let item = checked_item(&response)?;
-        let metadata = &item.metadata;
-        let identifiers = metadata
-            .get("softwareVersionExternalIdentifiers")
-            .and_then(Value::as_array)
+        let identifiers = item
+            .metadata_field("softwareVersionExternalIdentifiers")
+            .and_then(plist::Value::as_array)
             .context("download metadata has no version identifiers")?;
         let external_version_identifiers = identifiers
             .iter()
             .map(version_string)
             .collect::<Result<Vec<_>>>()?;
-        let latest_external_version_id = metadata
-            .get("softwareVersionExternalIdentifier")
+        let latest_external_version_id = item
+            .metadata_field("softwareVersionExternalIdentifier")
             .context("download metadata has no latest version")
             .and_then(version_string)?;
         Ok(ListVersionsOutput {
@@ -466,14 +475,12 @@ impl DownloadProductClient {
         let response = self.send_product(account, app, version, || Ok(version.to_owned()))?;
         let item = checked_item(&response)?;
         let software_platform = item
-            .metadata
-            .get("software-platform")
-            .and_then(Value::as_str)
+            .metadata_field("software-platform")
+            .and_then(plist::Value::as_string)
             .unwrap_or_default();
         let product_type = item
-            .metadata
-            .get("product-type")
-            .and_then(Value::as_str)
+            .metadata_field("product-type")
+            .and_then(plist::Value::as_string)
             .unwrap_or_default();
         let response_is_mac = software_platform.eq_ignore_ascii_case("macos")
             || (software_platform.is_empty() && product_type.eq_ignore_ascii_case("mac-os-app"));
@@ -492,9 +499,8 @@ impl DownloadProductClient {
                     .is_some_and(|data| !data.is_empty())
             });
             let bundle_id = if app.bundle_id.is_empty() {
-                item.metadata
-                    .get("softwareVersionBundleId")
-                    .and_then(Value::as_str)
+                item.metadata_field("softwareVersionBundleId")
+                    .and_then(plist::Value::as_string)
                     .unwrap_or_default()
             } else {
                 &app.bundle_id
@@ -1007,9 +1013,8 @@ fn volume_url(account: &Account) -> Result<Url> {
 }
 
 fn display_version(item: &DownloadItem) -> &str {
-    item.metadata
-        .get("bundleShortVersionString")
-        .and_then(Value::as_str)
+    item.metadata_field("bundleShortVersionString")
+        .and_then(plist::Value::as_string)
         .filter(|value| !value.is_empty())
         .unwrap_or("unknown")
 }
@@ -1087,10 +1092,11 @@ fn fetch_artwork(url: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn version_string(value: &Value) -> Result<String> {
+fn version_string(value: &plist::Value) -> Result<String> {
     match value {
-        Value::String(value) if !value.is_empty() => Ok(value.clone()),
-        Value::Number(value) => Ok(value.to_string()),
+        plist::Value::String(value) if !value.is_empty() => Ok(value.clone()),
+        plist::Value::Integer(value) => Ok(value.to_string()),
+        plist::Value::Real(value) => Ok(value.to_string()),
         _ => bail!("invalid external version identifier in download metadata"),
     }
 }
@@ -1161,23 +1167,23 @@ fn validate_fallback(response: &DownloadProductResponse, app: &App, version: &st
     if response.status != 200 || response.data.items.len() != 1 {
         bail!("redownload response has no unique app item");
     }
-    let metadata = &response.data.items[0].metadata;
-    let id = metadata
-        .get("itemId")
+    let item = &response.data.items[0];
+    let id = item
+        .metadata_field("itemId")
         .context("redownload response has no app ID")?;
     if version_string(id)? != app.id.to_string() {
         bail!("redownload response does not match the requested app");
     }
-    let bundle = metadata
-        .get("softwareVersionBundleId")
-        .and_then(Value::as_str)
+    let bundle = item
+        .metadata_field("softwareVersionBundleId")
+        .and_then(plist::Value::as_string)
         .unwrap_or_default();
     if bundle.is_empty() || (!app.bundle_id.is_empty() && bundle != app.bundle_id) {
         bail!("redownload response does not match the requested bundle identifier");
     }
     if !version.is_empty()
-        && metadata
-            .get("softwareVersionExternalIdentifier")
+        && item
+            .metadata_field("softwareVersionExternalIdentifier")
             .map(version_string)
             .transpose()?
             .as_deref()
@@ -1959,16 +1965,40 @@ mod tests {
             .unwrap();
             stream.write_all(&ipa).unwrap();
         });
+        let mut product: plist::Value = serde_json::from_value(serde_json::json!({"songList": [{
+            "URL": url,
+            "metadata": {
+                "itemId": 42,
+                "softwareVersionBundleId": "com.example.app",
+                "softwareVersionExternalIdentifier": "101",
+                "bundleShortVersionString": "1.2.3"
+            }
+        }]}))
+        .unwrap();
+        let metadata = product
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("songList")
+            .unwrap()
+            .as_array_mut()
+            .unwrap()[0]
+            .as_dictionary_mut()
+            .unwrap()
+            .get_mut("metadata")
+            .unwrap()
+            .as_dictionary_mut()
+            .unwrap();
+        let release_date = plist::Date::from_xml_format("2024-05-01T00:00:00Z").unwrap();
+        metadata.insert("assetToken".into(), plist::Value::Data(vec![1, 2, 3]));
+        metadata.insert("releaseDate".into(), plist::Value::Date(release_date));
+        let mut body = Vec::new();
+        plist::to_writer_binary(&mut body, &product).unwrap();
         let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], move |_| {
-            Ok(response(serde_json::json!({"songList": [{
-                "URL": url,
-                "metadata": {
-                    "itemId": 42,
-                    "softwareVersionBundleId": "com.example.app",
-                    "softwareVersionExternalIdentifier": "101",
-                    "bundleShortVersionString": "1.2.3"
-                }
-            }]})))
+            Ok(Response {
+                status: 200,
+                headers: Default::default(),
+                body: body.clone(),
+            })
         });
         let directory = tempfile::tempdir().unwrap();
         let mut account = account();
@@ -1997,6 +2027,14 @@ mod tests {
         assert_eq!(
             metadata.as_dictionary().unwrap()["apple-id"].as_string(),
             Some("person@example.test")
+        );
+        assert_eq!(
+            metadata.as_dictionary().unwrap()["assetToken"].as_data(),
+            Some([1, 2, 3].as_slice())
+        );
+        assert_eq!(
+            metadata.as_dictionary().unwrap()["releaseDate"].as_date(),
+            Some(release_date)
         );
     }
 
