@@ -194,7 +194,7 @@ pub fn owned_apps<B: OwnedBackend>(
     limit: usize,
     platform: Option<Platform>,
 ) -> Result<OwnedAppsOutput> {
-    validate_selection(page, limit, platform)?;
+    let (page, limit) = normalize_selection(page, limit, platform)?;
     let config = backend
         .sap_config()
         .context("load purchase-history SAP configuration")?;
@@ -219,7 +219,7 @@ pub fn owned_apps_with_signer<B: OwnedBackend>(
     platform: Option<Platform>,
     signer: &mut ActionSigner<'_>,
 ) -> Result<OwnedAppsOutput> {
-    validate_selection(page, limit, platform)?;
+    let (page, limit) = normalize_selection(page, limit, platform)?;
     let guid = backend
         .hardware_id()
         .iter()
@@ -667,7 +667,7 @@ pub fn select_page(
     limit: usize,
     platform: Option<Platform>,
 ) -> Result<OwnedAppsOutput> {
-    validate_selection(page, limit, platform)?;
+    let (page, limit) = normalize_selection(page, limit, platform)?;
     if let Some(platform) = platform {
         apps.retain(|app| {
             app.platforms
@@ -691,17 +691,20 @@ pub fn select_page(
     })
 }
 
-fn validate_selection(page: usize, limit: usize, platform: Option<Platform>) -> Result<()> {
-    if page == 0 {
-        bail!("page must be greater than 0");
-    }
-    if limit == 0 || limit > MAX_LIMIT {
-        bail!("limit must be between 1 and {MAX_LIMIT}");
+fn normalize_selection(
+    page: usize,
+    limit: usize,
+    platform: Option<Platform>,
+) -> Result<(usize, usize)> {
+    let page = if page == 0 { 1 } else { page };
+    let limit = if limit == 0 { DEFAULT_LIMIT } else { limit };
+    if limit > MAX_LIMIT {
+        bail!("limit must not exceed {MAX_LIMIT}");
     }
     if matches!(platform, Some(Platform::Unknown | Platform::Watchos)) {
         bail!("invalid platform for purchase history");
     }
-    Ok(())
+    Ok((page, limit))
 }
 
 #[cfg(test)]
@@ -818,6 +821,20 @@ mod tests {
         assert_eq!(page.count, 0);
     }
 
+    #[test]
+    fn zero_pagination_uses_go_owned_apps_defaults() {
+        let apps = (0..12)
+            .map(|id| App {
+                id,
+                ..App::default()
+            })
+            .collect();
+        let output = select_page(apps, 0, 0, None).unwrap();
+        assert_eq!((output.page, output.count, output.total_count), (1, 10, 12));
+        assert_eq!(output.apps[0].id, 0);
+        assert_eq!(output.apps[9].id, 9);
+    }
+
     struct FixtureBackend {
         calls: Mutex<usize>,
     }
@@ -899,14 +916,19 @@ mod tests {
         account.store_front = "143441-1,29".into();
         account.directory_services_id = "123".into();
         account.password_token = "token".into();
-        let output = owned_apps_with_signer(&backend, &account, 1, 10, None, &mut |_| {
+        let output = owned_apps_with_signer(&backend, &account, 0, 0, None, &mut |_| {
             observed.fetch_add(1, Ordering::SeqCst);
             Ok(b"signed".to_vec())
         })
         .unwrap();
         assert_eq!(
-            (output.count, output.total_count, output.apps[0].id),
-            (1, 1, 42)
+            (
+                output.page,
+                output.count,
+                output.total_count,
+                output.apps[0].id
+            ),
+            (1, 1, 1, 42)
         );
         assert_eq!(
             output.apps[0].platforms.as_ref().unwrap(),
