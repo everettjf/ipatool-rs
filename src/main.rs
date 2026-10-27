@@ -26,7 +26,10 @@ use ipatool_rs::fairplay_oracle_domains::{
 use ipatool_rs::fairplay_oracle_export::export_checked_model;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
-use ipatool_rs::fairplay_recover_capture::{RecoverFromAccountOptions, recover_from_account};
+use ipatool_rs::fairplay_recover_capture::{
+    RecoverFromAccountOptions, RecoverFromSinfCopyOptions, recover_from_account,
+    recover_from_sinf_copy,
+};
 use ipatool_rs::fairplay_recovery;
 use ipatool_rs::fairplay_recovery_output::{
     read_private_block, read_private_bytes, read_private_frame, read_private_model,
@@ -241,6 +244,19 @@ enum FairplayEnrollCommand {
         capture: PathBuf,
         #[arg(long)]
         account_checkpoint: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 600)]
+        timeout_seconds: u64,
+        #[arg(long)]
+        skip_differential: bool,
+    },
+    /// Recover and decrypt a 26B118 capture from its private SINF-copy checkpoint.
+    RecoverFromSinfCopy {
+        #[arg(long)]
+        capture: PathBuf,
+        #[arg(long)]
+        sinf_copy_checkpoint: PathBuf,
         #[arg(long)]
         output: PathBuf,
         #[arg(long, default_value_t = 600)]
@@ -1205,6 +1221,29 @@ fn run() -> Result<()> {
                 let result = recover_from_account(RecoverFromAccountOptions {
                     capture: &capture,
                     account_checkpoint: &account_checkpoint,
+                    output: &output,
+                    timeout: Duration::from_secs(timeout_seconds),
+                    skip_differential,
+                })?;
+                match cli.format {
+                    Format::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+                    Format::Text => println!(
+                        "Recovered FairPlay enrollment for {} and decrypted IPA to {}",
+                        result.selector,
+                        result.decrypted_ipa.display()
+                    ),
+                }
+            }
+            FairplayEnrollCommand::RecoverFromSinfCopy {
+                capture,
+                sinf_copy_checkpoint,
+                output,
+                timeout_seconds,
+                skip_differential,
+            } => {
+                let result = recover_from_sinf_copy(RecoverFromSinfCopyOptions {
+                    capture: &capture,
+                    sinf_copy_checkpoint: &sinf_copy_checkpoint,
                     output: &output,
                     timeout: Duration::from_secs(timeout_seconds),
                     skip_differential,
@@ -2760,6 +2799,32 @@ mod tests {
                 command: FairplayEnrollCommand::RecoverFromAccount {
                     timeout_seconds: 900,
                     skip_differential: true,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn fairplay_recover_from_sinf_copy_accepts_private_paths() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "recover-from-sinf-copy",
+            "--capture",
+            "/private/capture",
+            "--sinf-copy-checkpoint",
+            "/private/sinf-copy.pkl.gz",
+            "--output",
+            "/private/recovery",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::RecoverFromSinfCopy {
+                    timeout_seconds: 600,
+                    skip_differential: false,
                     ..
                 }
             }
