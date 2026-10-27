@@ -196,10 +196,23 @@ impl AppStoreServer {
                     limit,
                     platform,
                 )?;
+                let catalog = CatalogClient::new().ok();
+                let country = country_code_from_storefront(&account.store_front).ok();
+                let apps = out
+                    .apps
+                    .into_iter()
+                    .map(|app| {
+                        complete_app(app, platform, |id, lookup_platform| {
+                            let catalog = catalog.as_ref().context("catalog unavailable")?;
+                            let country = country.context("account country unavailable")?;
+                            catalog.lookup(Some(id), None, country, lookup_platform)
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 Ok(
                     json!({"count": out.count, "totalCount": out.total_count, "page": out.page,
                     "max_results": limit, "platform": platform,
-                    "apps": out.apps.iter().map(app_value).collect::<Vec<_>>() }),
+                    "apps": apps.iter().map(app_value).collect::<Vec<_>>() }),
                 )
             })
         })
@@ -358,9 +371,123 @@ fn app_value(app: &App) -> Value {
         "platforms": app.platforms.clone().unwrap_or_default()})
 }
 
+fn complete_app(
+    mut app: App,
+    platform: Option<Platform>,
+    lookup: impl FnOnce(i64, Option<Platform>) -> Result<App>,
+) -> App {
+    let known_platforms = app.platforms.as_deref().is_some_and(|platforms| {
+        platforms
+            .first()
+            .is_some_and(|platform| *platform != Platform::Unknown)
+    });
+    if app.id <= 0
+        || (!app.bundle_id.is_empty()
+            && !app.name.is_empty()
+            && !app.version.is_empty()
+            && known_platforms)
+    {
+        return app;
+    }
+    let lookup_platform = platform.or_else(|| {
+        app.platforms
+            .as_deref()
+            .and_then(|platforms| platforms.first().copied())
+            .filter(|platform| *platform != Platform::Unknown)
+    });
+    let Ok(found) = lookup(app.id, lookup_platform) else {
+        return app;
+    };
+    if found.id != app.id {
+        return app;
+    }
+    if app.bundle_id.is_empty() {
+        app.bundle_id = found.bundle_id;
+    }
+    if app.name.is_empty() {
+        app.name = found.name;
+    }
+    if app.version.is_empty() {
+        app.version = found.version;
+    }
+    if !known_platforms
+        && found
+            .platforms
+            .as_ref()
+            .is_some_and(|platforms| !platforms.is_empty())
+    {
+        app.platforms = found.platforms;
+    }
+    if app.price == 0.0 {
+        app.price = found.price;
+    }
+    app
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purchase_metadata_fills_only_missing_fields() {
+        let original = App {
+            id: 42,
+            name: "Owned name".into(),
+            purchase_date: Some("2025-01-01T00:00:00Z".into()),
+            platforms: Some(vec![Platform::Unknown]),
+            ..App::default()
+        };
+        let completed = complete_app(original, None, |id, platform| {
+            assert_eq!(id, 42);
+            assert_eq!(platform, None);
+            Ok(App {
+                id,
+                bundle_id: "com.example.app".into(),
+                name: "Catalog name".into(),
+                version: "2.0".into(),
+                price: 1.99,
+                platforms: Some(vec![Platform::Iphone]),
+                ..App::default()
+            })
+        });
+        assert_eq!(completed.name, "Owned name");
+        assert_eq!(completed.bundle_id, "com.example.app");
+        assert_eq!(completed.version, "2.0");
+        assert_eq!(completed.price, 1.99);
+        assert_eq!(completed.platforms, Some(vec![Platform::Iphone]));
+        assert!(completed.purchase_date.is_some());
+    }
+
+    #[test]
+    fn purchase_metadata_preserves_delisted_and_complete_apps() {
+        let owned = App {
+            id: 42,
+            bundle_id: "com.example.app".into(),
+            name: "Owned name".into(),
+            price: 2.99,
+            ..App::default()
+        };
+        let delisted = complete_app(owned.clone(), None, |_, _| Err(AppNotFound.into()));
+        assert_eq!(delisted, owned);
+        let wrong = complete_app(owned.clone(), None, |_, _| {
+            Ok(App {
+                id: 99,
+                name: "Wrong app".into(),
+                ..App::default()
+            })
+        });
+        assert_eq!(wrong, owned);
+
+        let complete = App {
+            version: "1.0".into(),
+            platforms: Some(vec![Platform::Macos]),
+            ..owned
+        };
+        assert_eq!(
+            complete_app(complete.clone(), None, |_, _| panic!("unexpected lookup")),
+            complete
+        );
+    }
 
     #[tokio::test]
     async fn cancelled_call_keeps_store_gate_until_blocking_work_finishes() {
