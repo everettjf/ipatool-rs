@@ -1,6 +1,11 @@
 # ipatool-rs
 
-A Rust port of the sibling `ipatool-fairplay` project. The CLI implements the Go project's command paths, including App Store account operations, package downloads, an MCP server, and FairPlay diagnostics. Full parity is still being validated; see the [porting record](docs/PORTING.md) for evidence and the [TODO list](docs/TODO.md) for remaining work.
+## Thanks to the original projects
+
+- [ipatool](https://github.com/majd/ipatool) and its contributors for the App Store search, account, purchase, and download workflows.
+- [UnfairPlay](https://github.com/DrWhax/unfairplay) and its contributors for the FairPlay enrollment and IPA decryption work.
+
+Thank you to both projects and their maintainers. `ipatool-rs` brings these two areas together in a Rust CLI. The sibling `ipatool-fairplay` Go source tree served as a reference for the port. The CLI implements its command paths, including an MCP server and FairPlay diagnostics. Full parity is still being validated; see the [porting record](docs/PORTING.md) for evidence and the [TODO list](docs/TODO.md) for remaining work.
 
 The current delivery target is **macOS on Apple Silicon**. Work on macOS x86_64, iOS, Linux, and Windows is deferred at the user's request.
 
@@ -46,7 +51,3 @@ Native Mac App Store apps, including ScriptWidget, download as PKGs. An iPhone o
 Other commands include `purchase`, `get-version-metadata`, `mcp`, `fairplay-doctor`, `fairplay-enroll`, `fairplay-decrypt`, and shell `completion`. Run a command with `--help` for its options. Real FairPlay enrollment and decryption require paired private data and remain unverified on this host. The available account tests cover login without a 2FA challenge, a free purchase, purchase history, version metadata, authenticated MCP listing, and real Mac PKG downloads; default Keychain authorization and token-expiry recovery still need live validation.
 
 Keep credentials, cookies, downloaded packages, and private FairPlay captures outside the repository. The project is MIT licensed; see [LICENSE](LICENSE).
-
-## Acknowledgments
-
-Thanks to [@majd](https://github.com/majd) and the contributors to [ipatool](https://github.com/majd/ipatool) for the original project that made this Rust port possible.
