@@ -524,6 +524,92 @@ mod tests {
     }
 
     #[test]
+    fn repacks_zip64_directory_and_entry_offset_without_stale_metadata() {
+        let (directory, input) = source(None);
+        let mut data = std::fs::read(&input).unwrap();
+        let end = data.len() - 22;
+        assert_eq!(&data[end..end + 4], &0x0605_4b50u32.to_le_bytes());
+        let central_offset =
+            u32::from_le_bytes(data[end + 16..end + 20].try_into().unwrap()) as usize;
+        let original_central_size =
+            u32::from_le_bytes(data[end + 12..end + 16].try_into().unwrap()) as usize;
+        let name_len = u16::from_le_bytes(
+            data[central_offset + 28..central_offset + 30]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let extra_len = u16::from_le_bytes(
+            data[central_offset + 30..central_offset + 32]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert_eq!(extra_len, 0);
+        data[central_offset + 30..central_offset + 32].copy_from_slice(&12u16.to_le_bytes());
+        data[central_offset + 42..central_offset + 46].copy_from_slice(&u32::MAX.to_le_bytes());
+        let inserted_at = central_offset + 46 + name_len;
+        let mut offset_extra = Vec::new();
+        offset_extra.extend_from_slice(&1u16.to_le_bytes());
+        offset_extra.extend_from_slice(&8u16.to_le_bytes());
+        offset_extra.extend_from_slice(&0u64.to_le_bytes());
+        data.splice(inserted_at..inserted_at, offset_extra);
+        let new_end = end + 12;
+        let ordinary_end = data[new_end..].to_vec();
+        data.truncate(new_end);
+        let zip64_end_offset = data.len() as u64;
+        data.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+        data.extend_from_slice(&44u64.to_le_bytes());
+        data.extend_from_slice(&45u16.to_le_bytes());
+        data.extend_from_slice(&45u16.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&((original_central_size + 12) as u64).to_le_bytes());
+        data.extend_from_slice(&(central_offset as u64).to_le_bytes());
+        data.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&zip64_end_offset.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        let mut ordinary_end = ordinary_end;
+        ordinary_end[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        ordinary_end[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        ordinary_end[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        ordinary_end[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        data.extend_from_slice(&ordinary_end);
+        let zip64_input = directory.path().join("zip64.ipa");
+        std::fs::write(&zip64_input, data).unwrap();
+        assert_eq!(
+            ZipArchive::new(File::open(&zip64_input).unwrap())
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let output = directory.path().join("patched.ipa");
+        patch_ipa(
+            &zip64_input,
+            &output,
+            &serde_json::json!({}),
+            "account",
+            &[],
+            &[],
+        )
+        .unwrap();
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        assert_eq!(archive.len(), 3);
+        let mut executable = Vec::new();
+        archive
+            .by_name("Payload/App.app/App")
+            .unwrap()
+            .read_to_end(&mut executable)
+            .unwrap();
+        assert_eq!(executable, b"executable");
+        let first = archive.by_index(0).unwrap();
+        assert_eq!(first.header_start(), 0);
+        assert!(first.extra_data().unwrap_or_default().is_empty());
+    }
+
+    #[test]
     fn uses_info_executable_and_rejects_unsafe_manifest_without_publishing() {
         let (directory, input) = source(None);
         let output = directory.path().join("patched.ipa");

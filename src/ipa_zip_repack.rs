@@ -33,6 +33,10 @@ fn put32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn at_least_zip_version(value: u16, minimum: u8) -> u16 {
+    (value & 0xff00) | u16::from((value as u8).max(minimum))
+}
+
 fn append_extra(extra: &mut Vec<u8>, payload: &[u8]) -> Result<()> {
     ensure!(
         payload.len() <= u16::MAX as usize,
@@ -137,7 +141,7 @@ fn copy_member(
             sizes.extend_from_slice(&compressed.to_le_bytes());
         }
         append_extra(&mut local_extra, &sizes)?;
-        let version = u16_at(&local, 4).max(45);
+        let version = at_least_zip_version(u16_at(&local, 4), 45);
         put16(&mut local, 4, version);
     }
     put16(
@@ -191,8 +195,8 @@ fn copy_member(
     }
     if !zip64.is_empty() {
         append_extra(&mut central_extra, &zip64)?;
-        let needed = u16_at(&central, 6).max(45);
-        let made_by = u16_at(&central, 4).max(45);
+        let needed = at_least_zip_version(u16_at(&central, 6), 45);
+        let made_by = at_least_zip_version(u16_at(&central, 4), 45);
         put16(&mut central, 6, needed);
         put16(&mut central, 4, made_by);
     }
@@ -283,4 +287,87 @@ pub(crate) fn repack(source: &File, replacements: &File, output: &mut File) -> R
     output.write_all(&comment_len.to_le_bytes())?;
     output.write_all(comment)?;
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use zip::{ZipWriter, write::SimpleFileOptions};
+
+    #[test]
+    fn writes_zip64_offsets_and_end_record_after_sparse_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.zip");
+        let additions_path = directory.path().join("additions.zip");
+        for (path, name, bytes) in [
+            (&source_path, "Payload/App.app/App", b"app".as_slice()),
+            (
+                &additions_path,
+                "iTunesMetadata.plist",
+                b"metadata".as_slice(),
+            ),
+        ] {
+            let mut writer = ZipWriter::new(File::create(path).unwrap());
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+            writer.finish().unwrap();
+        }
+        let output_path = directory.path().join("sparse.zip");
+        let mut output = File::create(&output_path).unwrap();
+        output.seek(SeekFrom::Start(u32::MAX as u64)).unwrap();
+        repack(
+            &File::open(&source_path).unwrap(),
+            &File::open(&additions_path).unwrap(),
+            &mut output,
+        )
+        .unwrap();
+        drop(output);
+
+        let mut archive = ZipArchive::new(File::open(&output_path).unwrap()).unwrap();
+        assert_eq!(archive.len(), 2);
+        for (name, expected) in [
+            ("Payload/App.app/App", b"app".as_slice()),
+            ("iTunesMetadata.plist", b"metadata".as_slice()),
+        ] {
+            let mut actual = Vec::new();
+            archive
+                .by_name(name)
+                .unwrap()
+                .read_to_end(&mut actual)
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+        let first = archive.by_index_raw(0).unwrap();
+        assert_eq!(first.header_start(), u32::MAX as u64);
+        let mut raw = File::open(&output_path).unwrap();
+        raw.seek(SeekFrom::Start(first.central_header_start() + 4))
+            .unwrap();
+        let mut versions = [0u8; 4];
+        raw.read_exact(&mut versions).unwrap();
+        assert!(versions[0] >= 45, "ZIP64 creator version is too old");
+        assert!(versions[2] >= 45, "ZIP64 reader version is too old");
+        raw.seek(SeekFrom::Start(first.central_header_start() + 42))
+            .unwrap();
+        let mut offset_field = [0u8; 4];
+        raw.read_exact(&mut offset_field).unwrap();
+        assert_eq!(u32::from_le_bytes(offset_field), u32::MAX);
+        raw.seek(SeekFrom::Start(first.central_header_start() + 30))
+            .unwrap();
+        let mut extra_len = [0u8; 2];
+        raw.read_exact(&mut extra_len).unwrap();
+        assert_eq!(u16::from_le_bytes(extra_len), 12);
+        raw.seek(SeekFrom::Start(
+            first.central_header_start() + 46 + first.name_raw().len() as u64,
+        ))
+        .unwrap();
+        let mut extra = [0u8; 12];
+        raw.read_exact(&mut extra).unwrap();
+        assert_eq!(&extra[..4], &[1, 0, 8, 0]);
+        assert_eq!(
+            u64::from_le_bytes(extra[4..].try_into().unwrap()),
+            u32::MAX as u64
+        );
+    }
 }
