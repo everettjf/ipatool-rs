@@ -9,6 +9,10 @@ elements in its TOC, file, and data records, plus symlink and FIFO entries.
 The Go XAR reader accepted its single checksummed payload and skipped the
 special entries. It contains no account or package data.
 
+`mac-xar-no-regular-synthetic.pkg` is a 274-byte XAR containing only a
+directory, a symlink, and a FIFO. The Go reader reports zero regular files,
+so macOS package validation rejects it. It contains no account data.
+
 `fairplay-oracle-raw-source-synthetic.model.gz` extends the account-free
 26A428 synthetic model with zero-filled pages so the six checked raw-source
 kernels can run one iteration. Expected state hashes were cross-checked with

@@ -335,7 +335,10 @@ pub fn validate_mac_package(path: &Path) -> Result<()> {
         bail!("macOS XAR table of contents checksum mismatch");
     }
     let files = archive.files()?;
-    if files.is_empty() {
+    if !files
+        .iter()
+        .any(|(_, entry)| matches!(entry.file_type, FileType::File))
+    {
         bail!("macOS XAR archive contains no files");
     }
     for (name, entry) in &files {
@@ -545,6 +548,23 @@ mod tests {
         )
         .unwrap();
         validate_mac_package(&path).unwrap();
+    }
+
+    #[test]
+    fn rejects_xar_without_regular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(
+            &path,
+            include_bytes!("../tests/fixtures/mac-xar-no-regular-synthetic.pkg"),
+        )
+        .unwrap();
+        assert!(
+            validate_mac_package(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("no files")
+        );
     }
 
     #[test]
