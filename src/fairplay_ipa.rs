@@ -128,10 +128,7 @@ fn find_sinf(archive: &mut ZipArchive<File>) -> Result<(HashSet<String>, Vec<u8>
         if !names.insert(name.clone()) {
             bail!("duplicate IPA member {name:?}");
         }
-        if name.contains("/SC_Info/")
-            && name.to_ascii_lowercase().ends_with(".sinf")
-            && sinf_name.replace(name).is_some()
-        {
+        if name.ends_with(".sinf") && sinf_name.replace(name).is_some() {
             bail!("FairPlay decryption requires exactly one SINF");
         }
     }
@@ -963,6 +960,7 @@ mod tests {
             ("Payload/A.app/SC_Info/A.supf", supf_bytes.as_slice()),
             ("Payload/A.app/A", encrypted.as_slice()),
             ("Payload/A.app/Info.plist", b"unchanged".as_slice()),
+            ("Payload/A.app/Resources/ignored.SINF", b"other".as_slice()),
         ] {
             if name == "Payload/A.app/A" || name == "Payload/A.app/Info.plist" {
                 let mut extra = FullFileOptions::default();
@@ -1039,6 +1037,13 @@ mod tests {
             .read_to_end(&mut unchanged)
             .unwrap();
         assert_eq!(unchanged, b"unchanged");
+        let mut ignored = Vec::new();
+        archive
+            .by_name("Payload/A.app/Resources/ignored.SINF")
+            .unwrap()
+            .read_to_end(&mut ignored)
+            .unwrap();
+        assert_eq!(ignored, b"other");
     }
 
     #[test]
@@ -1154,7 +1159,10 @@ mod tests {
         let supf_bytes = supf(record);
         let mut writer = ZipWriter::new(File::create(&input).unwrap());
         writer
-            .start_file("Payload/A.app/SC_Info/B.sinf", SimpleFileOptions::default())
+            .start_file(
+                "Payload/A.app/Resources/B.sinf",
+                SimpleFileOptions::default(),
+            )
             .unwrap();
         writer.write_all(b"first").unwrap();
         writer
