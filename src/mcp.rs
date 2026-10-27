@@ -115,7 +115,8 @@ struct PurchasesInput {
 impl AppStoreServer {
     #[tool(
         name = "search_apps",
-        description = "Search for apps on the App Store."
+        description = "Search for apps on the App Store.",
+        annotations(read_only_hint = true, idempotent_hint = false)
     )]
     async fn search_apps(&self, Parameters(input): Parameters<SearchInput>) -> CallToolResult {
         self.run(move || {
@@ -134,7 +135,8 @@ impl AppStoreServer {
 
     #[tool(
         name = "list_app_versions",
-        description = "List available external version identifiers for an app."
+        description = "List available external version identifiers for an app.",
+        annotations(read_only_hint = true, idempotent_hint = false)
     )]
     async fn list_app_versions(&self, Parameters(input): Parameters<AppInput>) -> CallToolResult {
         self.run(move || {
@@ -152,7 +154,8 @@ impl AppStoreServer {
 
     #[tool(
         name = "get_version_metadata",
-        description = "Get a display version and release date for an external version ID."
+        description = "Get a display version and release date for an external version ID.",
+        annotations(read_only_hint = true, idempotent_hint = false)
     )]
     async fn get_version_metadata(
         &self,
@@ -175,7 +178,8 @@ impl AppStoreServer {
 
     #[tool(
         name = "list_purchases",
-        description = "List apps owned by the authenticated account, with pagination."
+        description = "List apps owned by the authenticated account, with pagination.",
+        annotations(read_only_hint = true, idempotent_hint = false)
     )]
     async fn list_purchases(
         &self,
@@ -221,7 +225,8 @@ impl AppStoreServer {
 
     #[tool(
         name = "purchase_app",
-        description = "Acquire a license for a free app; paid apps are unsupported."
+        description = "Acquire a license for a free app; paid apps are unsupported.",
+        annotations(read_only_hint = false, idempotent_hint = false)
     )]
     async fn purchase_app(&self, Parameters(input): Parameters<AppInput>) -> CallToolResult {
         self.run(move || {
@@ -239,7 +244,8 @@ impl AppStoreServer {
 
     #[tool(
         name = "download_app",
-        description = "Download an app package; optionally acquire a free license."
+        description = "Download an app package; optionally acquire a free license.",
+        annotations(read_only_hint = false, idempotent_hint = false)
     )]
     async fn download_app(&self, Parameters(input): Parameters<DownloadInput>) -> CallToolResult {
         self.run(move || {
