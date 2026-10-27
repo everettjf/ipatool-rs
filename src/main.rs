@@ -2590,6 +2590,72 @@ mod tests {
     }
 
     #[test]
+    fn download_uses_refreshed_account_for_later_purchase() {
+        let mut account = Account::default();
+        account.password_token = "expired".into();
+        let events = std::cell::RefCell::new(Vec::new());
+        let (output, purchased) = retry_download(
+            &mut account,
+            true,
+            |account| {
+                assert_eq!(account.password_token, "expired");
+                events.borrow_mut().push("refresh");
+                let mut renewed = Account::default();
+                renewed.password_token = "renewed".into();
+                Ok(renewed)
+            },
+            |account, purchase_required, purchased| {
+                if account.password_token == "expired" {
+                    events.borrow_mut().push("expired download");
+                    return Err(PasswordTokenExpired.into());
+                }
+                if !*purchase_required {
+                    events.borrow_mut().push("unlicensed download");
+                    return Err(LicenseRequired.into());
+                }
+                assert_eq!(account.password_token, "renewed");
+                events.borrow_mut().push("purchase and download");
+                *purchase_required = false;
+                *purchased = true;
+                Ok("downloaded")
+            },
+        )
+        .unwrap();
+        assert_eq!(output, "downloaded");
+        assert!(purchased);
+        assert_eq!(account.password_token, "renewed");
+        assert_eq!(
+            events.into_inner(),
+            [
+                "expired download",
+                "refresh",
+                "unlicensed download",
+                "purchase and download"
+            ]
+        );
+    }
+
+    #[test]
+    fn download_does_not_purchase_without_explicit_flag() {
+        let mut account = Account::default();
+        let mut attempts = 0;
+        let error = retry_download::<()>(
+            &mut account,
+            false,
+            |_| unreachable!("license errors must not trigger login"),
+            |_, purchase_required, purchased| {
+                attempts += 1;
+                assert!(!*purchase_required);
+                assert!(!*purchased);
+                Err(LicenseRequired.into())
+            },
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<LicenseRequired>().is_some());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
     fn download_stops_after_three_expired_attempts() {
         let mut account = Account::default();
         let mut refreshes = 0;
