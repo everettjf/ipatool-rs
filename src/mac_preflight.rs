@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use apple_xar::reader::XarReader;
+use apple_xar::{reader::XarReader, table_of_contents::FileType};
 use roxmltree::Document;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
@@ -85,7 +85,9 @@ fn parse_preflight_reader<R: Read + Seek + Debug>(
         bail!("Mac preflight XAR checksum mismatch");
     }
     let files = archive.files().context("list Mac preflight XAR files")?;
-    let mut distributions = files.iter().filter(|(name, _)| name == "Distribution");
+    let mut distributions = files
+        .iter()
+        .filter(|(name, file)| name == "Distribution" && matches!(file.file_type, FileType::File));
     let (_, distribution) = distributions
         .next()
         .context("Mac preflight package has no Distribution")?;
@@ -259,6 +261,15 @@ mod tests {
         extra_size: usize,
         toc_padding: usize,
     ) -> Vec<u8> {
+        fixture_xar_with_toc_entry(distribution, extra_size, toc_padding, "")
+    }
+
+    fn fixture_xar_with_toc_entry(
+        distribution: &str,
+        extra_size: usize,
+        toc_padding: usize,
+        additional_entry: &str,
+    ) -> Vec<u8> {
         let checksum = ChecksumType::Sha1
             .digest_data(distribution.as_bytes())
             .unwrap();
@@ -291,7 +302,7 @@ mod tests {
             format!("<!--{}-->", "x".repeat(toc_padding))
         };
         let toc = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?><xar><toc><checksum style="sha1"><offset>0</offset><size>20</size></checksum><creation-time>2023-01-04T22:53:15</creation-time>{entry}{extra_entry}{comment}</toc></xar>"#
+            r#"<?xml version="1.0" encoding="UTF-8"?><xar><toc><checksum style="sha1"><offset>0</offset><size>20</size></checksum><creation-time>2023-01-04T22:53:15</creation-time>{entry}{extra_entry}{additional_entry}{comment}</toc></xar>"#
         );
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(toc.as_bytes()).unwrap();
@@ -325,6 +336,19 @@ mod tests {
                 .to_string()
                 .contains("checksum mismatch")
         );
+    }
+
+    #[test]
+    fn ignores_directory_named_distribution() {
+        let package = fixture_xar_with_toc_entry(
+            DISTRIBUTION,
+            0,
+            0,
+            r#"<file id="3"><type>directory</type><name>Distribution</name></file>"#,
+        );
+        let metadata = parse_preflight_xar(&package, "com.example.mac").unwrap();
+        assert_eq!(metadata.display_version, "4.2");
+        assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
     }
 
     #[test]
