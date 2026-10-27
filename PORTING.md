@@ -189,6 +189,7 @@ The 2026-10-27 help-only audit compared long flags on the root command, `auth` a
 - Go excludes directories and special XAR entries from its package file count; Rust's flattened archive list included them, so a package with no regular payload passed validation. A 274-byte synthetic XAR containing a directory, symlink, and FIFO produced `files=0` in Go and passed the old Rust validator. Rust now requires at least one regular file. The regression passed on macOS ARM64 and Rosetta x86_64; the full active suite passed 375 library and 40 CLI tests, plus formatting and Clippy. The signed universal release built from `8c75842` passed signature verification, contained both slices, and returned identical live US macOS Keynote results on both. SHA-256: `3c84ed367afe6ab8fc24a11a6bcc5fff371093a99ae56ff30b8c0eaa9df5ba5e`.
 - Mac version metadata now takes its build timestamp only from a regular `Payload` file. The Go XAR reader exposed only `App.pkg/PackageInfo` in a 448-byte synthetic archive whose `Payload` was a timestamped directory; the old Rust reader accepted that directory as a timestamp source. The regression failed before the fix and passed afterward on macOS ARM64 and Rosetta x86_64. The full active suite passed 376 library and 40 CLI tests, plus formatting and Clippy. The signed universal release built from `335973b` passed signature verification, contained both slices, and returned identical live US macOS Keynote results on both. SHA-256: `39d312d1a4e6e45c8eb2fc86c8c560686dc09d0aae5131b4b43a52c8190f6c46`.
 - Mac preflight `Distribution` lookup now filters out directory and special entries, as Go's XAR file list does. A synthetic XAR containing one regular `Distribution` plus a same-name directory passed the focused regression on macOS ARM64 and Rosetta x86_64; the previous Rust selection treated it as a duplicate. The full active suite passed 377 library and 40 CLI tests, plus formatting and Clippy. The signed universal release built from `9d4e9c3` passed signature verification, contained both slices, and returned identical live US macOS Keynote results on both. SHA-256: `00b244f6d0dcc2c04e510f6a971bf23017430ba5eeacf87f048d8003f9e8c3ad`.
+- At source `e2423f1`, the opt-in pinned StoreAgent tests initialized its guest global context and generated KBSync on native macOS ARM64 (release build) and Rosetta x86_64 (debug build). Both used cached Apple framework assets and no account or Keychain data. They do not validate account authentication, real `dpInfo`, or encrypted PKG decryption.
 
 ## Gates before claiming full parity
 
@@ -199,6 +200,41 @@ The 2026-10-27 help-only audit compared long flags on the root command, `auth` a
 5. Record any discovered differences, fix them in Rust, rerun the relevant verification, and commit each fix.
 
 ## Target-system checks
+
+### macOS (current priority)
+
+From the repository root, the following public checks need no account and
+should not request Keychain access:
+
+```sh
+./target/release/ipatool-macos-universal --version
+./target/release/ipatool-macos-universal --non-interactive search Keynote --platform macos --country US --limit 1
+```
+
+With a controlled Apple account, run the commands below interactively. Replace
+`APP_ID` with a free macOS app available to that account and `VERSION_ID` with
+a value returned by `list-versions`. Do not pass the password or 2FA code on
+the command line. Account commands use the macOS Keychain and may require its
+authorization dialog; `--non-interactive` is for the public checks above.
+
+```sh
+./target/release/ipatool-macos-universal auth login
+./target/release/ipatool-macos-universal auth info
+./target/release/ipatool-macos-universal list-purchases --platform macos --max-results 2
+./target/release/ipatool-macos-universal purchase --app-id APP_ID --platform macos
+./target/release/ipatool-macos-universal list-versions --app-id APP_ID --platform macos
+./target/release/ipatool-macos-universal get-version-metadata --app-id APP_ID --platform macos --external-version-id VERSION_ID
+./target/release/ipatool-macos-universal download --app-id APP_ID --platform macos --output /tmp/ipatool-macos-test.download
+file /tmp/ipatool-macos-test.download
+```
+
+The download response may select an IPA rather than a PKG for some Mac apps;
+inspect the resulting file before interpreting it as one format. Keep
+credentials, cookies, downloaded packages, and private FairPlay material out
+of the repository. A failing command and redacted error output are sufficient
+to continue the parity work.
+
+### Deferred iOS and other targets
 
 The current `ipatool-ios-arm64` is an `ldid`-signed iOS 15+ CLI binary for a
 jailbroken arm64 device. Rebuild with `scripts/build-ios.sh` after source code
