@@ -226,8 +226,8 @@ impl<R: Read + Seek + Sized + Debug> XarReader<R> {
 
     /// Write decoded file data for a given file record to a writer.
     ///
-    /// This will call [Self::write_file_data_heap_from_file] and will decode
-    /// that data stream, if the file data is encoded.
+    /// Streams archived bytes through a decoder, if the file data is encoded.
+    /// Reading the decoder to EOF also validates the compressed stream trailer.
     pub fn write_file_data_decoded_from_file(
         &mut self,
         file: &File,
@@ -235,22 +235,30 @@ impl<R: Read + Seek + Sized + Debug> XarReader<R> {
     ) -> XarResult<usize> {
         let data = file.data.as_ref().ok_or(Error::FileNoData)?;
 
-        let mut writer = match data.encoding.style.as_str() {
-            "application/octet-stream" => Box::new(writer) as Box<dyn Write>,
+        if data.encoding.style == "application/octet-stream" {
+            return self.write_file_data_heap_from_file(file, writer);
+        }
+
+        let start = self
+            .heap_start_offset
+            .checked_add(data.offset)
+            .ok_or(Error::TableOfContentsCorrupted("file data offset overflow"))?;
+        self.reader.seek(SeekFrom::Start(start))?;
+        let input = self.reader.by_ref().take(data.length);
+        match data.encoding.style.as_str() {
             "application/x-bzip2" => {
-                Box::new(bzip2::write::BzDecoder::new(writer)) as Box<dyn Write>
+                std::io::copy(&mut bzip2::read::BzDecoder::new(input), writer)?;
             }
             // The media type is arguably wrong, as there is no gzip header.
             "application/x-gzip" => {
-                Box::new(flate2::write::ZlibDecoder::new(writer)) as Box<dyn Write>
+                std::io::copy(&mut flate2::read::ZlibDecoder::new(input), writer)?;
             }
-            "application/x-lzma" => Box::new(xz2::write::XzDecoder::new(writer)) as Box<dyn Write>,
-            encoding => {
-                return Err(Error::UnimplementedFileEncoding(encoding.to_string()));
+            "application/x-lzma" => {
+                std::io::copy(&mut xz2::read::XzDecoder::new(input), writer)?;
             }
-        };
-
-        self.write_file_data_heap_from_file(file, &mut writer)
+            encoding => return Err(Error::UnimplementedFileEncoding(encoding.to_string())),
+        }
+        Ok(data.length as _)
     }
 
     /// Write decoded file data for a given file ID to a writer.

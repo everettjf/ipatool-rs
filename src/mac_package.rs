@@ -452,21 +452,46 @@ mod tests {
     }
 
     fn xar_with_package_info(package_info: &str, mtime: Option<&str>) -> Vec<u8> {
+        xar_with_package_info_encoding(package_info, mtime, false, false)
+    }
+
+    fn xar_with_package_info_encoding(
+        package_info: &str,
+        mtime: Option<&str>,
+        compressed_info: bool,
+        truncate_stream: bool,
+    ) -> Vec<u8> {
         let info = package_info.as_bytes();
         let payload = b"installer payload";
+        let mut stored_info = if compressed_info {
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(info).unwrap();
+            encoder.finish().unwrap()
+        } else {
+            info.to_vec()
+        };
+        if truncate_stream {
+            stored_info.truncate(stored_info.len() - 4);
+        }
+        let encoding = if compressed_info {
+            "application/x-gzip"
+        } else {
+            "application/octet-stream"
+        };
         let info_checksum = sha1::Sha1::digest(info);
+        let stored_info_checksum = sha1::Sha1::digest(&stored_info);
         let payload_checksum = sha1::Sha1::digest(payload);
         let mtime = mtime
             .map(|value| format!("<mtime>{value}</mtime>"))
             .unwrap_or_default();
         let toc = format!(
-            "<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><creation-time>2025-01-01T00:00:00Z</creation-time><file id=\"1\"><type>directory</type><name>App.pkg</name><file id=\"2\"><type>file</type><name>PackageInfo</name><data><length>{}</length><offset>20</offset><size>{}</size><encoding style=\"application/octet-stream\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file><file id=\"3\"><type>file</type><name>Payload</name>{mtime}<data><length>{}</length><offset>{}</offset><size>{}</size><encoding style=\"application/octet-stream\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file></file></toc></xar>",
+            "<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><creation-time>2025-01-01T00:00:00Z</creation-time><file id=\"1\"><type>directory</type><name>App.pkg</name><file id=\"2\"><type>file</type><name>PackageInfo</name><data><length>{}</length><offset>20</offset><size>{}</size><encoding style=\"{encoding}\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file><file id=\"3\"><type>file</type><name>Payload</name>{mtime}<data><length>{}</length><offset>{}</offset><size>{}</size><encoding style=\"application/octet-stream\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file></file></toc></xar>",
+            stored_info.len(),
             info.len(),
-            info.len(),
-            hex(&info_checksum),
+            hex(&stored_info_checksum),
             hex(&info_checksum),
             payload.len(),
-            20 + info.len(),
+            20 + stored_info.len(),
             payload.len(),
             hex(&payload_checksum),
             hex(&payload_checksum)
@@ -484,7 +509,7 @@ mod tests {
         archive[24..28].copy_from_slice(&1u32.to_be_bytes());
         archive.extend_from_slice(&compressed);
         archive.extend_from_slice(&toc_checksum);
-        archive.extend_from_slice(info);
+        archive.extend_from_slice(&stored_info);
         archive.extend_from_slice(payload);
         archive
     }
@@ -690,6 +715,43 @@ mod tests {
             .unwrap();
             assert!(read_package_version_from_path(&path, "com.example.mac").is_err());
         }
+    }
+
+    #[test]
+    fn reads_compressed_package_info_version_and_checksums() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(
+            &path,
+            xar_with_package_info_encoding(
+                r#"<pkg-info><bundle id="com.example.mac" CFBundleShortVersionString="4.2"/></pkg-info>"#,
+                Some("2012-07-06T09:54:33Z"),
+                true,
+                false,
+            ),
+        )
+        .unwrap();
+        validate_mac_package(&path).unwrap();
+        let metadata = read_package_version_from_path(&path, "com.example.mac").unwrap();
+        assert_eq!(metadata.display_version, "4.2");
+        assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
+    }
+
+    #[test]
+    fn rejects_truncated_compressed_package_info() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(
+            &path,
+            xar_with_package_info_encoding(
+                r#"<pkg-info><bundle id="com.example.mac" CFBundleShortVersionString="4.2"/></pkg-info>"#,
+                Some("2012-07-06T09:54:33Z"),
+                true,
+                true,
+            ),
+        )
+        .unwrap();
+        assert!(read_package_version_from_path(&path, "com.example.mac").is_err());
     }
 
     #[test]
