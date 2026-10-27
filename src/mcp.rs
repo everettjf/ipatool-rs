@@ -102,6 +102,9 @@ struct SearchInput {
     term: String,
     /// Maximum results (default 5; visionOS supports up to 12).
     limit: Option<i64>,
+    /// Two-letter Store country; defaults to US.
+    #[serde(default, deserialize_with = "optional_non_null")]
+    country: Option<String>,
     /// iphone, ipad, appletv, watchos, visionos, or macos.
     #[serde(default, deserialize_with = "optional_non_null")]
     platform: Option<String>,
@@ -184,7 +187,8 @@ impl AppStoreServer {
             let limit = input.limit.unwrap_or(5);
             if limit < 1 { bail!("limit must be greater than 0"); }
             let platform = parse_platform(input.platform.as_deref())?;
-            let result = CatalogClient::new()?.search(&input.term, "US", limit, platform)?;
+            let country = input.country.as_deref().unwrap_or("US");
+            let result = CatalogClient::new()?.search(&input.term, country, limit, platform)?;
             Ok(json!({"term": input.term, "limit": limit, "platform": platform_value(platform), "count": result.count,
                 "apps": result.apps.iter().map(app_value).collect::<Vec<_>>() }))
         }).await
@@ -816,6 +820,12 @@ mod tests {
             serde_json::from_value::<SearchInput>(json!({"term":"", "platform":null})).is_err()
         );
         assert!(serde_json::from_value::<SearchInput>(json!({"term":"", "limit":null})).is_ok());
+        assert!(
+            serde_json::from_value::<SearchInput>(json!({"term":"Apple", "country":"JP"})).is_ok()
+        );
+        assert!(
+            serde_json::from_value::<SearchInput>(json!({"term":"Apple", "country":null})).is_err()
+        );
         assert!(serde_json::from_value::<AppInput>(json!({"app_id":null})).is_err());
         assert!(
             serde_json::from_value::<DownloadInput>(json!({"app_id":42, "output":null})).is_err()
