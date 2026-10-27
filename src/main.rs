@@ -26,6 +26,7 @@ use ipatool_rs::fairplay_oracle_domains::{
 use ipatool_rs::fairplay_oracle_export::export_checked_model;
 use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
+use ipatool_rs::fairplay_recover_capture::{RecoverFromAccountOptions, recover_from_account};
 use ipatool_rs::fairplay_recovery;
 use ipatool_rs::fairplay_recovery_output::{
     read_private_block, read_private_bytes, read_private_frame, read_private_model,
@@ -233,6 +234,19 @@ enum FairplayEnrollCommand {
         product_version: Option<String>,
         #[arg(long)]
         build_version: Option<String>,
+    },
+    /// Recover and decrypt a 26A428 capture from its private account-entry checkpoint.
+    RecoverFromAccount {
+        #[arg(long)]
+        capture: PathBuf,
+        #[arg(long)]
+        account_checkpoint: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 600)]
+        timeout_seconds: u64,
+        #[arg(long)]
+        skip_differential: bool,
     },
     /// Resume a matching private FairPlay checkpoint for a bounded instruction span.
     ContinueCheckpoint {
@@ -1178,6 +1192,29 @@ fn run() -> Result<()> {
                         manifest.files.len(),
                         manifest.app.selector_id,
                         output.display()
+                    ),
+                }
+            }
+            FairplayEnrollCommand::RecoverFromAccount {
+                capture,
+                account_checkpoint,
+                output,
+                timeout_seconds,
+                skip_differential,
+            } => {
+                let result = recover_from_account(RecoverFromAccountOptions {
+                    capture: &capture,
+                    account_checkpoint: &account_checkpoint,
+                    output: &output,
+                    timeout: Duration::from_secs(timeout_seconds),
+                    skip_differential,
+                })?;
+                match cli.format {
+                    Format::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+                    Format::Text => println!(
+                        "Recovered FairPlay enrollment for {} and decrypted IPA to {}",
+                        result.selector,
+                        result.decrypted_ipa.display()
                     ),
                 }
             }
@@ -2694,6 +2731,35 @@ mod tests {
                 command: FairplayEnrollCommand::ValidateOracleModel {
                     timeout_seconds: 2,
                     normal_cases: 16,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn fairplay_recover_from_account_accepts_private_paths() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "recover-from-account",
+            "--capture",
+            "/private/capture",
+            "--account-checkpoint",
+            "/private/account.pkl.gz",
+            "--output",
+            "/private/recovery",
+            "--timeout-seconds",
+            "900",
+            "--skip-differential",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::RecoverFromAccount {
+                    timeout_seconds: 900,
+                    skip_differential: true,
                     ..
                 }
             }
