@@ -366,8 +366,35 @@ fn write_reencoded(
     Ok(())
 }
 
+fn clean_slash_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|previous| *previous != "..") => {
+                parts.pop();
+            }
+            ".." if !absolute => parts.push(part),
+            ".." => {}
+            _ => parts.push(part),
+        }
+    }
+    let cleaned = parts.join("/");
+    if absolute {
+        format!("/{cleaned}")
+    } else if cleaned.is_empty() {
+        ".".to_owned()
+    } else {
+        cleaned
+    }
+}
+
 fn supf_for<'a>(member: &str, names: &'a HashSet<String>) -> Option<&'a str> {
-    let (directory, base) = member.rsplit_once('/')?;
+    let (directory, base) = match member.rsplit_once('/') {
+        Some((directory, base)) => (clean_slash_path(&member[..directory.len() + 1]), base),
+        None => (".".to_owned(), member),
+    };
     for suffix in [".v5.supf", ".supf"] {
         let candidate = format!("{directory}/SC_Info/{base}{suffix}");
         if let Some(name) = names.get(&candidate) {
@@ -935,6 +962,32 @@ mod tests {
         let member = archive.by_name(name).unwrap();
         let local = local_extra(&mut File::open(path).unwrap(), &member).unwrap();
         (local, member.extra_data().unwrap_or_default().to_vec())
+    }
+
+    #[test]
+    fn matches_go_slash_path_rules_for_adjacent_supf() {
+        let names: HashSet<_> = [
+            "./SC_Info/A.supf",
+            "Payload/A.app/SC_Info/A.supf",
+            "Payload/A.app/SC_Info/A.v5.supf",
+            "//SC_Info/A.supf",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for member in [
+            "Payload/A.app/A",
+            "./Payload/A.app/A",
+            "Payload//A.app/A",
+            "Payload/Temp/../A.app/A",
+        ] {
+            assert_eq!(
+                supf_for(member, &names),
+                Some("Payload/A.app/SC_Info/A.v5.supf")
+            );
+        }
+        assert_eq!(supf_for("A", &names), Some("./SC_Info/A.supf"));
+        assert_eq!(supf_for("/A", &names), Some("//SC_Info/A.supf"));
     }
 
     #[test]

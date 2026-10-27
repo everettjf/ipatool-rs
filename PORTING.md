@@ -123,6 +123,8 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 
 - The current Linux ARM64 and x86_64 releases from `a958e9f` ran in read-only Debian 13 QEMU/HVF and QEMU/TCG snapshots with the two-encrypted-slice universal IPA and synthetic model. Both guests reported the expected CPU architecture, decrypted two images and two pages with exit 0, and recorded `exact_mutation_scope: true` at slice offsets 4096 and 16384. Their output IPA SHA-256 matched the macOS ARM64 Rust release: `4c69d7f7d415d4cee5786e8472bb566efa2945b776f819d16f832c4960bfbc0f`. These runs used no account or private captured material and do not verify authenticated Store flows.
 
+- Go uses slash-path cleaning when locating a Mach-O member's adjacent SUPF. Rust previously missed root-level members and members whose ZIP names contained `./`, repeated slashes, or a `..` component. Rust now applies the same lexical directory rule without touching the filesystem. A focused regression test covers these cases and SUPF variant preference. For four synthetic IPAs, the Go reference and rebuilt Rust debug executable now both exit 0, with identical normalized reports and uncompressed output members.
+
 ## Gates before claiming full parity
 
 1. Verify authenticated Store flows with a disposable or controlled Apple account: login including 2FA, search storefront, purchase, purchase history, version metadata, mobile IPA, macOS IPA/PKG, retries, SINF, and MCP calls. Do not commit credentials, cookies, captures, or private models.
