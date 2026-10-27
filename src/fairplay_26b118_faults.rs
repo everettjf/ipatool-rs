@@ -1,0 +1,58 @@
+// Generated from the checked 26B118 Go fault map.
+
+const ROUND6: [OracleFault; 16] = [
+    OracleFault { pc: 0x100222ac4, register: 12, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222be4, register: 21, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222bdc, register: 4, shift: 0, value: 0, kind: FaultKind::Pointer, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222c20, register: 3, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222ab0, register: 14, shift: 0, value: 0, kind: FaultKind::Index, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222bcc, register: 19, shift: 0, value: 0, kind: FaultKind::Pointer, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222c18, register: 2, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222c40, register: 23, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222b98, register: 8, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222ae0, register: 1, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222c38, register: 22, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222c04, register: 24, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222ad0, register: 14, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222c28, register: 7, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222bf4, register: 6, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222c54, register: 9, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+];
+
+const ROUND7: [OracleFault; 16] = [
+    OracleFault { pc: 0x100222dbc, register: 7, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222d90, register: 3, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222dec, register: 24, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222c58, register: 9, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222d8c, register: 15, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222d20, register: 19, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222d84, register: 8, shift: 0, value: 0, kind: FaultKind::Pointer, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222dd8, register: 25, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222d14, register: 19, shift: 0, value: 0, kind: FaultKind::Index, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222c84, register: 15, shift: 0, value: 0, kind: FaultKind::Index, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222dd0, register: 6, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222db4, register: 2, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222c74, register: 9, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222dc0, register: 22, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222da4, register: 4, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222df4, register: 23, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+];
+
+const ROUND8: [OracleFault; 16] = [
+    OracleFault { pc: 0x100222e04, register: 9, shift: 0, value: 0, kind: FaultKind::Index, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222f1c, register: 7, shift: 0, value: 0, kind: FaultKind::Pointer, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222fa0, register: 14, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222f64, register: 22, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222f18, register: 3, shift: 0, value: 0, kind: FaultKind::Pointer, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222f88, register: 9, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222ed8, register: 2, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222f80, register: 1, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222ebc, register: 21, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222ecc, register: 23, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222f6c, register: 4, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222f48, register: 15, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222eb0, register: 19, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222ea4, register: 8, shift: 0, value: 0, kind: FaultKind::Index, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222f2c, register: 6, shift: 0, value: 0, kind: FaultKind::Pointer, restore: false, table_bytes: 0x400, entry_bytes: 4 },
+    OracleFault { pc: 0x100222fac, register: 24, shift: 0, value: 0, kind: FaultKind::Pointer, restore: true, table_bytes: 0x400, entry_bytes: 4 },
+];

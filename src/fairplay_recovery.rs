@@ -16,7 +16,7 @@ use crate::{
     fairplay_recovery_round::{RoundRecovery, first_permutation, recover_round, round_permutation},
     fairplay_recovery_step1, fairplay_recovery_step2,
     fairplay_recovery_step3::Step3Recovery,
-    fairplay_recovery_target::{SidbTarget, deterministic_input},
+    fairplay_recovery_target::{OracleTarget, deterministic_input},
 };
 
 pub struct Recovery {
@@ -45,7 +45,7 @@ fn apply_last_round_decrypt(
 }
 
 fn external_encodings(
-    target: &mut SidbTarget<'_>,
+    target: &mut impl OracleTarget,
     gtilde: &Encoding,
     step3: &Step3Recovery,
     round: &RoundRecovery,
@@ -100,7 +100,7 @@ fn external_encodings(
 
 /// Recover one private SIDB model using the checked public transform and a
 /// caller-supplied enrollment frame. The result contains secret key material.
-pub fn recover(target: &mut SidbTarget<'_>) -> Result<Recovery> {
+pub fn recover(target: &mut impl OracleTarget) -> Result<Recovery> {
     let started = Instant::now();
     let step1 = fairplay_recovery_step1::search(target)?;
     let gtilde = fairplay_recovery_step2::recover(target, &step1)?;
@@ -119,6 +119,7 @@ pub fn recover(target: &mut SidbTarget<'_>) -> Result<Recovery> {
 mod tests {
     use super::*;
     use crate::fairplay_oracle_model::OracleModel;
+    use crate::fairplay_recovery_target::SidbTarget;
     use sha2::{Digest, Sha256};
 
     #[test]

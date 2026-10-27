@@ -10,6 +10,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::credentials::{AccountStore, open_system_keychain};
 use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
+use ipatool_rs::fairplay_26b118;
 use ipatool_rs::fairplay_checkpoint::FairplayCheckpoint;
 use ipatool_rs::fairplay_checkpoint_run::{CheckpointRunner, MemoryTraceOptions, VirtualFileStat};
 use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
@@ -26,7 +27,7 @@ use ipatool_rs::fairplay_recovery_output::{
     read_private_block, read_private_bytes, read_private_frame, read_private_model,
     write_private_binary, write_private_model,
 };
-use ipatool_rs::fairplay_recovery_target::SidbTarget;
+use ipatool_rs::fairplay_recovery_target::{SidbTarget, WhiteboxTarget};
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
 use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
 use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
@@ -310,6 +311,21 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         slot: Option<usize>,
     },
+    /// Evaluate one private 16-byte block with a checked 26B118 oracle model.
+    EvaluateWhitebox {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(
+            long,
+            default_value = "0xffff",
+            help = "Fault metadata; 0xffff disables faults"
+        )]
+        metadata: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Recover an FPSENR2 enrollment model by testing state slots against a private SINF.
     RecoverState {
         #[arg(long, help = "Private 192/224-byte state field at object +0x304")]
@@ -364,6 +380,13 @@ enum FairplayEnrollCommand {
         model: Option<PathBuf>,
         #[arg(long)]
         enrollment_frame: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Recover a 26B118 AES model from a private white-box oracle model.
+    RecoverWhitebox {
+        #[arg(long)]
+        model: PathBuf,
         #[arg(long)]
         output: PathBuf,
     },
@@ -1400,6 +1423,33 @@ fn run() -> Result<()> {
                     }
                 }
             }
+            FairplayEnrollCommand::EvaluateWhitebox {
+                model,
+                input,
+                metadata,
+                output,
+            } => {
+                let model = OracleModel::load_private(&model)?;
+                let input = read_private_block::<16>(&input)?;
+                let metadata = u32::try_from(parse_address(&metadata)?)
+                    .context("white-box fault metadata exceeds 32 bits")?;
+                let result = fairplay_26b118::evaluate(&model, &input, metadata)?;
+                write_private_binary(&output, &result)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "output": output,
+                            "bytes": result.len(),
+                            "metadata": format!("{metadata:#x}"),
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Evaluated private 26B118 white-box block in {}",
+                        output.display()
+                    ),
+                }
+            }
             FairplayEnrollCommand::RecoverState {
                 state_source,
                 source_block,
@@ -1547,6 +1597,25 @@ fn run() -> Result<()> {
                         "Recovered private SIDB AES model in {} ({:.1} ms)",
                         output.display(),
                         recovered.milliseconds
+                    ),
+                }
+            }
+            FairplayEnrollCommand::RecoverWhitebox { model, output } => {
+                let oracle = OracleModel::load_private(&model)?;
+                let mut target = WhiteboxTarget::new(&oracle)?;
+                let recovered = fairplay_recovery::recover(&mut target)?;
+                write_private_model(&output, &recovered)?;
+                match cli.format {
+                    Format::Json => println!(
+                        "{}",
+                        serde_json::json!({
+                            "output": output,
+                            "recovery_milliseconds": recovered.milliseconds,
+                        })
+                    ),
+                    Format::Text => println!(
+                        "Recovered private 26B118 white-box AES model in {}",
+                        output.display()
                     ),
                 }
             }
@@ -2110,6 +2179,46 @@ mod tests {
                     slot: None,
                     ..
                 }
+            }
+        ));
+    }
+
+    #[test]
+    fn whitebox_commands_accept_private_model_and_fault_metadata() {
+        let evaluate = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "evaluate-whitebox",
+            "--model",
+            "/private/oracle.model.gz",
+            "--input",
+            "/private/block.bin",
+            "--metadata",
+            "0x01000008",
+            "--output",
+            "/private/result.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            evaluate.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::EvaluateWhitebox { .. }
+            }
+        ));
+        let recover = Cli::try_parse_from([
+            "ipatool",
+            "fairplay-enroll",
+            "recover-whitebox",
+            "--model",
+            "/private/oracle.model.gz",
+            "--output",
+            "/private/recovered.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            recover.command,
+            Command::FairplayEnroll {
+                command: FairplayEnrollCommand::RecoverWhitebox { .. }
             }
         ));
     }

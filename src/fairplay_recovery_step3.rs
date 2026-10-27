@@ -11,7 +11,7 @@ use crate::{
         MatrixCandidate, association, c_coefficient, c_value, decrypt_candidates, inverse_table,
     },
     fairplay_recovery_math::{Encoding, Mat8, intertwiner_basis, invertible_from_basis},
-    fairplay_recovery_target::{OracleJob, SidbTarget, attack_view, deterministic_input},
+    fairplay_recovery_target::{OracleJob, OracleTarget, attack_view, deterministic_input},
 };
 
 #[derive(Default)]
@@ -25,7 +25,7 @@ pub struct Step3Recovery {
     pub coefficient: [u8; 16],
 }
 
-pub fn recover(target: &mut SidbTarget<'_>, gtilde: &Encoding) -> Result<Step3Recovery> {
+pub fn recover(target: &mut impl OracleTarget, gtilde: &Encoding) -> Result<Step3Recovery> {
     let reference = deterministic_input(0);
     let raw = target.apply(reference)?;
     let reference_view = attack_view(raw, std::slice::from_ref(gtilde), false);
@@ -221,6 +221,7 @@ fn build_gbar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fairplay_recovery_target::SidbTarget;
     use crate::{
         fairplay_oracle_model::OracleModel, fairplay_recovery_step1::search,
         fairplay_recovery_step2,

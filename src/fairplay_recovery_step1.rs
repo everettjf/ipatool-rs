@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     fairplay_recovery_math::shift_rows,
-    fairplay_recovery_target::{OracleJob, SidbTarget, counter},
+    fairplay_recovery_target::{OracleJob, OracleTarget, counter},
 };
 
 const PAIRS: [[usize; 4]; 3] = [[0, 1, 2, 3], [0, 2, 3, 1], [0, 3, 1, 2]];
@@ -126,7 +126,7 @@ impl Step1State {
 
 /// Search up to the checked eight-million-block bound for a complete Step 1.
 /// The reference is the same deterministic input used by the original attack.
-pub fn search(target: &mut SidbTarget<'_>) -> Result<Step1Selection> {
+pub fn search(target: &mut impl OracleTarget) -> Result<Step1Selection> {
     let reference_input = crate::fairplay_recovery_target::deterministic_input(0);
     let reference_output = shift_rows(target.apply(reference_input)?);
     let mut state = Step1State::new(reference_input, reference_output);
@@ -154,7 +154,7 @@ pub fn search(target: &mut SidbTarget<'_>) -> Result<Step1Selection> {
 }
 
 pub fn verify(
-    target: &mut SidbTarget<'_>,
+    target: &mut impl OracleTarget,
     reference_input: [u8; 16],
     selection: &Step1Selection,
 ) -> Result<()> {
@@ -196,6 +196,7 @@ pub fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fairplay_recovery_target::SidbTarget;
     use crate::{
         fairplay_oracle_model::OracleModel, fairplay_recovery_target::deterministic_input,
     };

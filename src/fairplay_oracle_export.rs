@@ -13,8 +13,11 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
-    fairplay_checkpoint::FairplayCheckpoint, fairplay_checkpoint_run::CheckpointRunner,
-    fairplay_frame::BUILD_HASH, fairplay_oracle_model::OracleModel,
+    fairplay_26b118::{BUILD_HASH as HASH_26B118, required_index_sites},
+    fairplay_checkpoint::FairplayCheckpoint,
+    fairplay_checkpoint_run::CheckpointRunner,
+    fairplay_frame::BUILD_HASH,
+    fairplay_oracle_model::OracleModel,
     fairplay_recovery_output::open_private_file,
 };
 
@@ -26,33 +29,8 @@ const MAX_TRACE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_TRACE_EVENTS: usize = 2_000_000;
 const ENTRY_26A428: u64 = 0x1002_34cdc;
 const BLOCK_26A428: u64 = 0x7100_0001_4ee8;
-const HASH_26B118: [u8; 32] = [
-    0xf6, 0x8e, 0x44, 0x07, 0xe9, 0x0a, 0xf5, 0x46, 0x6d, 0x27, 0x66, 0xe1, 0xb1, 0xc4, 0x63, 0x72,
-    0x60, 0xd0, 0x8c, 0xb0, 0x51, 0x8f, 0x99, 0x1e, 0x17, 0x97, 0xac, 0x6c, 0x49, 0x64, 0x43, 0x9d,
-];
 const ENTRY_26B118: u64 = 0x1002_21894;
 const BLOCK_26B118: u64 = 0x7100_0001_4ee0;
-// The index-fault sites in generated_26b118.go. Pointer faults need no domains.
-const INDEX_SITES_26B118: &[(u64, u8)] = &[
-    (0x1002_22ab0, 14),
-    (0x1002_22ac4, 12),
-    (0x1002_22ad0, 14),
-    (0x1002_22ae0, 1),
-    (0x1002_22b98, 8),
-    (0x1002_22c54, 9),
-    (0x1002_22c58, 9),
-    (0x1002_22c74, 9),
-    (0x1002_22c84, 15),
-    (0x1002_22d14, 19),
-    (0x1002_22d20, 19),
-    (0x1002_22e04, 9),
-    (0x1002_22ea4, 8),
-    (0x1002_22eb0, 19),
-    (0x1002_22ebc, 21),
-    (0x1002_22ecc, 23),
-    (0x1002_22ed8, 2),
-    (0x1002_22f48, 15),
-];
 type IndexDomains = BTreeMap<(u64, u8), Zeroizing<[u64; 256]>>;
 
 #[derive(Deserialize)]
@@ -174,7 +152,7 @@ fn validate_26b118_domains(
     if report.binary_sha256 != expected_hash {
         bail!("index domains do not match the checkpoint build");
     }
-    let expected: BTreeSet<_> = INDEX_SITES_26B118.iter().copied().collect();
+    let expected = required_index_sites();
     if report.domains.len() != expected.len() {
         bail!("26B118 requires exactly {} index domains", expected.len());
     }
@@ -391,9 +369,9 @@ mod tests {
             .collect::<String>();
         let make_report = || IndexDomainReport {
             binary_sha256: hash.clone(),
-            domains: INDEX_SITES_26B118
-                .iter()
-                .map(|&(pc, register)| IndexDomain {
+            domains: required_index_sites()
+                .into_iter()
+                .map(|(pc, register)| IndexDomain {
                     pc: format!("{pc:#x}"),
                     register,
                     values: (0..256).map(|value| format!("{value:#x}")).collect(),

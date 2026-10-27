@@ -8,8 +8,9 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
+    fairplay_26b118,
     fairplay_frame::BUILD_HASH,
-    fairplay_oracle_model::{OracleModel, OracleState},
+    fairplay_oracle_model::{FaultKind, OracleModel, OracleState},
     fairplay_recovery_math::{Encoding, mix_columns, shift_rows},
     fairplay_sidb::{evaluate_in_state, fault_for_metadata},
 };
@@ -18,6 +19,28 @@ use crate::{
 pub struct OracleJob {
     pub block: [u8; 16],
     pub metadata: u32,
+}
+
+pub trait OracleTarget {
+    fn evaluate_jobs(&mut self, jobs: &[OracleJob]) -> Result<Vec<[u8; 16]>>;
+
+    fn apply(&mut self, block: [u8; 16]) -> Result<[u8; 16]> {
+        Ok(self.evaluate_jobs(&[OracleJob {
+            block,
+            metadata: 0xffff,
+        }])?[0])
+    }
+
+    fn apply_fault(
+        &mut self,
+        block: [u8; 16],
+        round: u16,
+        position: u8,
+        xor: u8,
+    ) -> Result<[u8; 16]> {
+        let metadata = u32::from(round) | (u32::from(position) << 16) | (u32::from(xor) << 24);
+        Ok(self.evaluate_jobs(&[OracleJob { block, metadata }])?[0])
+    }
 }
 
 pub struct SidbTarget<'a> {
@@ -63,6 +86,50 @@ impl<'a> SidbTarget<'a> {
     ) -> Result<[u8; 16]> {
         let metadata = u32::from(round) | (u32::from(position) << 16) | (u32::from(xor) << 24);
         Ok(self.evaluate_jobs(&[OracleJob { block, metadata }])?[0])
+    }
+}
+
+impl OracleTarget for SidbTarget<'_> {
+    fn evaluate_jobs(&mut self, jobs: &[OracleJob]) -> Result<Vec<[u8; 16]>> {
+        SidbTarget::evaluate_jobs(self, jobs)
+    }
+}
+
+pub struct WhiteboxTarget<'a> {
+    model: &'a OracleModel,
+    state: OracleState<'a>,
+}
+
+impl<'a> WhiteboxTarget<'a> {
+    pub fn new(model: &'a OracleModel) -> Result<Self> {
+        if model.binary_hash != fairplay_26b118::BUILD_HASH {
+            bail!("white-box oracle model does not match the checked 26B118 build");
+        }
+        for (pc, register) in fairplay_26b118::required_index_sites() {
+            if model.domain(pc, register).is_none() {
+                bail!("26B118 white-box model lacks learned index domain at {pc:#x}/x{register}");
+            }
+        }
+        Ok(Self {
+            model,
+            state: model.state(),
+        })
+    }
+}
+
+impl OracleTarget for WhiteboxTarget<'_> {
+    fn evaluate_jobs(&mut self, jobs: &[OracleJob]) -> Result<Vec<[u8; 16]>> {
+        jobs.iter()
+            .map(|job| {
+                let fault = fairplay_26b118::fault_for_metadata(job.metadata)?;
+                if fault.kind == FaultKind::Index
+                    && self.model.domain(fault.pc, fault.register).is_none()
+                {
+                    bail!("26B118 index fault requires its learned domain");
+                }
+                fairplay_26b118::evaluate_in_state(&mut self.state, &job.block, fault)
+            })
+            .collect()
     }
 }
 
@@ -127,6 +194,40 @@ mod tests {
         assert_eq!(hex(&outputs[3]), "3195f1b50a1e72888eaa6b292ccd0772");
         assert_eq!(target.apply([0; 16]).unwrap(), outputs[0]);
         assert_eq!(target.apply_fault([0; 16], 9, 0, 1).unwrap(), outputs[3]);
+    }
+
+    #[test]
+    fn whitebox_target_requires_domains_and_evaluates_batches() {
+        let without_domains = OracleModel::parse_gzip(include_bytes!(
+            "../tests/fixtures/fairplay-oracle-26b118-synthetic.model.gz"
+        ))
+        .unwrap();
+        assert!(WhiteboxTarget::new(&without_domains).is_err());
+
+        let model = OracleModel::parse_gzip(include_bytes!(
+            "../tests/fixtures/fairplay-oracle-26b118-synthetic-domains.model.gz"
+        ))
+        .unwrap();
+        assert_eq!(model.domain_count(), 18);
+        let mut target = WhiteboxTarget::new(&model).unwrap();
+        let block = core::array::from_fn(|index| index as u8);
+        let outputs = target
+            .evaluate_jobs(&[
+                OracleJob {
+                    block,
+                    metadata: 0xffff,
+                },
+                OracleJob {
+                    block,
+                    metadata: 0x0100_0008,
+                },
+            ])
+            .unwrap();
+        assert_eq!(outputs, vec![block, block]);
+        assert_eq!(
+            target.state.digest(),
+            "be849dbd2dc2935d99b2e1b70c99ce349d5ccb6069b202492297bbce21ee9b3a"
+        );
     }
 
     #[test]

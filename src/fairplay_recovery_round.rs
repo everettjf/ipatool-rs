@@ -13,7 +13,7 @@ use crate::{
         Encoding, INV_SHIFT, SBOX, gf_inv, gf_mul, inv_shift_rows, revert_aes128_round_key,
     },
     fairplay_recovery_step3::Step3Recovery,
-    fairplay_recovery_target::{OracleJob, SidbTarget, attack_view, deterministic_input},
+    fairplay_recovery_target::{OracleJob, OracleTarget, attack_view, deterministic_input},
 };
 
 #[derive(Clone, Copy)]
@@ -175,7 +175,7 @@ fn meet(
 }
 
 fn column_slice(
-    target: &mut SidbTarget<'_>,
+    target: &mut impl OracleTarget,
     plaintext: [u8; 16],
     reference: [u8; 16],
     column: usize,
@@ -243,7 +243,7 @@ pub fn first_permutation(gtilde: &Encoding, gbar: &Encoding, coefficient: [u8; 1
 }
 
 pub fn recover_step4(
-    target: &mut SidbTarget<'_>,
+    target: &mut impl OracleTarget,
     gtilde: &Encoding,
     step3: &Step3Recovery,
 ) -> Result<([u8; 16], [u8; 16])> {
@@ -315,7 +315,7 @@ pub fn round_permutation(lambda: [u8; 16], beta: [u8; 16]) -> Encoding {
 }
 
 pub fn recover_step5(
-    target: &mut SidbTarget<'_>,
+    target: &mut impl OracleTarget,
     gtilde: &Encoding,
     step3: &Step3Recovery,
     lambda: [u8; 16],
@@ -350,7 +350,7 @@ pub fn recover_step5(
 }
 
 pub fn recover_round(
-    target: &mut SidbTarget<'_>,
+    target: &mut impl OracleTarget,
     gtilde: &Encoding,
     step3: &Step3Recovery,
 ) -> Result<RoundRecovery> {
@@ -368,6 +368,7 @@ pub fn recover_round(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fairplay_recovery_target::SidbTarget;
     use crate::{
         fairplay_oracle_model::OracleModel, fairplay_recovery_step1::search,
         fairplay_recovery_step2, fairplay_recovery_step3,

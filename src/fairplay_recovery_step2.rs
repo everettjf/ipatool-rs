@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 use crate::{
     fairplay_recovery_math::{Encoding, INV_SHIFT, shift_rows},
     fairplay_recovery_step1::Step1Selection,
-    fairplay_recovery_target::{OracleJob, SidbTarget},
+    fairplay_recovery_target::{OracleJob, OracleTarget},
 };
 
 fn fault_byte(position: usize, candidate: usize) -> u8 {
@@ -69,7 +69,7 @@ pub fn tolhuizen(rows: &[[u8; 256]; 256]) -> Result<[u8; 256]> {
     Ok(result)
 }
 
-pub fn recover(target: &mut SidbTarget<'_>, step1: &Step1Selection) -> Result<Encoding> {
+pub fn recover(target: &mut impl OracleTarget, step1: &Step1Selection) -> Result<Encoding> {
     if step1.matrices.len() != 16 || step1.companions.len() != 16 {
         bail!("step1 selection does not contain sixteen byte positions");
     }
@@ -154,6 +154,7 @@ pub fn recover(target: &mut SidbTarget<'_>, step1: &Step1Selection) -> Result<En
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fairplay_recovery_target::SidbTarget;
     use crate::{fairplay_oracle_model::OracleModel, fairplay_recovery_step1::search};
     use sha2::{Digest, Sha256};
 

@@ -11,6 +11,7 @@ pub mod download_package;
 pub mod dyld_cache;
 pub mod dyld_export;
 pub mod fairplay;
+pub mod fairplay_26b118;
 pub mod fairplay_arm64;
 pub mod fairplay_checkpoint;
 pub mod fairplay_checkpoint_run;
