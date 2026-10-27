@@ -10387,6 +10387,25 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_getpid_matches_go_emulator() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let calls = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .filter(|call| call.symbol.trim_start_matches('_') == "getpid")
+            .map(|call| call.address)
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        for address in calls {
+            assert_eq!(runtime.call(address, &[]).unwrap(), 123);
+        }
+    }
+
+    #[test]
     fn purchase_validation_accepts_unrelated_plist_data() {
         let body = br#"<plist version="1.0"><dict><key>price</key><string>0</string><key>salableAdamId</key><string>1234</string><key>pricingParameters</key><string>STDQ</string><key>productType</key><string>C</string><key>opaque</key><data>AQID</data></dict></plist>"#;
         let parameters = serde_json::json!({
