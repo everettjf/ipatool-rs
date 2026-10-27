@@ -1,5 +1,7 @@
 //! Repack downloaded IPAs with account metadata, artwork, and Store SINF data.
 
+#[cfg(unix)]
+use std::{fs, fs::OpenOptions, os::unix::fs::OpenOptionsExt};
 use std::{
     fs::File,
     io::{Read, Write},
@@ -27,7 +29,7 @@ pub fn patch_ipa(
         File::open(source).with_context(|| format!("open IPA {}", source.display()))?;
     let mut archive = ZipArchive::new(source_file).context("open downloaded IPA ZIP")?;
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let output = tempfile::NamedTempFile::new_in(parent)
+    let output = output_file(parent, destination)
         .with_context(|| format!("create temporary IPA in {}", parent.display()))?;
     let additions = tempfile::NamedTempFile::new_in(parent)
         .with_context(|| format!("create temporary IPA entries in {}", parent.display()))?;
@@ -76,6 +78,40 @@ pub fn patch_ipa(
         .persist(destination)
         .with_context(|| format!("publish patched IPA {}", destination.display()))?;
     Ok(())
+}
+
+fn output_file(parent: &Path, destination: &Path) -> Result<tempfile::NamedTempFile> {
+    #[cfg(unix)]
+    {
+        let existing_permissions = match fs::metadata(destination) {
+            Ok(metadata) => Some(metadata.permissions()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("inspect existing IPA permissions"),
+        };
+        let output = tempfile::Builder::new().make_in(parent, |path| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .open(path)
+        })?;
+        if let Some(permissions) = existing_permissions {
+            output
+                .as_file()
+                .set_permissions(permissions)
+                .context("preserve existing IPA permissions")?;
+        }
+        Ok(output)
+    }
+    #[cfg(not(unix))]
+    {
+        let output = tempfile::NamedTempFile::new_in(parent)?;
+        if let Ok(metadata) = std::fs::metadata(destination) {
+            output.as_file().set_permissions(metadata.permissions())?;
+        }
+        Ok(output)
+    }
 }
 
 fn sinf_paths(archive: &mut ZipArchive<File>, count: usize) -> Result<Vec<String>> {
@@ -164,9 +200,54 @@ fn read_plist_entry(archive: &mut ZipArchive<File>, index: usize) -> Result<Valu
 mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom};
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     fn metadata(value: serde_json::Value) -> Value {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_ipa_uses_normal_file_mode_and_replacement_keeps_existing_mode() {
+        let (directory, input) = source(None);
+        let output = directory.path().join("patched.ipa");
+        let control = directory.path().join("control");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&control)
+            .unwrap();
+        let new_mode = fs::metadata(&control).unwrap().permissions().mode() & 0o777;
+        patch_ipa(
+            &input,
+            &output,
+            &metadata(serde_json::json!({})),
+            "account",
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            new_mode
+        );
+
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o640)).unwrap();
+        patch_ipa(
+            &input,
+            &output,
+            &metadata(serde_json::json!({})),
+            "account",
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 
     fn source(manifest: Option<&str>) -> (tempfile::TempDir, std::path::PathBuf) {
