@@ -17,11 +17,12 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 
 ## Build and test evidence
 
-- `cargo test --all-targets`: 300 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
+- `cargo test --all-targets`: 301 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
 - `cargo clippy --all-targets -- -D warnings` passed after the current CLI and MCP changes.
 - `cargo check` passed for macOS x86_64, Linux x86_64 and ARM64, Windows x86_64 GNU and ARM64 GNU/LLVM, and iOS ARM64. Cross-target C dependencies required local cross compiler and archiver wrappers on this macOS host.
 - Release binaries were built for macOS ARM64 and x86_64 (Mach-O), Linux x86_64 and ARM64 (ELF), Windows x86_64 and ARM64 (PE), and iOS ARM64 (Mach-O). The macOS x86_64 binary ran under Rosetta and completed a public catalog search. The iOS binary is signed with `ldid` and private entitlements for a jailbroken device, declares iOS 15.0 as its minimum, and contains the Unicorn API symbols. `ldid -e` confirms the embedded entitlements, while macOS `codesign --verify` does not accept this signature; execution and trust must be checked on the target device.
-- At commit `1055c22`, all seven release targets were rebuilt: macOS ARM64/x86_64, Linux ARM64/x86_64, Windows ARM64/x86_64, and iOS ARM64. `file` confirmed the Linux ELF and Windows PE architectures. The macOS x86_64 binary ran under Rosetta and completed a live Japan catalog search. The available `ipatool-ios-arm64` is an arm64 Mach-O with minimum iOS 15.0, embedded `ldid` entitlements, and SHA-256 `98c70e82966a38d7e094ee1d6606cfb399097718d5af0a3658526abe5c7ef56b`. The later plist fixes require rebuilding releases before target-device validation.
+- At commit `1055c22`, all seven release targets were rebuilt: macOS ARM64/x86_64, Linux ARM64/x86_64, Windows ARM64/x86_64, and iOS ARM64. `file` confirmed the Linux ELF and Windows PE architectures. The macOS x86_64 binary ran under Rosetta and completed a live Japan catalog search. Those desktop release binaries predate the later plist fixes and require rebuilding before target-system validation.
+- The iOS ARM64 binary was rebuilt from source commit `5b35119` after the plist fixes. `file` reports an arm64 Mach-O; `vtool` reports platform iOS and minimum version 15.0; `ldid -e` shows the embedded entitlements; and `llvm-nm` finds the linked Unicorn API symbols. Its SHA-256 is `5ce38e670f75418da57b988181cb7d1f8ff1c4ea1f9708574ff2ffc2cb4a827f`. It still needs execution on the target device.
 - `scripts/build-windows-arm64.sh` reproducibly links the Windows ARM64 release with a checksum-pinned llvm-mingw toolchain cached under `target/toolchains`. The resulting PE reports `IMAGE_FILE_MACHINE_ARM64` and does not import the toolchain's `libunwind.dll`; Windows ARM64 runtime behavior still requires a target host.
 - `scripts/build-linux.sh x86_64` and `scripts/build-linux.sh aarch64` rebuilt both Linux releases from current source with Zig 0.17.0 and a glibc 2.17 target. Zig rejects Rust's Cortex-A53 linker workaround on ARM64, so the script removes that flag; actual Cortex-A53 hardware still needs validation.
 - Earlier Linux ARM64 and x86_64 release binaries booted inside QEMU with SHA-256-verified Debian netboot kernel/initramfs images. Both returned version 0.1.0, completed a live public `Apple`/US search, and served MCP over stdio with six tools and the expected invalid-search error. This checks executable startup, TLS/HTTP catalog access, and MCP transport on those artifacts; authenticated Store and package workflows remain untested there.
@@ -42,9 +43,9 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 
 ## Target-system checks
 
-The last built `ipatool-ios-arm64` is an `ldid`-signed iOS 15+ CLI binary for a
-jailbroken arm64 device. Rebuild the latest source with `scripts/build-ios.sh`
-before copying it to the device. Make it executable, then first run these
+The current `ipatool-ios-arm64` is an `ldid`-signed iOS 15+ CLI binary for a
+jailbroken arm64 device. Rebuild with `scripts/build-ios.sh` if source code
+changes after commit `5b35119`. Copy it to the device, make it executable, and first run these
 read-only commands:
 
 Store and SAP commands need four checksum-pinned Apple framework files. A
