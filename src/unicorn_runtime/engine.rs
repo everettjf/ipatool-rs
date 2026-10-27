@@ -25,6 +25,7 @@ pub const REG_X0: i32 = 199;
 pub const REG_X1: i32 = 200;
 pub const REG_X29: i32 = 1;
 pub const REG_PC: i32 = 260;
+const REG_V0: i32 = 228;
 const ARM64: i32 = 2;
 const MODE_ARM: i32 = 0;
 const PROT_ALL: u32 = 7;
@@ -35,6 +36,13 @@ const HOOK_UNMAPPED_MEMORY: i32 = 1 << 4 | 1 << 5 | 1 << 6;
 const HOOK_MEMORY_READ: i32 = 1 << 10;
 const HOOK_MEMORY_WRITE: i32 = 1 << 11;
 const HOOK_MEMORY_ACCESS: i32 = 1 << 10 | 1 << 11;
+
+fn require_scalar_register(register: i32) -> Result<()> {
+    if (REG_V0..REG_PC).contains(&register) {
+        bail!("Unicorn register {register} is 128-bit; use reg_read_128 or reg_write_128");
+    }
+    Ok(())
+}
 
 type Handle = *mut c_void;
 
@@ -148,6 +156,7 @@ impl HookContext {
     }
 
     pub fn reg_read(&self, register: i32) -> Result<u64> {
+        require_scalar_register(register)?;
         let mut value = 0u64;
         let code = unsafe {
             (self.operations.reg_read)(self.handle, register, (&mut value as *mut u64).cast())
@@ -160,6 +169,7 @@ impl HookContext {
     }
 
     pub fn reg_write(&self, register: i32, value: u64) -> Result<()> {
+        require_scalar_register(register)?;
         let code = unsafe {
             (self.operations.reg_write)(self.handle, register, (&value as *const u64).cast())
         };
@@ -450,6 +460,7 @@ impl Engine {
     }
 
     pub fn reg_read(&self, register: i32) -> Result<u64> {
+        require_scalar_register(register)?;
         let mut value = 0u64;
         self.check(unsafe {
             (self.api.reg_read)(self.handle, register, (&mut value as *mut u64).cast())
@@ -458,6 +469,7 @@ impl Engine {
     }
 
     pub fn reg_write(&mut self, register: i32, value: u64) -> Result<()> {
+        require_scalar_register(register)?;
         self.check(unsafe {
             (self.api.reg_write)(self.handle, register, (&value as *const u64).cast())
         })
@@ -791,7 +803,14 @@ mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
 
-    const REG_V0: i32 = 228;
+    #[test]
+    fn scalar_register_calls_reject_vector_registers() {
+        assert!(require_scalar_register(REG_X29).is_ok());
+        assert!(require_scalar_register(REG_X0 + 28).is_ok());
+        assert!(require_scalar_register(REG_PC).is_ok());
+        assert!(require_scalar_register(REG_V0).is_err());
+        assert!(require_scalar_register(REG_PC - 1).is_err());
+    }
 
     #[test]
     #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
@@ -990,6 +1009,8 @@ mod tests {
             .mem_write(0x1000, &[0x20, 0x00, 0x80, 0xd2, 0x00, 0x04, 0x00, 0x91])
             .unwrap();
         engine.reg_write(REG_X29, 0x1234_5678).unwrap();
+        assert!(engine.reg_read(REG_V0).is_err());
+        assert!(engine.reg_write(REG_V0, 0).is_err());
         engine
             .add_code_hook(0x1004, 0x1004, |context, _, _| {
                 assert_eq!(context.reg_read(REG_X0).unwrap(), 1);
@@ -998,6 +1019,8 @@ mod tests {
                     assert_eq!(context.reg_read(REG_X0 + index).unwrap(), 0);
                 }
                 context.reg_write(REG_X0, 7).unwrap();
+                assert!(context.reg_read(REG_V0).is_err());
+                assert!(context.reg_write(REG_V0, 0).is_err());
                 let vector = [0xa5; 16];
                 context.reg_write_128(REG_V0, vector).unwrap();
                 assert_eq!(context.reg_read_128(REG_V0).unwrap(), vector);
