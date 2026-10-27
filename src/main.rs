@@ -63,9 +63,13 @@ enum Format {
 #[command(
     name = "ipatool",
     version,
+    disable_version_flag = true,
     about = "Rust port of ipatool-fairplay (in progress)"
 )]
 struct Cli {
+    /// Print the ipatool version.
+    #[arg(short = 'v', long = "version", action = clap::ArgAction::Version)]
+    _version: bool,
     #[arg(long, global = true, value_enum, default_value_t = Format::Text)]
     format: Format,
     #[arg(long, global = true)]
