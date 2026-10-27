@@ -56,6 +56,7 @@ schemars = "1"
 flate2 = "1"
 serde-pickle = "1.2.0"
 num-bigint = "0.4"
+psl = "2.1.245"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 security-framework = "3.7"

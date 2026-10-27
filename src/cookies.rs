@@ -129,7 +129,7 @@ impl SavedCookies {
         if !valid_cookie_pair(cookie.name(), cookie.value_trimmed()) {
             return;
         }
-        let domain = match cookie.domain() {
+        let (domain, host_only) = match cookie.domain() {
             Some(domain) => {
                 let domain = domain
                     .strip_prefix('.')
@@ -143,11 +143,17 @@ impl SavedCookies {
                 {
                     return;
                 }
-                domain
+                if psl::suffix_str(&domain) == Some(domain.as_str()) {
+                    if host != domain {
+                        return;
+                    }
+                    (domain, true)
+                } else {
+                    (domain, false)
+                }
             }
-            None => host.clone(),
+            None => (host.clone(), true),
         };
-        let host_only = cookie.domain().is_none();
         let path = cookie
             .path()
             .filter(|path| path.starts_with('/'))
@@ -324,12 +330,7 @@ fn jar_key(host: &str) -> &str {
     if host.parse::<IpAddr>().is_ok() {
         return host;
     }
-    let Some(last_dot) = host.rfind('.') else {
-        return host;
-    };
-    host[..last_dot]
-        .rfind('.')
-        .map_or(host, |previous_dot| &host[previous_dot + 1..])
+    psl::domain_str(host).unwrap_or(host)
 }
 
 fn open_private_cookie_file(path: &Path) -> Result<File> {
@@ -532,6 +533,25 @@ mod tests {
                 .header_for(&url, now + time::Duration::hours(2))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn rejects_public_suffix_domain_and_keeps_suffix_host_cookie_local() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = OffsetDateTime::parse("2026-01-01T00:00:00Z", &Rfc3339).unwrap();
+        let origin = Url::parse("https://shop.example.co.uk/").unwrap();
+        let sibling = Url::parse("https://other.co.uk/").unwrap();
+        let suffix = Url::parse("https://co.uk/").unwrap();
+        let suffix_child = Url::parse("https://sub.co.uk/").unwrap();
+        let mut jar = SavedCookies::open(directory.path()).unwrap();
+        jar.set_cookie(&origin, "wide=1; Domain=co.uk; Path=/", now);
+        jar.set_cookie(&origin, "site=2; Domain=example.co.uk; Path=/", now);
+        assert_eq!(jar.header_for(&origin, now).as_deref(), Some("site=2"));
+        assert!(jar.header_for(&sibling, now).is_none());
+
+        jar.set_cookie(&suffix, "direct=3; Domain=co.uk; Path=/", now);
+        assert_eq!(jar.header_for(&suffix, now).as_deref(), Some("direct=3"));
+        assert!(jar.header_for(&suffix_child, now).is_none());
     }
 
     #[test]
