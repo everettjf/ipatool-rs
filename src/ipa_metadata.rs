@@ -19,7 +19,6 @@ use crate::{
 };
 
 const CHUNK_SIZE: u64 = 256 * 1024;
-const MAX_INFO_PLIST: u64 = 4 * 1024 * 1024;
 type Sender = dyn Fn(Request) -> Result<Response> + Send + Sync;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -49,17 +48,10 @@ pub fn read_version_metadata_with_sender(
         if !is_main_info_plist(&String::from_utf8_lossy(&raw_name)) {
             continue;
         }
-        if file.size() > MAX_INFO_PLIST {
-            bail!("IPA Info.plist exceeds size limit");
-        }
-        let mut bytes = Vec::with_capacity(file.size() as usize);
+        let mut bytes = Vec::new();
         file.by_ref()
-            .take(MAX_INFO_PLIST + 1)
             .read_to_end(&mut bytes)
             .context("read IPA Info.plist")?;
-        if bytes.len() as u64 > MAX_INFO_PLIST {
-            bail!("IPA Info.plist exceeds size limit");
-        }
         return parse_info_plist(&bytes, file.extra_data_fields(), file.last_modified());
     }
     bail!("IPA has no top-level app Info.plist")
@@ -442,6 +434,23 @@ mod tests {
         assert_eq!(metadata.display_version, "2.3.4");
         assert_eq!(metadata.release_date, "2025-01-02T03:04:05Z");
         assert!(served.load(Ordering::SeqCst) < data.len() / 2);
+    }
+
+    #[test]
+    fn reads_info_plist_larger_than_four_megabytes() {
+        let info = format!(
+            "<plist version=\"1.0\"><dict><key>CFBundleShortVersionString</key><string>2.3.4</string><key>releaseDate</key><string>2025-01-02T03:04:05Z</string><key>Note</key><string>{}</string></dict></plist>",
+            "x".repeat(4 * 1024 * 1024)
+        );
+        assert!(info.len() > 4 * 1024 * 1024);
+        let data = Arc::new(fixture_ipa(info.as_bytes()));
+        let metadata = read_version_metadata_with_sender(
+            "https://example.test/app.ipa",
+            fixture_sender(data, Arc::new(AtomicUsize::new(0))),
+        )
+        .unwrap();
+        assert_eq!(metadata.display_version, "2.3.4");
+        assert_eq!(metadata.release_date, "2025-01-02T03:04:05Z");
     }
 
     #[test]
