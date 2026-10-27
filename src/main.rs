@@ -875,186 +875,167 @@ fn run() -> Result<()> {
             let mut account = account_store.load()?;
             let backend = DownloadProductClient::open()?;
             let catalog = CatalogClient::new()?;
-            let mut refreshed = false;
-            let mut purchased = false;
-            loop {
-                let mut app = App {
-                    id: app_id.unwrap_or_default(),
-                    bundle_id: bundle_identifier.clone().unwrap_or_default(),
-                    ..App::default()
-                };
-                if let Some(bundle_id) = bundle_identifier.as_deref().filter(|id| !id.is_empty()) {
-                    let country = country_code_from_storefront(&account.store_front)?;
-                    match catalog.lookup(None, Some(bundle_id), country, requested_platform) {
-                        Ok(found) => app = found,
-                        Err(error)
-                            if app.id > 0 && error.downcast_ref::<AppNotFound>().is_some() => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-                let mut captured_download = None;
-                let result = if platform == Platform::Macos && fairplay_capture_dir.is_some() {
-                    match backend.download_macos_ipa_with_capture(
-                        &catalog,
-                        &account,
-                        &app,
-                        &external_version_id,
-                        output.as_deref(),
-                    ) {
-                        Ok(download) => {
-                            let path = download.path.clone();
-                            captured_download = Some(download);
-                            Ok(path)
-                        }
-                        Err(error) => Err(error),
-                    }
-                } else if platform == Platform::Macos {
-                    backend.download_macos(
-                        &catalog,
-                        &account,
-                        &app,
-                        &external_version_id,
-                        output.as_deref(),
+            let ((app, path, captured_download), purchased) = retry_download(
+                &mut account,
+                purchase,
+                |account| {
+                    let authentication_backend = NativeAuthenticationBackend::open()?;
+                    store_login::login(
+                        &authentication_backend,
+                        &account_store,
+                        LoginInput {
+                            email: account.email.clone(),
+                            password: account.password.clone(),
+                            auth_code: String::new(),
+                        },
                     )
-                } else if fairplay_capture_dir.is_some() {
-                    match backend.download_ipa_with_capture(
-                        &catalog,
-                        &account,
-                        &app,
-                        &external_version_id,
-                        platform,
-                        output.as_deref(),
-                    ) {
-                        Ok(download) => {
-                            let path = download.path.clone();
-                            captured_download = Some(download);
-                            Ok(path)
-                        }
-                        Err(error) => Err(error),
-                    }
-                } else {
-                    backend.download_ipa(
-                        &catalog,
-                        &account,
-                        &app,
-                        &external_version_id,
-                        platform,
-                        output.as_deref(),
-                    )
-                };
-                match result {
-                    Ok(path) => {
-                        let capture_output =
-                            if let Some(directory) = fairplay_capture_dir.as_deref() {
-                                let download = captured_download
-                                    .as_ref()
-                                    .context("missing paired FairPlay download capture")?;
-                                Some(write_download_capture(
-                                    directory,
-                                    download,
-                                    &app,
-                                    &external_version_id,
-                                    platform,
-                                )?)
-                            } else {
-                                None
-                            };
-                        let decrypted = if fairplay_decrypt {
-                            let model = match fairplay_model.as_deref() {
-                                Some(model) => model,
-                                None => bail!("{}", require_model_diagnostic(&path)?),
-                            };
-                            let (decrypted_path, report_path) = fairplay_download_paths(
-                                &path,
-                                fairplay_output.as_deref(),
-                                fairplay_report.as_deref(),
-                            )?;
-                            decrypt_ipa_with_options(
-                                &path,
-                                &decrypted_path,
-                                model,
-                                Some(&report_path),
-                                fairplay_force,
-                            )?;
-                            Some((decrypted_path, report_path))
-                        } else {
-                            None
-                        };
-                        match cli.format {
-                            Format::Json => {
-                                let mut output = serde_json::json!({
-                                    "output": path, "purchased": purchased, "success": true
-                                });
-                                if let Some((decrypted_path, report_path)) = &decrypted {
-                                    output["decryptedOutput"] = serde_json::json!(decrypted_path);
-                                    output["report"] = serde_json::json!(report_path);
-                                }
-                                if let Some(capture_output) = &capture_output {
-                                    output["fairplayCapture"] = serde_json::json!(capture_output);
-                                }
-                                println!("{output}");
-                            }
-                            Format::Text => {
-                                println!("{}", path.display());
-                                if let Some((decrypted_path, report_path)) = decrypted {
-                                    println!("decrypted: {}", decrypted_path.display());
-                                    println!("report: {}", report_path.display());
-                                }
-                                if let Some(capture_output) = capture_output {
-                                    println!("fairplay capture: {}", capture_output.display());
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    Err(error)
-                        if purchase
-                            && !purchased
-                            && error.downcast_ref::<LicenseRequired>().is_some() =>
+                },
+                |account, purchase_required, purchased| {
+                    let mut app = App {
+                        id: app_id.unwrap_or_default(),
+                        bundle_id: bundle_identifier.clone().unwrap_or_default(),
+                        ..App::default()
+                    };
+                    if let Some(bundle_id) =
+                        bundle_identifier.as_deref().filter(|id| !id.is_empty())
                     {
+                        let country = country_code_from_storefront(&account.store_front)?;
+                        match catalog.lookup(None, Some(bundle_id), country, requested_platform) {
+                            Ok(found) => app = found,
+                            Err(error)
+                                if app.id > 0 && error.downcast_ref::<AppNotFound>().is_some() => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    if *purchase_required {
                         let purchase_backend = NativePurchaseBackend::open()?;
-                        acquire_download_license(
-                            &mut account,
-                            &mut refreshed,
-                            |account| {
-                                store_purchase::purchase(
-                                    &purchase_backend,
-                                    account,
-                                    &app,
-                                    requested_platform,
-                                )
-                            },
-                            |account| {
-                                let authentication_backend = NativeAuthenticationBackend::open()?;
-                                store_login::login(
-                                    &authentication_backend,
-                                    &account_store,
-                                    LoginInput {
-                                        email: account.email.clone(),
-                                        password: account.password.clone(),
-                                        auth_code: String::new(),
-                                    },
-                                )
-                            },
-                        )?;
-                        purchased = true;
+                        match store_purchase::purchase(
+                            &purchase_backend,
+                            account,
+                            &app,
+                            requested_platform,
+                        ) {
+                            Ok(()) => {}
+                            Err(error)
+                                if error.downcast_ref::<LicenseAlreadyExists>().is_some() => {}
+                            Err(error) => return Err(error),
+                        }
+                        *purchase_required = false;
+                        *purchased = true;
                     }
-                    Err(error)
-                        if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
-                    {
-                        let authentication_backend = NativeAuthenticationBackend::open()?;
-                        account = store_login::login(
-                            &authentication_backend,
-                            &account_store,
-                            LoginInput {
-                                email: account.email.clone(),
-                                password: account.password.clone(),
-                                auth_code: String::new(),
-                            },
-                        )?;
-                        refreshed = true;
+                    let mut captured_download = None;
+                    let result = if platform == Platform::Macos && fairplay_capture_dir.is_some() {
+                        match backend.download_macos_ipa_with_capture(
+                            &catalog,
+                            account,
+                            &app,
+                            &external_version_id,
+                            output.as_deref(),
+                        ) {
+                            Ok(download) => {
+                                let path = download.path.clone();
+                                captured_download = Some(download);
+                                Ok(path)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else if platform == Platform::Macos {
+                        backend.download_macos(
+                            &catalog,
+                            account,
+                            &app,
+                            &external_version_id,
+                            output.as_deref(),
+                        )
+                    } else if fairplay_capture_dir.is_some() {
+                        match backend.download_ipa_with_capture(
+                            &catalog,
+                            account,
+                            &app,
+                            &external_version_id,
+                            platform,
+                            output.as_deref(),
+                        ) {
+                            Ok(download) => {
+                                let path = download.path.clone();
+                                captured_download = Some(download);
+                                Ok(path)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        backend.download_ipa(
+                            &catalog,
+                            account,
+                            &app,
+                            &external_version_id,
+                            platform,
+                            output.as_deref(),
+                        )
+                    };
+                    result.map(|path| (app, path, captured_download))
+                },
+            )?;
+            {
+                let capture_output = if let Some(directory) = fairplay_capture_dir.as_deref() {
+                    let download = captured_download
+                        .as_ref()
+                        .context("missing paired FairPlay download capture")?;
+                    Some(write_download_capture(
+                        directory,
+                        download,
+                        &app,
+                        &external_version_id,
+                        platform,
+                    )?)
+                } else {
+                    None
+                };
+                let decrypted = if fairplay_decrypt {
+                    let model = match fairplay_model.as_deref() {
+                        Some(model) => model,
+                        None => bail!("{}", require_model_diagnostic(&path)?),
+                    };
+                    let (decrypted_path, report_path) = fairplay_download_paths(
+                        &path,
+                        fairplay_output.as_deref(),
+                        fairplay_report.as_deref(),
+                    )?;
+                    decrypt_ipa_with_options(
+                        &path,
+                        &decrypted_path,
+                        model,
+                        Some(&report_path),
+                        fairplay_force,
+                    )?;
+                    Some((decrypted_path, report_path))
+                } else {
+                    None
+                };
+                match cli.format {
+                    Format::Json => {
+                        let mut output = serde_json::json!({
+                            "output": path, "purchased": purchased, "success": true
+                        });
+                        if let Some((decrypted_path, report_path)) = &decrypted {
+                            output["decryptedOutput"] = serde_json::json!(decrypted_path);
+                            output["report"] = serde_json::json!(report_path);
+                        }
+                        if let Some(capture_output) = &capture_output {
+                            output["fairplayCapture"] = serde_json::json!(capture_output);
+                        }
+                        println!("{output}");
                     }
-                    Err(error) => return Err(error),
+                    Format::Text => {
+                        println!("{}", path.display());
+                        if let Some((decrypted_path, report_path)) = decrypted {
+                            println!("decrypted: {}", decrypted_path.display());
+                            println!("report: {}", report_path.display());
+                        }
+                        if let Some(capture_output) = capture_output {
+                            println!("fairplay capture: {}", capture_output.display());
+                        }
+                    }
                 }
             }
         }
@@ -2484,23 +2465,39 @@ fn print_purchase_success(already_owned: bool, format: Format) -> Result<()> {
     Ok(())
 }
 
-fn acquire_download_license(
+fn retry_download<T>(
     account: &mut Account,
-    refreshed: &mut bool,
-    mut purchase: impl FnMut(&Account) -> Result<()>,
+    acquire_license: bool,
     mut refresh: impl FnMut(&Account) -> Result<Account>,
-) -> Result<()> {
-    loop {
-        match purchase(account) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.downcast_ref::<LicenseAlreadyExists>().is_some() => return Ok(()),
-            Err(error) if !*refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() => {
+    mut attempt: impl FnMut(&Account, &mut bool, &mut bool) -> Result<T>,
+) -> Result<(T, bool)> {
+    let mut purchase_required = false;
+    let mut purchased = false;
+    let mut token_expired = false;
+    for attempt_index in 0..3 {
+        let result = (|| {
+            if token_expired {
                 *account = refresh(account)?;
-                *refreshed = true;
+            }
+            attempt(account, &mut purchase_required, &mut purchased)
+        })();
+        match result {
+            Ok(output) => return Ok((output, purchased)),
+            Err(error) if attempt_index < 2 => {
+                if error.downcast_ref::<PasswordTokenExpired>().is_some() {
+                    token_expired = true;
+                } else if acquire_license && error.downcast_ref::<LicenseRequired>().is_some() {
+                    purchase_required = true;
+                    token_expired = false;
+                } else {
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(1));
             }
             Err(error) => return Err(error),
         }
     }
+    unreachable!("download retry loop always returns on its final attempt")
 }
 
 #[cfg(test)]
@@ -2515,34 +2512,104 @@ mod tests {
     }
 
     #[test]
-    fn automatic_download_purchase_retries_with_refreshed_account() {
+    fn download_reauthenticates_twice_within_three_attempts() {
         let mut account = Account::default();
-        account.password_token = "expired-token".into();
-        let mut refreshed = false;
-        let mut purchase_tokens = Vec::new();
+        account.password_token = "token-0".into();
+        let mut attempted_tokens = Vec::new();
         let mut refresh_count = 0;
-        acquire_download_license(
+        let (output, purchased) = retry_download(
             &mut account,
-            &mut refreshed,
+            false,
             |account| {
-                purchase_tokens.push(account.password_token.clone());
-                if account.password_token == "expired-token" {
-                    return Err(PasswordTokenExpired.into());
-                }
-                Ok(())
-            },
-            |account| {
-                assert_eq!(account.password_token, "expired-token");
                 refresh_count += 1;
                 let mut refreshed_account = Account::default();
-                refreshed_account.password_token = "refreshed-token".into();
+                refreshed_account.password_token = format!("token-{refresh_count}");
+                assert_eq!(
+                    account.password_token,
+                    format!("token-{}", refresh_count - 1)
+                );
                 Ok(refreshed_account)
+            },
+            |account, purchase_required, purchased| {
+                assert!(!*purchase_required);
+                assert!(!*purchased);
+                attempted_tokens.push(account.password_token.clone());
+                if account.password_token != "token-2" {
+                    return Err(PasswordTokenExpired.into());
+                }
+                Ok("downloaded")
             },
         )
         .unwrap();
-        assert!(refreshed);
-        assert_eq!(refresh_count, 1);
-        assert_eq!(purchase_tokens, ["expired-token", "refreshed-token"]);
+        assert_eq!(output, "downloaded");
+        assert!(!purchased);
+        assert_eq!(refresh_count, 2);
+        assert_eq!(attempted_tokens, ["token-0", "token-1", "token-2"]);
+    }
+
+    #[test]
+    fn download_keeps_license_pending_after_purchase_token_expiry() {
+        let mut account = Account::default();
+        account.password_token = "old".into();
+        let mut events = Vec::new();
+        let (output, purchased) = retry_download(
+            &mut account,
+            true,
+            |account| {
+                assert_eq!(account.password_token, "old");
+                let mut renewed = Account::default();
+                renewed.password_token = "new".into();
+                Ok(renewed)
+            },
+            |account, purchase_required, purchased| {
+                if !*purchase_required {
+                    events.push("download without license");
+                    return Err(LicenseRequired.into());
+                }
+                if account.password_token == "old" {
+                    events.push("purchase with expired token");
+                    return Err(PasswordTokenExpired.into());
+                }
+                events.push("purchase and download with new token");
+                *purchase_required = false;
+                *purchased = true;
+                Ok("downloaded")
+            },
+        )
+        .unwrap();
+        assert_eq!(output, "downloaded");
+        assert!(purchased);
+        assert_eq!(
+            events,
+            [
+                "download without license",
+                "purchase with expired token",
+                "purchase and download with new token"
+            ]
+        );
+    }
+
+    #[test]
+    fn download_stops_after_three_expired_attempts() {
+        let mut account = Account::default();
+        let mut refreshes = 0;
+        let mut attempts = 0;
+        let error = retry_download::<()>(
+            &mut account,
+            false,
+            |_| {
+                refreshes += 1;
+                Ok(Account::default())
+            },
+            |_, _, _| {
+                attempts += 1;
+                Err(PasswordTokenExpired.into())
+            },
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<PasswordTokenExpired>().is_some());
+        assert_eq!(refreshes, 2);
+        assert_eq!(attempts, 3);
     }
 
     #[test]

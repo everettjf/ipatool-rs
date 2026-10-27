@@ -17,7 +17,8 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 
 ## Build and test evidence
 
-- `cargo test --all-targets`: 326 library tests and 37 CLI tests passed; 42 opt-in tests were skipped by the default test run.
+- `cargo test --all-targets`: 331 library tests and 39 CLI tests passed; 43 opt-in tests were skipped by the default test run.
+- The CLI download retry now follows the Go command's three-attempt budget. A token-expired result can trigger authentication again on the third attempt, and a purchase that encounters an expired token remains pending for the next attempt. Fake transaction tests cover consecutive expiries, the license/purchase/refresh sequence, and the final retry limit; no Apple account is used.
 - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` passed after the HTTP 500 redownload fallback fix.
 - Local sender fixtures confirmed that an unpinned redownload uses the Go reference's 30-second timeout, while pinned redownload and update requests retain no request timeout.
 - IPA version metadata now accepts HTTP and HTTPS byte-range URLs like the Go reader and the Rust full-package downloader; the range and archive checks remain in place.
