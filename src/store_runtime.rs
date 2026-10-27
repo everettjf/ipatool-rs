@@ -3157,7 +3157,13 @@ fn dispatch_call(
                 .get(&self_address)
                 .context("unknown Swift task-local")?;
             let size = object.properties["valueSize"];
-            let source = object.properties["defaultValue"];
+            let owner = state.current_swift_task.unwrap_or(0);
+            let source = state.task_locals.get(owner, self_address);
+            let source = if source == 0 {
+                object.properties["defaultValue"]
+            } else {
+                source
+            };
             let output = context.reg_read(REG_X0 + 8)?;
             context.mem_write(output, &context.mem_read(source, size as usize)?)?;
         }
@@ -9201,6 +9207,51 @@ mod tests {
         runtime.state.borrow_mut().current_swift_task = None;
         assert_eq!(runtime.call(get, &[key]).unwrap(), value);
         assert_eq!(runtime.call(get, &[key + 1]).unwrap(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_task_local_wrapper_reads_bound_value() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let get = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.symbol == "$ss9TaskLocalC3getxyF")
+            .unwrap()
+            .address;
+        let wrapper = runtime.allocate(32).unwrap();
+        let bound = runtime.allocate(8).unwrap();
+        let output = runtime.allocate(8).unwrap();
+        runtime.write_u64(wrapper + 16, 11).unwrap();
+        runtime.write_u64(bound, 22).unwrap();
+        runtime.state.borrow_mut().objects.insert(
+            wrapper,
+            StoreObject {
+                class: "HostSwiftTaskLocal".into(),
+                value: StoreValue::Empty,
+                properties: HashMap::from([
+                    ("valueSize".into(), 8),
+                    ("defaultValue".into(), wrapper + 16),
+                ]),
+            },
+        );
+        runtime.engine.reg_write(REG_X0 + 20, wrapper).unwrap();
+        runtime.engine.reg_write(REG_X0 + 8, output).unwrap();
+        runtime.call(get, &[]).unwrap();
+        assert_eq!(runtime.read_u64(output).unwrap(), 11);
+
+        {
+            let mut state = runtime.state.borrow_mut();
+            state.task_locals.push(42, wrapper, bound);
+            state.current_swift_task = Some(42);
+        }
+        runtime.engine.reg_write(REG_X0 + 20, wrapper).unwrap();
+        runtime.engine.reg_write(REG_X0 + 8, output).unwrap();
+        runtime.call(get, &[]).unwrap();
+        assert_eq!(runtime.read_u64(output).unwrap(), 22);
     }
 
     #[test]
