@@ -116,7 +116,7 @@ fn copy_private(root: &Path, relative: &Path, source: &Path) -> Result<CaptureFi
 }
 
 fn copy_tree(root: &Path, source: &Path, relative: &Path) -> Result<Vec<CaptureFile>> {
-    let metadata = match fs::symlink_metadata(source) {
+    let metadata = match fs::metadata(source) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
@@ -126,6 +126,11 @@ fn copy_tree(root: &Path, source: &Path, relative: &Path) -> Result<Vec<CaptureF
             "capture state path is not a directory: {}",
             source.display()
         );
+    }
+    // Go first calls Stat, then WalkDir. WalkDir visits a symlink at the
+    // source root but does not descend into it, leaving this capture empty.
+    if fs::symlink_metadata(source)?.file_type().is_symlink() {
+        return Ok(Vec::new());
     }
     let mut entries: Vec<_> = fs::read_dir(source)?.collect::<std::io::Result<_>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -489,6 +494,26 @@ mod tests {
         fs::remove_file(path).unwrap();
         fs::write(app.join("SC_Info/A.SİNF"), sinf()).unwrap();
         assert!(installed_sinf(&app).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_skips_source_directory_symlink_but_rejects_nested_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("state.bin"), b"native state").unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&source, &alias).unwrap();
+        let destination = directory.path().join("capture");
+        let files = copy_tree(&destination, &alias, Path::new("state")).unwrap();
+        assert!(files.is_empty());
+        assert!(!destination.join("state/state.bin").exists());
+
+        symlink(source.join("state.bin"), source.join("nested-link")).unwrap();
+        assert!(copy_tree(&destination, &source, Path::new("other")).is_err());
     }
 
     #[test]
