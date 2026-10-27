@@ -6892,7 +6892,7 @@ fn dispatch_message(
                 bail!("cookie properties are not a dictionary");
             };
             let entries = entries.clone();
-            let mut properties = HashMap::from([("properties".into(), fields)]);
+            let mut properties = HashMap::new();
             for (field, property) in [
                 ("Name", "name"),
                 ("Value", "value"),
@@ -6926,16 +6926,72 @@ fn dispatch_message(
             context.reg_write(REG_X0, receiver)?;
             return Ok(());
         }
+        if selector == "properties" {
+            let properties = state.objects[&receiver].properties.clone();
+            let mut fields = HashMap::new();
+            for (property, field) in [
+                ("name", "Name"),
+                ("value", "Value"),
+                ("domain", "Domain"),
+                ("path", "Path"),
+            ] {
+                let value = properties.get(property).copied().unwrap_or(0);
+                let value = if value == 0 {
+                    new_guest_object(
+                        context,
+                        profile,
+                        state,
+                        "NSString",
+                        StoreValue::String(String::new()),
+                    )?
+                } else {
+                    value
+                };
+                fields.insert(field.into(), value);
+            }
+            let expires = properties.get("expiresDate").copied().unwrap_or(0);
+            let secure = properties.get("isSecure").copied().unwrap_or(0) != 0;
+            let http_only = properties.get("isHTTPOnly").copied().unwrap_or(0) != 0;
+            let created = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSNumber",
+                StoreValue::Number(time::OffsetDateTime::now_utc().unix_timestamp() - 978_307_200),
+            )?;
+            fields.insert("Created".into(), created);
+            for (enabled, field) in [
+                (secure, "Secure"),
+                (http_only, "HttpOnly"),
+                (expires == 0, "Discard"),
+            ] {
+                if enabled {
+                    let yes = new_guest_object(
+                        context,
+                        profile,
+                        state,
+                        "NSString",
+                        StoreValue::String("TRUE".into()),
+                    )?;
+                    fields.insert(field.into(), yes);
+                }
+            }
+            if expires != 0 {
+                fields.insert("Expires".into(), expires);
+            }
+            let dictionary = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSDictionary",
+                StoreValue::Entries(fields),
+            )?;
+            context.reg_write(REG_X0, dictionary)?;
+            return Ok(());
+        }
         if matches!(
             selector,
-            "properties"
-                | "name"
-                | "value"
-                | "domain"
-                | "path"
-                | "expiresDate"
-                | "isSecure"
-                | "isHTTPOnly"
+            "name" | "value" | "domain" | "path" | "expiresDate" | "isSecure" | "isHTTPOnly"
         ) {
             let value = state.objects[&receiver]
                 .properties
@@ -7459,6 +7515,17 @@ fn dispatch_message(
         && (class_is_kind_of(profile, &class_name, "ACAccount")
             || matches!(class_name.as_str(), "ACAccountType" | "ACAccountCredential"))
     {
+        if selector == "initWithPassword:" {
+            let password = context.reg_read(REG_X0 + 2)?;
+            state
+                .objects
+                .get_mut(&receiver)
+                .expect("known account credential")
+                .properties
+                .insert("password".into(), password);
+            context.reg_write(REG_X0, receiver)?;
+            return Ok(());
+        }
         if matches!(
             selector,
             "accountPropertyForKey:" | "setAccountProperty:forKey:"
@@ -8626,47 +8693,17 @@ fn dispatch_message(
                     "NSString",
                     StoreValue::String(cookie.path().unwrap_or("/").into()),
                 )?;
-                let mut fields = HashMap::from([
-                    ("Name".into(), name),
-                    ("Value".into(), value),
-                    ("Domain".into(), domain),
-                    ("Path".into(), path),
-                ]);
                 let expires = if let Some(expires) = cookie.expires_datetime() {
-                    let date = new_guest_object(
+                    new_guest_object(
                         context,
                         profile,
                         state,
                         "NSDate",
                         StoreValue::Float(expires.unix_timestamp() as f64),
-                    )?;
-                    fields.insert("Expires".into(), date);
-                    date
+                    )?
                 } else {
                     0
                 };
-                for (enabled, key) in [
-                    (cookie.secure().unwrap_or(false), "Secure"),
-                    (cookie.http_only().unwrap_or(false), "HttpOnly"),
-                ] {
-                    if enabled {
-                        let yes = new_guest_object(
-                            context,
-                            profile,
-                            state,
-                            "NSString",
-                            StoreValue::String("TRUE".into()),
-                        )?;
-                        fields.insert(key.into(), yes);
-                    }
-                }
-                let property_dictionary = new_guest_object(
-                    context,
-                    profile,
-                    state,
-                    "NSDictionary",
-                    StoreValue::Entries(fields),
-                )?;
                 let object =
                     new_guest_object(context, profile, state, "NSHTTPCookie", StoreValue::Empty)?;
                 state
@@ -8679,7 +8716,6 @@ fn dispatch_message(
                         ("value".into(), value),
                         ("domain".into(), domain),
                         ("path".into(), path),
-                        ("properties".into(), property_dictionary),
                         ("expiresDate".into(), expires),
                         (
                             "isSecure".into(),
@@ -12029,6 +12065,22 @@ mod tests {
         let account_type = runtime
             .new_object("ACAccountType", StoreValue::Empty)
             .unwrap();
+        let credential = runtime
+            .new_object("ACAccountCredential", StoreValue::Empty)
+            .unwrap();
+        let password = runtime
+            .new_object("NSString", StoreValue::String("synthetic-only".into()))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .invoke(credential, "initWithPassword:", &[password])
+                .unwrap(),
+            credential
+        );
+        assert_eq!(
+            runtime.state.borrow().objects[&credential].properties["password"],
+            password
+        );
         runtime
             .invoke(account, "initWithAccountType:", &[account_type])
             .unwrap();
@@ -12134,7 +12186,22 @@ mod tests {
             .unwrap();
         assert_eq!(runtime.invoke(cookie, "name", &[]).unwrap(), name);
         assert_eq!(runtime.invoke(cookie, "isSessionOnly", &[]).unwrap(), 1);
-        assert_eq!(runtime.invoke(cookie, "properties", &[]).unwrap(), fields);
+        let cookie_properties = runtime.invoke(cookie, "properties", &[]).unwrap();
+        let state = runtime.state.borrow();
+        let StoreValue::Entries(properties) = &state.objects[&cookie_properties].value else {
+            panic!("cookie properties are not a dictionary");
+        };
+        assert_eq!(properties["Name"], name);
+        assert_eq!(properties["Value"], value);
+        assert_eq!(
+            object_string_value(&state, properties["Discard"]).unwrap(),
+            "TRUE"
+        );
+        assert!(matches!(
+            state.objects[&properties["Created"]].value,
+            StoreValue::Number(_)
+        ));
+        drop(state);
         let header = runtime
             .new_object(
                 "NSString",
