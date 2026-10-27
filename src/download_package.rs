@@ -116,7 +116,6 @@ pub fn validate_ipa_platform(path: &Path, platform: Platform) -> Result<()> {
         }) {
             return Ok(());
         }
-        bail!("downloaded package does not declare {expected} support");
     }
     bail!("downloaded package does not declare {expected} support")
 }
@@ -216,5 +215,29 @@ mod tests {
         assert!(validate_ipa_platform(ipa(None).path(), Platform::Iphone).is_ok());
         assert!(validate_ipa_platform(ipa(Some(&[])).path(), Platform::Iphone).is_err());
         assert!(validate_ipa_platform(ipa(None).path(), Platform::Visionos).is_err());
+    }
+
+    #[test]
+    fn checks_all_top_level_apps_before_rejecting_platform() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut writer = ZipWriter::new(File::create(file.path()).unwrap());
+        for (name, platform) in [("First", "AppleTVOS"), ("Second", "iPhoneOS")] {
+            writer
+                .start_file(
+                    format!("Payload/{name}.app/Info.plist"),
+                    SimpleFileOptions::default(),
+                )
+                .unwrap();
+            let mut fields = plist::Dictionary::new();
+            fields.insert(
+                "CFBundleSupportedPlatforms".into(),
+                Value::Array(vec![Value::String(platform.into())]),
+            );
+            plist::to_writer_xml(&mut writer, &Value::Dictionary(fields)).unwrap();
+        }
+        writer.finish().unwrap();
+
+        assert!(validate_ipa_platform(file.path(), Platform::Iphone).is_ok());
+        assert!(validate_ipa_platform(file.path(), Platform::Visionos).is_err());
     }
 }
