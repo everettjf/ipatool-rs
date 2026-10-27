@@ -40,6 +40,7 @@ static SHARED_COOKIES: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<SavedCookies>>
 
 pub const DEFAULT_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_STORE_RESPONSE_BODY: usize = 32 << 20;
+const MAX_STORE_REDIRECTS: usize = 4;
 static VERBOSE_HTTP: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
@@ -357,7 +358,12 @@ impl Transport {
         let mut url = request.url;
         let mut headers = request.headers;
         let mut body = request.body;
-        for redirects in 0..=10 {
+        let redirect_limit = if matches!(policy, BodyPolicy::Store(_)) {
+            MAX_STORE_REDIRECTS
+        } else {
+            10
+        };
+        for redirects in 0..=redirect_limit {
             let mut send_headers = headers.clone();
             if !send_headers.contains_key(COOKIE) {
                 let cookie_header = cookies
@@ -406,7 +412,7 @@ impl Transport {
             if request.no_redirects || !matches!(status, 301 | 302 | 303 | 307 | 308) {
                 return Self::response_from_http(response, policy);
             }
-            if redirects == 10 {
+            if redirects == redirect_limit {
                 bail!("too many HTTP redirects");
             }
             let next = url.join(location).context("invalid redirect Location")?;
