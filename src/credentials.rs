@@ -274,12 +274,18 @@ impl<S: CredentialStore> AccountStore<S> {
     }
 
     pub fn load(&self) -> Result<Account> {
-        let data = self
-            .credentials
-            .get(ACCOUNT_KEY)?
-            .ok_or_else(|| anyhow!("account not found in keychain"))?;
+        self.load_optional()?
+            .ok_or_else(|| anyhow!("account not found in keychain"))
+    }
+
+    pub fn load_optional(&self) -> Result<Option<Account>> {
+        let Some(data) = self.credentials.get(ACCOUNT_KEY)? else {
+            return Ok(None);
+        };
         let data = Zeroizing::new(data);
-        serde_json::from_slice(&data).context("failed to decode account JSON")
+        Ok(Some(
+            serde_json::from_slice(&data).context("failed to decode account JSON")?,
+        ))
     }
 
     pub fn save(&self, account: &Account) -> Result<()> {
@@ -375,6 +381,22 @@ mod tests {
         let encoded = serde_json::to_string(&summary).unwrap();
         assert!(!encoded.contains("secret-token"));
         assert!(!encoded.contains("secret-password"));
+    }
+
+    #[test]
+    fn optional_account_load_distinguishes_missing_from_invalid_data() {
+        let store = AccountStore::new(MemoryStore::default());
+        assert!(store.load_optional().unwrap().is_none());
+        store.credentials.set(ACCOUNT_KEY, b"not-json").unwrap();
+        assert!(store.load_optional().is_err());
+        store
+            .credentials
+            .set(ACCOUNT_KEY, br#"{"email":"person@example.test"}"#)
+            .unwrap();
+        assert_eq!(
+            store.load_optional().unwrap().unwrap().email,
+            "person@example.test"
+        );
     }
 
     #[test]

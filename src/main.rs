@@ -9,7 +9,9 @@ use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use ipatool_rs::catalog::AppNotFound;
-use ipatool_rs::credentials::{AccountStore, configure_file_keychain, open_system_keychain};
+use ipatool_rs::credentials::{
+    Account, AccountStore, configure_file_keychain, open_system_keychain,
+};
 use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
 use ipatool_rs::fairplay_26a428;
 use ipatool_rs::fairplay_checkpoint::FairplayCheckpoint;
@@ -95,8 +97,9 @@ enum Command {
         limit: i64,
         #[arg(long)]
         platform: Option<String>,
-        #[arg(long, default_value = "US")]
-        country: String,
+        /// Store country; uses the saved account's storefront when omitted.
+        #[arg(long)]
+        country: Option<String>,
     },
     /// Look up an app by numeric ID or bundle identifier.
     Lookup {
@@ -106,8 +109,9 @@ enum Command {
         bundle_identifier: Option<String>,
         #[arg(long)]
         platform: Option<String>,
-        #[arg(long, default_value = "US")]
-        country: String,
+        /// Store country; uses the saved account's storefront when omitted.
+        #[arg(long)]
+        country: Option<String>,
     },
     /// Obtain a license for a free app from the App Store.
     Purchase {
@@ -182,8 +186,9 @@ enum Command {
         bundle_identifier: Option<String>,
         #[arg(long, default_value = "iphone")]
         platform: String,
-        #[arg(long, default_value = "US")]
-        country: String,
+        /// Store country; uses the saved account's storefront when omitted.
+        #[arg(long)]
+        country: Option<String>,
     },
     /// Diagnose IPA SINF and enrollment model compatibility.
     FairplayDoctor {
@@ -735,6 +740,9 @@ fn run() -> Result<()> {
         } => {
             let client = CatalogClient::new()?;
             let platform = parse_platform(platform.as_deref())?;
+            let country = catalog_country(country.as_deref(), || {
+                AccountStore::new(open_system_keychain()?).load_optional()
+            })?;
             let output = client.search(&term, &country, limit, platform)?;
             print_search(&output, cli.format)?;
         }
@@ -749,6 +757,9 @@ fn run() -> Result<()> {
                 bail!("an app ID or bundle identifier is required");
             }
             let platform = parse_platform(platform.as_deref())?;
+            let country = catalog_country(country.as_deref(), || {
+                AccountStore::new(open_system_keychain()?).load_optional()
+            })?;
             let app = client.lookup(app_id, bundle_identifier.as_deref(), &country, platform)?;
             print_app(&app, cli.format)?;
         }
@@ -1057,6 +1068,9 @@ fn run() -> Result<()> {
         } => {
             let client = CatalogClient::new()?;
             let platform = Platform::parse(&platform)?.context("platform is required")?;
+            let country = catalog_country(country.as_deref(), || {
+                AccountStore::new(open_system_keychain()?).load_optional()
+            })?;
             let app = App {
                 id: app_id,
                 bundle_id: bundle_identifier.unwrap_or_default(),
@@ -2359,6 +2373,19 @@ fn parse_platform(value: Option<&str>) -> Result<Option<Platform>> {
     Platform::parse(value.unwrap_or_default())
 }
 
+fn catalog_country(
+    explicit: Option<&str>,
+    load_account: impl FnOnce() -> Result<Option<Account>>,
+) -> Result<String> {
+    if let Some(country) = explicit {
+        return Ok(country.to_owned());
+    }
+    match load_account()? {
+        Some(account) => Ok(country_code_from_storefront(&account.store_front)?.to_owned()),
+        None => Ok("US".to_owned()),
+    }
+}
+
 fn fairplay_download_paths(
     package: &std::path::Path,
     output: Option<&std::path::Path>,
@@ -2427,6 +2454,22 @@ fn print_purchase_success(already_owned: bool, format: Format) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_defaults_to_account_storefront_and_honors_explicit_country() {
+        let mut account = Account::default();
+        account.store_front = "143444-1,29".into();
+        assert_eq!(catalog_country(None, || Ok(Some(account))).unwrap(), "GB");
+        assert_eq!(catalog_country(None, || Ok(None)).unwrap(), "US");
+        assert_eq!(
+            catalog_country(Some("JP"), || bail!("must not open keychain")).unwrap(),
+            "JP"
+        );
+
+        let mut invalid = Account::default();
+        invalid.store_front = "999999-1,29".into();
+        assert!(catalog_country(None, || Ok(Some(invalid))).is_err());
+    }
 
     #[test]
     fn fairplay_recover_oracle_accepts_private_input_paths() {
