@@ -7915,6 +7915,19 @@ fn dispatch_message(
             )?;
             context.reg_write(REG_X0, string)?;
         }
+        (true, "stringWithUTF8String:")
+            if matches!(class_name.as_str(), "NSString" | "NSMutableString") =>
+        {
+            let value = guest_cstring(context, profile, state, context.reg_read(REG_X0 + 2)?)?;
+            let string = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(value),
+            )?;
+            context.reg_write(REG_X0, string)?;
+        }
         (true, "distantPast" | "distantFuture") if class_name == "NSDate" => {
             let seconds = if selector == "distantPast" {
                 -62_135_769_600
@@ -8155,6 +8168,42 @@ fn dispatch_message(
                 StoreValue::Entries(HashMap::new()),
             )?;
             context.reg_write(REG_X0, address)?;
+        }
+        (true, "dictionaryWithDictionary:") => {
+            let source = context.reg_read(REG_X0 + 2)?;
+            let StoreValue::Entries(entries) = &state
+                .objects
+                .get(&source)
+                .context("unknown source dictionary")?
+                .value
+            else {
+                bail!("dictionaryWithDictionary: source is not a dictionary");
+            };
+            let entries = entries.clone();
+            let copied = new_guest_object(
+                context,
+                profile,
+                state,
+                &class_name,
+                StoreValue::Entries(entries),
+            )?;
+            context.reg_write(REG_X0, copied)?;
+        }
+        (
+            true,
+            "strongToStrongObjectsMapTable"
+            | "strongToWeakObjectsMapTable"
+            | "weakToStrongObjectsMapTable"
+            | "weakToWeakObjectsMapTable",
+        ) if class_name == "NSMapTable" => {
+            let table = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSMapTable",
+                StoreValue::Entries(HashMap::new()),
+            )?;
+            context.reg_write(REG_X0, table)?;
         }
         (true, "cookiesWithResponseHeaderFields:forURL:") if class_name == "NSHTTPCookie" => {
             let headers = context.reg_read(REG_X0 + 2)?;
@@ -8417,6 +8466,39 @@ fn dispatch_message(
             };
             entries.remove(&key);
             context.reg_write(REG_X0, 0)?;
+        }
+        (false, "initWithArray:") => {
+            let source = context.reg_read(REG_X0 + 2)?;
+            let StoreValue::Addresses(items) = &state
+                .objects
+                .get(&source)
+                .context("unknown source array")?
+                .value
+            else {
+                bail!("initWithArray: source is not an array");
+            };
+            let items = items.clone();
+            state.objects.get_mut(&receiver).expect("known array").value =
+                StoreValue::Addresses(items);
+            context.reg_write(REG_X0, receiver)?;
+        }
+        (false, "initWithDictionary:") => {
+            let source = context.reg_read(REG_X0 + 2)?;
+            let StoreValue::Entries(entries) = &state
+                .objects
+                .get(&source)
+                .context("unknown source dictionary")?
+                .value
+            else {
+                bail!("initWithDictionary: source is not a dictionary");
+            };
+            let entries = entries.clone();
+            state
+                .objects
+                .get_mut(&receiver)
+                .expect("known dictionary")
+                .value = StoreValue::Entries(entries);
+            context.reg_write(REG_X0, receiver)?;
         }
         (false, "boolForKey:") if class_name == "NSUserDefaults" => {
             let key = object_string_value(state, context.reg_read(REG_X0 + 2)?)?;
@@ -9053,6 +9135,66 @@ fn dispatch_message(
             };
             value.push_str(&suffix);
             context.reg_write(REG_X0, 0)?;
+        }
+        (false, "stringByAppendingString:") => {
+            let prefix = object_string_value(state, receiver)?;
+            let suffix = object_string_value(state, context.reg_read(REG_X0 + 2)?)?;
+            let value = format!("{prefix}{suffix}");
+            let string = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(value),
+            )?;
+            context.reg_write(REG_X0, string)?;
+        }
+        (false, "dataUsingEncoding:") => {
+            let value = object_string_value(state, receiver)?;
+            let encoding = context.reg_read(REG_X0 + 2)?;
+            let data = match encoding {
+                4 => value.as_bytes().to_vec(),
+                10 => {
+                    let mut data = vec![0xff, 0xfe];
+                    for word in value.encode_utf16() {
+                        data.extend_from_slice(&word.to_le_bytes());
+                    }
+                    data
+                }
+                _ => bail!("unsupported string encoding {encoding}"),
+            };
+            let object =
+                new_guest_object(context, profile, state, "NSData", StoreValue::Bytes(data))?;
+            context.reg_write(REG_X0, object)?;
+        }
+        (false, "stringByTrimmingCharactersInSet:") => {
+            let value = object_string_value(state, receiver)?;
+            let set = state
+                .objects
+                .get(&context.reg_read(REG_X0 + 2)?)
+                .context("unknown Store character set")?;
+            let StoreValue::String(characters) = &set.value else {
+                bail!("invalid Store character set");
+            };
+            let inverted = set.properties.get("inverted").copied().unwrap_or(0) != 0;
+            let trimmed = value
+                .trim_matches(|character: char| {
+                    let matches = if characters == "0123456789" {
+                        character.is_numeric()
+                    } else {
+                        characters.contains(character)
+                    };
+                    matches != inverted
+                })
+                .to_owned();
+            let string = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String(trimmed),
+            )?;
+            context.reg_write(REG_X0, string)?;
         }
         (false, "componentsJoinedByString:") => {
             let separator = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
@@ -10688,6 +10830,180 @@ mod tests {
             object_string_value(&runtime.state.borrow(), identifier).unwrap(),
             "me.majd.ipatool"
         );
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_collection_constructors_copy_containers() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |selector: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.selector == selector)
+                .unwrap()
+                .address
+        };
+        let dictionary_with_dictionary = call_address("dictionaryWithDictionary:");
+        let init_with_dictionary = call_address("initWithDictionary:");
+        let init_with_array = call_address("initWithArray:");
+        let dictionary_class = runtime.profile.index.classes
+            [runtime.profile.runtime.classes_by_name["NSDictionary"]]
+            .address;
+        let value = runtime
+            .new_object("NSString", StoreValue::String("value".into()))
+            .unwrap();
+        let source_dictionary = runtime
+            .new_object(
+                "NSDictionary",
+                StoreValue::Entries(HashMap::from([("key".into(), value)])),
+            )
+            .unwrap();
+        let copied_dictionary = runtime
+            .call(
+                dictionary_with_dictionary,
+                &[dictionary_class, 0, source_dictionary],
+            )
+            .unwrap();
+        let initialized_dictionary = runtime
+            .new_object("NSMutableDictionary", StoreValue::Empty)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .call(
+                    init_with_dictionary,
+                    &[initialized_dictionary, 0, source_dictionary]
+                )
+                .unwrap(),
+            initialized_dictionary
+        );
+        let source_array = runtime
+            .new_object("NSArray", StoreValue::Addresses(vec![value]))
+            .unwrap();
+        let initialized_array = runtime
+            .new_object("NSMutableArray", StoreValue::Empty)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .call(init_with_array, &[initialized_array, 0, source_array])
+                .unwrap(),
+            initialized_array
+        );
+        let mut state = runtime.state.borrow_mut();
+        state.objects.get_mut(&source_dictionary).unwrap().value =
+            StoreValue::Entries(HashMap::new());
+        state.objects.get_mut(&source_array).unwrap().value = StoreValue::Addresses(Vec::new());
+        for dictionary in [copied_dictionary, initialized_dictionary] {
+            let StoreValue::Entries(entries) = &state.objects[&dictionary].value else {
+                panic!("copy is not a dictionary");
+            };
+            assert_eq!(entries["key"], value);
+        }
+        let StoreValue::Addresses(items) = &state.objects[&initialized_array].value else {
+            panic!("copy is not an array");
+        };
+        assert_eq!(items.as_slice(), &[value]);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_string_creation_conversion_and_trimming() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |selector: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.selector == selector)
+                .unwrap()
+                .address
+        };
+        let create = call_address("stringWithUTF8String:");
+        let append = call_address("stringByAppendingString:");
+        let encode = call_address("dataUsingEncoding:");
+        let trim = call_address("stringByTrimmingCharactersInSet:");
+        let string_class =
+            runtime.profile.index.classes[runtime.profile.runtime.classes_by_name["NSString"]]
+                .address;
+        let bytes = runtime.allocate(16).unwrap();
+        runtime.engine.mem_write(bytes, "éx\0".as_bytes()).unwrap();
+        let string = runtime.call(create, &[string_class, 0, bytes]).unwrap();
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), string).unwrap(),
+            "éx"
+        );
+        let suffix = runtime
+            .new_object("NSString", StoreValue::String("世界".into()))
+            .unwrap();
+        let combined = runtime.call(append, &[string, 0, suffix]).unwrap();
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), combined).unwrap(),
+            "éx世界"
+        );
+        let utf8 = runtime.call(encode, &[combined, 0, 4]).unwrap();
+        let utf16 = runtime.call(encode, &[combined, 0, 10]).unwrap();
+        let state = runtime.state.borrow();
+        let StoreValue::Bytes(utf8_bytes) = &state.objects[&utf8].value else {
+            panic!("UTF-8 conversion did not return data");
+        };
+        assert_eq!(utf8_bytes, "éx世界".as_bytes());
+        let StoreValue::Bytes(utf16_bytes) = &state.objects[&utf16].value else {
+            panic!("UTF-16 conversion did not return data");
+        };
+        assert_eq!(&utf16_bytes[..2], &[0xff, 0xfe]);
+        assert_eq!(utf16_bytes.len(), 10);
+        drop(state);
+        let padded = runtime
+            .new_object("NSString", StoreValue::String("éé hello é".into()))
+            .unwrap();
+        let characters = runtime
+            .new_object("NSCharacterSet", StoreValue::String("é ".into()))
+            .unwrap();
+        let trimmed = runtime.call(trim, &[padded, 0, characters]).unwrap();
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), trimmed).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_map_table_factories_return_empty_maps() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let class =
+            runtime.profile.index.classes[runtime.profile.runtime.classes_by_name["NSMapTable"]]
+                .address;
+        let calls = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call.selector.as_str(),
+                    "strongToStrongObjectsMapTable"
+                        | "strongToWeakObjectsMapTable"
+                        | "weakToStrongObjectsMapTable"
+                )
+            })
+            .map(|call| call.address)
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 3);
+        for call in calls {
+            let table = runtime.call(call, &[class]).unwrap();
+            let state = runtime.state.borrow();
+            assert_eq!(state.objects[&table].class, "NSMapTable");
+            let StoreValue::Entries(entries) = &state.objects[&table].value else {
+                panic!("map table has no dictionary storage");
+            };
+            assert!(entries.is_empty());
+        }
     }
 
     #[test]
