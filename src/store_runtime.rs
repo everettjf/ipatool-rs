@@ -1567,6 +1567,42 @@ fn dispatch_call(
             context.mem_write(output, &digest)?;
             context.reg_write(REG_X0, output)?;
         }
+        "strftime" => {
+            let output = context.reg_read(REG_X0)?;
+            let limit = context.reg_read(REG_X0 + 1)?;
+            let format = guest_cstring(context, profile, state, context.reg_read(REG_X0 + 2)?)?;
+            if format != "%a, %d %b %Y %H:%M:%S GMT" {
+                bail!("unsupported date output format {format}");
+            }
+            let tm = read_guest_tm(context, context.reg_read(REG_X0 + 3)?)?;
+            let value = format_guest_http_date(normalize_guest_tm(tm)?);
+            if value.len() as u64 + 1 > limit {
+                context.reg_write(REG_X0, 0)?;
+            } else {
+                let mut bytes = value.into_bytes();
+                bytes.push(0);
+                context.mem_write(output, &bytes)?;
+                context.reg_write(REG_X0, (bytes.len() - 1) as u64)?;
+            }
+        }
+        "strptime" => {
+            let input = context.reg_read(REG_X0)?;
+            let value = guest_cstring(context, profile, state, input)?;
+            let format = guest_cstring(context, profile, state, context.reg_read(REG_X0 + 1)?)?;
+            if format != "%a, %d %b %Y %H:%M:%S GMT" && format != "%a, %d %b %Y %H:%M:%S %Z" {
+                bail!("unsupported date format {format}");
+            }
+            if let Some(tm) = parse_guest_http_date(&value) {
+                write_guest_tm(context, context.reg_read(REG_X0 + 2)?, tm)?;
+                context.reg_write(REG_X0, input + value.len() as u64)?;
+            } else {
+                context.reg_write(REG_X0, 0)?;
+            }
+        }
+        "timegm" => {
+            let tm = read_guest_tm(context, context.reg_read(REG_X0)?)?;
+            context.reg_write(REG_X0, normalize_guest_tm(tm)?.unix_timestamp() as u64)?;
+        }
         "res_9_ninit" => context.reg_write(REG_X0, u32::MAX as u64)?,
         "res_9_ndestroy" => {}
         "CRIsAutoSubmitEnabled"
@@ -9115,6 +9151,97 @@ fn new_bundle_info(
     )
 }
 
+fn read_guest_tm(context: &HookContext, address: u64) -> Result<[i32; 9]> {
+    let bytes = context.mem_read(address, 36)?;
+    Ok(std::array::from_fn(|index| {
+        i32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().expect("tm word"))
+    }))
+}
+
+fn write_guest_tm(context: &HookContext, address: u64, fields: [i32; 9]) -> Result<()> {
+    for (index, field) in fields.into_iter().enumerate() {
+        context.mem_write(address + (index * 4) as u64, &field.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn normalize_guest_tm(fields: [i32; 9]) -> Result<time::OffsetDateTime> {
+    let month = i64::from(fields[4]);
+    let year = i64::from(fields[5]) + 1900 + month.div_euclid(12);
+    let year = i32::try_from(year).context("guest date year is out of range")?;
+    let month = time::Month::try_from((month.rem_euclid(12) + 1) as u8)?;
+    let date = time::Date::from_calendar_date(year, month, 1)?;
+    let seconds = (i64::from(fields[3]) - 1) * 86_400
+        + i64::from(fields[2]) * 3600
+        + i64::from(fields[1]) * 60
+        + i64::from(fields[0]);
+    date.midnight()
+        .checked_add(time::Duration::seconds(seconds))
+        .context("guest date is out of range")
+        .map(time::PrimitiveDateTime::assume_utc)
+}
+
+fn format_guest_http_date(date: time::OffsetDateTime) -> String {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let weekday = WEEKDAYS[date.weekday().number_days_from_sunday() as usize];
+    let month = MONTHS[date.month() as usize - 1];
+    format!(
+        "{weekday}, {:02} {month} {:04} {:02}:{:02}:{:02} GMT",
+        date.day(),
+        date.year(),
+        date.hour(),
+        date.minute(),
+        date.second()
+    )
+}
+
+fn parse_guest_http_date(value: &str) -> Option<[i32; 9]> {
+    if !value.is_ascii() || value.len() != 29 {
+        return None;
+    }
+    if !matches!(
+        &value[..3],
+        "Sun" | "Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat"
+    ) || &value[3..5] != ", "
+        || &value[7..8] != " "
+        || &value[11..12] != " "
+        || &value[16..17] != " "
+        || &value[19..20] != ":"
+        || &value[22..23] != ":"
+        || &value[25..] != " GMT"
+    {
+        return None;
+    }
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|month| *month == &value[8..11])?;
+    let day: u8 = value[5..7].parse().ok()?;
+    let year: i32 = value[12..16].parse().ok()?;
+    let hour: u8 = value[17..19].parse().ok()?;
+    let minute: u8 = value[20..22].parse().ok()?;
+    let second: u8 = value[23..25].parse().ok()?;
+    let date =
+        time::Date::from_calendar_date(year, time::Month::try_from(month as u8 + 1).ok()?, day)
+            .ok()?;
+    time::Time::from_hms(hour, minute, second).ok()?;
+    Some([
+        i32::from(second),
+        i32::from(minute),
+        i32::from(hour),
+        i32::from(day),
+        month as i32,
+        year - 1900,
+        i32::from(date.weekday().number_days_from_sunday()),
+        i32::from(date.ordinal()) - 1,
+        0,
+    ])
+}
+
 fn random_uuid_string() -> Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).context("generate Store guest UUID")?;
@@ -9221,6 +9348,32 @@ fn allowed_store_url(url: &url::Url, authenticated: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_http_date_parser_matches_go_layout_and_tm_normalization() {
+        let parsed = parse_guest_http_date("Mon, 27 Oct 2026 12:34:56 GMT").unwrap();
+        assert_eq!(parsed, [56, 34, 12, 27, 9, 126, 2, 299, 0]);
+        assert_eq!(
+            normalize_guest_tm(parsed).unwrap().unix_timestamp(),
+            1_793_104_496
+        );
+        assert_eq!(
+            format_guest_http_date(normalize_guest_tm(parsed).unwrap()),
+            "Tue, 27 Oct 2026 12:34:56 GMT"
+        );
+        assert_eq!(
+            format_guest_http_date(normalize_guest_tm([0, 0, 0, 0, 12, 126, 0, 0, 0]).unwrap()),
+            "Thu, 31 Dec 2026 00:00:00 GMT"
+        );
+        for value in [
+            "Tue, 27 Oct 2026 12:34:56 UTC",
+            "Tue, 27 Oct 2026 12:34:56 +0000",
+            "Tue,  7 Oct 2026 12:34:56 GMT",
+            "Tue, 27 Oct 2026 12:34:56 GMT extra",
+        ] {
+            assert!(parse_guest_http_date(value).is_none(), "{value}");
+        }
+    }
 
     #[test]
     fn task_locals_shadow_pop_and_copy_to_child() {
@@ -9420,6 +9573,80 @@ mod tests {
             panic!("bundle executable URL is not a string");
         };
         assert_eq!(value, "file:///ipatool");
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_parses_formats_and_converts_http_dates() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |symbol: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.symbol == symbol)
+                .unwrap()
+                .address
+        };
+        let parse_call = call_address("strptime");
+        let format_call = call_address("strftime");
+        let timegm_call = call_address("timegm");
+        let input = b"Tue, 27 Oct 2026 12:34:56 GMT\0";
+        let parse_format = b"%a, %d %b %Y %H:%M:%S %Z\0";
+        let output_format = b"%a, %d %b %Y %H:%M:%S GMT\0";
+        let input_address = runtime.allocate(input.len() as u64).unwrap();
+        let parse_format_address = runtime.allocate(parse_format.len() as u64).unwrap();
+        let output_format_address = runtime.allocate(output_format.len() as u64).unwrap();
+        let tm_address = runtime.allocate(36).unwrap();
+        let output_address = runtime.allocate(30).unwrap();
+        runtime.engine.mem_write(input_address, input).unwrap();
+        runtime
+            .engine
+            .mem_write(parse_format_address, parse_format)
+            .unwrap();
+        runtime
+            .engine
+            .mem_write(output_format_address, output_format)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .call(
+                    parse_call,
+                    &[input_address, parse_format_address, tm_address]
+                )
+                .unwrap(),
+            input_address + 29
+        );
+        let tm_bytes = runtime.engine.mem_read(tm_address, 36).unwrap();
+        let fields: [i32; 9] = std::array::from_fn(|index| {
+            i32::from_le_bytes(tm_bytes[index * 4..index * 4 + 4].try_into().unwrap())
+        });
+        assert_eq!(fields, [56, 34, 12, 27, 9, 126, 2, 299, 0]);
+        assert_eq!(
+            runtime.call(timegm_call, &[tm_address]).unwrap(),
+            1_793_104_496
+        );
+        assert_eq!(
+            runtime
+                .call(
+                    format_call,
+                    &[output_address, 30, output_format_address, tm_address]
+                )
+                .unwrap(),
+            29
+        );
+        assert_eq!(runtime.engine.mem_read(output_address, 30).unwrap(), input);
+        assert_eq!(
+            runtime
+                .call(
+                    format_call,
+                    &[output_address, 29, output_format_address, tm_address]
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
