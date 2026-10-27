@@ -37,6 +37,7 @@ use crate::{
     store_purchase::PasswordTokenExpired,
     storefront::country_code_from_storefront,
     transport::{DEFAULT_AUTHENTICATION_TIMEOUT, Request, Response, Transport},
+    version::VersionLookupNotFound,
 };
 
 const VOLUME_PATH: &str = "/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct";
@@ -230,7 +231,7 @@ impl DownloadProductClient {
         }
         let country = country_code_from_storefront(&account.store_front)?;
         let response = self.send_product(account, app, version, || {
-            catalog.latest_external_version_id(app, country, platform)
+            download_fallback_version(catalog, app, country, platform)
         })?;
         let item = checked_item(&response)?;
         self.download_mobile_item(account, app, item, platform, output)
@@ -252,7 +253,7 @@ impl DownloadProductClient {
         }
         let country = country_code_from_storefront(&account.store_front)?;
         let response = self.send_product(account, app, version, || {
-            catalog.latest_external_version_id(app, country, platform)
+            download_fallback_version(catalog, app, country, platform)
         })?;
         let item = checked_item(&response)?;
         self.captured_mobile_item(account, app, item, &response, platform, output)
@@ -1095,6 +1096,32 @@ fn version_string(value: &Value) -> Result<String> {
     }
 }
 
+fn download_fallback_version(
+    catalog: &CatalogClient,
+    app: &App,
+    country: &str,
+    platform: Platform,
+) -> Result<String> {
+    match catalog.latest_external_version_id(app, country, platform) {
+        Ok(version) => Ok(version),
+        Err(error) if allows_unpinned_redownload(platform, &error) => Err(AppNotFound.into()),
+        Err(error) => Err(error),
+    }
+}
+
+fn allows_unpinned_redownload(platform: Platform, error: &anyhow::Error) -> bool {
+    matches!(
+        (platform, error.downcast_ref::<VersionLookupNotFound>()),
+        (
+            Platform::Iphone | Platform::Ipad,
+            Some(VersionLookupNotFound::IosCatalog)
+        ) | (
+            Platform::Appletv,
+            Some(VersionLookupNotFound::PlatformApp | VersionLookupNotFound::PlatformOffers)
+        )
+    )
+}
+
 fn checked_item(response: &DownloadProductResponse) -> Result<&DownloadItem> {
     let result = &response.data;
     if matches!(result.failure_type.as_str(), "2034" | "2042") {
@@ -1394,6 +1421,23 @@ mod tests {
             .send_product(&account(), &app(), "", || Err(AppNotFound.into()))
             .unwrap_err();
         assert!(error.to_string().contains("no package URL"));
+    }
+
+    #[test]
+    fn unpinned_fallback_requires_a_confirmed_missing_catalog_offer() {
+        let ios_missing = VersionLookupNotFound::IosCatalog.into();
+        assert!(allows_unpinned_redownload(Platform::Iphone, &ios_missing));
+        assert!(allows_unpinned_redownload(Platform::Ipad, &ios_missing));
+        assert!(!allows_unpinned_redownload(Platform::Watchos, &ios_missing));
+
+        let tv_missing = VersionLookupNotFound::PlatformOffers.into();
+        assert!(allows_unpinned_redownload(Platform::Appletv, &tv_missing));
+        assert!(!allows_unpinned_redownload(Platform::Iphone, &tv_missing));
+        assert!(!allows_unpinned_redownload(Platform::Watchos, &tv_missing));
+        assert!(!allows_unpinned_redownload(
+            Platform::Appletv,
+            &anyhow::anyhow!("network failure")
+        ));
     }
 
     #[test]

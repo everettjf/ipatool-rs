@@ -122,11 +122,19 @@ impl CatalogClient {
     }
 
     pub(crate) fn get(&self, url: Url) -> Result<Response> {
+        self.get_allow_not_found(url)?
+            .ok_or_else(|| AppNotFound.into())
+    }
+
+    pub(crate) fn get_allow_not_found(&self, url: Url) -> Result<Option<Response>> {
         let mut request = Request::get(url);
         request.timeout = Some(std::time::Duration::from_secs(30));
         let response = self.http.send(request)?;
+        if response.status == 404 {
+            return Ok(None);
+        }
         response.ensure_success()?;
-        Ok(response)
+        Ok(Some(response))
     }
 
     pub fn search(

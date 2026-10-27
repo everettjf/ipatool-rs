@@ -1,10 +1,31 @@
 //! Public catalog lookup of the latest platform external version identifier.
 
+use std::{error::Error, fmt};
+
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use url::Url;
 
 use crate::{App, CatalogClient, Platform, catalog::validate_country, macos, vision};
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum VersionLookupNotFound {
+    PlatformApp,
+    PlatformOffers,
+    IosCatalog,
+}
+
+impl fmt::Display for VersionLookupNotFound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PlatformApp => "platform version lookup returned no app",
+            Self::PlatformOffers => "platform version lookup returned no offers",
+            Self::IosCatalog => "iOS catalog lookup returned HTTP 404",
+        })
+    }
+}
+
+impl Error for VersionLookupNotFound {}
 
 impl CatalogClient {
     pub fn latest_external_version_id(
@@ -39,15 +60,14 @@ impl CatalogClient {
             Platform::Macos => unreachable!("handled above"),
             Platform::Unknown | Platform::Visionos => bail!("invalid platform"),
         };
-        let mut last_error = String::new();
+        let mut last_missing = VersionLookupNotFound::PlatformApp;
         for catalog in catalogs {
             let url = mdm_lookup_url(app.id, country, catalog)?;
             let value: Value = self.get(url)?.json()?;
             match mdm_version_id(&value, app.id) {
                 Ok(Some(id)) => return Ok(id),
                 Ok(None) => {
-                    last_error =
-                        format!("platform version lookup returned no app or offers in {catalog}")
+                    last_missing = mdm_missing_reason(&value, app.id);
                 }
                 Err(error) => return Err(error),
             }
@@ -55,16 +75,18 @@ impl CatalogClient {
 
         if matches!(platform, Platform::Iphone | Platform::Ipad) {
             let url = ios_catalog_url(app.id, country, platform)?;
-            let value: Value = self.get(url)?.json()?;
+            let response = self
+                .get_allow_not_found(url)?
+                .ok_or(VersionLookupNotFound::IosCatalog)?;
+            let value: Value = response.json()?;
             return ios_catalog_version_id(&value, app, platform);
         }
-        Err(anyhow!(
-            "app {} in storefront {} (catalogs: {}): {}",
+        Err(anyhow!(last_missing).context(format!(
+            "app {} in storefront {} (catalogs: {})",
             app.id,
             country,
             catalogs.join(", "),
-            last_error
-        ))
+        )))
     }
 }
 
@@ -140,6 +162,18 @@ fn mdm_version_id(value: &Value, app_id: i64) -> Result<Option<String>> {
     Ok(Some(id))
 }
 
+fn mdm_missing_reason(value: &Value, app_id: i64) -> VersionLookupNotFound {
+    if value
+        .get("results")
+        .and_then(|results| results.get(app_id.to_string().as_str()))
+        .is_some()
+    {
+        VersionLookupNotFound::PlatformOffers
+    } else {
+        VersionLookupNotFound::PlatformApp
+    }
+}
+
 fn ios_catalog_version_id(value: &Value, app: &App, platform: Platform) -> Result<String> {
     let items = value
         .get("data")
@@ -212,6 +246,16 @@ mod tests {
         .unwrap();
         assert_eq!(mdm_version_id(&data, 42).unwrap(), Some("456".into()));
         assert_eq!(mdm_version_id(&data, 43).unwrap(), None);
+        assert_eq!(
+            mdm_missing_reason(&data, 43),
+            VersionLookupNotFound::PlatformApp
+        );
+        let no_offers = serde_json::json!({"results": {"42": {"offers": []}}});
+        assert_eq!(mdm_version_id(&no_offers, 42).unwrap(), None);
+        assert_eq!(
+            mdm_missing_reason(&no_offers, 42),
+            VersionLookupNotFound::PlatformOffers
+        );
     }
 
     #[test]
