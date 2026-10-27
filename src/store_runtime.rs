@@ -265,6 +265,11 @@ enum CallbackAction {
         semaphore: u64,
         previous_queue: u64,
     },
+    GroupWait {
+        group: u64,
+        timeout: u64,
+        previous_queue: u64,
+    },
     ScheduleComplete {
         task: u64,
     },
@@ -281,6 +286,7 @@ enum CallbackAction {
         saved: Vec<(i32, u64)>,
         poll_after: Option<(u64, u64)>,
         semaphore_after: Option<u64>,
+        group_after: Option<(u64, u64)>,
     },
     PollSwiftContinuation {
         task: u64,
@@ -1848,6 +1854,38 @@ fn dispatch_call(
                 };
                 dispatch_pending_for_semaphore(context, profile, state, semaphore, work)?;
             }
+        }
+        "dispatch_group_create" => {
+            let group = new_guest_object(
+                context,
+                profile,
+                state,
+                "HostDispatchGroup",
+                StoreValue::Number(0),
+            )?;
+            context.reg_write(REG_X0, group)?;
+        }
+        "dispatch_group_enter" => {
+            let group = context.reg_read(REG_X0)?;
+            let count = group_count(state, group)?;
+            *count = count
+                .checked_add(1)
+                .context("guest dispatch group overflow")?;
+            context.reg_write(REG_X0, 0)?;
+        }
+        "dispatch_group_leave" => {
+            let group = context.reg_read(REG_X0)?;
+            let count = group_count(state, group)?;
+            if *count <= 0 {
+                bail!("guest dispatch group leave without enter");
+            }
+            *count -= 1;
+            context.reg_write(REG_X0, 0)?;
+        }
+        "dispatch_group_wait" => {
+            let group = context.reg_read(REG_X0)?;
+            let timeout = context.reg_read(REG_X0 + 1)?;
+            poll_dispatch_group(context, profile, state, group, timeout)?;
         }
         "dispatch_block_create" => {
             let block = context.reg_read(REG_X0 + 1)?;
@@ -4741,6 +4779,7 @@ fn start_swift_task(
     handle: u64,
     poll_after: Option<(u64, u64)>,
     semaphore_after: Option<u64>,
+    group_after: Option<(u64, u64)>,
 ) -> Result<()> {
     let task = state
         .swift_tasks
@@ -4771,6 +4810,7 @@ fn start_swift_task(
                 saved,
                 poll_after,
                 semaphore_after,
+                group_after,
             },
         },
     );
@@ -4843,6 +4883,20 @@ fn consume_signaled_semaphore(state: &mut StoreState, address: u64) -> Result<()
     Ok(())
 }
 
+fn group_count(state: &mut StoreState, address: u64) -> Result<&mut i64> {
+    let object = state
+        .objects
+        .get_mut(&address)
+        .context("unknown guest dispatch group")?;
+    if object.class != "HostDispatchGroup" {
+        bail!("invalid guest dispatch group");
+    }
+    match &mut object.value {
+        StoreValue::Number(count) if *count >= 0 => Ok(count),
+        _ => bail!("invalid guest dispatch group count"),
+    }
+}
+
 fn take_runnable_pending(state: &mut StoreState) -> Option<PendingWork> {
     let index = state.pending.iter().position(|work| match work {
         PendingWork::Guest { queue, .. } => state
@@ -4877,7 +4931,7 @@ fn dispatch_pending_for_semaphore(
             )
         }
         PendingWork::SwiftTask { task } => {
-            start_swift_task(context, state, task, None, Some(semaphore))
+            start_swift_task(context, state, task, None, Some(semaphore), None)
         }
         work => {
             let resume = install_callback_resume(
@@ -4885,6 +4939,83 @@ fn dispatch_pending_for_semaphore(
                 state,
                 CallbackAction::SemaphoreWait {
                     semaphore,
+                    previous_queue: state.current_queue,
+                },
+            )?;
+            context.reg_write(REG_LR, resume)?;
+            match work {
+                PendingWork::Http { task } => perform_http(context, profile, state, task),
+                PendingWork::DeliverData { task } => {
+                    deliver_http_data(context, profile, state, task)
+                }
+                PendingWork::Complete { task } => complete_http_task(context, profile, state, task),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+fn poll_dispatch_group(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    group: u64,
+    timeout: u64,
+) -> Result<()> {
+    if *group_count(state, group)? == 0 {
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if timeout == 0
+        || (timeout != u64::MAX
+            && timeout <= time::OffsetDateTime::now_utc().unix_timestamp_nanos() as u64)
+    {
+        context.reg_write(REG_X0, 1)?;
+        return Ok(());
+    }
+    let Some(work) = take_runnable_pending(state) else {
+        if timeout == u64::MAX {
+            bail!("guest dispatch group has no runnable completion");
+        }
+        context.reg_write(REG_X0, 1)?;
+        return Ok(());
+    };
+    dispatch_pending_for_group(context, profile, state, group, timeout, work)
+}
+
+fn dispatch_pending_for_group(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    group: u64,
+    timeout: u64,
+    work: PendingWork,
+) -> Result<()> {
+    match work {
+        PendingWork::Guest { block, queue } => {
+            let previous_queue = std::mem::replace(&mut state.current_queue, queue);
+            begin_callback(
+                context,
+                state,
+                read_guest_u64(context, block + 16)?,
+                &[block],
+                CallbackAction::GroupWait {
+                    group,
+                    timeout,
+                    previous_queue,
+                },
+            )
+        }
+        PendingWork::SwiftTask { task } => {
+            start_swift_task(context, state, task, None, None, Some((group, timeout)))
+        }
+        work => {
+            let resume = install_callback_resume(
+                context,
+                state,
+                CallbackAction::GroupWait {
+                    group,
+                    timeout,
                     previous_queue: state.current_queue,
                 },
             )?;
@@ -4940,7 +5071,14 @@ fn poll_swift_continuation(
         }
         PendingWork::SwiftTask { task: child } => {
             state.current_swift_task = None;
-            start_swift_task(context, state, child, Some((task, continuation)), None)
+            start_swift_task(
+                context,
+                state,
+                child,
+                Some((task, continuation)),
+                None,
+                None,
+            )
         }
         work => {
             // The transport helpers start guest callbacks. Route their return
@@ -5203,6 +5341,17 @@ fn resume_callback(
             consume_signaled_semaphore(state, semaphore)?;
             context.reg_write(REG_X0, 0)?;
         }
+        CallbackAction::GroupWait {
+            group,
+            timeout,
+            previous_queue,
+        } => {
+            state.current_queue = previous_queue;
+            context.reg_write(REG_LR, resume.link)?;
+            context.reg_write(REG_PC, resume.link)?;
+            poll_dispatch_group(context, profile, state, group, timeout)?;
+            return Ok(());
+        }
         CallbackAction::CopyProperty { destination } => {
             let value = context.reg_read(REG_X0)?;
             write_guest_u64(context, destination, value)?;
@@ -5214,6 +5363,7 @@ fn resume_callback(
             saved,
             poll_after,
             semaphore_after,
+            group_after,
         } => {
             let task = state
                 .swift_tasks
@@ -5234,7 +5384,9 @@ fn resume_callback(
             }
             context.reg_write(
                 REG_X0,
-                u64::from(poll_after.is_none() && semaphore_after.is_none()),
+                u64::from(
+                    poll_after.is_none() && semaphore_after.is_none() && group_after.is_none(),
+                ),
             )?;
             if let Some((parent, continuation)) = poll_after {
                 state.current_swift_task = Some(parent);
@@ -5244,6 +5396,9 @@ fn resume_callback(
                     consume_signaled_semaphore(state, semaphore)?;
                 }
                 context.reg_write(REG_PC, link)?;
+                if let Some((group, timeout)) = group_after {
+                    poll_dispatch_group(context, profile, state, group, timeout)?;
+                }
             }
             return Ok(());
         }
@@ -6784,7 +6939,7 @@ fn dispatch_message(
                         complete_http_task(context, profile, state, task)?
                     }
                     PendingWork::SwiftTask { task } => {
-                        start_swift_task(context, state, task, None, None)?
+                        start_swift_task(context, state, task, None, None, None)?
                     }
                 }
                 return Ok(());
@@ -9953,6 +10108,50 @@ mod tests {
 
     #[test]
     #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_dispatch_group_wait_drains_runnable_callbacks() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |symbol: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.symbol == symbol)
+                .unwrap()
+                .address
+        };
+        let create = call_address("dispatch_group_create");
+        let enter = call_address("dispatch_group_enter");
+        let leave = call_address("dispatch_group_leave");
+        let wait = call_address("dispatch_group_wait");
+        let group = runtime.call(create, &[]).unwrap();
+        assert_eq!(runtime.call(wait, &[group, 0]).unwrap(), 0);
+        assert!(runtime.call(leave, &[group]).is_err());
+        runtime.call(enter, &[group]).unwrap();
+        runtime.call(enter, &[group]).unwrap();
+        assert_eq!(runtime.call(wait, &[group, 0]).unwrap(), 1);
+        assert_eq!(runtime.call(wait, &[group, 1]).unwrap(), 1);
+        runtime.write_u64(group + 16, leave).unwrap();
+        for _ in 0..2 {
+            runtime.state.borrow_mut().pending.push(PendingWork::Guest {
+                block: group,
+                queue: 0,
+            });
+        }
+        assert_eq!(runtime.call(wait, &[group, 1]).unwrap(), 1);
+        assert_eq!(runtime.state.borrow().pending.len(), 2);
+        assert_eq!(runtime.call(wait, &[group, u64::MAX]).unwrap(), 0);
+        assert!(runtime.state.borrow().pending.is_empty());
+        let state = runtime.state.borrow();
+        let StoreValue::Number(count) = state.objects[&group].value else {
+            panic!("guest dispatch group count is not numeric");
+        };
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
     fn pinned_guest_clock_gettime_nsec_uses_host_clock() {
         let assets = SapAssetBundle::load_cached().unwrap();
         let mut runtime = StoreRuntime::open(&assets).unwrap();
@@ -10020,7 +10219,7 @@ mod tests {
     }
 
     #[test]
-    fn swift_continuation_and_semaphore_run_pending_http_delegate_callbacks() {
+    fn swift_continuation_semaphore_and_group_run_pending_http_callbacks() {
         let assets = SapAssetBundle::load_cached().unwrap();
         let mut runtime = StoreRuntime::open(&assets).unwrap();
         let request = runtime
@@ -10162,6 +10361,46 @@ mod tests {
                 .contains("guest semaphore remains unsignaled"),
             "{error:#}"
         );
+        assert!(
+            runtime
+                .state
+                .borrow()
+                .http_responses
+                .contains_key(&http_task)
+        );
+
+        let group_create = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.symbol == "dispatch_group_create")
+            .unwrap()
+            .address;
+        let group_enter = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.symbol == "dispatch_group_enter")
+            .unwrap()
+            .address;
+        let group_wait = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.symbol == "dispatch_group_wait")
+            .unwrap()
+            .address;
+        let group = runtime.call(group_create, &[]).unwrap();
+        runtime.call(group_enter, &[group]).unwrap();
+        {
+            let mut state = runtime.state.borrow_mut();
+            state.http_responses.remove(&http_task);
+            state.pending.push(PendingWork::Http { task: http_task });
+        }
+        assert_eq!(runtime.call(group_wait, &[group, u64::MAX - 1]).unwrap(), 1);
         assert!(
             runtime
                 .state
