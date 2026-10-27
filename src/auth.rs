@@ -288,6 +288,7 @@ mod tests {
     #[test]
     fn bag_ignores_unrelated_binary_values() {
         let response = Response {
+            set_cookie_headers: Vec::new(),
             status: 200,
             headers: Default::default(),
             body: br#"<plist version="1.0"><dict><key>urlBag</key><dict/><key>unrelatedCertificate</key><data>AQID</data></dict></plist>"#.to_vec(),

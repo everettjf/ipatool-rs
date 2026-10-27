@@ -95,6 +95,7 @@ impl Request {
 pub struct Response {
     pub status: u16,
     pub headers: HashMap<String, String>,
+    pub set_cookie_headers: Vec<String>,
     pub body: Vec<u8>,
 }
 
@@ -426,16 +427,23 @@ impl Transport {
 
     fn response_from_http(response: HttpResponse, policy: BodyPolicy) -> Result<Response> {
         let status = response.status().as_u16();
-        let headers = response
+        let set_cookie_headers = response
             .headers()
+            .get_all(SET_COOKIE)
             .iter()
-            .map(|(key, value)| {
-                (
-                    key.as_str().to_ascii_lowercase(),
-                    value.to_str().unwrap_or_default().to_owned(),
-                )
-            })
+            .filter_map(|value| value.to_str().ok().map(str::to_owned))
             .collect();
+        let mut headers: HashMap<String, String> = HashMap::new();
+        for (key, value) in response.headers().iter() {
+            let value = value.to_str().unwrap_or_default();
+            headers
+                .entry(key.as_str().to_ascii_lowercase())
+                .and_modify(|combined| {
+                    combined.push_str(", ");
+                    combined.push_str(value);
+                })
+                .or_insert_with(|| value.to_owned());
+        }
         let body = match policy {
             BodyPolicy::Sap(_) if status != 200 => Vec::new(),
             BodyPolicy::Sap(limit) | BodyPolicy::Store(limit) => {
@@ -461,6 +469,7 @@ impl Transport {
         Ok(Response {
             status,
             headers,
+            set_cookie_headers,
             body,
         })
     }
@@ -548,6 +557,7 @@ mod tests {
 
     fn response(status: u16, body: &str) -> Response {
         Response {
+            set_cookie_headers: Vec::new(),
             status,
             headers: HashMap::new(),
             body: body.as_bytes().to_vec(),
@@ -621,6 +631,49 @@ mod tests {
             .insert("content-range".into(), "bytes 0-3/8".into());
         assert_eq!(res.header("Content-Range"), Some("bytes 0-3/8"));
         assert_eq!(res.body, b"part");
+    }
+
+    #[test]
+    fn preserves_all_set_cookie_headers_for_store_guest() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nSet-Cookie: one=1; Path=/\r\nSet-Cookie: two=2; Path=/\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let transport = Transport::with_cookies(directory.path()).unwrap();
+        let response = transport
+            .send_store(Request::get(
+                Url::parse(&format!("http://{address}/cookies")).unwrap(),
+            ))
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            response.set_cookie_headers,
+            ["one=1; Path=/", "two=2; Path=/"]
+        );
+        assert_eq!(
+            response.header("set-cookie"),
+            Some("one=1; Path=/, two=2; Path=/")
+        );
+        let jar = transport.cookies.as_ref().unwrap().lock().unwrap();
+        let header = jar
+            .header_for(
+                &Url::parse(&format!("http://{address}/cookies")).unwrap(),
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        assert!(header.contains("one=1"));
+        assert!(header.contains("two=2"));
     }
 
     #[test]

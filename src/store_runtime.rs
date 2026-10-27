@@ -111,6 +111,7 @@ struct StoreState {
     transport_no_redirects: bool,
     transport_timeout: Option<Duration>,
     http_responses: HashMap<u64, HostResponse>,
+    response_set_cookies: HashMap<u64, Vec<String>>,
     last_http_task: Option<u64>,
     host_blocks: HashMap<u64, HostBlockAction>,
     allocations: HashMap<u64, u64>,
@@ -477,6 +478,7 @@ impl StoreRuntime {
             transport_no_redirects: false,
             transport_timeout: None,
             http_responses: HashMap::new(),
+            response_set_cookies: HashMap::new(),
             last_http_task: None,
             host_blocks: HashMap::new(),
             allocations: HashMap::new(),
@@ -4527,6 +4529,11 @@ fn perform_http(
         "NSDictionary",
         StoreValue::Entries(header_values),
     )?;
+    if !response.set_cookie_headers.is_empty() {
+        state
+            .response_set_cookies
+            .insert(headers, response.set_cookie_headers.clone());
+    }
     let mime = response
         .header("content-type")
         .unwrap_or("")
@@ -8646,16 +8653,23 @@ fn dispatch_message(
             let StoreValue::Entries(entries) = &state.objects[&headers].value else {
                 bail!("cookie response headers are not a dictionary");
             };
-            let raw = entries
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
-                .map(|(_, &value)| object_string_value(state, value))
-                .transpose()?
-                .map(str::to_owned);
+            let raw = if let Some(values) = state.response_set_cookies.get(&headers) {
+                values.clone()
+            } else {
+                entries
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
+                    .map(|(_, &value)| object_string_value(state, value))
+                    .transpose()?
+                    .map(str::to_owned)
+                    .into_iter()
+                    .collect()
+            };
             let mut items = Vec::new();
-            if let Some(raw) = raw
-                && let Ok(cookie) = cookie::Cookie::parse(raw)
-            {
+            for raw in raw {
+                let Ok(cookie) = cookie::Cookie::parse(raw) else {
+                    continue;
+                };
                 let name = new_guest_object(
                     context,
                     profile,
@@ -12216,6 +12230,13 @@ mod tests {
                 StoreValue::Entries(HashMap::from([("Set-Cookie".into(), header)])),
             )
             .unwrap();
+        runtime.state.borrow_mut().response_set_cookies.insert(
+            headers,
+            vec![
+                "token=abc; Path=/; Expires=Wed, 21 Oct 2037 07:28:00 GMT".into(),
+                "session=xyz; Path=/".into(),
+            ],
+        );
         let response_cookies = runtime
             .invoke(
                 cookie_class,
@@ -12223,10 +12244,20 @@ mod tests {
                 &[headers, url],
             )
             .unwrap();
-        let response_cookie = match &runtime.state.borrow().objects[&response_cookies].value {
-            StoreValue::Addresses(items) => items[0],
-            _ => panic!("response cookies are not an array"),
-        };
+        let (response_cookie, session_cookie) =
+            match &runtime.state.borrow().objects[&response_cookies].value {
+                StoreValue::Addresses(items) => {
+                    assert_eq!(items.len(), 2);
+                    (items[0], items[1])
+                }
+                _ => panic!("response cookies are not an array"),
+            };
+        assert_eq!(
+            runtime
+                .invoke(session_cookie, "isSessionOnly", &[])
+                .unwrap(),
+            1
+        );
         assert_eq!(
             runtime
                 .invoke(response_cookie, "isSessionOnly", &[])
@@ -12335,6 +12366,7 @@ mod tests {
         runtime.set_transport(|request| {
             assert_eq!(request.url.as_str(), "https://buy.itunes.apple.com/request");
             Ok(HostResponse {
+                set_cookie_headers: Vec::new(),
                 status: 200,
                 headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
                 body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
@@ -12668,13 +12700,49 @@ mod tests {
         runtime.set_transport(|request| {
             assert_eq!(request.url.as_str(), "https://buy.itunes.apple.com/request");
             Ok(HostResponse {
+                set_cookie_headers: vec!["one=1; Path=/".into(), "two=2; Path=/".into()],
                 status: 200,
-                headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
+                headers: HashMap::from([
+                    ("content-type".into(), "application/x-apple-plist".into()),
+                    ("set-cookie".into(), "one=1; Path=/, two=2; Path=/".into()),
+                ]),
                 body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
             })
         });
         let (result, response) = runtime.send_request(session, request).unwrap();
         assert_eq!(response.status, 200);
+        let response_headers = *runtime
+            .state
+            .borrow()
+            .response_set_cookies
+            .keys()
+            .next()
+            .unwrap();
+        assert!(runtime.state.borrow().objects.values().any(|object| {
+            object.class == "NSHTTPURLResponse"
+                && object.properties.get("allHeaderFields") == Some(&response_headers)
+        }));
+        let cookies = runtime
+            .invoke(
+                runtime.class_address("NSHTTPCookie").unwrap(),
+                "cookiesWithResponseHeaderFields:forURL:",
+                &[response_headers, url],
+            )
+            .unwrap();
+        let state = runtime.state.borrow();
+        let StoreValue::Addresses(items) = &state.objects[&cookies].value else {
+            panic!("Store response cookies are not an array");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            object_string_value(&state, state.objects[&items[0]].properties["name"]).unwrap(),
+            "one"
+        );
+        assert_eq!(
+            object_string_value(&state, state.objects[&items[1]].properties["name"]).unwrap(),
+            "two"
+        );
+        drop(state);
         assert_eq!(
             response.header("content-type"),
             Some("application/x-apple-plist")
@@ -12707,6 +12775,7 @@ mod tests {
             assert_eq!(request.body.as_deref(), Some(b"raw request".as_slice()));
             assert_eq!(request.headers.get("x-test").unwrap(), "present, second");
             Ok(HostResponse {
+                set_cookie_headers: Vec::new(),
                 status: 200,
                 headers: HashMap::from([(
                     "content-type".into(),
@@ -12896,6 +12965,7 @@ mod tests {
             assert_eq!(body["salableAdamId"], "1234");
             assert_eq!(body["price"], "0");
             Ok(HostResponse {
+                set_cookie_headers: Vec::new(),
                 status: 200,
                 headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
                 body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
@@ -12948,6 +13018,7 @@ mod tests {
         let mut runtime = StoreRuntime::open(&assets).unwrap();
         runtime.set_transport(|_| {
             Ok(HostResponse {
+                set_cookie_headers: Vec::new(),
                 status: 200,
                 headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
                 body: br#"<plist version="1.0"><dict><key>failureType</key><string>9610</string><key>customerMessage</key><string>fixture-value</string></dict></plist>"#.to_vec(),
@@ -13009,6 +13080,7 @@ mod tests {
             assert_eq!(body["attempt"], 2);
             assert_eq!(body["why"], "signin");
             Ok(HostResponse {
+                set_cookie_headers: Vec::new(),
                 status: 200,
                 headers: HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
                 body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
@@ -13065,6 +13137,7 @@ mod tests {
             );
             assert_eq!(request.body.as_deref(), Some(b"session-id=7".as_slice()));
             Ok(HostResponse {
+                set_cookie_headers: Vec::new(),
                 status: 200,
                 headers: HashMap::new(),
                 body: b"raw DMAP response".to_vec(),

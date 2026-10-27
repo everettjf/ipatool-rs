@@ -517,6 +517,7 @@ mod tests {
             let bytes = data[start..=end].to_vec();
             served.fetch_add(bytes.len(), Ordering::SeqCst);
             Ok(Response {
+                set_cookie_headers: Vec::new(),
                 status: 206,
                 headers: std::collections::HashMap::from([
                     (
@@ -533,6 +534,7 @@ mod tests {
     #[test]
     fn range_response_accepts_go_compatible_unit_case_but_checks_bounds() {
         let response = Response {
+            set_cookie_headers: Vec::new(),
             status: 206,
             headers: std::collections::HashMap::from([(
                 "content-range".into(),
@@ -778,6 +780,7 @@ mod tests {
         let wrong_status =
             read_version_metadata_with_sender("https://example.test/app.ipa", |_| {
                 Ok(Response {
+                    set_cookie_headers: Vec::new(),
                     status: 200,
                     headers: Default::default(),
                     body: Vec::new(),
@@ -787,6 +790,7 @@ mod tests {
         let wrong_range =
             read_version_metadata_with_sender("https://example.test/app.ipa", move |_| {
                 Ok(Response {
+                    set_cookie_headers: Vec::new(),
                     status: 206,
                     headers: std::collections::HashMap::from([(
                         "content-range".into(),

@@ -260,6 +260,7 @@ mod tests {
                         "https://init.itunes.apple.com/bag.xml?guid=000102030405"
                     );
                     return Ok(HostResponse {
+                        set_cookie_headers: Vec::new(),
                         status: 200,
                         headers: std::collections::HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
                         body: br#"<Document><dict><key>urlBag</key><dict><key>buyProduct</key><string>https://buy.itunes.apple.com/stale</string></dict><key>unrelatedCertificate</key><data>AQID</data><key>unrelatedDate</key><date>2024-05-01T00:00:00Z</date></dict></Document>"#.to_vec(),
@@ -271,6 +272,7 @@ mod tests {
                     PURCHASE_USER_AGENT
                 );
                 Ok(HostResponse {
+                    set_cookie_headers: Vec::new(),
                     status: 200,
                     headers: std::collections::HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
                     body: br#"<plist version="1.0"><dict><key>status</key><integer>0</integer></dict></plist>"#.to_vec(),
@@ -320,6 +322,7 @@ mod tests {
         let backend =
             StoreBackend::with_sender(assets.apple_media_services, [0, 1, 2, 3, 4, 5], |_| {
                 Ok(HostResponse {
+                    set_cookie_headers: Vec::new(),
                     status: 200,
                     headers: std::collections::HashMap::from([(
                         "content-type".into(),
@@ -352,6 +355,7 @@ mod tests {
         let backend =
             StoreBackend::with_sender(assets.apple_media_services, [0, 1, 2, 3, 4, 5], |_| {
                 Ok(HostResponse {
+                    set_cookie_headers: Vec::new(),
                     status: 200,
                     headers: std::collections::HashMap::from([(
                         "content-type".into(),

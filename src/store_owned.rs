@@ -898,6 +898,7 @@ mod tests {
                 }
             };
             Ok(Response {
+                set_cookie_headers: Vec::new(),
                 status: 200,
                 headers: std::collections::HashMap::new(),
                 body,
@@ -966,6 +967,7 @@ mod tests {
                     _ => dmap::tag(b"mlcl", &item(42, APP_MEDIA_KIND as u32, 1, 100))?,
                 };
                 Ok(Response {
+                    set_cookie_headers: Vec::new(),
                     status: 200,
                     headers: std::collections::HashMap::new(),
                     body,
@@ -1027,6 +1029,7 @@ mod tests {
             _ => dmap::tag(b"mlcl", &item(42, APP_MEDIA_KIND as u32, 1, 100))?,
         };
         Ok(Response {
+            set_cookie_headers: Vec::new(),
             status: 200,
             headers: std::collections::HashMap::new(),
             body,
@@ -1043,6 +1046,7 @@ mod tests {
             );
             assert!(request.no_redirects);
             Ok(Response {
+                set_cookie_headers: Vec::new(),
                 status: 200,
                 headers: std::collections::HashMap::new(),
                 body: br#"<plist version="1.0"><dict><key>urlBag</key><dict/></dict></plist>"#

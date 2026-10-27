@@ -613,6 +613,7 @@ mod tests {
 
     fn fixture_response(status: u16, body: &str) -> Response {
         Response {
+            set_cookie_headers: Vec::new(),
             status,
             headers: std::collections::HashMap::from([(
                 "x-set-apple-store-front".into(),
