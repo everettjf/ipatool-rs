@@ -6993,8 +6993,9 @@ fn dispatch_message(
             let StoreValue::Bytes(bytes) = &state.objects[&data].value else {
                 bail!("property list input is not NSData");
             };
-            let parsed: Value = plist::from_bytes(bytes).context("parse Store property list")?;
-            let value = import_guest_json(context, profile, state, &parsed, 0)?;
+            let parsed: plist::Value =
+                plist::from_bytes(bytes).context("parse Store property list")?;
+            let value = import_guest_plist(context, profile, state, &parsed, 0)?;
             context.reg_write(REG_X0, value)?;
         }
         (true, "dataWithPropertyList:format:options:error:")
@@ -8412,56 +8413,81 @@ fn collection_key(state: &StoreState, address: u64) -> String {
     format!("#object:{address:x}")
 }
 
-fn import_guest_json(
+fn import_guest_plist(
     context: &HookContext,
     profile: &ProfileData,
     state: &mut StoreState,
-    value: &Value,
+    value: &plist::Value,
     depth: usize,
 ) -> Result<u64> {
     if depth > 32 {
         bail!("Store Foundation import exceeds nesting limit");
     }
     match value {
-        Value::Null => Ok(0),
-        Value::String(value) => new_guest_object(
+        plist::Value::String(value) => new_guest_object(
             context,
             profile,
             state,
             "NSString",
             StoreValue::String(value.clone()),
         ),
-        Value::Bool(value) => new_guest_object(
+        plist::Value::Boolean(value) => new_guest_object(
             context,
             profile,
             state,
             "NSNumber",
             StoreValue::Boolean(*value),
         ),
-        Value::Number(value) => {
-            let number = if let Some(integer) = value.as_i64() {
-                StoreValue::Number(integer)
-            } else if let Some(integer) = value.as_u64().filter(|value| *value <= i64::MAX as u64) {
-                StoreValue::Number(integer as i64)
-            } else {
-                StoreValue::Float(value.as_f64().context("invalid Store number")?)
-            };
+        plist::Value::Integer(value) => {
+            let number = value.as_signed().map_or_else(
+                || StoreValue::Float(value.as_unsigned().unwrap() as f64),
+                StoreValue::Number,
+            );
             new_guest_object(context, profile, state, "NSNumber", number)
         }
-        Value::Array(values) => {
+        plist::Value::Real(value) => new_guest_object(
+            context,
+            profile,
+            state,
+            "NSNumber",
+            StoreValue::Float(*value),
+        ),
+        plist::Value::Uid(value) => {
+            let value = value.get();
+            let number = i64::try_from(value)
+                .map(StoreValue::Number)
+                .unwrap_or_else(|_| StoreValue::Float(value as f64));
+            new_guest_object(context, profile, state, "NSNumber", number)
+        }
+        plist::Value::Data(value) => new_guest_object(
+            context,
+            profile,
+            state,
+            "NSData",
+            StoreValue::Bytes(value.clone()),
+        ),
+        plist::Value::Date(value) => {
+            let time: std::time::SystemTime = (*value).into();
+            let seconds = match time.duration_since(std::time::UNIX_EPOCH) {
+                Ok(duration) => duration.as_secs_f64(),
+                Err(error) => -error.duration().as_secs_f64(),
+            };
+            new_guest_object(
+                context,
+                profile,
+                state,
+                "NSDate",
+                StoreValue::Float(seconds),
+            )
+        }
+        plist::Value::Array(values) => {
             if values.len() > 65_536 {
                 bail!("Store Foundation array exceeds size limit");
             }
-            let mut items = Vec::with_capacity(values.len());
-            for value in values {
-                items.push(import_guest_json(
-                    context,
-                    profile,
-                    state,
-                    value,
-                    depth + 1,
-                )?);
-            }
+            let items = values
+                .iter()
+                .map(|value| import_guest_plist(context, profile, state, value, depth + 1))
+                .collect::<Result<Vec<_>>>()?;
             new_guest_object(
                 context,
                 profile,
@@ -8470,7 +8496,7 @@ fn import_guest_json(
                 StoreValue::Addresses(items),
             )
         }
-        Value::Object(values) => {
+        plist::Value::Dictionary(values) => {
             if values.len() > 65_536 {
                 bail!("Store Foundation dictionary exceeds size limit");
             }
@@ -8478,7 +8504,7 @@ fn import_guest_json(
             for (key, value) in values {
                 entries.insert(
                     key.clone(),
-                    import_guest_json(context, profile, state, value, depth + 1)?,
+                    import_guest_plist(context, profile, state, value, depth + 1)?,
                 );
             }
             new_guest_object(
@@ -8489,6 +8515,7 @@ fn import_guest_json(
                 StoreValue::Entries(entries),
             )
         }
+        _ => bail!("unsupported Store property list value"),
     }
 }
 

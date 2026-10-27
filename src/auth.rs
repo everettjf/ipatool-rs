@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
 
-use crate::transport::{DEFAULT_AUTHENTICATION_TIMEOUT, Request, Transport};
+use crate::transport::{DEFAULT_AUTHENTICATION_TIMEOUT, Request, Response, Transport};
 
 const AUTH_PATH: &str = "/WebObjects/MZFinance.woa/wa/authenticate";
 const FALLBACK_AUTH_ENDPOINT: &str =
@@ -179,6 +179,10 @@ pub fn fetch_bag(transport: &Transport, mac_address: &str) -> Result<SapConfig> 
         .send(request)
         .context("failed to request Apple URL bag")?;
     response.ensure_success()?;
+    sap_config_from_bag_response(&response)
+}
+
+pub(crate) fn sap_config_from_bag_response(response: &Response) -> Result<SapConfig> {
     let parsed: BagResponse = response.plist(false)?;
     config_from_bag(parsed)
 }
@@ -247,6 +251,19 @@ mod tests {
         assert_eq!(config.auth_endpoint.path(), format!("{AUTH_PATH}/"));
         let parsed: BagResponse = plist::from_bytes(b"<plist version=\"1.0\"><dict><key>urlBag</key><dict><key>sign-sap-setup</key><string>http://invalid.test</string></dict></dict></plist>").unwrap();
         assert!(config_from_bag(parsed).is_err());
+    }
+
+    #[test]
+    fn bag_ignores_unrelated_binary_values() {
+        let response = Response {
+            status: 200,
+            headers: Default::default(),
+            body: br#"<plist version="1.0"><dict><key>urlBag</key><dict/><key>unrelatedCertificate</key><data>AQID</data></dict></plist>"#.to_vec(),
+        };
+        assert_eq!(
+            sap_config_from_bag_response(&response).unwrap().version,
+            200
+        );
     }
 
     #[test]

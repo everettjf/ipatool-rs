@@ -614,22 +614,24 @@ impl DownloadProductClient {
         request.timeout = Some(DEFAULT_AUTHENTICATION_TIMEOUT);
         let response = (self.sender)(request).context("request Store URL bag")?;
         response.ensure_success()?;
-        let value: Value = response.plist(false)?;
+        let value: plist::Value = response.plist(false)?;
         let bag = value
-            .get("urlBag")
+            .as_dictionary()
+            .and_then(|fields| fields.get("urlBag"))
+            .and_then(plist::Value::as_dictionary)
             .context("Store URL bag is missing urlBag")?;
         Ok(DownloadBag {
             ent_download: bag
                 .get("volumeStoreDownloadProduct")
-                .and_then(Value::as_str)
+                .and_then(plist::Value::as_string)
                 .map(str::to_owned),
             redownload: bag
                 .get("redownloadProduct")
-                .and_then(Value::as_str)
+                .and_then(plist::Value::as_string)
                 .map(str::to_owned),
             update: bag
                 .get("updateProduct")
-                .and_then(Value::as_str)
+                .and_then(plist::Value::as_string)
                 .map(str::to_owned),
         })
     }
@@ -1462,6 +1464,21 @@ mod tests {
             client
                 .send_product(&account(), &app(), "101", || unreachable!())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn download_bag_ignores_unrelated_binary_values() {
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| {
+            Ok(Response {
+                status: 200,
+                headers: Default::default(),
+                body: br#"<plist version="1.0"><dict><key>urlBag</key><dict><key>redownloadProduct</key><string>https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/redownloadProduct</string></dict><key>unrelatedCertificate</key><data>AQID</data></dict></plist>"#.to_vec(),
+            })
+        });
+        assert_eq!(
+            client.fetch_bag().unwrap().redownload.as_deref(),
+            Some("https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/redownloadProduct")
         );
     }
 

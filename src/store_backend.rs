@@ -115,10 +115,12 @@ impl StoreBackend {
         if response.status != 200 {
             bail!("Store bag returned HTTP {}", response.status);
         }
-        let bag: Value = plist::from_bytes(&response.body).context("decode Store URL bag")?;
-        if !bag.is_object() {
+        let raw: plist::Value =
+            plist::from_bytes(&response.body).context("decode Store URL bag")?;
+        if raw.as_dictionary().is_none() {
             bail!("Store URL bag is not a dictionary");
         }
+        let bag = serde_json::to_value(&raw).context("convert Store URL bag for guest")?;
         *self.bag.lock().expect("Store bag lock poisoned") = Some(bag.clone());
         Ok(bag)
     }
@@ -226,7 +228,7 @@ mod tests {
                     return Ok(HostResponse {
                         status: 200,
                         headers: std::collections::HashMap::from([("content-type".into(), "application/x-apple-plist".into())]),
-                        body: br#"<plist version="1.0"><dict><key>urlBag</key><dict><key>buyProduct</key><string>https://buy.itunes.apple.com/stale</string></dict></dict></plist>"#.to_vec(),
+                        body: br#"<plist version="1.0"><dict><key>urlBag</key><dict><key>buyProduct</key><string>https://buy.itunes.apple.com/stale</string></dict><key>unrelatedCertificate</key><data>AQID</data><key>unrelatedDate</key><date>2024-05-01T00:00:00Z</date></dict></plist>"#.to_vec(),
                     });
                 }
                 assert_eq!(request.url.as_str(), "https://buy.itunes.apple.com/request");

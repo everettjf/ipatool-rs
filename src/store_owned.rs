@@ -15,7 +15,7 @@ use time::{
 };
 
 use crate::{
-    auth::{SapConfig, sap_config_from_bag_value},
+    auth::{SapConfig, sap_config_from_bag_response},
     catalog::App,
     credentials::Account,
     dmap,
@@ -93,8 +93,7 @@ impl OwnedBackend for NativeOwnedBackend {
         request.timeout = Some(DEFAULT_AUTHENTICATION_TIMEOUT);
         let response = (self.sender)(request).context("request Apple URL bag")?;
         response.ensure_success()?;
-        let bag: serde_json::Value = response.plist(false)?;
-        sap_config_from_bag_value(&bag)
+        sap_config_from_bag_response(&response)
     }
 
     fn send_history(

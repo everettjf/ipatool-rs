@@ -15,7 +15,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     auth::{
         SapConfig, normalize_auth_code, phone_number_storefront, resolve_auth_redirect,
-        sap_config_from_bag_value, validate_auth_endpoint,
+        sap_config_from_bag_response, validate_auth_endpoint,
     },
     credentials::{Account, AccountStore, CredentialStore},
     host::hardware_mac_address,
@@ -87,8 +87,7 @@ impl AuthenticationBackend for NativeAuthenticationBackend {
         request.timeout = Some(DEFAULT_AUTHENTICATION_TIMEOUT);
         let response = (self.sender)(request).context("request Apple URL bag")?;
         response.ensure_success()?;
-        let bag: serde_json::Value = response.plist(false)?;
-        sap_config_from_bag_value(&bag)
+        sap_config_from_bag_response(&response)
     }
 
     fn send_authentication(
