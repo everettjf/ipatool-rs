@@ -17,7 +17,7 @@ use ipatool_rs::{App, CatalogClient, Platform};
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -37,7 +37,11 @@ impl AppStoreServer {
         }
     }
 
-    async fn run(&self, work: impl FnOnce() -> Result<Value> + Send + 'static) -> CallToolResult {
+    async fn run(
+        &self,
+        name: &'static str,
+        work: impl FnOnce() -> Result<Value> + Send + 'static,
+    ) -> CallToolResult {
         let guard = Arc::clone(&self.gate).lock_owned().await;
         match tokio::task::spawn_blocking(move || {
             let _guard = guard;
@@ -46,14 +50,16 @@ impl AppStoreServer {
         .await
         {
             Ok(Ok(value)) => CallToolResult::structured(value),
-            Ok(Err(error)) => {
-                CallToolResult::structured_error(json!({ "error": format!("{error:#}") }))
-            }
-            Err(error) => CallToolResult::structured_error(
-                json!({ "error": format!("tool task failed: {error}") }),
-            ),
+            Ok(Err(error)) => tool_failure(name, format!("{error:#}")),
+            Err(error) => tool_failure(name, format!("tool task failed: {error}")),
         }
     }
+}
+
+fn tool_failure(name: &str, message: String) -> CallToolResult {
+    let mut result = CallToolResult::structured_error(json!({ "error": message }));
+    result.content = vec![ContentBlock::text(format!("{name} failed: {message}"))];
+    result
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -119,7 +125,7 @@ impl AppStoreServer {
         annotations(read_only_hint = true, idempotent_hint = false)
     )]
     async fn search_apps(&self, Parameters(input): Parameters<SearchInput>) -> CallToolResult {
-        self.run(move || {
+        self.run("search_apps", move || {
             if input.term.trim().is_empty() { bail!("search term must not be empty"); }
             let limit = input.limit.unwrap_or(5);
             if limit < 1 { bail!("limit must be greater than 0"); }
@@ -139,7 +145,7 @@ impl AppStoreServer {
         annotations(read_only_hint = true, idempotent_hint = false)
     )]
     async fn list_app_versions(&self, Parameters(input): Parameters<AppInput>) -> CallToolResult {
-        self.run(move || {
+        self.run("list_app_versions", move || {
             let platform = parse_platform(input.platform.as_deref())?.unwrap_or(Platform::Iphone);
             with_account(|account| {
                 let catalog = CatalogClient::new()?;
@@ -161,7 +167,7 @@ impl AppStoreServer {
         &self,
         Parameters(input): Parameters<MetadataInput>,
     ) -> CallToolResult {
-        self.run(move || {
+        self.run("get_version_metadata", move || {
             if input.external_version_id.trim().is_empty() { bail!("external version identifier must not be empty"); }
             let app_input = AppInput { app_id: input.app_id, bundle_identifier: input.bundle_identifier, platform: input.platform };
             let platform = parse_platform(app_input.platform.as_deref())?;
@@ -185,7 +191,7 @@ impl AppStoreServer {
         &self,
         Parameters(input): Parameters<PurchasesInput>,
     ) -> CallToolResult {
-        self.run(move || {
+        self.run("list_purchases", move || {
             let page = input.page.unwrap_or(1);
             let limit = input.max_results.unwrap_or(DEFAULT_LIMIT);
             if page == 0 || limit == 0 || limit > MAX_LIMIT {
@@ -229,7 +235,7 @@ impl AppStoreServer {
         annotations(read_only_hint = false, idempotent_hint = false)
     )]
     async fn purchase_app(&self, Parameters(input): Parameters<AppInput>) -> CallToolResult {
-        self.run(move || {
+        self.run("purchase_app", move || {
             let platform = parse_platform(input.platform.as_deref())?;
             with_account(|account| {
                 let app = resolve_app(&CatalogClient::new()?, account, &input, platform, false)?;
@@ -248,7 +254,7 @@ impl AppStoreServer {
         annotations(read_only_hint = false, idempotent_hint = false)
     )]
     async fn download_app(&self, Parameters(input): Parameters<DownloadInput>) -> CallToolResult {
-        self.run(move || {
+        self.run("download_app", move || {
             let app_input = AppInput { app_id: input.app_id, bundle_identifier: input.bundle_identifier.clone(), platform: input.platform.clone() };
             let platform = parse_platform(input.platform.as_deref())?.unwrap_or(Platform::Iphone);
             let version = input.external_version_id.unwrap_or_default();
@@ -596,7 +602,7 @@ mod tests {
             let server = server.clone();
             async move {
                 server
-                    .run(move || {
+                    .run("first", move || {
                         let _ = started_tx.send(());
                         release_rx.recv()?;
                         Ok(json!({ "first": true }))
@@ -609,7 +615,7 @@ mod tests {
         let (second_started_tx, mut second_started_rx) = tokio::sync::oneshot::channel();
         let second = tokio::spawn(async move {
             server
-                .run(move || {
+                .run("second", move || {
                     let _ = second_started_tx.send(());
                     Ok(json!({ "second": true }))
                 })
