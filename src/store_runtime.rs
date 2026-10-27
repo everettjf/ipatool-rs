@@ -6264,7 +6264,10 @@ fn dispatch_message(
             .class
             .clone()
     };
-    if class_name == "AMSConcurrency" && selector == "logFaultFromSwiftConcurrencyOnInternalBuild" {
+    if class_name == "AMSLogConfig"
+        || (class_name == "AMSConcurrency"
+            && selector == "logFaultFromSwiftConcurrencyOnInternalBuild")
+    {
         context.reg_write(REG_X0, 0)?;
         return Ok(());
     }
@@ -11894,14 +11897,14 @@ mod tests {
             .unwrap()
             .address;
         let custom = runtime
-            .new_object("AMSLogConfig", StoreValue::Empty)
+            .new_object("AMSAccountIdentity", StoreValue::Empty)
             .unwrap();
         let second = runtime
-            .new_object("AMSLogConfig", StoreValue::Empty)
+            .new_object("AMSAccountIdentity", StoreValue::Empty)
             .unwrap();
         assert!(
             runtime
-                .method_address("AMSLogConfig", "copyWithZone:", false)
+                .method_address("AMSAccountIdentity", "copyWithZone:", false)
                 .is_some()
         );
         let source = runtime
@@ -11923,6 +11926,23 @@ mod tests {
         };
         assert!(state.objects.contains_key(&entries["custom"]));
         assert!(state.objects.contains_key(&entries["second"]));
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_ams_log_config_is_host_noop() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let logger = runtime
+            .new_object("AMSLogConfig", StoreValue::Empty)
+            .unwrap();
+        assert!(
+            runtime
+                .method_address("AMSLogConfig", "copyWithZone:", false)
+                .is_some()
+        );
+        assert_eq!(runtime.invoke(logger, "copyWithZone:", &[0]).unwrap(), 0);
+        assert_eq!(runtime.invoke(logger, "copy", &[]).unwrap(), 0);
     }
 
     #[test]
