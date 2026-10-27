@@ -108,10 +108,22 @@ struct DecryptionReport {
     warnings: [&'static str; 4],
 }
 
-fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
-    let mut entry = archive
-        .by_name(name)
-        .with_context(|| format!("open IPA member {name}"))?;
+fn raw_member_name(source: &mut File, member: &ZipFile<'_, File>) -> Result<String> {
+    let raw = crate::duplicate_zip::read_raw_central_name(source, member.central_header_start())?;
+    Ok(String::from_utf8_lossy(&raw).into_owned())
+}
+
+fn read_entry(archive: &mut ZipArchive<File>, source: &mut File, name: &str) -> Result<Vec<u8>> {
+    let mut selected = None;
+    for index in 0..archive.len() {
+        let member = archive.by_index_raw(index)?;
+        if raw_member_name(source, &member)? == name {
+            selected = Some(index);
+            break;
+        }
+    }
+    let index = selected.with_context(|| format!("open IPA member {name}"))?;
+    let mut entry = archive.by_index(index)?;
     let mut bytes = Vec::new();
     entry
         .read_to_end(&mut bytes)
@@ -119,30 +131,36 @@ fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn find_sinf(archive: &mut ZipArchive<File>) -> Result<(HashSet<String>, Vec<u8>)> {
+fn find_sinf(
+    archive: &mut ZipArchive<File>,
+    source: &mut File,
+) -> Result<(HashSet<String>, Vec<u8>)> {
     let mut names = HashSet::with_capacity(archive.len());
-    let mut sinf_name = None;
+    let mut sinf_index = None;
     for index in 0..archive.len() {
         let entry = archive.by_index(index).context("inspect IPA ZIP member")?;
-        let name = entry.name()?.into_owned();
+        let name = raw_member_name(source, &entry)?;
         if !names.insert(name.clone()) {
             bail!("duplicate IPA member {name:?}");
         }
-        if name.ends_with(".sinf") && sinf_name.replace(name).is_some() {
+        if name.ends_with(".sinf") && sinf_index.replace(index).is_some() {
             bail!("FairPlay decryption requires exactly one SINF");
         }
     }
-    let sinf_name = sinf_name.context("FairPlay decryption requires exactly one SINF")?;
-    Ok((names, read_entry(archive, &sinf_name)?))
+    let index = sinf_index.context("FairPlay decryption requires exactly one SINF")?;
+    let mut entry = archive.by_index(index)?;
+    let mut bytes = Vec::new();
+    entry.read_to_end(&mut bytes)?;
+    Ok((names, bytes))
 }
 
 pub fn require_model_diagnostic(input: &Path) -> Result<String> {
     let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
-    let mut directory_source = source.try_clone().context("clone IPA ZIP handle")?;
+    let mut directory_source = File::open(input).context("open IPA ZIP directory handle")?;
     let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
     validate_unique_zip_members(&mut directory_source, &archive)?;
-    preflight_encrypted_images(&mut archive)?;
-    let (_, sinf) = find_sinf(&mut archive)?;
+    preflight_encrypted_images(&mut archive, &mut directory_source)?;
+    let (_, sinf) = find_sinf(&mut archive, &mut directory_source)?;
     missing_model_diagnostic(&sinf)
 }
 
@@ -214,11 +232,11 @@ fn read_macho_probe(member: &mut ZipFile<'_, File>) -> Result<Vec<u8>> {
     Ok(header)
 }
 
-fn preflight_encrypted_images(archive: &mut ZipArchive<File>) -> Result<()> {
+fn preflight_encrypted_images(archive: &mut ZipArchive<File>, source: &mut File) -> Result<()> {
     let mut names = HashSet::with_capacity(archive.len());
     for index in 0..archive.len() {
         let member = archive.by_index(index).context("inspect IPA ZIP member")?;
-        let name = member.name()?.into_owned();
+        let name = raw_member_name(source, &member)?;
         if !names.insert(name.clone()) {
             bail!("duplicate IPA member {name:?}");
         }
@@ -226,10 +244,10 @@ fn preflight_encrypted_images(archive: &mut ZipArchive<File>) -> Result<()> {
     let mut images = 0usize;
     for index in 0..archive.len() {
         let mut member = archive.by_index(index).context("inspect IPA ZIP member")?;
-        if member.is_dir() {
+        let name = raw_member_name(source, &member)?;
+        if name.ends_with('/') {
             continue;
         }
-        let name = member.name()?.into_owned();
         let total_size =
             usize::try_from(member.size()).context("Mach-O member exceeds platform")?;
         let probe = read_macho_probe(&mut member).with_context(|| format!("inspect {name}"))?;
@@ -248,7 +266,7 @@ fn preflight_encrypted_images(archive: &mut ZipArchive<File>) -> Result<()> {
         }
         let supf_name = supf_for(&name, &names)
             .with_context(|| format!("encrypted Mach-O {name} has no adjacent SUPF"))?;
-        let supf = Supf::parse(&read_entry(archive, supf_name)?)
+        let supf = Supf::parse(&read_entry(archive, source, supf_name)?)
             .with_context(|| format!("parse {supf_name}"))?;
         for slice in encrypted {
             let records = supf.records_for(slice.layout.cpu_type, slice.layout.cpu_subtype)?;
@@ -349,12 +367,12 @@ fn full_options(
 fn write_reencoded(
     writer: &mut ZipWriter<File>,
     member: &mut ZipFile<'_, File>,
+    name: &str,
     local: &[u8],
     central: &[u8],
     prefix: &[u8],
     rest: Option<&[u8]>,
 ) -> Result<()> {
-    let name = member.name()?.into_owned();
     let options = full_options(member, local, central)?;
     writer.start_file(name, options)?;
     writer.write_all(prefix)?;
@@ -556,11 +574,11 @@ pub fn decrypt_ipa_with_options(
 ) -> Result<IpaDecryptResult> {
     validate_destinations(input, output, model_path, report, force)?;
     let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
-    let mut raw_source = source.try_clone().context("clone IPA ZIP handle")?;
+    let mut raw_source = File::open(input).context("open IPA ZIP directory handle")?;
     let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
     validate_unique_zip_members(&mut raw_source, &archive)?;
-    preflight_encrypted_images(&mut archive)?;
-    let (names, sinf) = find_sinf(&mut archive)?;
+    preflight_encrypted_images(&mut archive, &mut raw_source)?;
+    let (names, sinf) = find_sinf(&mut archive, &mut raw_source)?;
     let (logical, model) = logical_key(model_path, &sinf)?;
     let key = Zeroizing::new(logical);
     let deriver = PageKeyDeriver::from_logical_key(*key);
@@ -576,11 +594,11 @@ pub fn decrypt_ipa_with_options(
     let mut image_reports = Vec::new();
     for index in 0..archive.len() {
         let mut member = archive.by_index(index).context("read IPA member")?;
-        let name = member.name()?.into_owned();
+        let name = raw_member_name(&mut raw_source, &member)?;
         let local = local_extra(&mut raw_source, &member)?;
         let central = member.extra_data().unwrap_or_default().to_vec();
         let has_extra = !local.is_empty() || !central.is_empty();
-        if member.is_dir() {
+        if name.ends_with('/') {
             if has_extra {
                 let options = full_options(&member, &local, &central)?;
                 writer.add_directory(name, options)?;
@@ -591,7 +609,7 @@ pub fn decrypt_ipa_with_options(
         }
         if member.size() < 4 {
             if has_extra {
-                write_reencoded(&mut writer, &mut member, &local, &central, &[], None)?;
+                write_reencoded(&mut writer, &mut member, &name, &local, &central, &[], None)?;
             } else {
                 writer.raw_copy_file(member)?;
             }
@@ -601,7 +619,15 @@ pub fn decrypt_ipa_with_options(
         member.read_exact(&mut prefix)?;
         if !is_macho(&prefix) {
             if has_extra {
-                write_reencoded(&mut writer, &mut member, &local, &central, &prefix, None)?;
+                write_reencoded(
+                    &mut writer,
+                    &mut member,
+                    &name,
+                    &local,
+                    &central,
+                    &prefix,
+                    None,
+                )?;
             } else {
                 drop(member);
                 writer.raw_copy_file(archive.by_index_raw(index)?)?;
@@ -617,7 +643,15 @@ pub fn decrypt_ipa_with_options(
         let encrypted = slices.iter().any(|slice| slice.layout.crypt_id != 0);
         if !encrypted {
             if has_extra {
-                write_reencoded(&mut writer, &mut member, &local, &central, &blob, Some(&[]))?;
+                write_reencoded(
+                    &mut writer,
+                    &mut member,
+                    &name,
+                    &local,
+                    &central,
+                    &blob,
+                    Some(&[]),
+                )?;
             } else {
                 drop(member);
                 writer.raw_copy_file(archive.by_index_raw(index)?)?;
@@ -631,7 +665,7 @@ pub fn decrypt_ipa_with_options(
         drop(member);
         let supf_name = supf_for(&name, &names)
             .with_context(|| format!("encrypted Mach-O {name} has no adjacent SUPF"))?;
-        let supf = Supf::parse(&read_entry(&mut archive, supf_name)?)
+        let supf = Supf::parse(&read_entry(&mut archive, &mut raw_source, supf_name)?)
             .with_context(|| format!("parse {supf_name}"))?;
         let (decrypted, reports) =
             decrypt_macho(&blob, &supf, *key).with_context(|| format!("decrypt {name}"))?;
@@ -1375,6 +1409,74 @@ mod tests {
         assert!(diagnostic.contains(&format!("sinf_sha256={:x}", Sha256::digest(&sinf))));
         assert!(diagnostic.contains("priv_bytes="));
         assert!(diagnostic.contains("requires a private enrollment model"));
+    }
+
+    #[test]
+    fn decrypts_with_original_sinf_and_supf_names_under_unicode_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("aliased.ipa");
+        let output = directory.path().join("decrypted.ipa");
+        let model_path = directory.path().join("enrollment.bin");
+        let logical = [0x31; 16];
+        let (model, sinf) = model_and_sinf(logical);
+        fs::write(&model_path, model).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let (encrypted, record, _) = encrypted_fixture(logical);
+        let supf_bytes = supf(record);
+        let mut writer = ZipWriter::new(File::create(&input).unwrap());
+        for (name, alias, crc, data) in [
+            (
+                "Payload/A.app/SC_Info/A.sinf",
+                "Payload/B.app/SC_Info/B.sinf",
+                0x55bc_8223u32,
+                sinf.as_slice(),
+            ),
+            (
+                "Payload/A.app/SC_Info/A.supf",
+                "Payload/B.app/SC_Info/B.supf",
+                0x94c1_e7e8u32,
+                supf_bytes.as_slice(),
+            ),
+        ] {
+            let mut options = FullFileOptions::default();
+            let mut unicode_path = vec![1];
+            unicode_path.extend_from_slice(&crc.to_le_bytes());
+            unicode_path.extend_from_slice(alias.as_bytes());
+            options
+                .add_extra_field(0x7075, unicode_path, false)
+                .unwrap();
+            writer.start_file(name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        writer
+            .start_file("Payload/A.app/A", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&encrypted).unwrap();
+        writer.finish().unwrap();
+
+        let diagnostic = require_model_diagnostic(&input).unwrap();
+        assert!(diagnostic.contains("requires a private enrollment model"));
+        let result = decrypt_ipa(&input, &output, &model_path).unwrap();
+        assert_eq!(result.encrypted_images, 1);
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        let mut names = Vec::new();
+        let mut source = File::open(&output).unwrap();
+        for index in 0..archive.len() {
+            let entry = archive.by_index_raw(index).unwrap();
+            names.push(
+                crate::duplicate_zip::read_raw_central_name(
+                    &mut source,
+                    entry.central_header_start(),
+                )
+                .unwrap(),
+            );
+        }
+        assert!(names.contains(&b"Payload/A.app/SC_Info/A.sinf".to_vec()));
+        assert!(names.contains(&b"Payload/A.app/SC_Info/A.supf".to_vec()));
     }
 
     #[test]
