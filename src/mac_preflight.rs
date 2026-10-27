@@ -2,7 +2,8 @@
 
 use std::{
     collections::HashSet,
-    io::{Cursor, Read, Write},
+    fmt::Debug,
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
 };
 
 use anyhow::{Context, Result, bail};
@@ -14,7 +15,6 @@ use url::Url;
 
 use crate::ipa_metadata::VersionMetadata;
 
-const MAX_XAR_BYTES: usize = 32 * 1024 * 1024;
 const MAX_TOC_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DISTRIBUTION_BYTES: usize = 4 * 1024 * 1024;
 
@@ -38,46 +38,50 @@ pub fn read_preflight_version_metadata(url: &str, bundle_id: &str) -> Result<Ver
         }))
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .context("download Mac preflight package")?;
     if !response.status().is_success() {
         bail!("Mac preflight package returned HTTP {}", response.status());
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_XAR_BYTES as u64)
-    {
-        bail!("Mac preflight package exceeds size limit");
-    }
-    let mut bytes = Vec::new();
-    response
-        .take(MAX_XAR_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_XAR_BYTES {
-        bail!("Mac preflight package exceeds size limit");
-    }
-    parse_preflight_xar(&bytes, bundle_id)
+    let mut package = tempfile::tempfile().context("create Mac preflight staging")?;
+    io::copy(&mut response, &mut package).context("stage Mac preflight package")?;
+    parse_preflight_reader(package, bundle_id)
 }
 
 pub fn parse_preflight_xar(bytes: &[u8], bundle_id: &str) -> Result<VersionMetadata> {
-    if bytes.len() < 28 || bytes.len() > MAX_XAR_BYTES || &bytes[..4] != b"xar!" {
+    parse_preflight_reader(Cursor::new(bytes), bundle_id)
+}
+
+fn parse_preflight_reader<R: Read + Seek + Debug>(
+    mut reader: R,
+    bundle_id: &str,
+) -> Result<VersionMetadata> {
+    let size = reader.seek(SeekFrom::End(0))?;
+    reader.rewind()?;
+    if size < 28 {
         bail!("invalid Mac preflight XAR header");
     }
-    let header_size = u16::from_be_bytes(bytes[4..6].try_into().unwrap()) as usize;
-    let compressed = u64::from_be_bytes(bytes[8..16].try_into().unwrap());
-    let uncompressed = u64::from_be_bytes(bytes[16..24].try_into().unwrap());
+    let mut header = [0u8; 28];
+    reader.read_exact(&mut header)?;
+    if &header[..4] != b"xar!" {
+        bail!("invalid Mac preflight XAR header");
+    }
+    let header_size = u16::from_be_bytes(header[4..6].try_into().unwrap()) as u64;
+    let compressed = u64::from_be_bytes(header[8..16].try_into().unwrap());
+    let uncompressed = u64::from_be_bytes(header[16..24].try_into().unwrap());
     if !(28..=4096).contains(&header_size)
         || compressed > MAX_TOC_BYTES
         || uncompressed > MAX_TOC_BYTES
         || header_size
-            .checked_add(compressed as usize)
-            .is_none_or(|end| end > bytes.len())
+            .checked_add(compressed)
+            .is_none_or(|end| end > size)
     {
         bail!("invalid Mac preflight XAR table of contents");
     }
-    let mut archive = XarReader::new(Cursor::new(bytes)).context("open Mac preflight XAR")?;
+    reader.rewind()?;
+    let mut archive = XarReader::new(reader).context("open Mac preflight XAR")?;
     if !archive
         .verify_table_of_contents_checksum()
         .context("verify Mac preflight XAR")?
@@ -269,6 +273,10 @@ mod tests {
 </installer-gui-script>"#;
 
     fn fixture_xar(distribution: &str) -> Vec<u8> {
+        fixture_xar_with_extra(distribution, 0)
+    }
+
+    fn fixture_xar_with_extra(distribution: &str, extra_size: usize) -> Vec<u8> {
         let checksum = ChecksumType::Sha1
             .digest_data(distribution.as_bytes())
             .unwrap();
@@ -281,8 +289,22 @@ mod tests {
             distribution.len(),
             distribution.len()
         );
+        let extra = vec![0x5a; extra_size];
+        let extra_entry = if extra_size == 0 {
+            String::new()
+        } else {
+            let checksum = ChecksumType::Sha1.digest_data(&extra).unwrap();
+            let hex = checksum
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!(
+                r#"<file id="2"><type>file</type><name>AdditionalResources</name><data><length>{extra_size}</length><offset>{}</offset><size>{extra_size}</size><encoding style="application/octet-stream"/><archived-checksum style="sha1">{hex}</archived-checksum><extracted-checksum style="sha1">{hex}</extracted-checksum></data></file>"#,
+                20 + distribution.len()
+            )
+        };
         let toc = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?><xar><toc><checksum style="sha1"><offset>0</offset><size>20</size></checksum><creation-time>2023-01-04T22:53:15</creation-time>{entry}</toc></xar>"#
+            r#"<?xml version="1.0" encoding="UTF-8"?><xar><toc><checksum style="sha1"><offset>0</offset><size>20</size></checksum><creation-time>2023-01-04T22:53:15</creation-time>{entry}{extra_entry}</toc></xar>"#
         );
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(toc.as_bytes()).unwrap();
@@ -298,6 +320,7 @@ mod tests {
         result.extend_from_slice(&compressed);
         result.extend_from_slice(&toc_checksum);
         result.extend_from_slice(distribution.as_bytes());
+        result.extend_from_slice(&extra);
         result
     }
 
@@ -332,6 +355,34 @@ mod tests {
                 package.len()
             );
             stream.write_all(header.as_bytes()).unwrap();
+            stream.write_all(&package).unwrap();
+        });
+        let metadata = read_preflight_version_metadata(
+            &format!("http://{address}/preflight.pkg"),
+            "com.example.mac",
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(metadata.display_version, "4.2");
+        assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
+    }
+
+    #[test]
+    fn reads_preflight_package_over_previous_size_limit() {
+        let package = fixture_xar_with_extra(DISTRIBUTION, 33 * 1024 * 1024);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            assert!(request[..read].starts_with(b"GET /preflight.pkg HTTP/1.1"));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                package.len()
+            )
+            .unwrap();
             stream.write_all(&package).unwrap();
         });
         let metadata = read_preflight_version_metadata(
