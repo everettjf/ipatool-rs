@@ -183,7 +183,11 @@ impl<R: Read + Seek + Sized + Debug> XarReader<R> {
         size: usize,
         writer: &mut impl Write,
     ) -> XarResult<()> {
-        self.write_file_slice(self.heap_start_offset + offset, size, writer)
+        let start = self
+            .heap_start_offset
+            .checked_add(offset)
+            .ok_or(Error::TableOfContentsCorrupted("heap offset overflow"))?;
+        self.write_file_slice(start, size, writer)
     }
 
     /// Write heap file data for a given file record to a writer.

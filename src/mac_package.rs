@@ -419,6 +419,15 @@ mod tests {
     }
 
     fn xar_with_toc_padding(payload: &[u8], corrupt: bool, toc_padding: usize) -> Vec<u8> {
+        xar_with_toc_padding_and_offset(payload, corrupt, toc_padding, 20)
+    }
+
+    fn xar_with_toc_padding_and_offset(
+        payload: &[u8],
+        corrupt: bool,
+        toc_padding: usize,
+        payload_offset: u64,
+    ) -> Vec<u8> {
         let checksum = sha1::Sha1::digest(payload);
         let bad = [0xff; 20];
         let stored = if corrupt { &bad[..] } else { &checksum[..] };
@@ -428,7 +437,7 @@ mod tests {
             format!("<!--{}-->", "x".repeat(toc_padding))
         };
         let toc = format!(
-            "<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><creation-time>2025-01-01T00:00:00Z</creation-time><file id=\"1\"><type>file</type><name>Payload</name><data><length>{}</length><offset>20</offset><size>{}</size><encoding style=\"application/octet-stream\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file>{comment}</toc></xar>",
+            "<xar><toc><checksum style=\"sha1\"><offset>0</offset><size>20</size></checksum><creation-time>2025-01-01T00:00:00Z</creation-time><file id=\"1\"><type>file</type><name>Payload</name><data><length>{}</length><offset>{payload_offset}</offset><size>{}</size><encoding style=\"application/octet-stream\"/><archived-checksum style=\"sha1\">{}</archived-checksum><extracted-checksum style=\"sha1\">{}</extracted-checksum></data></file>{comment}</toc></xar>",
             payload.len(),
             payload.len(),
             hex(stored),
@@ -563,6 +572,19 @@ mod tests {
                 .to_string()
                 .contains("checksum")
         );
+    }
+
+    #[test]
+    fn rejects_xar_file_offset_overflow_without_panicking() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(
+            &path,
+            xar_with_toc_padding_and_offset(b"package payload", false, 0, u64::MAX),
+        )
+        .unwrap();
+        let error = validate_mac_package(&path).unwrap_err();
+        assert!(format!("{error:#}").contains("heap offset overflow"));
     }
 
     #[test]
