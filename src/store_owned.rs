@@ -352,6 +352,10 @@ fn history_headers(
 }
 
 fn local_timezone(now: OffsetDateTime) -> (String, i64) {
+    let timezone = timezone_label();
+    if timezone == "UTC" {
+        return (timezone, 0);
+    }
     #[cfg(unix)]
     {
         let timestamp: libc::time_t = now.unix_timestamp();
@@ -359,25 +363,54 @@ fn local_timezone(now: OffsetDateTime) -> (String, i64) {
         let mut local: libc::tm = unsafe { std::mem::zeroed() };
         // SAFETY: timestamp and local are valid pointers for this call.
         if !unsafe { libc::localtime_r(&timestamp, &mut local) }.is_null() {
-            let timezone = timezone_label();
             return (timezone, local.tm_gmtoff / 60);
         }
     }
     #[cfg(windows)]
     if let Ok(offset) = time::UtcOffset::local_offset_at(now) {
-        let timezone = timezone_label();
         return (timezone, i64::from(offset.whole_seconds()) / 60);
     }
     ("UTC".into(), 0)
 }
 
 fn timezone_label() -> String {
-    match std::env::var("TZ") {
-        // Go's time.Local also resolves an explicitly empty TZ to UTC.
-        Ok(value) if value.is_empty() => "UTC".into(),
-        Ok(value) => value,
-        Err(_) => "Local".into(),
+    let value = std::env::var("TZ").ok();
+    resolve_timezone_label(value.as_deref())
+}
+
+fn resolve_timezone_label(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "Local".into();
+    };
+    let value = value.strip_prefix(':').unwrap_or(value);
+    if value.is_empty() || value == "UTC" {
+        return "UTC".into();
     }
+    #[cfg(unix)]
+    {
+        use std::{io::Read, path::Path};
+
+        let path = if value.starts_with('/') {
+            Path::new(value).to_path_buf()
+        } else {
+            if value.contains("..") {
+                return "UTC".into();
+            }
+            Path::new("/usr/share/zoneinfo").join(value)
+        };
+        let mut magic = [0u8; 4];
+        if std::fs::File::open(path)
+            .and_then(|mut file| file.read_exact(&mut magic))
+            .is_err()
+            || &magic != b"TZif"
+        {
+            return "UTC".into();
+        }
+        if value == "/etc/localtime" {
+            return "Local".into();
+        }
+    }
+    value.into()
 }
 
 fn items_body(session: u32, revision: u32, now: OffsetDateTime) -> Result<Vec<u8>> {
@@ -594,6 +627,21 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn timezone_labels_follow_go_local_rules() {
+        assert_eq!(resolve_timezone_label(None), "Local");
+        assert_eq!(resolve_timezone_label(Some("")), "UTC");
+        assert_eq!(resolve_timezone_label(Some(":UTC")), "UTC");
+        assert_eq!(resolve_timezone_label(Some("Not/AZone")), "UTC");
+        assert_eq!(resolve_timezone_label(Some("PST8")), "UTC");
+        assert_eq!(
+            resolve_timezone_label(Some("America/Los_Angeles")),
+            "America/Los_Angeles"
+        );
+        assert_eq!(resolve_timezone_label(Some(":/etc/localtime")), "Local");
+    }
 
     #[derive(Debug, PartialEq)]
     struct WireHistory {
