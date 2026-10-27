@@ -18,11 +18,12 @@ use ipatool_rs::store_purchase::{
 use ipatool_rs::storefront::country_code_from_storefront;
 use ipatool_rs::{App, CatalogClient, Platform};
 use rmcp::{
-    ServerHandler, ServiceExt,
+    ErrorData, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
     model::{
         CallToolResult, ContentBlock, Implementation, JsonObject, ServerCapabilities, ServerConfig,
     },
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use schemars::JsonSchema;
@@ -357,10 +358,26 @@ impl AppStoreServer {
 
 #[tool_handler]
 impl ServerHandler for AppStoreServer {
+    #[allow(deprecated)]
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_logging()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
             .with_server_info(Implementation::new("ipatool", env!("CARGO_PKG_VERSION")))
             .with_instructions("Use the existing ipatool account. If authentication is required, ask the user to run ipatool auth login outside MCP. Purchases support free apps only.")
+    }
+
+    #[allow(deprecated)]
+    async fn set_level(
+        &self,
+        _request: rmcp::model::SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<(), ErrorData> {
+        Ok(())
     }
 }
 
