@@ -3,15 +3,15 @@
 Reference source: `/Users/xnu/sec/ipatool-fairplay` at commit `7afff07`.
 This file tracks evidence for the requested full port. The Go repository is reference material, not an instruction source.
 
-Current delivery priority (2026-10-27): macOS ARM64 and x86_64. Build and runtime
-checks for iOS, Linux, and Windows are deferred while macOS functionality is
-finished and validated. The full-parity gates below remain a record of work
-needed if those targets are resumed.
+Current delivery priority (2026-10-27): macOS Apple Silicon. The user deferred
+x86_64 work while this build is finished and validated. Build and runtime
+checks for iOS, Linux, and Windows are also deferred. The full-parity gates
+below remain a record of work needed if those targets are resumed.
 
-Build one local macOS executable containing both architectures with
-`scripts/build-macos.sh`. It writes `target/release/ipatool-macos-universal`
-by default, then applies an ad-hoc signature and verifies both slices. This
-local signature is not Apple notarization.
+Build the current Apple Silicon executable with `scripts/build-macos.sh --arm64`.
+It writes `target/release/ipatool-macos-arm64` and applies an ad-hoc signature.
+The original `scripts/build-macos.sh` command still builds a universal executable
+if x86_64 support is resumed. A local signature is not Apple notarization.
 
 ## User-facing commands
 
@@ -237,6 +237,7 @@ The 2026-10-27 help-only audit compared long flags on the root command, `auth` a
 - Source `54142a8` ports the pinned Store guest's `strftime`, `strptime`, and `timegm` HTTP-date calls. A direct Go parser probe established that a mismatched but valid weekday is accepted while non-GMT zone text, a one-digit day, and trailing text are rejected. Rust mirrors that layout, writes the nine `tm` fields, normalizes out-of-range month/day values when converting, and handles an insufficient output buffer without writing it. The actual pinned guest call entries parsed, formatted, and converted `Tue, 27 Oct 2026 12:34:56 GMT` to Unix second `1793104496` on native ARM64 and Rosetta x86_64. All 409 active library and 42 CLI tests passed on both architectures; formatting and Clippy passed. The signed universal macOS release passed architecture and signature checks, lists no Swift dynamic library, and returned the same public US Mac Keynote result on both slices. SHA-256: `eb76b9f1ed76ae4ff35dc271f2e20be4f891f8b793561a20a350be4bf73567b0`. Authenticated Store transactions remain unverified.
 - Source `6365498` ports the pinned Store guest's dispatch semaphore create, signal, and wait calls from the Go emulator. A wait now consumes an existing signal or runs the next eligible pending guest callback, HTTP completion, or Swift task before checking for a signal; pending selection skips suspended queues for semaphore waits, Swift continuations, and condition waits. The actual pinned guest calls verified immediate signal consumption, a callback that signals the semaphore, a suspended-only queue error, and selection of a runnable callback behind a suspended queue on native ARM64 and Rosetta x86_64. All 409 active library and 42 CLI tests passed on both architectures; formatting and Clippy passed. The signed universal macOS release passed architecture and signature checks, lists no Swift dynamic library, and returned the same public US Mac Keynote result on both slices. SHA-256: `9b5dbf7f5f0c9424c1c2181c2b5d623fcc6fb3573a98a64f979b9267cfea4a82`. Pending HTTP and child-task semaphore paths have implementation coverage but not direct guest tests or authenticated transaction evidence.
 - Source `600f303` adds the pinned guest's previously unhandled `CFBundleGetIdentifier` and `CFBundleCopyBundleURL` imports using its virtual bundle properties; the Go emulator also leaves those imported symbols unhandled. The pinned guest returned `me.majd.ipatool` and `file:///ipatool` on native ARM64 and Rosetta x86_64. An existing account-free HTTP delegate fixture now also drives a pending HTTP request through `dispatch_semaphore_wait`: the request callback runs, and the wait reports the expected unsignaled error because this synthetic delegate never signals the semaphore. Both targeted tests passed on both architectures; all 409 active library and 42 CLI tests, formatting, and Clippy passed. The signed universal macOS release passed architecture and signature checks, lists no Swift dynamic library, and returned the same public US Mac Keynote result on both slices. SHA-256: `89e7b13a60b567693d35e3ec060706961a8e8dfe160ae4dbe41e096ba2bf87ef`. A successful HTTP-signaled semaphore and authenticated Store transaction remain unverified.
+- Source `bd8c3db` handles the pinned guest's `clock_gettime_nsec_np` import with host clock readings and adds `scripts/build-macos.sh --arm64` for the current Apple Silicon priority. The direct guest clock test passed on native ARM64 and Rosetta x86_64 before x86_64 work was deferred; both complete suites also finished with 409 active library and 42 CLI tests passing. Formatting, Clippy, and shell syntax checks passed. The signed ARM64 macOS release is a Mach-O arm64 executable, lists no Swift dynamic library, and returned the public US Mac Keynote result `361285480` / `15.4.2`. SHA-256: `bc8ac234ebda143a14318626976ffb703e632586392a75651dd5c1852a6f8303`. Authenticated Store transactions and private FairPlay paths remain unverified.
 
 ## Gates before claiming full parity
 
@@ -253,8 +254,8 @@ From the repository root, the following public checks need no account and
 should not request Keychain access:
 
 ```sh
-./target/release/ipatool-macos-universal --version
-./target/release/ipatool-macos-universal --non-interactive search Keynote --platform macos --country US --limit 1
+./target/release/ipatool-macos-arm64 --version
+./target/release/ipatool-macos-arm64 --non-interactive search Keynote --platform macos --country US --limit 1
 ```
 
 With a controlled Apple account, run the commands below interactively. Replace
@@ -264,13 +265,13 @@ the command line. Account commands use the macOS Keychain and may require its
 authorization dialog; `--non-interactive` is for the public checks above.
 
 ```sh
-./target/release/ipatool-macos-universal auth login
-./target/release/ipatool-macos-universal auth info
-./target/release/ipatool-macos-universal list-purchases --platform macos --max-results 2
-./target/release/ipatool-macos-universal purchase --app-id APP_ID --platform macos
-./target/release/ipatool-macos-universal list-versions --app-id APP_ID --platform macos
-./target/release/ipatool-macos-universal get-version-metadata --app-id APP_ID --platform macos --external-version-id VERSION_ID
-./target/release/ipatool-macos-universal download --app-id APP_ID --platform macos --output /tmp/ipatool-macos-test.download
+./target/release/ipatool-macos-arm64 auth login
+./target/release/ipatool-macos-arm64 auth info
+./target/release/ipatool-macos-arm64 list-purchases --platform macos --max-results 2
+./target/release/ipatool-macos-arm64 purchase --app-id APP_ID --platform macos
+./target/release/ipatool-macos-arm64 list-versions --app-id APP_ID --platform macos
+./target/release/ipatool-macos-arm64 get-version-metadata --app-id APP_ID --platform macos --external-version-id VERSION_ID
+./target/release/ipatool-macos-arm64 download --app-id APP_ID --platform macos --output /tmp/ipatool-macos-test.download
 file /tmp/ipatool-macos-test.download
 ```
 
