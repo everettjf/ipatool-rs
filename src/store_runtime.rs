@@ -2893,6 +2893,30 @@ fn dispatch_call(
             })?;
             context.reg_write(REG_X0, *witness)?;
         }
+        "swift_getSingletonMetadata" => {
+            let candidate = context.reg_read(REG_X0 + 1)?;
+            let metadata = profile
+                .index
+                .swift_singletons
+                .get(&candidate.to_string())
+                .copied()
+                .filter(|value| *value != 0)
+                .with_context(|| format!("unprepared Swift singleton metadata {candidate:#x}"))?;
+            context.reg_write(REG_X0, metadata)?;
+            context.reg_write(REG_X0 + 1, 0)?;
+        }
+        "swift_getForeignTypeMetadata" => {
+            let candidate = context.reg_read(REG_X0 + 1)?;
+            let metadata = match profile.index.swift_foreign.get(&candidate.to_string()) {
+                Some(&value) if value != 0 => value,
+                _ if candidate == 0x1eaa52f08 && read_guest_u64(context, candidate)? == 0x201 => {
+                    candidate
+                }
+                _ => bail!("unsupported foreign metadata {candidate:#x}"),
+            };
+            context.reg_write(REG_X0, metadata)?;
+            context.reg_write(REG_X0 + 1, 0)?;
+        }
         "swift_getTypeByMangledNameInContext2" => {
             let mangled = context.reg_read(REG_X0)?;
             let parent = context.reg_read(REG_X0 + 2)?;
@@ -3006,6 +3030,10 @@ fn dispatch_call(
             write_guest_u64(context, context.reg_read(REG_X0 + 8)?, request)?;
         }
         "$s10Foundation10URLRequestV19_bridgeToObjectiveCSo12NSURLRequestCyF" => {
+            let value = read_guest_u64(context, context.reg_read(REG_X0 + 20)?)?;
+            context.reg_write(REG_X0, value)?;
+        }
+        "$s10Foundation3URLV19_bridgeToObjectiveCSo5NSURLCyF" => {
             let value = read_guest_u64(context, context.reg_read(REG_X0 + 20)?)?;
             context.reg_write(REG_X0, value)?;
         }
@@ -9252,6 +9280,56 @@ mod tests {
         runtime.engine.reg_write(REG_X0 + 8, output).unwrap();
         runtime.call(get, &[]).unwrap();
         assert_eq!(runtime.read_u64(output).unwrap(), 22);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_resolves_swift_metadata_and_url_bridge() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |symbol: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.symbol == symbol)
+                .unwrap()
+                .address
+        };
+        let singleton_call = call_address("swift_getSingletonMetadata");
+        let foreign_call = call_address("swift_getForeignTypeMetadata");
+        let url_call = call_address("$s10Foundation3URLV19_bridgeToObjectiveCSo5NSURLCyF");
+        let (singleton_candidate, &singleton_metadata) = runtime
+            .profile
+            .index
+            .swift_singletons
+            .iter()
+            .next()
+            .unwrap();
+        let singleton_candidate: u64 = singleton_candidate.parse().unwrap();
+        assert_eq!(
+            runtime
+                .call(singleton_call, &[0, singleton_candidate])
+                .unwrap(),
+            singleton_metadata
+        );
+        assert_eq!(runtime.engine.reg_read(REG_X0 + 1).unwrap(), 0);
+
+        let (foreign_candidate, &foreign_metadata) =
+            runtime.profile.index.swift_foreign.iter().next().unwrap();
+        let foreign_candidate: u64 = foreign_candidate.parse().unwrap();
+        assert_eq!(
+            runtime.call(foreign_call, &[0, foreign_candidate]).unwrap(),
+            foreign_metadata
+        );
+        assert_eq!(runtime.engine.reg_read(REG_X0 + 1).unwrap(), 0);
+        assert!(runtime.call(foreign_call, &[0, 1]).is_err());
+
+        let url_value = runtime.allocate(8).unwrap();
+        runtime.write_u64(url_value, 0x1234).unwrap();
+        runtime.engine.reg_write(REG_X0 + 20, url_value).unwrap();
+        assert_eq!(runtime.call(url_call, &[]).unwrap(), 0x1234);
     }
 
     #[test]
