@@ -8,7 +8,12 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     ptr,
     rc::Rc,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -22,7 +27,6 @@ pub const REG_PC: i32 = 260;
 const ARM64: i32 = 2;
 const MODE_ARM: i32 = 0;
 const PROT_ALL: u32 = 7;
-const QUERY_TIMEOUT: i32 = 4;
 const CONTROL_CPU_MODEL: u32 = 7 | 1 << 26 | 1 << 30;
 const ARM64_CPU_MODEL_MAX: u32 = 3;
 const HOOK_CODE: i32 = 1 << 2;
@@ -37,7 +41,6 @@ struct Api {
     open: unsafe extern "C" fn(i32, i32, *mut Handle) -> i32,
     close: unsafe extern "C" fn(Handle) -> i32,
     control: unsafe extern "C" fn(Handle, u32, ...) -> i32,
-    query: unsafe extern "C" fn(Handle, i32, *mut u64) -> i32,
     strerror: unsafe extern "C" fn(i32) -> *const c_char,
     mem_map: unsafe extern "C" fn(Handle, u64, usize, u32) -> i32,
     mem_unmap: unsafe extern "C" fn(Handle, u64, usize) -> i32,
@@ -75,7 +78,6 @@ impl Api {
             open: unsafe { symbol(library, b"uc_open")? },
             close: unsafe { symbol(library, b"uc_close")? },
             control: unsafe { symbol(library, b"uc_ctl")? },
-            query: unsafe { symbol(library, b"uc_query")? },
             strerror: unsafe { symbol(library, b"uc_strerror")? },
             mem_map: unsafe { symbol(library, b"uc_mem_map")? },
             mem_unmap: unsafe { symbol(library, b"uc_mem_unmap")? },
@@ -485,12 +487,36 @@ impl Engine {
         if let Some(failure) = self.guard_failure() {
             return Err(anyhow::Error::new(failure));
         }
-        let micros = u64::try_from(timeout.as_micros())
-            .unwrap_or(u64::MAX)
-            .max(1);
         let started = Instant::now();
-        let result = self.check(unsafe {
-            (self.api.emu_start)(self.handle, begin, end, micros, instruction_limit)
+        let timed_out = AtomicBool::new(false);
+        let handle = self.handle as usize;
+        let stop = self.api.emu_stop;
+        let (done, receiver) = mpsc::channel::<()>();
+        // Unicorn 2.1.4 has reported a 120-second timeout after only a few
+        // milliseconds under parallel Store tests. Use a host monotonic clock
+        // and uc_emu_stop, as Unicorn's own timer does, without its timer flag.
+        let code = thread::scope(|scope| {
+            let timeout_flag = &timed_out;
+            let watchdog = scope.spawn(move || {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if matches!(
+                    receiver.recv_timeout(remaining),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    timeout_flag.store(true, Ordering::Release);
+                    // SAFETY: the Engine owns this handle until the scoped
+                    // watchdog joins; Unicorn's timer also calls uc_emu_stop
+                    // from its timer thread.
+                    unsafe { stop(handle as Handle) };
+                }
+            });
+            // SAFETY: the exclusive Engine borrow keeps the handle valid;
+            // the watchdog only requests a stop through Unicorn's API.
+            let code =
+                unsafe { (self.api.emu_start)(self.handle, begin, end, 0, instruction_limit) };
+            let _ = done.send(());
+            watchdog.join().expect("Unicorn watchdog thread panicked");
+            code
         });
         if let Some(failure) = self.hooks.iter().find_map(|hook| hook.data.failure()) {
             bail!("{failure}");
@@ -498,17 +524,14 @@ impl Engine {
         if let Some(failure) = self.guard_failure() {
             return Err(anyhow::Error::new(failure));
         }
-        result?;
-        let mut timed_out = 0u64;
-        self.check(unsafe { (self.api.query)(self.handle, QUERY_TIMEOUT, &mut timed_out) })?;
-        if timed_out != 0 {
+        if timed_out.load(Ordering::Acquire) {
             let pc = self.reg_read(REG_PC).unwrap_or(0);
             bail!(
                 "Unicorn emulation timed out (requested {timeout:?}, elapsed {:?}, pc={pc:#x})",
                 started.elapsed()
             );
         }
-        Ok(())
+        self.check(code)
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -797,6 +820,21 @@ mod tests {
             .start_bounded(0x1000, 0x1008, Duration::from_secs(1), 10)
             .unwrap();
         assert_eq!(engine.reg_read(REG_X0).unwrap(), 2);
+    }
+
+    #[test]
+    #[ignore = "downloads the pinned Unicorn library when the cache is empty"]
+    fn host_watchdog_stops_an_infinite_guest_loop() {
+        let mut engine = Engine::new().unwrap();
+        engine.mem_map(0x1000, 4096).unwrap();
+        engine.mem_write(0x1000, &[0x00, 0x00, 0x00, 0x14]).unwrap();
+        let started = Instant::now();
+        let error = engine
+            .start_bounded(0x1000, 0x1004, Duration::from_millis(25), 0)
+            .unwrap_err();
+        assert!(error.to_string().contains("Unicorn emulation timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(engine.reg_read(REG_PC).unwrap(), 0x1000);
     }
 
     #[test]
