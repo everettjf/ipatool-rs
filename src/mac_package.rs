@@ -536,6 +536,18 @@ mod tests {
     }
 
     #[test]
+    fn accepts_go_xar_with_extra_metadata_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.pkg");
+        fs::write(
+            &path,
+            include_bytes!("../tests/fixtures/mac-xar-extra-synthetic.pkg"),
+        )
+        .unwrap();
+        validate_mac_package(&path).unwrap();
+    }
+
+    #[test]
     fn validates_toc_larger_than_sixty_four_megabytes() {
         let package = xar_with_toc_padding(b"package payload", false, 65 * 1024 * 1024);
         let uncompressed = u64::from_be_bytes(package[16..24].try_into().unwrap());

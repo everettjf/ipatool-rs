@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! XAR XML table of contents data structure.
+//! Unknown extension elements are ignored, matching Go's XAR reader.
 
 use {
     crate::{format::XarChecksum, Error, XarResult},
@@ -23,7 +24,6 @@ use {
 
 /// An XML table of contents in a XAR file.
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TableOfContents {
     toc: XarToC,
 }
@@ -115,7 +115,7 @@ impl TableOfContents {
 
 /// The main data structure inside a table of contents.
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub struct XarToC {
     pub creation_time: String,
     pub checksum: Checksum,
@@ -153,7 +153,6 @@ impl XarToC {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Checksum {
     /// The digest format used.
     pub style: ChecksumType,
@@ -252,7 +251,6 @@ impl ChecksumType {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct File {
     pub id: u64,
     pub ctime: Option<String>,
@@ -438,7 +436,7 @@ impl Display for FileType {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub struct FileData {
     pub offset: u64,
     pub size: u64,
@@ -479,7 +477,6 @@ impl FileData {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FileChecksum {
     pub style: ChecksumType,
     #[serde(rename = "$value")]
@@ -497,13 +494,12 @@ impl FileChecksum {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FileEncoding {
     pub style: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub struct Ea {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
@@ -559,14 +555,12 @@ impl Ea {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct FinderCreateTime {
     pub nanoseconds: u64,
     pub time: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Signature {
     pub style: SignatureStyle,
     pub offset: u64,
@@ -632,7 +626,6 @@ impl Display for SignatureStyle {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct KeyInfo {
     #[serde(rename = "X509Data")]
     pub x509_data: X509Data,
@@ -679,7 +672,6 @@ impl KeyInfo {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct X509Data {
     #[serde(rename = "X509Certificate")]
     pub x509_certificate: Vec<String>,
