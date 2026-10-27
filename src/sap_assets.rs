@@ -118,7 +118,7 @@ impl SapAssetBundle {
         if let Some(directory) = configured_cache_directory()? {
             return Self::load_from(&directory).context("validate IPATOOL_SAP_CACHE_DIR assets");
         }
-        let directory = cache_directory()?;
+        let directory = default_cache_directory()?;
         if let Ok(bundle) = Self::load_from(&directory) {
             return Ok(bundle);
         }
@@ -209,6 +209,10 @@ pub fn cache_directory() -> Result<PathBuf> {
     if let Some(directory) = configured_cache_directory()? {
         return Ok(directory);
     }
+    default_cache_directory()
+}
+
+fn default_cache_directory() -> Result<PathBuf> {
     let root = dirs::cache_dir().context("find user cache directory")?;
     Ok(root.join("ipatool").join("sap").join(CACHE_DIRECTORY))
 }
@@ -264,7 +268,7 @@ mod tests {
 
     #[test]
     fn cache_path_matches_go_layout() {
-        let path = cache_directory().unwrap();
+        let path = default_cache_directory().unwrap();
         assert!(path.ends_with("ipatool/sap/apple-assets-macos-27-26A434-arm64-v1"));
     }
 
