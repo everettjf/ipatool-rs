@@ -319,7 +319,8 @@ impl DownloadProductClient {
         if package_platform(Platform::Macos, item)? != Platform::Iphone {
             bail!("FairPlay download capture requires an IPA package; the macOS offer is a PKG");
         }
-        self.captured_mobile_item(account, app, item, &response, Platform::Iphone, output)
+        // The package is an IPA, but the requested Store platform remains macOS.
+        self.captured_mobile_item(account, app, item, &response, Platform::Macos, output)
     }
 
     fn captured_mobile_item(
@@ -382,7 +383,8 @@ impl DownloadProductClient {
         let item = checked_download_item(&response)?;
         match package_platform(Platform::Macos, item)? {
             Platform::Iphone => {
-                self.download_mobile_item(account, app, item, Platform::Iphone, output)
+                // Go validates against the requested platform, not the IPA type.
+                self.download_mobile_item(account, app, item, Platform::Macos, output)
             }
             Platform::Macos => {
                 let display_version = display_version(item);
@@ -2783,7 +2785,7 @@ mod tests {
             )
             .unwrap();
         archive
-            .write_all(br#"<plist version="1.0"><dict><key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array><key>CFBundleExecutable</key><string>App</string></dict></plist>"#)
+            .write_all(br#"<plist version="1.0"><dict><key>CFBundleSupportedPlatforms</key><array><string>MacOSX</string></array><key>CFBundleExecutable</key><string>App</string></dict></plist>"#)
             .unwrap();
         let ipa = archive.finish().unwrap().into_inner();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
