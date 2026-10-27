@@ -1237,9 +1237,10 @@ fn fetch_artwork_with_transport(url: &str, transport: Option<&Transport>) -> Res
 
 fn version_string(value: &plist::Value) -> Result<String> {
     match value {
-        plist::Value::String(value) if !value.is_empty() => Ok(value.clone()),
+        plist::Value::String(value) => Ok(value.clone()),
         plist::Value::Integer(value) => Ok(value.to_string()),
         plist::Value::Real(value) => Ok(value.to_string()),
+        plist::Value::Boolean(value) => Ok(value.to_string()),
         _ => bail!("invalid external version identifier in download metadata"),
     }
 }
@@ -1910,6 +1911,18 @@ mod tests {
             .unwrap();
         assert_eq!(versions.external_version_identifiers, ["100", "101"]);
         assert_eq!(versions.latest_external_version_id, "101");
+
+        let client = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| {
+            Ok(response(serde_json::json!({"songList": [{"metadata": {
+                "softwareVersionExternalIdentifiers": ["", true, false],
+                "softwareVersionExternalIdentifier": false
+            }}]})))
+        });
+        let versions = client
+            .list_versions(&catalog, &account(), &app(), Platform::Iphone)
+            .unwrap();
+        assert_eq!(versions.external_version_identifiers, ["", "true", "false"]);
+        assert_eq!(versions.latest_external_version_id, "false");
 
         let expired = DownloadProductClient::with_sender([0, 1, 2, 3, 4, 5], |_| {
             Ok(response(serde_json::json!({"failureType": "2034"})))

@@ -95,6 +95,7 @@ The Rust CLI has implementation paths for every Go top-level command: `auth logi
 - A live non-interactive iPhone catalog search succeeded without `--country` or keychain access. `IPATOOL_SAP_CACHE_DIR` selected the four prevalidated framework files and booted the Store guest; an explicit invalid cache fails without fetching a restore image.
 - The rebuilt macOS ARM64 MCP server completed a live public `search_apps` request with `country: "JP"` and returned one result without accessing account storage.
 - The 26B118 Go evaluator generated 208 output and full-state vectors from an account-free synthetic model; Rust matches all 208. With an extra eighteenth domain at the post-lookup XOR site `0x100222c58`, Rust now matches Go on 205 outputs and the three index-domain rejections. A checked 17-domain synthetic variant confirms that those three cases instead take the direct XOR and match the Go vectors when that extra domain is absent. Private native capture still needs differential validation.
+- Store version lists now preserve empty string identifiers and stringify Boolean identifiers as Go does. The focused response test, all 335 active library tests and 40 CLI tests, and Clippy pass; 43 opt-in tests remain skipped. A current Linux x86_64 release was started in a read-only QEMU snapshot, but the guest did not emit the smoke-test markers, so this run provides no runtime validation.
 
 ## Gates before claiming full parity
 
