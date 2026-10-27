@@ -18,7 +18,9 @@ use crate::{
         CaptureApp, CaptureFile, ENROLLMENT_CAPTURE_SCHEMA, EnrollmentCaptureManifest,
         FairPlayBuildSupport, lookup_fairplay_build,
     },
-    fairplay::{SinfSelector, parse_sinf_selector},
+    fairplay::{
+        SinfSelector, has_sinf_extension, is_sinf_extension_equal_fold, parse_sinf_selector,
+    },
     host::{arm64e_slice, hardware_mac_for_interface},
 };
 
@@ -208,7 +210,8 @@ fn installed_sinf(app: &Path) -> Result<(PathBuf, SinfSelector)> {
             && entry
                 .path()
                 .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("sinf"))
+                .and_then(|ext| ext.to_str())
+                .is_some_and(is_sinf_extension_equal_fold)
         {
             paths.push(entry.path());
         }
@@ -265,7 +268,7 @@ fn capture_ipa(
     for index in 0..archive.len() {
         let mut member = archive.by_index(index)?;
         let name = member.name()?.into_owned();
-        if !name.contains("/SC_Info/") || !name.to_ascii_lowercase().ends_with(".sinf") {
+        if !name.contains("/SC_Info/") || !has_sinf_extension(&name) {
             continue;
         }
         let mut bytes = Vec::new();
@@ -472,6 +475,20 @@ mod tests {
         fields.extend(atom(*b"key ", &9u32.to_be_bytes()));
         fields.extend(atom(*b"priv", b"sample"));
         atom(*b"sinf", &atom(*b"schi", &fields))
+    }
+
+    #[test]
+    fn installed_sinf_uses_go_equal_fold_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = directory.path().join("A.app");
+        fs::create_dir_all(app.join("SC_Info")).unwrap();
+        fs::write(app.join("SC_Info/A.ſinf"), sinf()).unwrap();
+        let (path, selector) = installed_sinf(&app).unwrap();
+        assert_eq!(path.file_name().unwrap(), "A.ſinf");
+        assert_eq!(selector, SinfSelector { user: 7, key: 9 });
+        fs::remove_file(path).unwrap();
+        fs::write(app.join("SC_Info/A.SİNF"), sinf()).unwrap();
+        assert!(installed_sinf(&app).is_err());
     }
 
     #[test]

@@ -160,7 +160,7 @@ pub fn inspect_sinf(bytes: &[u8]) -> Result<SinfDiagnostic> {
     })
 }
 
-fn has_sinf_extension(name: &str) -> bool {
+pub(crate) fn has_sinf_extension(name: &str) -> bool {
     // Go's strings.ToLower uses the simple Unicode mapping: U+0130 becomes
     // `i`, while Rust's full lowercase mapping yields `i` plus a combining dot.
     let mut chars = name.chars().rev();
@@ -180,6 +180,21 @@ fn has_sinf_extension(name: &str) -> bool {
         }
     }
     true
+}
+
+pub(crate) fn is_sinf_extension_equal_fold(extension: &str) -> bool {
+    // Go's strings.EqualFold also groups the long s with ASCII s. Unlike
+    // strings.ToLower, it does not group U+0130 with ASCII i.
+    let mut chars = extension.chars();
+    for expected in ['s', 'i', 'n', 'f'] {
+        let Some(ch) = chars.next() else {
+            return false;
+        };
+        if !ch.eq_ignore_ascii_case(&expected) && !(ch == '\u{017f}' && expected == 's') {
+            return false;
+        }
+    }
+    chars.next().is_none()
 }
 
 pub fn inspect_ipa_sinfs(path: &Path) -> Result<Vec<SinfDiagnostic>> {
@@ -706,6 +721,10 @@ mod tests {
 
     #[test]
     fn matches_go_unicode_lowercase_for_sinf_extension() {
+        assert!(has_sinf_extension("A.SİNF"));
+        assert!(!has_sinf_extension("A.ſinf"));
+        assert!(!is_sinf_extension_equal_fold("SİNF"));
+        assert!(is_sinf_extension_equal_fold("ſinf"));
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("app.ipa");
         let file = fs::File::create(&path).unwrap();
