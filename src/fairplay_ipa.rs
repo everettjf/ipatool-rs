@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 use zip::{ZipArchive, ZipWriter, read::ZipFile, write::FullFileOptions};
 
 use crate::{
-    fairplay::{inspect_model_path, parse_sinf_selector},
+    fairplay::{inspect_model_path, inspect_model_registry, parse_sinf_selector},
     fairplay_decrypt::{DecryptedSlice, decrypt_macho},
     fairplay_key::{CurrentSinfModel, missing_model_diagnostic},
     fairplay_macho::{is_macho, parse_macho_slices},
@@ -204,7 +204,17 @@ fn supf_for<'a>(member: &str, names: &'a HashSet<String>) -> Option<&'a str> {
 
 fn logical_key(model_path: &Path, sinf: &[u8]) -> Result<[u8; 16]> {
     let selector = parse_sinf_selector(sinf)?;
-    let models = inspect_model_path(model_path)?;
+    let registry = fs::metadata(model_path)
+        .context("inspect FairPlay enrollment model path")?
+        .is_dir();
+    let models = if registry {
+        inspect_model_registry(model_path)?
+    } else {
+        inspect_model_path(model_path)?
+    };
+    if registry && models.iter().any(|model| model.selector.is_none()) {
+        bail!("FairPlay version 1 model cannot be used in a registry");
+    }
     let compatible: Vec<_> = models
         .into_iter()
         .filter(|model| model.selector.is_none_or(|bound| bound == selector))
@@ -734,5 +744,29 @@ mod tests {
         assert!(diagnostic.contains(&format!("sinf_sha256={:x}", Sha256::digest(&sinf))));
         assert!(diagnostic.contains("priv_bytes="));
         assert!(diagnostic.contains("requires a private enrollment model"));
+    }
+
+    #[test]
+    fn version_one_model_requires_an_explicit_file_not_a_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = directory.path().join("models");
+        fs::create_dir(&registry).unwrap();
+        let model_path = registry.join("legacy.bin");
+        let (model, sinf) = model_and_sinf([0x31; 16]);
+        fs::write(&model_path, model).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&registry, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        assert_eq!(logical_key(&model_path, &sinf).unwrap(), [0x31; 16]);
+        assert!(
+            logical_key(&registry, &sinf)
+                .unwrap_err()
+                .to_string()
+                .contains("version 1 model cannot be used in a registry")
+        );
     }
 }

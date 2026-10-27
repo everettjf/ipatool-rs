@@ -287,6 +287,17 @@ pub fn inspect_enrollment_model(path: &Path) -> Result<EnrollmentModelDiagnostic
 }
 
 pub fn inspect_model_path(path: &Path) -> Result<Vec<EnrollmentModelDiagnostic>> {
+    inspect_model_path_with_rules(path, false)
+}
+
+pub(crate) fn inspect_model_registry(path: &Path) -> Result<Vec<EnrollmentModelDiagnostic>> {
+    inspect_model_path_with_rules(path, true)
+}
+
+fn inspect_model_path_with_rules(
+    path: &Path,
+    registry_rules: bool,
+) -> Result<Vec<EnrollmentModelDiagnostic>> {
     let metadata = fs::metadata(path).context("inspect FairPlay enrollment model path")?;
     if !metadata.is_dir() {
         return Ok(vec![inspect_enrollment_model(path)?]);
@@ -296,12 +307,24 @@ pub fn inspect_model_path(path: &Path) -> Result<Vec<EnrollmentModelDiagnostic>>
     for entry in fs::read_dir(path).context("read FairPlay enrollment model directory")? {
         let entry = entry?;
         let entry_path = entry.path();
-        if entry.file_type()?.is_dir()
-            || !entry_path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
+        if !entry_path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
         {
             continue;
+        }
+        let file_type = entry.file_type()?;
+        if registry_rules && file_type.is_symlink() {
+            bail!(
+                "FairPlay enrollment model registry contains a symlink: {}",
+                entry.file_name().to_string_lossy()
+            );
+        }
+        if file_type.is_dir() {
+            continue;
+        }
+        if registry_rules && result.len() == 256 {
+            bail!("FairPlay enrollment model registry contains more than 256 models");
         }
         result.push(inspect_enrollment_model(&entry_path)?);
     }
@@ -683,6 +706,35 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
             assert!(inspect_enrollment_model(&path).is_err());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_registry_rejects_symlinks_and_more_than_256_models() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let model_path = directory.path().join("model.bin");
+        fs::write(&model_path, model(SinfSelector { user: 1, key: 2 })).unwrap();
+        fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let link_path = directory.path().join("linked.bin");
+        symlink(&model_path, &link_path).unwrap();
+        assert_eq!(inspect_model_path(directory.path()).unwrap().len(), 2);
+        let error = inspect_model_registry(directory.path()).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error:#}");
+        fs::remove_file(link_path).unwrap();
+
+        for index in 0..256 {
+            fs::hard_link(&model_path, directory.path().join(format!("{index}.bin"))).unwrap();
+        }
+        assert!(
+            inspect_model_registry(directory.path())
+                .unwrap_err()
+                .to_string()
+                .contains("more than 256 models")
+        );
     }
 
     #[test]
