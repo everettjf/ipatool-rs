@@ -240,8 +240,15 @@ impl DownloadProductClient {
             );
         }
         let country = country_code_from_storefront(&account.store_front)?;
-        let response = self.send_product(account, app, version, || {
-            download_fallback_version(catalog, app, country, platform)
+        let selected_version = select_mobile_download_version(version, platform, || {
+            catalog.latest_external_version_id(app, country, platform)
+        })?;
+        let response = self.send_product(account, app, &selected_version, || {
+            if platform == Platform::Appletv && selected_version.is_empty() {
+                Err(AppNotFound.into())
+            } else {
+                download_fallback_version(catalog, app, country, platform)
+            }
         })?;
         let item = checked_download_item(&response)?;
         self.download_mobile_item(account, app, item, platform, output)
@@ -262,8 +269,15 @@ impl DownloadProductClient {
             bail!("FairPlay capture requires a mobile IPA platform");
         }
         let country = country_code_from_storefront(&account.store_front)?;
-        let response = self.send_product(account, app, version, || {
-            download_fallback_version(catalog, app, country, platform)
+        let selected_version = select_mobile_download_version(version, platform, || {
+            catalog.latest_external_version_id(app, country, platform)
+        })?;
+        let response = self.send_product(account, app, &selected_version, || {
+            if platform == Platform::Appletv && selected_version.is_empty() {
+                Err(AppNotFound.into())
+            } else {
+                download_fallback_version(catalog, app, country, platform)
+            }
         })?;
         let item = checked_download_item(&response)?;
         self.captured_mobile_item(account, app, item, &response, platform, output)
@@ -1133,6 +1147,31 @@ fn download_fallback_version(
     }
 }
 
+fn select_mobile_download_version(
+    version: &str,
+    platform: Platform,
+    lookup: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    if !version.is_empty()
+        || !matches!(
+            platform,
+            Platform::Appletv | Platform::Watchos | Platform::Visionos
+        )
+    {
+        return Ok(version.to_owned());
+    }
+    match lookup() {
+        Ok(version) if !version.is_empty() => Ok(version),
+        Ok(_) => bail!("platform version lookup returned an empty version"),
+        Err(error)
+            if platform == Platform::Appletv && allows_unpinned_redownload(platform, &error) =>
+        {
+            Ok(String::new())
+        }
+        Err(error) => Err(error).context("resolve platform version for download"),
+    }
+}
+
 fn allows_unpinned_redownload(platform: Platform, error: &anyhow::Error) -> bool {
     matches!(
         (platform, error.downcast_ref::<VersionLookupNotFound>()),
@@ -1522,6 +1561,45 @@ mod tests {
             Platform::Appletv,
             &anyhow::anyhow!("network failure")
         ));
+    }
+
+    #[test]
+    fn mobile_download_pins_platform_version_before_store_request() {
+        for platform in [Platform::Appletv, Platform::Watchos, Platform::Visionos] {
+            let selected =
+                select_mobile_download_version("", platform, || Ok("101".into())).unwrap();
+            assert_eq!(selected, "101");
+        }
+        assert_eq!(
+            select_mobile_download_version("", Platform::Iphone, || unreachable!()).unwrap(),
+            ""
+        );
+        assert_eq!(
+            select_mobile_download_version("99", Platform::Watchos, || unreachable!()).unwrap(),
+            "99"
+        );
+        for missing in [
+            VersionLookupNotFound::PlatformApp,
+            VersionLookupNotFound::PlatformOffers,
+        ] {
+            assert_eq!(
+                select_mobile_download_version("", Platform::Appletv, || Err(missing.into()))
+                    .unwrap(),
+                ""
+            );
+        }
+        assert!(
+            select_mobile_download_version("", Platform::Watchos, || {
+                Err(VersionLookupNotFound::PlatformOffers.into())
+            })
+            .is_err()
+        );
+        assert!(
+            select_mobile_download_version("", Platform::Appletv, || {
+                Err(anyhow::anyhow!("network failure"))
+            })
+            .is_err()
+        );
     }
 
     #[test]
