@@ -1,7 +1,7 @@
 use std::{error::Error, fmt};
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
 use crate::{
@@ -43,32 +43,44 @@ impl Error for AppNotFound {}
 
 #[derive(Debug, Deserialize)]
 struct CatalogResponse {
-    #[serde(rename = "resultCount", default)]
+    #[serde(rename = "resultCount", default, deserialize_with = "default_on_null")]
     count: usize,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "default_on_null")]
     results: Vec<CatalogApp>,
 }
 
 #[derive(Debug, Deserialize)]
 struct CatalogApp {
-    #[serde(rename = "trackId", default)]
+    #[serde(rename = "trackId", default, deserialize_with = "default_on_null")]
     id: i64,
-    #[serde(rename = "bundleId", default)]
+    #[serde(rename = "bundleId", default, deserialize_with = "default_on_null")]
     bundle_id: String,
-    #[serde(rename = "trackName", default)]
+    #[serde(rename = "trackName", default, deserialize_with = "default_on_null")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "default_on_null")]
     version: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "default_on_null")]
     price: f64,
-    #[serde(rename = "kind", default)]
+    #[serde(rename = "kind", default, deserialize_with = "default_on_null")]
     kind: String,
-    #[serde(rename = "supportedDevices", default)]
+    #[serde(
+        rename = "supportedDevices",
+        default,
+        deserialize_with = "default_on_null"
+    )]
     supported_devices: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "default_on_null")]
     platforms: Vec<Platform>,
     #[serde(rename = "purchaseDate", default)]
     purchase_date: Option<String>,
+}
+
+fn default_on_null<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl From<CatalogApp> for App {
@@ -349,6 +361,29 @@ mod tests {
             output.apps[0].platforms,
             Some(vec![Platform::Iphone, Platform::Ipad])
         );
+    }
+
+    #[test]
+    fn catalog_null_fields_keep_go_zero_values() {
+        let response: CatalogResponse = serde_json::from_str(
+            r#"{"resultCount":null,"results":[{"trackId":null,"bundleId":null,"trackName":null,"version":null,"price":null,"kind":null,"supportedDevices":null,"platforms":null}]}"#,
+        )
+        .unwrap();
+        let output = search_output(response, None);
+        assert_eq!(output.count, 0);
+        assert_eq!(output.apps.len(), 1);
+        assert_eq!(output.apps[0].id, 0);
+        assert_eq!(output.apps[0].bundle_id, "");
+        assert_eq!(output.apps[0].name, "");
+        assert_eq!(output.apps[0].version, "");
+        assert_eq!(output.apps[0].price, 0.0);
+        assert_eq!(output.apps[0].platforms, Some(vec![Platform::Unknown]));
+
+        let empty: CatalogResponse =
+            serde_json::from_str(r#"{"resultCount":null,"results":null}"#).unwrap();
+        let output = search_output(empty, None);
+        assert_eq!(output.count, 0);
+        assert!(output.apps.is_empty());
     }
 
     #[test]
