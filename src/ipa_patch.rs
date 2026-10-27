@@ -82,7 +82,7 @@ pub fn patch_ipa(
 fn sinf_paths(archive: &mut ZipArchive<File>, count: usize) -> Result<Vec<String>> {
     let mut bundle = None;
     let mut info_index = None;
-    let mut manifest_index = None;
+    let mut manifests = Vec::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index).context("inspect IPA entry")?;
         let entry_name = entry.name()?.into_owned();
@@ -92,6 +92,7 @@ fn sinf_paths(archive: &mut ZipArchive<File>, count: usize) -> Result<Vec<String
             && parts[1].ends_with(".app")
             && parts[1].len() > ".app".len()
             && parts[2] == "Info.plist"
+            && info_index.is_none()
         {
             bundle = Some(parts[1].to_owned());
             info_index = Some(index);
@@ -102,12 +103,12 @@ fn sinf_paths(archive: &mut ZipArchive<File>, count: usize) -> Result<Vec<String
             && parts[2] == "SC_Info"
             && parts[3] == "Manifest.plist"
         {
-            manifest_index = Some(index);
+            manifests.push((parts[1].to_owned(), index));
         }
     }
     let bundle = bundle.context("IPA has no top-level app Info.plist")?;
-    if let Some(index) = manifest_index {
-        let manifest = read_plist_entry(archive, index)?;
+    if let Some((_, index)) = manifests.iter().find(|(name, _)| name == &bundle) {
+        let manifest = read_plist_entry(archive, *index)?;
         let paths = manifest
             .as_dictionary()
             .and_then(|fields| fields.get("SinfPaths"))
@@ -685,6 +686,45 @@ mod tests {
                 .unwrap()
                 .size(),
             0
+        );
+    }
+
+    #[test]
+    fn ignores_manifest_from_a_different_app_bundle() {
+        let (directory, input) = source(None);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut writer = ZipWriter::new_append(file).unwrap();
+        writer
+            .start_file(
+                "Payload/Other.app/SC_Info/Manifest.plist",
+                SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer
+            .write_all(br#"<plist version="1.0"><dict><key>SinfPaths</key><array><string>SC_Info/Other.sinf</string></array></dict></plist>"#)
+            .unwrap();
+        writer.finish().unwrap();
+
+        let output = directory.path().join("patched.ipa");
+        patch_ipa(
+            &input,
+            &output,
+            &serde_json::json!({}),
+            "account",
+            &[],
+            &[mobile_sinf()],
+        )
+        .unwrap();
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        assert!(archive.by_name("Payload/App.app/SC_Info/App.sinf").is_ok());
+        assert!(
+            archive
+                .by_name("Payload/App.app/SC_Info/Other.sinf")
+                .is_err()
         );
     }
 }
