@@ -271,6 +271,12 @@ enum CallbackAction {
         function: u64,
         reverse: bool,
     },
+    DictionaryCopy {
+        receiver: u64,
+        keys: Vec<String>,
+        index: usize,
+        key: String,
+    },
     RestoreQueue {
         previous: u64,
     },
@@ -5413,6 +5419,23 @@ fn resume_callback(
             }
             context.reg_write(REG_X0, destination)?;
         }
+        CallbackAction::DictionaryCopy {
+            receiver,
+            keys,
+            index,
+            key,
+        } => {
+            let value = context.reg_read(REG_X0)?;
+            let StoreValue::Entries(entries) = &mut state.objects.get_mut(&receiver).unwrap().value
+            else {
+                bail!("dictionary copy target is not a dictionary");
+            };
+            entries.insert(key, value);
+            context.reg_write(REG_LR, resume.link)?;
+            if copy_dictionary_items(context, profile, state, receiver, keys, index)? {
+                return Ok(());
+            }
+        }
         CallbackAction::RestoreQueue { previous } => {
             state.current_queue = previous;
             context.reg_write(REG_X0, 0)?;
@@ -6904,26 +6927,27 @@ fn dispatch_message(
         context.reg_write(REG_X0, 0)?;
         return Ok(());
     }
-    if !class_method && class_is_kind_of(profile, &class_name, "NSError") {
+    if !class_method
+        && class_is_kind_of(profile, &class_name, "NSError")
+        && matches!(selector, "domain" | "userInfo" | "code")
+    {
         let StoreValue::Entries(fields) = &state.objects[&receiver].value else {
             bail!("invalid Store error object");
         };
-        if matches!(selector, "domain" | "userInfo" | "code") {
-            let mut value = fields.get(selector).copied().unwrap_or(0);
-            if selector == "code" {
-                let StoreValue::Number(code) = state
-                    .objects
-                    .get(&value)
-                    .context("missing Store error code")?
-                    .value
-                else {
-                    bail!("invalid Store error code");
-                };
-                value = code as u64;
-            }
-            context.reg_write(REG_X0, value)?;
-            return Ok(());
+        let mut value = fields.get(selector).copied().unwrap_or(0);
+        if selector == "code" {
+            let StoreValue::Number(code) = state
+                .objects
+                .get(&value)
+                .context("missing Store error code")?
+                .value
+            else {
+                bail!("invalid Store error code");
+            };
+            value = code as u64;
         }
+        context.reg_write(REG_X0, value)?;
+        return Ok(());
     }
     if !class_method && class_name == "NSIndexSet" {
         match selector {
@@ -7377,6 +7401,48 @@ fn dispatch_message(
             if is_directory != 0 {
                 context.mem_write(is_directory, &[0])?;
             }
+        }
+        context.reg_write(REG_X0, 0)?;
+        return Ok(());
+    }
+    if !class_method
+        && class_name == "NSFileManager"
+        && matches!(
+            selector,
+            "createDirectoryAtPath:withIntermediateDirectories:attributes:error:"
+                | "createDirectoryAtURL:withIntermediateDirectories:attributes:error:"
+        )
+    {
+        let out = context.reg_read(REG_X0 + 5)?;
+        if out != 0 {
+            let domain = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSString",
+                StoreValue::String("NSCocoaErrorDomain".into()),
+            )?;
+            let code =
+                new_guest_object(context, profile, state, "NSNumber", StoreValue::Number(513))?;
+            let user_info = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSDictionary",
+                StoreValue::Entries(HashMap::new()),
+            )?;
+            let error = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSError",
+                StoreValue::Entries(HashMap::from([
+                    ("domain".into(), domain),
+                    ("code".into(), code),
+                    ("userInfo".into(), user_info),
+                ])),
+            )?;
+            write_guest_u64(context, out, error)?;
         }
         context.reg_write(REG_X0, 0)?;
         return Ok(());
@@ -7973,6 +8039,15 @@ fn dispatch_message(
             )?;
             context.reg_write(REG_X0, date)?;
         }
+        (false, "initWithTimeIntervalSince1970:") if class_name == "NSDate" => {
+            let seconds = f64::from_bits(context.reg_read(40)?);
+            if !seconds.is_finite() || seconds <= i64::MIN as f64 || seconds >= i64::MAX as f64 {
+                bail!("unsupported Store date interval");
+            }
+            state.objects.get_mut(&receiver).expect("known date").value =
+                StoreValue::Float(seconds);
+            context.reg_write(REG_X0, receiver)?;
+        }
         (
             false,
             "timeIntervalSinceNow" | "timeIntervalSince1970" | "timeIntervalSinceReferenceDate",
@@ -8482,6 +8557,42 @@ fn dispatch_message(
                 StoreValue::Addresses(items);
             context.reg_write(REG_X0, receiver)?;
         }
+        (false, "removeObject:" | "removeObjectsInArray:") => {
+            let argument = context.reg_read(REG_X0 + 2)?;
+            if argument != 0 {
+                let remove = if selector == "removeObjectsInArray:" {
+                    let StoreValue::Addresses(items) = &state
+                        .objects
+                        .get(&argument)
+                        .context("unknown removal array")?
+                        .value
+                    else {
+                        bail!("removeObjectsInArray: argument is not an array");
+                    };
+                    items.clone()
+                } else {
+                    vec![argument]
+                };
+                let StoreValue::Addresses(items) = &state.objects[&receiver].value else {
+                    bail!("object removal on {class_name}");
+                };
+                let retained = items
+                    .iter()
+                    .copied()
+                    .filter(|&item| {
+                        !remove
+                            .iter()
+                            .any(|&candidate| foundation_equal(state, item, candidate, 0))
+                    })
+                    .collect();
+                state
+                    .objects
+                    .get_mut(&receiver)
+                    .expect("known collection")
+                    .value = StoreValue::Addresses(retained);
+            }
+            context.reg_write(REG_X0, 0)?;
+        }
         (false, "initWithDictionary:") => {
             let source = context.reg_read(REG_X0 + 2)?;
             let StoreValue::Entries(entries) = &state
@@ -8499,6 +8610,31 @@ fn dispatch_message(
                 .expect("known dictionary")
                 .value = StoreValue::Entries(entries);
             context.reg_write(REG_X0, receiver)?;
+        }
+        (false, "initWithDictionary:copyItems:") => {
+            let source = context.reg_read(REG_X0 + 2)?;
+            let copy_items = context.reg_read(REG_X0 + 3)? != 0;
+            let StoreValue::Entries(entries) = &state
+                .objects
+                .get(&source)
+                .context("unknown source dictionary")?
+                .value
+            else {
+                bail!("initWithDictionary:copyItems: source is not a dictionary");
+            };
+            let entries = entries.clone();
+            let mut keys = entries.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            state
+                .objects
+                .get_mut(&receiver)
+                .expect("known dictionary")
+                .value = StoreValue::Entries(entries);
+            if copy_items {
+                copy_dictionary_items(context, profile, state, receiver, keys, 0)?;
+            } else {
+                context.reg_write(REG_X0, receiver)?;
+            }
         }
         (false, "boolForKey:") if class_name == "NSUserDefaults" => {
             let key = object_string_value(state, context.reg_read(REG_X0 + 2)?)?;
@@ -8991,7 +9127,14 @@ fn dispatch_message(
             )?;
             context.reg_write(REG_X0, address)?;
         }
-        (false, "isEqual:" | "isEqualToString:" | "isEqualToDictionary:" | "isEqualToArray:") => {
+        (
+            false,
+            "isEqual:"
+            | "isEqualToDate:"
+            | "isEqualToString:"
+            | "isEqualToDictionary:"
+            | "isEqualToArray:",
+        ) => {
             let other = context.reg_read(REG_X0 + 2)?;
             context.reg_write(
                 REG_X0,
@@ -9009,6 +9152,16 @@ fn dispatch_message(
                 new_bundle_info(context, profile, state)?
             };
             context.reg_write(REG_X0, value)?;
+        }
+        (false, "localizedStringForKey:value:table:") if class_name == "NSBundle" => {
+            let key = context.reg_read(REG_X0 + 2)?;
+            let fallback = context.reg_read(REG_X0 + 3)?;
+            let result = if fallback != 0 && !object_string_value(state, fallback)?.is_empty() {
+                fallback
+            } else {
+                key
+            };
+            context.reg_write(REG_X0, result)?;
         }
         (
             false,
@@ -9136,6 +9289,23 @@ fn dispatch_message(
             value.push_str(&suffix);
             context.reg_write(REG_X0, 0)?;
         }
+        (false, "initWithBytesNoCopy:length:encoding:freeWhenDone:")
+            if class_is_kind_of(profile, &class_name, "NSString") =>
+        {
+            let address = context.reg_read(REG_X0 + 2)?;
+            let length = context.reg_read(REG_X0 + 3)?;
+            let encoding = context.reg_read(REG_X0 + 4)?;
+            if !matches!(encoding, 1 | 4) || length > 1 << 20 {
+                bail!("unsupported string buffer initialization");
+            }
+            let bytes = context.mem_read(address, length as usize)?;
+            state
+                .objects
+                .get_mut(&receiver)
+                .expect("known string")
+                .value = StoreValue::String(String::from_utf8_lossy(&bytes).into_owned());
+            context.reg_write(REG_X0, receiver)?;
+        }
         (false, "stringByAppendingString:") => {
             let prefix = object_string_value(state, receiver)?;
             let suffix = object_string_value(state, context.reg_read(REG_X0 + 2)?)?;
@@ -9195,6 +9365,24 @@ fn dispatch_message(
                 StoreValue::String(trimmed),
             )?;
             context.reg_write(REG_X0, string)?;
+        }
+        (false, "initWithDomain:code:userInfo:") if class_name == "NSError" => {
+            let domain = context.reg_read(REG_X0 + 2)?;
+            let code = new_guest_object(
+                context,
+                profile,
+                state,
+                "NSNumber",
+                StoreValue::Number(context.reg_read(REG_X0 + 3)? as i64),
+            )?;
+            let user_info = context.reg_read(REG_X0 + 4)?;
+            state.objects.get_mut(&receiver).expect("known error").value =
+                StoreValue::Entries(HashMap::from([
+                    ("domain".into(), domain),
+                    ("code".into(), code),
+                    ("userInfo".into(), user_info),
+                ]));
+            context.reg_write(REG_X0, receiver)?;
         }
         (false, "componentsJoinedByString:") => {
             let separator = object_string_value(state, context.reg_read(REG_X0 + 2)?)?.to_owned();
@@ -9744,6 +9932,78 @@ fn foundation_equal(state: &StoreState, first: u64, second: u64, depth: usize) -
         }
         _ => false,
     }
+}
+
+fn copy_foundation_value(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    address: u64,
+) -> Result<u64> {
+    let object = state
+        .objects
+        .get(&address)
+        .context("unknown dictionary copy value")?;
+    let class = object.class.as_str();
+    let target = match class {
+        "NSArray" | "NSMutableArray" => "NSArray",
+        "NSSet" | "NSMutableSet" => "NSSet",
+        "NSDictionary" | "NSMutableDictionary" => "NSDictionary",
+        "NSMutableString" => "NSString",
+        _ => return Ok(address),
+    };
+    let value = object.value.clone();
+    new_guest_object(context, profile, state, target, value)
+}
+
+fn copy_dictionary_items(
+    context: &HookContext,
+    profile: &ProfileData,
+    state: &mut StoreState,
+    receiver: u64,
+    keys: Vec<String>,
+    mut index: usize,
+) -> Result<bool> {
+    while index < keys.len() {
+        let key = keys[index].clone();
+        let value = {
+            let StoreValue::Entries(entries) = &state.objects[&receiver].value else {
+                bail!("dictionary copy target is not a dictionary");
+            };
+            entries[&key]
+        };
+        let class = state
+            .objects
+            .get(&value)
+            .context("unknown dictionary copy value")?
+            .class
+            .clone();
+        if let Some(function) = method_address(profile, &class, "copyWithZone:", false) {
+            let selector = selector_address_for_hook(context, profile, state, "copyWithZone:")?;
+            begin_callback(
+                context,
+                state,
+                function,
+                &[value, selector, 0],
+                CallbackAction::DictionaryCopy {
+                    receiver,
+                    keys,
+                    index: index + 1,
+                    key,
+                },
+            )?;
+            return Ok(true);
+        }
+        let copied = copy_foundation_value(context, profile, state, value)?;
+        let StoreValue::Entries(entries) = &mut state.objects.get_mut(&receiver).unwrap().value
+        else {
+            unreachable!("dictionary was checked before copying")
+        };
+        entries.insert(key, copied);
+        index += 1;
+    }
+    context.reg_write(REG_X0, receiver)?;
+    Ok(false)
 }
 
 fn new_guest_object(
@@ -11004,6 +11264,333 @@ mod tests {
             };
             assert!(entries.is_empty());
         }
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_directory_and_localization_fallbacks() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |selector: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.selector == selector)
+                .unwrap()
+                .address
+        };
+        let create_path =
+            call_address("createDirectoryAtPath:withIntermediateDirectories:attributes:error:");
+        let create_url =
+            call_address("createDirectoryAtURL:withIntermediateDirectories:attributes:error:");
+        let localized = call_address("localizedStringForKey:value:table:");
+        let init_error = call_address("initWithDomain:code:userInfo:");
+        let manager = runtime
+            .new_object("NSFileManager", StoreValue::Empty)
+            .unwrap();
+        let path = runtime
+            .new_object("NSString", StoreValue::String("/ipatool/test".into()))
+            .unwrap();
+        let out = runtime.allocate(8).unwrap();
+        for call in [create_path, create_url] {
+            runtime.write_u64(out, 0).unwrap();
+            assert_eq!(
+                runtime.call(call, &[manager, 0, path, 1, 0, out]).unwrap(),
+                0
+            );
+            let error = runtime.read_u64(out).unwrap();
+            let state = runtime.state.borrow();
+            let StoreValue::Entries(fields) = &state.objects[&error].value else {
+                panic!("directory failure did not return NSError");
+            };
+            assert_eq!(
+                object_string_value(&state, fields["domain"]).unwrap(),
+                "NSCocoaErrorDomain"
+            );
+            let StoreValue::Number(code) = &state.objects[&fields["code"]].value else {
+                panic!("directory error code is not numeric");
+            };
+            assert_eq!(*code, 513);
+        }
+
+        let bundle = runtime.new_object("NSBundle", StoreValue::Empty).unwrap();
+        let key = runtime
+            .new_object("NSString", StoreValue::String("missing.key".into()))
+            .unwrap();
+        let fallback = runtime
+            .new_object("NSString", StoreValue::String("fallback".into()))
+            .unwrap();
+        let empty = runtime
+            .new_object("NSString", StoreValue::String(String::new()))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .call(localized, &[bundle, 0, key, fallback, 0])
+                .unwrap(),
+            fallback
+        );
+        assert_eq!(
+            runtime
+                .call(localized, &[bundle, 0, key, empty, 0])
+                .unwrap(),
+            key
+        );
+
+        let error = runtime.new_object("NSError", StoreValue::Empty).unwrap();
+        let domain = runtime
+            .new_object("NSString", StoreValue::String("TestDomain".into()))
+            .unwrap();
+        let user_info = runtime
+            .new_object("NSDictionary", StoreValue::Entries(HashMap::new()))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .call(init_error, &[error, 0, domain, 42, user_info])
+                .unwrap(),
+            error
+        );
+        let state = runtime.state.borrow();
+        let StoreValue::Entries(fields) = &state.objects[&error].value else {
+            panic!("initialized NSError has no fields");
+        };
+        assert_eq!(fields["domain"], domain);
+        assert_eq!(fields["userInfo"], user_info);
+        let StoreValue::Number(code) = &state.objects[&fields["code"]].value else {
+            panic!("initialized error code is not numeric");
+        };
+        assert_eq!(*code, 42);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_date_and_string_buffer_initializers() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |selector: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.selector == selector)
+                .unwrap()
+                .address
+        };
+        let init_date = call_address("initWithTimeIntervalSince1970:");
+        let equal_date = call_address("isEqualToDate:");
+        let init_string = call_address("initWithBytesNoCopy:length:encoding:freeWhenDone:");
+        let date = runtime.new_object("NSDate", StoreValue::Empty).unwrap();
+        runtime.engine.reg_write(40, 123.5f64.to_bits()).unwrap();
+        assert_eq!(runtime.call(init_date, &[date]).unwrap(), date);
+        let matching = runtime
+            .new_object("NSDate", StoreValue::Float(123.5))
+            .unwrap();
+        let different = runtime
+            .new_object("NSDate", StoreValue::Float(124.0))
+            .unwrap();
+        assert_eq!(runtime.call(equal_date, &[date, 0, matching]).unwrap(), 1);
+        assert_eq!(runtime.call(equal_date, &[date, 0, different]).unwrap(), 0);
+
+        let bytes = "héllo".as_bytes();
+        let buffer = runtime.allocate(bytes.len() as u64).unwrap();
+        runtime.engine.mem_write(buffer, bytes).unwrap();
+        let string = runtime
+            .new_object("NSMutableString", StoreValue::Empty)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .call(init_string, &[string, 0, buffer, bytes.len() as u64, 4, 1])
+                .unwrap(),
+            string
+        );
+        assert_eq!(
+            object_string_value(&runtime.state.borrow(), string).unwrap(),
+            "héllo"
+        );
+        assert!(
+            runtime
+                .call(init_string, &[string, 0, buffer, 1, 10, 0])
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_collection_removal_uses_value_equality() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call_address = |selector: &str| {
+            runtime
+                .profile
+                .index
+                .calls
+                .iter()
+                .find(|call| call.selector == selector)
+                .unwrap()
+                .address
+        };
+        let remove_one = call_address("removeObject:");
+        let remove_many = call_address("removeObjectsInArray:");
+        let first = runtime
+            .new_object("NSString", StoreValue::String("same".into()))
+            .unwrap();
+        let duplicate = runtime
+            .new_object("NSString", StoreValue::String("same".into()))
+            .unwrap();
+        let different = runtime
+            .new_object("NSString", StoreValue::String("other".into()))
+            .unwrap();
+        let equal = runtime
+            .new_object("NSString", StoreValue::String("same".into()))
+            .unwrap();
+        let collection = runtime
+            .new_object(
+                "NSMutableArray",
+                StoreValue::Addresses(vec![first, different, duplicate]),
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.call(remove_one, &[collection, 0, equal]).unwrap(),
+            0
+        );
+        let state = runtime.state.borrow();
+        let StoreValue::Addresses(items) = &state.objects[&collection].value else {
+            panic!("removal target is not an array");
+        };
+        assert_eq!(items.as_slice(), &[different]);
+        drop(state);
+
+        runtime
+            .state
+            .borrow_mut()
+            .objects
+            .get_mut(&collection)
+            .unwrap()
+            .value = StoreValue::Addresses(vec![first, different, duplicate]);
+        let removal = runtime
+            .new_object("NSArray", StoreValue::Addresses(vec![equal, different]))
+            .unwrap();
+        assert_eq!(
+            runtime
+                .call(remove_many, &[collection, 0, removal])
+                .unwrap(),
+            0
+        );
+        let state = runtime.state.borrow();
+        let StoreValue::Addresses(items) = &state.objects[&collection].value else {
+            panic!("removal target is not an array");
+        };
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_dictionary_copy_items_copies_immediate_values() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.selector == "initWithDictionary:copyItems:")
+            .unwrap()
+            .address;
+        let string = runtime
+            .new_object("NSMutableString", StoreValue::String("original".into()))
+            .unwrap();
+        let array = runtime
+            .new_object("NSMutableArray", StoreValue::Addresses(vec![string]))
+            .unwrap();
+        let number = runtime
+            .new_object("NSNumber", StoreValue::Number(7))
+            .unwrap();
+        let source = runtime
+            .new_object(
+                "NSDictionary",
+                StoreValue::Entries(HashMap::from([
+                    ("array".into(), array),
+                    ("number".into(), number),
+                    ("string".into(), string),
+                ])),
+            )
+            .unwrap();
+        let shallow = runtime
+            .new_object("NSMutableDictionary", StoreValue::Empty)
+            .unwrap();
+        let copied = runtime
+            .new_object("NSMutableDictionary", StoreValue::Empty)
+            .unwrap();
+        assert_eq!(
+            runtime.call(call, &[shallow, 0, source, 0]).unwrap(),
+            shallow
+        );
+        assert_eq!(runtime.call(call, &[copied, 0, source, 1]).unwrap(), copied);
+        let state = runtime.state.borrow();
+        let StoreValue::Entries(shallow_entries) = &state.objects[&shallow].value else {
+            panic!("shallow copy is not a dictionary");
+        };
+        assert_eq!(shallow_entries["string"], string);
+        assert_eq!(shallow_entries["array"], array);
+        let StoreValue::Entries(entries) = &state.objects[&copied].value else {
+            panic!("copied value is not a dictionary");
+        };
+        assert_ne!(entries["string"], string);
+        assert_eq!(state.objects[&entries["string"]].class, "NSString");
+        assert_eq!(
+            object_string_value(&state, entries["string"]).unwrap(),
+            "original"
+        );
+        assert_ne!(entries["array"], array);
+        assert_eq!(state.objects[&entries["array"]].class, "NSArray");
+        assert_eq!(entries["number"], number);
+    }
+
+    #[test]
+    #[ignore = "requires cached pinned Apple image and Unicorn library"]
+    fn pinned_guest_dictionary_copy_items_runs_native_copy_callback() {
+        let assets = SapAssetBundle::load_cached().unwrap();
+        let mut runtime = StoreRuntime::open(&assets).unwrap();
+        let call = runtime
+            .profile
+            .index
+            .calls
+            .iter()
+            .find(|call| call.selector == "initWithDictionary:copyItems:")
+            .unwrap()
+            .address;
+        let custom = runtime
+            .new_object("AMSLogConfig", StoreValue::Empty)
+            .unwrap();
+        let second = runtime
+            .new_object("AMSLogConfig", StoreValue::Empty)
+            .unwrap();
+        assert!(
+            runtime
+                .method_address("AMSLogConfig", "copyWithZone:", false)
+                .is_some()
+        );
+        let source = runtime
+            .new_object(
+                "NSDictionary",
+                StoreValue::Entries(HashMap::from([
+                    ("custom".into(), custom),
+                    ("second".into(), second),
+                ])),
+            )
+            .unwrap();
+        let target = runtime
+            .new_object("NSMutableDictionary", StoreValue::Empty)
+            .unwrap();
+        assert_eq!(runtime.call(call, &[target, 0, source, 1]).unwrap(), target);
+        let state = runtime.state.borrow();
+        let StoreValue::Entries(entries) = &state.objects[&target].value else {
+            panic!("copy target is not a dictionary");
+        };
+        assert!(state.objects.contains_key(&entries["custom"]));
+        assert!(state.objects.contains_key(&entries["second"]));
     }
 
     #[test]
