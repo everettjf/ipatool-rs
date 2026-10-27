@@ -421,7 +421,10 @@ pub enum FileType {
     File,
     Directory,
     HardLink,
+    #[serde(rename = "symlink", alias = "link")]
     Link,
+    #[serde(other)]
+    Other,
 }
 
 impl Display for FileType {
@@ -431,6 +434,7 @@ impl Display for FileType {
             FileType::Directory => f.write_str("directory"),
             FileType::HardLink => f.write_str("hardlink"),
             FileType::Link => f.write_str("symlink"),
+            FileType::Other => f.write_str("unknown"),
         }
     }
 }

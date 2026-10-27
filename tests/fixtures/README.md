@@ -4,9 +4,10 @@ sanitized 26A428 frame, state, and SIDB models from
 state for regression tests, not a user's enrollment. Private oracle models must
 never be added here.
 
-`mac-xar-extra-synthetic.pkg` is a 346-byte synthetic XAR with extra XML
-elements in its TOC, file, and data records. The Go XAR reader accepted its
-single checksummed payload. It contains no account or package data.
+`mac-xar-extra-synthetic.pkg` is a 386-byte synthetic XAR with extra XML
+elements in its TOC, file, and data records, plus symlink and FIFO entries.
+The Go XAR reader accepted its single checksummed payload and skipped the
+special entries. It contains no account or package data.
 
 `fairplay-oracle-raw-source-synthetic.model.gz` extends the account-free
 26A428 synthetic model with zero-filled pages so the six checked raw-source

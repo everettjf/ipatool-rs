@@ -295,6 +295,7 @@ impl<R: Read + Seek + Sized + Debug> XarReader<R> {
                 }
                 FileType::HardLink => return Err(Error::Unsupported("writing hard links")),
                 FileType::Link => return Err(Error::Unsupported("writing symlinks")),
+                FileType::Other => return Err(Error::Unsupported("writing unknown file types")),
             }
         }
 
