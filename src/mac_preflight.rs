@@ -3,17 +3,20 @@
 use std::{
     collections::HashSet,
     fmt::Debug,
-    io::{self, Cursor, Read, Seek, SeekFrom},
+    io::{Cursor, Read, Seek, SeekFrom},
 };
 
 use anyhow::{Context, Result, bail};
 use apple_xar::reader::XarReader;
-use reqwest::{header::HeaderMap, redirect::Policy};
 use roxmltree::Document;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use url::Url;
 
-use crate::{ipa_metadata::VersionMetadata, transport::Transport};
+use crate::{
+    download_file::{download_file, download_file_with_transport},
+    ipa_metadata::VersionMetadata,
+    transport::Transport,
+};
 
 pub fn read_preflight_version_metadata(url: &str, bundle_id: &str) -> Result<VersionMetadata> {
     read_preflight_version_metadata_using(url, bundle_id, None)
@@ -36,31 +39,14 @@ fn read_preflight_version_metadata_using(
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         bail!("unsupported Mac preflight URL");
     }
-    let mut response = if let Some(transport) = transport {
-        transport.stream_get(url, HeaderMap::new(), None)?
+    let package = tempfile::NamedTempFile::new().context("create Mac preflight staging")?;
+    if let Some(transport) = transport {
+        download_file_with_transport(transport, url.as_str(), package.path())
     } else {
-        let client = reqwest::blocking::Client::builder()
-            .redirect(Policy::custom(|attempt| {
-                if attempt.previous().len() < 10
-                    && matches!(attempt.url().scheme(), "http" | "https")
-                {
-                    attempt.follow()
-                } else {
-                    attempt.stop()
-                }
-            }))
-            .build()?;
-        client
-            .get(url)
-            .send()
-            .context("download Mac preflight package")?
-    };
-    if !response.status().is_success() {
-        bail!("Mac preflight package returned HTTP {}", response.status());
+        download_file(url.as_str(), package.path())
     }
-    let mut package = tempfile::tempfile().context("create Mac preflight staging")?;
-    io::copy(&mut response, &mut package).context("stage Mac preflight package")?;
-    parse_preflight_reader(package, bundle_id)
+    .context("download Mac preflight package")?;
+    parse_preflight_reader(package.reopen()?, bundle_id)
 }
 
 pub fn parse_preflight_xar(bytes: &[u8], bundle_id: &str) -> Result<VersionMetadata> {
@@ -396,6 +382,49 @@ mod tests {
         assert_eq!(metadata.display_version, "4.2");
         assert_eq!(metadata.release_date, "2012-07-06T09:54:33Z");
         assert_eq!(streamed, metadata);
+    }
+
+    #[test]
+    fn reads_preflight_metadata_from_range_only_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let package = fixture_xar(DISTRIBUTION);
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while stream.read_exact(&mut byte).is_ok() {
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with("GET /preflight.pkg HTTP/1.1"));
+                assert!(request.to_ascii_lowercase().contains("range: bytes=0-\r\n"));
+                write!(
+                    stream,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    package.len() - 1,
+                    package.len(),
+                    package.len()
+                )
+                .unwrap();
+                stream.write_all(&package).unwrap();
+            }
+        });
+        let url = format!("http://{address}/preflight.pkg");
+        let direct = read_preflight_version_metadata(&url, "com.example.mac").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let transport = Transport::with_cookies(directory.path()).unwrap();
+        let authenticated =
+            read_preflight_version_metadata_with_transport(&url, "com.example.mac", &transport)
+                .unwrap();
+        server.join().unwrap();
+        assert_eq!(direct.display_version, "4.2");
+        assert_eq!(direct.release_date, "2012-07-06T09:54:33Z");
+        assert_eq!(authenticated, direct);
     }
 
     #[test]
