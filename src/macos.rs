@@ -118,4 +118,12 @@ mod tests {
             assert!(product_version_id(&page(config), &app()).is_err());
         }
     }
+
+    #[test]
+    fn prefers_double_quoted_product_data_marker_over_earlier_single_quoted_text() {
+        let body = format!(
+            r#"<script>const example = "id='serialized-server-data'";</script><script id="serialized-server-data">{MAC_OFFER}</script>"#
+        );
+        assert_eq!(product_version_id(&body, &app()).unwrap(), "876660716");
+    }
 }

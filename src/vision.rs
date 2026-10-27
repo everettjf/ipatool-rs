@@ -28,10 +28,9 @@ pub fn product_url(app_id: i64, country: &str) -> Result<Url> {
 }
 
 pub(crate) fn serialized_server_data(body: &str) -> Result<&str> {
-    let marker = [format!("id=\"{SCRIPT_ID}\""), format!("id='{SCRIPT_ID}'")]
-        .into_iter()
-        .filter_map(|needle| body.find(&needle))
-        .min()
+    let marker = body
+        .find(&format!("id=\"{SCRIPT_ID}\""))
+        .or_else(|| body.find(&format!("id='{SCRIPT_ID}'")))
         .ok_or_else(|| anyhow!("serialized server data was not found"))?;
     let script_start = body[..marker]
         .rfind("<script")
