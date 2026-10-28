@@ -47,7 +47,6 @@ pub mod fairplay_recovery_step3;
 pub mod fairplay_recovery_target;
 pub mod fairplay_sidb;
 pub mod fairplay_startup;
-pub mod fairplay_startup_export;
 pub mod fairplay_state;
 pub mod fairplay_supf;
 pub mod file_keychain;

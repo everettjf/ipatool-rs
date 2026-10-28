@@ -23,5 +23,3 @@ Export the existing `ipatool-fairplay-startup-cache-v1` fields only: `schema`, a
 ## Current code gaps
 
 `src/fairplay_collect.rs` currently copies installed app, license, state, hardware, IPA, and exact `fairplayd` bytes into a private capture. It does not emulate daemon startup. `src/fairplay_startup.rs` consumes two embedded overlays and has request entry addresses only for their hashes. The reference project's startup tracer has build-specific entry and host-call behavior; its profile builder requires a pre-request checkpoint or trace cache. Porting that startup behavior to Rust and validating it are the main implementation tasks.
-
-The draft export implementation adds a deterministic, bounded, private candidate writer in `src/fairplay_startup_export.rs`. It accepts only an exact binary image, an address-to-byte map, and once tokens, and emits no account or request fields. The writer cannot prove the trace boundary itself and is deliberately not called by `collect` until a dedicated pre-request startup runner and validation exist. The user-visible `--export-startup-profile` flag remains pending.
