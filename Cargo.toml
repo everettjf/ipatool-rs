@@ -1,6 +1,6 @@
 [package]
 name = "ipatool-rs"
-version = "0.1.0-preview.2"
+version = "0.1.0-preview.3"
 edition = "2024"
 license = "MIT"
 description = "Rust port of ipatool-fairplay"
