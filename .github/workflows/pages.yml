@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - web/**
+      - docs/images/architecture.*
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -28,6 +29,10 @@ jobs:
         uses: actions/checkout@v6
       - name: Configure Pages
         uses: actions/configure-pages@v5
+      - name: Include shared architecture assets
+        run: |
+          mkdir -p web/images
+          cp docs/images/architecture.png docs/images/architecture.svg web/images/
       - name: Upload the static site
         uses: actions/upload-pages-artifact@v4
         with:
