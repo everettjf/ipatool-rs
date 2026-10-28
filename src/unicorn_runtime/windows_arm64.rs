@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
-use super::{MAX_ARTIFACT_SIZE, file_matches_sha256};
+use super::{MAX_ARTIFACT_SIZE, file_matches_sha256, install_verified_library};
 
 const FIRST: &[u8] = &[0xe8, 0x21, 0xcc, 0x1a, 0xe8, 0x03, 0x28, 0x2a];
 const SECOND: &[u8] = &[0xef, 0x21, 0xc8, 0x1a, 0xef, 0x03, 0x2f, 0x2a];
@@ -38,8 +38,7 @@ pub(super) fn prepare_runtime_library(path: &Path) -> Result<PathBuf> {
         .as_file()
         .sync_all()
         .context("sync prepared Unicorn DLL")?;
-    temporary
-        .persist(&destination)
+    install_verified_library(temporary, &destination, &checksum)
         .context("install prepared Unicorn DLL")?;
     if !file_matches_sha256(&destination, &checksum)? {
         bail!("prepared Windows ARM64 Unicorn DLL failed integrity verification");
@@ -106,6 +105,38 @@ mod tests {
     #[test]
     fn rejects_unrecognized_arm64_mask_layout() {
         assert!(patch_tcg_masks(&mut [0; 128]).is_err());
+    }
+
+    #[test]
+    fn concurrently_prepares_one_checked_arm64_dll() {
+        use std::sync::{Arc, Barrier};
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("libunicorn.dll");
+        let mut image = vec![0; PATTERN_COUNT * 64];
+        for index in 0..PATTERN_COUNT {
+            let offset = index * 64;
+            image[offset..offset + 8].copy_from_slice(FIRST);
+            image[offset + 24..offset + 32].copy_from_slice(SECOND);
+        }
+        fs::write(&source, image).unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..8 {
+                let barrier = Arc::clone(&barrier);
+                let source = &source;
+                workers.push(scope.spawn(move || {
+                    barrier.wait();
+                    prepare_runtime_library(source).unwrap()
+                }));
+            }
+            let mut paths = Vec::new();
+            for worker in workers {
+                paths.push(worker.join().unwrap());
+            }
+            assert!(paths.iter().all(|path| path == &paths[0]));
+        });
     }
 
     #[test]
