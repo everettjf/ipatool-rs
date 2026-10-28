@@ -226,6 +226,9 @@ uses aligned icon/label columns and a compact icon-only toggle; project
 recommendations remain in documentation instead of the workspace. Search has a
 leading icon and compact clear action, account/download actions have icons, and
 selected controls share one blue accent. Old light captures are historical.
+The native window title provides the app name; the sidebar no longer repeats
+that brand. The toolbar shows a page title only when the wide sidebar is hidden,
+so visible navigation identifies the page without another heading.
 The signed release app repeated real Mac/US public search (17 results with public
 artwork), clear-query/result removal, sidebar collapse/restore, Down/Enter/
 Command-W selection retention, and Command-Comma settings checks. The current

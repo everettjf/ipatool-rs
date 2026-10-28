@@ -12,7 +12,7 @@ affected captures.
 
 | Capture | Observed state | Evidence limit |
 | --- | --- | --- |
-| [Explore, refined dark](explore-refined-dark.png) | Signed release app with compact sidebar toggle, aligned navigation, search/clear/download icons, one dark palette, and 17 real public Mac / US results. | Public browsing only; no account operation. |
+| [Explore, refined dark](explore-refined-dark.png) | Signed release app with one app title, no repeated page heading beside visible navigation, compact sidebar toggle, aligned icons/labels, one dark palette, and 17 real public Mac / US results. | Public browsing only; no account operation. |
 | [Explore, dark](explore-dark.png) | Public ScriptWidget search, Mac / US, 17 results; real public artwork; keyboard-selected Widgy details; fixed sign-in/download action. | No account or download was exercised. |
 | [Explore release build, dark](explore-release-dark.png) | Signed release app, real public Mac / US search and artwork; metadata scrolled to the end with all copy actions visible inside the window. | Launch and public browsing evidence only. |
 | [Historical light appearance](explore-light.png) | Superseded appearance option, captured before the dark-only scope decision. | Historical evidence; no longer a supported mode. |

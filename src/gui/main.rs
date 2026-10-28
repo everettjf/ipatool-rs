@@ -529,14 +529,6 @@ impl Render for DesktopWindow {
             .gap_1()
             .border_r_1()
             .border_color(cx.theme().border)
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .px_3()
-                    .mb_4()
-                    .child("ipatool"),
-            )
             .children(
                 [
                     Page::Explore,
@@ -631,7 +623,10 @@ impl Render for DesktopWindow {
                                 })),
                         )
                     })
-                    .child(div().text_lg().child(self.page.title()))
+                    .when(
+                        window.viewport_size().width >= px(1000.) && !self.sidebar_visible,
+                        |row| row.child(div().text_lg().child(self.page.title())),
+                    )
                     .when(self.session.is_fixture(), |row| {
                         row.child(
                             div()
