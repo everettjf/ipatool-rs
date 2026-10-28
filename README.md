@@ -17,7 +17,7 @@ Built on the work of [ipatool](https://github.com/majd/ipatool), [UnfairPlay](ht
 | Area | Capabilities |
 | --- | --- |
 | Public catalog | Search applications, look up details, and find the latest external version ID without signing in. |
-| Desktop preview | Optional GPUI catalog browser with search, ID / bundle lookup, platform and country controls, and copy actions. |
+| Desktop preview | Optional GPUI desktop for public browsing, account interaction, Library, download tasks, and primary FairPlay workflows. Desktop account/private-data validation is in progress. |
 | Account and Store | Sign in, inspect or revoke saved credentials, obtain free-app licenses, and query purchases and version metadata. |
 | Packages | Download entitled IPA or Mac PKG packages, with package metadata and SINF handling. |
 | MCP | Expose six App Store tools to compatible clients over standard input and output. |
@@ -130,7 +130,7 @@ Use `ipatool-rs --help` or a command's `--help` for its available options.
 
 ![ipatool-rs architecture: CLI and MCP share Rust workflows backed by platform services, Apple endpoints, and build-specific guest execution.](docs/images/architecture.png)
 
-The CLI and MCP server share the same Rust application modules. Public catalog queries use the catalog client directly and do not need a saved account or Apple guest execution.
+The CLI, MCP server, and optional GPUI desktop share Rust application modules. Public catalog queries use the catalog client directly and do not need a saved account or Apple guest execution.
 
 Selected Store and SAP signing paths load pinned Apple framework images and execute ARM64 guest code through Unicorn. Rust supplies the image loaders, execution control, and host-call models. The program does not launch a separate Go, Python, or Swift executable; it still depends on the corresponding Apple guest code and the Unicorn runtime for these paths.
 
@@ -140,30 +140,46 @@ The editable diagram is available as [SVG](docs/images/architecture.svg). Implem
 
 ## Desktop preview (GPUI)
 
-Build and run the optional native catalog browser from source:
+Build and run the optional native desktop from source:
 
 ```sh
 cargo run --locked --features gui --bin ipatool-gui
 ```
 
-The preview supports public search, lookup by App ID or bundle identifier, six
+The desktop uses a focused dark theme, compact sidebar controls, and aligned
+icon/label navigation. It supports public search, lookup by App ID or bundle identifier, six
 offer platforms, and two-letter country codes. Select a result to inspect its
 metadata or copy identifiers, JSON, and CLI commands. Press Enter in either input
 to submit. Queries run in the background and report loading, empty, and error
 states. No request is sent until you submit.
 
 The GUI is a source-only experiment, initially validated on Apple Silicon macOS.
-It is not included in release archives or Homebrew. Linux and Windows GUI builds
-and desktop sessions remain unverified; their CLI release status is unchanged.
+It is not included in release archives or Homebrew. The Windows GNU x86_64 GUI
+cross-build links successfully on macOS. Native Linux/Windows desktop sessions
+and the Windows MSVC GUI build remain unverified; CLI release status is unchanged.
 GPUI requires a graphical desktop and graphics support; macOS builds need Xcode
 with the Metal compiler tools. See the pinned [GPUI crate](https://docs.rs/crate/gpui/0.2.2)
 for platform dependencies.
 
-Account login, purchases, downloads, and FairPlay operations remain available
-through the CLI. A copied download command uses the saved account's storefront
-and requires the appropriate entitlement. The desktop preview does not load
-account credentials. Building without `--features gui` keeps the CLI-only build;
+The in-progress desktop also exposes login/verification and file-store unlock,
+purchase history, version selection, background downloads, and FairPlay
+inspection/collection/recovery/model decryption through shared Rust application
+workflows. Browsing does not open credential storage. Account access starts only
+through an explicit account/download action; downloads check the account's
+storefront and entitlement. Task history contains request metadata and artifact
+paths, without credentials or signed download URLs. Interrupted tasks require
+explicit review and retry. See [current evidence and remaining gates](docs/PORTING.md#shared-cli--gpui-implementation-in-progress-2026-10-28).
+
+For a locally signed Apple Silicon application bundle, use
+`scripts/build-gui-macos.sh` (or `--debug`). The generated `.app` is ad hoc signed,
+not notarized or published. Live desktop account and private FairPlay checks
+remain open. Building without `--features gui` keeps the CLI-only build;
 plain `cargo run` still selects `ipatool`.
+
+[Native screenshots](docs/screenshots/README.md) include public browsing and
+separately labeled synthetic account/task walkthroughs. The optional
+[fixture preview](docs/GUI_FIXTURE_PREVIEW.md) supports repeatable interaction
+testing without an Apple account; its simulated results are not live validation.
 
 ## Credentials and local state
 

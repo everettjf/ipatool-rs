@@ -16,10 +16,16 @@ Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and r
 
 ## GPUI desktop preview
 
+The shared CLI/GUI workflow architecture, implementation milestones,
+and acceptance criteria are in [CLI_GUI_IMPLEMENTATION_PLAN.md](CLI_GUI_IMPLEMENTATION_PLAN.md).
+Rust package publication and a workspace split are deferred; this plan does not
+mark any implementation or live-validation gate complete.
+
 - [ ] Validate screen-reader accessibility and keyboard navigation. The pinned GPUI build's macOS accessibility tree currently exposes the window chrome but not the custom catalog controls.
-- [ ] Validate Linux x86_64 and Windows x86_64 GUI builds and desktop interaction; CLI CI does not cover the optional `gui` feature on these hosts.
-- [ ] Add native application bundles, icons, signing, and release packaging before distributing the GUI. Current releases remain CLI-only.
-- [ ] Add account and package workflows to the GUI only with explicit interaction for login, 2FA, credential-store access, entitlements, and output selection. The first preview browses the public catalog and copies CLI commands.
+- [ ] Validate Linux x86_64 and Windows x86_64 GUI builds and desktop interaction. Windows GNU GUI cross-build and strict all-targets Clippy pass on macOS; native MSVC/Linux builds and desktop sessions remain separate gates. Native GUI build/fixture jobs have been added locally; their execution remains pending submission. CLI CI is separate evidence.
+- [ ] Complete distribution signing/notarization and release packaging before distributing the GUI. A repeatable, ad hoc signed macOS bundle build now passes locally; current releases remain CLI-only.
+- [ ] Finish fixture and live validation of the implemented account, download, and FairPlay desktop workflows, including 2FA, credential-store access, task recovery, safe cancellation, and output selection. Keep manual account/private-data checks last.
+- [ ] Complete private FairPlay processing and interruption walkthroughs. Refined dark normal/narrow, synthetic selector mismatch/matched prerequisites, report collision/retry, model pickers, and decryption-input handoff have native screenshot/interaction evidence. Light/system themes are out of scope at the user's request. Native synthetic challenge continuation, populated Library/filter/version selection, expired-session queue continuation, cancellation/completion, restart/download retry, and active-work quit handling now have observed evidence in `screenshots/fixtures/`; these do not close live account gates.
 
 ## Current macOS Apple Silicon gates
 

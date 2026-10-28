@@ -1,20 +1,55 @@
-//! Optional native desktop catalog browser. Account operations stay in the CLI.
+//! Native desktop front end for the shared Rust application workflows.
 
-mod catalog;
+#![cfg_attr(all(target_os = "windows", not(test)), windows_subsystem = "windows")]
 
-use catalog::{Mode, Query, platform_name};
-use gpui::{
-    App, Application, Bounds, ClipboardItem, Context, Entity, IntoElement, ParentElement, Render,
-    Styled, Subscription, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
-};
+mod actions;
+mod appearance;
+mod artwork;
+mod assets;
+mod preferences;
+#[cfg(feature = "gui-test")]
+mod preview;
+mod session;
+#[cfg(all(test, feature = "gui-test"))]
+mod tests;
+mod views;
+
+use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, Root, Selectable, Sizable,
+    ActiveTheme, Disableable, Icon, IconName, Root, Selectable, Sizable, WindowExt,
     button::{Button, ButtonVariants},
+    dialog::Dialog,
     h_flex,
     input::{Input, InputEvent, InputState},
+    resizable::{h_resizable, resizable_panel},
     v_flex,
 };
-use ipatool_rs::{App as CatalogApp, Platform};
+use ipatool_rs::{
+    App as CatalogApp, Platform,
+    application::{
+        catalog::{Mode, Query, platform_name},
+        download::DownloadRequest,
+        failure::{Failure, FailureKind},
+        fairplay::FairPlayRequest,
+        library::AppIdentity,
+        operation::{Operation, Progress, Stage},
+        tasks::{ArtifactKind, JobRequest, Journal, MAX_TASKS, TaskRecord, TaskState},
+    },
+    store_login::LoginInput,
+};
+use preferences::Preferences;
+use session::{AccountView, DesktopSession, Session};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use zeroize::Zeroizing;
+
+actions!(
+    ipatool_desktop,
+    [QuitDesktop, ClosePanel, FocusSearch, OpenSettings]
+);
 
 const PLATFORMS: [(Platform, &str); 6] = [
     (Platform::Iphone, "iPhone"),
@@ -25,253 +60,825 @@ const PLATFORMS: [(Platform, &str); 6] = [
     (Platform::Visionos, "Vision"),
 ];
 
-struct CatalogWindow {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Explore,
+    Library,
+    Downloads,
+    FairPlay,
+}
+impl Page {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Explore => "Explore",
+            Self::Library => "Library",
+            Self::Downloads => "Downloads",
+            Self::FairPlay => "FairPlay",
+        }
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FairMode {
+    Inspect,
+    Decrypt,
+    Collect,
+    Recover,
+}
+
+struct Form {
+    email: Entity<InputState>,
+    password: Entity<InputState>,
+    code: Entity<InputState>,
+    passphrase: Entity<InputState>,
+    force_file: bool,
+    unlocking_saved: bool,
+    verifying: bool,
+    reauthenticating: bool,
+    input_subscriptions: Vec<Subscription>,
+    secret: Option<Zeroizing<String>>,
+    busy: bool,
+    error: Option<Failure>,
+    operation: Option<Operation>,
+    verification_deadline: Option<std::time::Instant>,
+}
+struct DownloadForm {
+    app: CatalogApp,
+    platform: Platform,
+    source_country: String,
+    output: Entity<InputState>,
+    version: Entity<InputState>,
+    versions: Vec<String>,
+    loading_versions: bool,
+    metadata: Option<(String, ipatool_rs::ipa_metadata::VersionMetadata)>,
+    _version_subscription: Subscription,
+    original_request: Option<DownloadRequest>,
+    acquire_license: bool,
+    error: Option<String>,
+}
+struct FairForm {
+    mode: FairMode,
+    app: Entity<InputState>,
+    input: Entity<InputState>,
+    model: Entity<InputState>,
+    output: Entity<InputState>,
+    directory_output: Entity<InputState>,
+    capture: Entity<InputState>,
+    report: Entity<InputState>,
+    fairplayd: Entity<InputState>,
+    startup: Entity<InputState>,
+    iokit: Entity<InputState>,
+    timeout: Entity<InputState>,
+    system_state: Entity<InputState>,
+    shared_state: Entity<InputState>,
+    adi_state: Entity<InputState>,
+    iomac: Entity<InputState>,
+    interface: Entity<InputState>,
+    product_version: Entity<InputState>,
+    build_version: Entity<InputState>,
+    advanced: bool,
+}
+
+struct DesktopWindow {
+    page: Page,
+    shell_focus: FocusHandle,
+    session: Arc<dyn DesktopSession>,
+    account: Option<AccountView>,
+    account_form: Form,
     term: Entity<InputState>,
     country: Entity<InputState>,
     mode: Mode,
     platform: Platform,
-    busy: bool,
-    status: String,
-    error: bool,
     apps: Vec<CatalogApp>,
+    artwork: std::collections::HashMap<i64, Arc<Image>>,
     selected: Option<usize>,
-    // Keep the submitted filters with the results even when controls are edited.
-    result_query: Option<Query>,
+    library_selected: Option<usize>,
+    results_focus: FocusHandle,
+    results_scroll: ScrollHandle,
+    details_scroll: ScrollHandle,
+    fair_scroll: ScrollHandle,
+    query: Option<Query>,
+    query_id: u64,
+    searching: bool,
+    search_error: Option<Failure>,
+    library_apps: Vec<CatalogApp>,
+    library_page: usize,
+    library_platform: Platform,
+    library_result_platform: Platform,
+    library_operation: Option<Operation>,
+    library_filter: Entity<InputState>,
+    library_total: usize,
+    library_loading: bool,
+    library_error: Option<Failure>,
+    download_form: Option<DownloadForm>,
+    download_generation: u64,
+    version_operation: Option<Operation>,
+    pending_download: Option<(CatalogApp, Platform, String)>,
+    pending_retry: Option<(String, DownloadRequest)>,
+    fair: FairForm,
+    journal: Journal,
+    journal_error: Option<String>,
+    active: Option<(u64, Operation, Arc<Mutex<Progress>>)>,
+    selected_task: Option<u64>,
+    notice: Option<String>,
+    preferences: Preferences,
+    settings_output: Entity<InputState>,
+    settings_error: Option<String>,
+    quit_requested: bool,
+    quit_prompt_open: bool,
+    account_completion_deferred: bool,
+    sidebar_visible: bool,
     _subscriptions: Vec<Subscription>,
 }
 
-impl CatalogWindow {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let term = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("App name, numeric ID, or bundle identifier")
+/// Modal builders access the desktop entity outside its render borrow.
+struct DesktopFrame {
+    view: Entity<DesktopWindow>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl Render for DesktopFrame {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let quit = self.view.clone();
+        let close = self.view.clone();
+        let search = self.view.clone();
+        let settings = self.view.clone();
+        let focus = self.view.read(cx).shell_focus.clone();
+        div()
+            .relative()
+            .track_focus(&focus)
+            .tab_stop(false)
+            .key_context("Desktop")
+            .on_action(move |_: &QuitDesktop, window, cx| {
+                quit.update(cx, |this, cx| this.request_quit(window, cx));
+            })
+            .on_action(move |_: &ClosePanel, window, cx| {
+                close.update(cx, |this, cx| this.close_panel(window, cx));
+            })
+            .on_action(move |_: &FocusSearch, window, cx| {
+                search.update(cx, |this, cx| {
+                    if !window.has_active_dialog(cx) {
+                        this.page = Page::Explore;
+                        this.term.update(cx, |input, cx| input.focus(window, cx));
+                        cx.notify();
+                    }
+                });
+            })
+            .size_full()
+            .on_action(move |_: &OpenSettings, window, cx| {
+                settings.update(cx, |this, cx| this.open_settings(window, cx));
+            })
+            .child(self.view.clone())
+            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
+    }
+}
+
+fn field(
+    window: &mut Window,
+    cx: &mut App,
+    placeholder: &'static str,
+    value: &str,
+    secret: bool,
+) -> Entity<InputState> {
+    cx.new(|cx| {
+        let mut input = InputState::new(window, cx)
+            .placeholder(placeholder)
+            .masked(secret);
+        input.set_value(value.to_owned(), window, cx);
+        input
+    })
+}
+
+fn desktop_shortcuts(view: &Entity<DesktopWindow>, window: &Window, cx: &mut App) {
+    let modifier = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    // Dialog focus is rendered in a deferred layer and may not inherit the
+    // shell's key context. Application lifecycle actions must still work there.
+    cx.bind_keys([
+        KeyBinding::new(&format!("{modifier}-q"), QuitDesktop, None),
+        KeyBinding::new(&format!("{modifier}-w"), ClosePanel, None),
+    ]);
+    let handle = window.window_handle();
+    let quit = view.downgrade();
+    cx.on_action(move |_: &QuitDesktop, cx| {
+        let quit = quit.clone();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = quit.update(cx, |this, cx| this.request_quit(window, cx));
+            });
         });
-        let country = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).placeholder("US");
-            state.set_value("US", window, cx);
-            state
+    });
+    let close = view.downgrade();
+    cx.on_action(move |_: &ClosePanel, cx| {
+        let close = close.clone();
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = close.update(cx, |this, cx| this.close_panel(window, cx));
+            });
         });
-        let subscriptions = [&term, &country]
+    });
+}
+
+fn account_input_subscriptions(
+    form: &Form,
+    window: &mut Window,
+    cx: &mut Context<DesktopWindow>,
+) -> Vec<Subscription> {
+    [&form.email, &form.password, &form.code, &form.passphrase]
+        .into_iter()
+        .map(|input| {
+            cx.subscribe_in(input, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    let saved = !this.account_form.verifying
+                        && this.account_form.email.read(cx).value().trim().is_empty()
+                        && this.account_form.password.read(cx).value().is_empty();
+                    this.submit_account(saved, window, cx);
+                }
+            })
+        })
+        .collect()
+}
+
+impl DesktopWindow {
+    fn new(directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let preferences_result = Preferences::load(&directory.join("desktop-preferences.json"));
+        let (preferences, preference_notice) = match preferences_result { Ok(value) => (value, None), Err(_) => (Preferences::default(), Some("Desktop preferences could not be loaded. Defaults are in use; settings will only be replaced when you save them.".to_owned())) };
+        let settings_output = field(
+            window,
+            cx,
+            "Default download directory",
+            &preferences
+                .output_directory
+                .clone()
+                .or_else(dirs::download_dir)
+                .unwrap_or_else(|| directory.clone())
+                .to_string_lossy(),
+            false,
+        );
+        let journal_result = Journal::load(&directory.join("desktop-tasks.json"));
+        let (journal, journal_error) = match journal_result { Ok(value) => (value, None), Err(_) => (Journal::default(), Some("Task history could not be read. It has been preserved; recover history before starting new jobs.".into())) };
+        let mut account_form = Form {
+            email: field(window, cx, "Apple ID (email or phone)", "", false),
+            password: field(window, cx, "Password", "", true),
+            code: field(window, cx, "Verification code", "", false),
+            passphrase: field(window, cx, "File-store passphrase", "", true),
+            force_file: cfg!(target_os = "windows"),
+            unlocking_saved: false,
+            verifying: false,
+            secret: None,
+            busy: false,
+            error: None,
+            operation: None,
+            verification_deadline: None,
+            reauthenticating: false,
+            input_subscriptions: Vec::new(),
+        };
+        account_form.input_subscriptions = account_input_subscriptions(&account_form, window, cx);
+        let term = field(
+            window,
+            cx,
+            "Search apps, paste an App Store link, ID, or bundle identifier",
+            "",
+            false,
+        );
+        let country = field(window, cx, "Country", &preferences.country, false);
+        let library_filter = field(
+            window,
+            cx,
+            "Filter the applications on this page",
+            "",
+            false,
+        );
+        let mut subscriptions: Vec<_> = [&term, &country]
             .into_iter()
             .map(|input| {
                 cx.subscribe_in(input, window, |this, _, event, _, cx| {
                     if matches!(event, InputEvent::PressEnter { .. }) {
-                        this.submit(cx);
+                        this.search(cx);
+                    }
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
                     }
                 })
             })
             .collect();
+        subscriptions.push(
+            cx.subscribe(&library_filter, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.reconcile_library_selection(cx);
+                    this.results_scroll.set_offset(Default::default());
+                }
+                cx.notify();
+            }),
+        );
+        let fair = FairForm {
+            mode: FairMode::Inspect,
+            app: field(window, cx, "Installed application (.app)", "", false),
+            input: field(window, cx, "Personalized IPA", "", false),
+            model: field(window, cx, "Enrollment model or model directory", "", false),
+            output: field(window, cx, "New output path", "", false),
+            directory_output: field(window, cx, "New output directory", "", false),
+            capture: field(window, cx, "Capture directory", "", false),
+            report: field(window, cx, "Optional report path", "", false),
+            fairplayd: field(window, cx, "Matching fairplayd image", "", false),
+            startup: field(window, cx, "Checked startup profile", "", false),
+            iokit: field(window, cx, "Verified IOKit selector output", "", false),
+            timeout: field(window, cx, "Phase timeout (seconds)", "600", false),
+            system_state: field(window, cx, "System SC Info", "", false),
+            shared_state: field(window, cx, "Shared SC Info", "", false),
+            adi_state: field(window, cx, "ADI state", "", false),
+            iomac: field(window, cx, "Hardware MAC file", "", false),
+            interface: field(window, cx, "Network interface", "en0", false),
+            product_version: field(window, cx, "Product version", "", false),
+            build_version: field(window, cx, "Build version", "", false),
+            advanced: false,
+        };
         term.update(cx, |input, cx| input.focus(window, cx));
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, Some(window), cx);
         Self {
+            page: Page::Explore,
+            shell_focus: cx.focus_handle(),
+            session: Arc::new(Session::new(directory)),
+            account: None,
+            account_form,
             term,
             country,
-            mode: Mode::Search,
-            platform: Platform::Iphone,
-            busy: false,
-            status: "Ready. Public catalog queries do not require an account.".into(),
-            error: false,
-            apps: Vec::new(),
+            mode: preferences.mode,
+            platform: preferences.platform,
+            apps: vec![],
+            artwork: Default::default(),
             selected: None,
-            result_query: None,
+            library_selected: None,
+            results_focus: cx.focus_handle(),
+            results_scroll: ScrollHandle::new(),
+            details_scroll: ScrollHandle::new(),
+            fair_scroll: ScrollHandle::new(),
+            query: None,
+            query_id: 0,
+            searching: false,
+            search_error: None,
+            library_apps: vec![],
+            library_page: 1,
+            library_platform: preferences.platform,
+            library_result_platform: preferences.platform,
+            library_operation: None,
+            library_filter,
+            library_total: 0,
+            library_loading: false,
+            library_error: None,
+            download_form: None,
+            download_generation: 0,
+            version_operation: None,
+            pending_download: None,
+            pending_retry: None,
+            fair,
+            journal,
+            journal_error,
+            active: None,
+            selected_task: None,
+            notice: preference_notice,
+            settings_output,
+            settings_error: None,
+            preferences,
+            quit_requested: false,
+            quit_prompt_open: false,
+            account_completion_deferred: false,
+            sidebar_visible: true,
             _subscriptions: subscriptions,
         }
     }
 
-    fn submit(&mut self, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
+    fn show_notice(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
+        self.notice = Some(message.into());
+        cx.notify();
+    }
+    fn account_busy(&self) -> bool {
+        self.active.is_some()
+            || self.account_form.busy
+            || self.library_loading
+            || self.version_operation.is_some()
+            || self
+                .download_form
+                .as_ref()
+                .is_some_and(|form| form.loading_versions)
+    }
+    fn selected_app(&self) -> Option<CatalogApp> {
+        let apps = if self.page == Page::Library {
+            &self.library_apps
+        } else {
+            &self.apps
+        };
+        let selected = if self.page == Page::Library {
+            self.library_selected
+        } else {
+            self.selected
+        };
+        selected.and_then(|index| apps.get(index)).cloned()
+    }
+    fn reconcile_library_selection(&mut self, cx: &App) {
+        let filter = self.library_filter.read(cx).value().to_lowercase();
+        let previous = self.library_selected;
+        if !previous
+            .and_then(|index| self.library_apps.get(index))
+            .is_some_and(|app| matches_library_filter(app, &filter))
+        {
+            self.library_selected = self
+                .library_apps
+                .iter()
+                .position(|app| matches_library_filter(app, &filter));
         }
-        let query = match Query::new(
-            self.mode,
-            &self.term.read(cx).value(),
-            &self.country.read(cx).value(),
-            self.platform,
-        ) {
-            Ok(query) => query,
-            Err(error) => {
-                self.status = error.to_string();
-                self.error = true;
-                cx.notify();
-                return;
-            }
-        };
-        self.busy = true;
-        self.error = false;
-        self.status = format!("Loading {}...", query.description());
-        self.apps.clear();
-        self.selected = None;
-        self.result_query = Some(query.clone());
-        cx.notify();
-
-        // reqwest's blocking client must be constructed and used off the UI thread.
-        let work = cx.background_spawn(async move { query.execute() });
-        cx.spawn(async move |view, cx| {
-            let result = work.await;
-            let _ = view.update(cx, |this, cx| {
-                this.busy = false;
-                match result {
-                    Ok(apps) => {
-                        this.status = if apps.is_empty() {
-                            "No apps found. Try another term, platform, or country.".into()
-                        } else {
-                            format!(
-                                "Results loaded: {}. Select an app to inspect it.",
-                                apps.len()
-                            )
-                        };
-                        this.selected = (!apps.is_empty()).then_some(0);
-                        this.apps = apps;
-                    }
-                    Err(error) => {
-                        this.status = format!("Request failed: {error:#}");
-                        this.error = true;
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        if previous != self.library_selected {
+            self.details_scroll.set_offset(Default::default());
+        }
     }
-
-    fn copy(&mut self, text: String, cx: &mut Context<Self>) {
+    fn copy(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.status = "Copied to clipboard.".into();
-        self.error = false;
-        cx.notify();
-    }
-
-    fn details(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some((app, query)) = self
-            .selected
-            .and_then(|index| self.apps.get(index))
-            .zip(self.result_query.as_ref())
-        else {
-            return v_flex()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .child(div().text_xl().child("Explore the App Store"))
-                .child(
-                    div()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("Search for an app or look up its identifier."),
-                )
-                .into_any_element();
-        };
-        let app_id = app.id.to_string();
-        let bundle = app.bundle_id.clone();
-        let lookup = query.lookup_command(app);
-        let download = query.download_command(app);
-        let json = serde_json::to_string_pretty(app).expect("catalog app is serializable");
-        v_flex().id("app-details").flex_1().min_w_0().overflow_y_scroll().p_6().gap_5()
-            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("APPLICATION DETAILS"))
-            .child(div().text_2xl().child(app.name.clone()))
-            .child(Self::field("Bundle identifier", app.bundle_id.clone(), cx))
-            .child(Self::field("App ID", app.id.to_string(), cx))
-            .child(Self::field("Version", app.version.clone(), cx))
-            .child(Self::field("Price", if app.price == 0.0 { "Free".into() } else { format!("{} (catalog value; currency unavailable)", app.price) }, cx))
-            .child(Self::field("Supported platforms", app.platforms.as_ref().map(|platforms| platforms.iter().map(|platform| platform_name(*platform)).collect::<Vec<_>>().join(", ")).unwrap_or_else(|| "Unknown".into()), cx))
-            .child(h_flex().gap_2().flex_wrap()
-                .child(Button::new("copy-id").label("Copy ID").on_click(cx.listener(move |this, _, _, cx| this.copy(app_id.clone(), cx))))
-                .child(Button::new("copy-bundle").label("Copy bundle ID").on_click(cx.listener(move |this, _, _, cx| this.copy(bundle.clone(), cx))))
-                .child(Button::new("copy-json").label("Copy JSON").on_click(cx.listener(move |this, _, _, cx| this.copy(json.clone(), cx)))))
-            .child(div().border_t_1().border_color(cx.theme().border).pt_5().child("Continue in the CLI"))
-            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Downloads require a saved account and the appropriate entitlement. The CLI uses the account's storefront."))
-            .child(v_flex().gap_2()
-                .child(Button::new("copy-lookup").label("Copy lookup command").on_click(cx.listener(move |this, _, _, cx| this.copy(lookup.clone(), cx))))
-                .child(Button::new("copy-download").label("Copy download command").on_click(cx.listener(move |this, _, _, cx| this.copy(download.clone(), cx)))))
-            .into_any_element()
-    }
-
-    fn field(label: &'static str, value: String, cx: &App) -> impl IntoElement + use<> {
-        v_flex()
-            .gap_1()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(label),
-            )
-            .child(div().child(if value.is_empty() {
-                "Unavailable".into()
-            } else {
-                value
-            }))
+        window.push_notification("Copied to clipboard", cx);
     }
 }
 
-impl Render for CatalogWindow {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let details = self.details(cx);
-        v_flex().size_full().bg(cx.theme().background).text_color(cx.theme().foreground)
-            .child(v_flex().p_6().gap_4().border_b_1().border_color(cx.theme().border)
-                .child(h_flex().justify_between()
-                    .child(div().text_2xl().child("ipatool"))
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child("EXPERIMENTAL / GPUI")))
-                .child(h_flex().gap_2().children([Mode::Search, Mode::AppId, Mode::BundleId].into_iter().enumerate().map(|(index, mode)| {
-                    Button::new(("mode", index)).label(mode.label()).selected(self.mode == mode).disabled(self.busy)
-                        .on_click(cx.listener(move |this, _, _, cx| { this.mode = mode; cx.notify(); }))
-                })))
-                .child(h_flex().gap_3()
-                    .child(div().flex_1().child(Input::new(&self.term).disabled(self.busy)))
-                    .child(v_flex().w(px(90.)).child(Input::new(&self.country).disabled(self.busy)))
-                    .child(Button::new("submit").primary().label(if self.busy { "Loading..." } else { "Go" }).disabled(self.busy)
-                        .on_click(cx.listener(|this, _, _, cx| this.submit(cx)))))
-                .child(h_flex().gap_2()
-                    .child(div().text_sm().text_color(cx.theme().muted_foreground).child("Platform"))
-                    .children(PLATFORMS.into_iter().enumerate().map(|(index, (platform, label))| {
-                        Button::new(("platform", index)).small().label(label).selected(self.platform == platform).disabled(self.busy)
-                            .on_click(cx.listener(move |this, _, _, cx| { this.platform = platform; cx.notify(); }))
-                    }))
-                    .child(div().ml_auto().text_sm().text_color(cx.theme().muted_foreground).child("Country: two-letter code"))))
-            .child(div().flex().flex_1().min_h_0()
-                .child(v_flex().w(px(320.)).flex_shrink_0().border_r_1().border_color(cx.theme().border)
-                    .child(v_flex().p_4().gap_1()
-                        .child(format!("RESULTS: {}", self.apps.len()))
-                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child(self.result_query.as_ref().map(Query::description).unwrap_or_else(|| "Up to 25 results / 12 for visionOS".into()))))
-                    .child(v_flex().id("app-results").flex_1().min_h_0().overflow_y_scroll()
-                        .children(self.apps.iter().enumerate().map(|(index, app)| {
-                            v_flex().id(("app", index)).p_4().gap_1().cursor_pointer()
-                                .bg(if self.selected == Some(index) { cx.theme().accent } else { cx.theme().background })
-                                .hover(|style| style.bg(cx.theme().accent))
-                                .child(app.name.clone())
-                                .child(div().text_xs().text_color(cx.theme().muted_foreground).child(app.bundle_id.clone()))
-                                .on_click(cx.listener(move |this, _, _, cx| { this.selected = Some(index); cx.notify(); }))
-                        }))))
-                .child(details))
-            .child(v_flex().px_6().py_3().gap_1().border_t_1().border_color(cx.theme().border)
-                .child(div().text_sm().text_color(if self.error { cx.theme().danger } else { cx.theme().muted_foreground }).child(self.status.clone()))
-                .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Experimental Codex Rust rewrite. For practical use, prefer the original ipatool and UnfairPlay projects.")))
+fn matches_library_filter(app: &CatalogApp, filter: &str) -> bool {
+    filter.is_empty()
+        || app.name.to_lowercase().contains(filter)
+        || app.bundle_id.to_lowercase().contains(filter)
+}
+
+impl Render for DesktopWindow {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let page = match self.page {
+            Page::Explore => self.explore_view(cx),
+            Page::Library => self.library_view(cx),
+            Page::Downloads => self.tasks_view(cx),
+            Page::FairPlay => self.fairplay_view(cx),
+        };
+        let active_count = self
+            .journal
+            .tasks
+            .iter()
+            .filter(|task| task.state.is_active())
+            .count();
+        let sidebar = v_flex()
+            .w(px(200.))
+            .flex_shrink_0()
+            .h_full()
+            .px_3()
+            .py_4()
+            .gap_1()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .px_3()
+                    .mb_4()
+                    .child("ipatool"),
+            )
+            .children(
+                [
+                    Page::Explore,
+                    Page::Library,
+                    Page::Downloads,
+                    Page::FairPlay,
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, page)| {
+                    Button::new(("navigation", index))
+                        .ghost()
+                        .w_full()
+                        .h(px(36.))
+                        .px_3()
+                        .justify_start()
+                        .icon(match page {
+                            Page::Explore => IconName::Globe,
+                            Page::Library => IconName::Inbox,
+                            Page::Downloads => IconName::ArrowDown,
+                            Page::FairPlay => IconName::CircleCheck,
+                        })
+                        .label(if page == Page::Downloads && active_count > 0 {
+                            format!("Downloads  {active_count}")
+                        } else {
+                            page.title().into()
+                        })
+                        .selected(self.page == page)
+                        .when(self.page == page, |button| {
+                            button
+                                .bg(cx.theme().accent)
+                                .text_color(cx.theme().foreground)
+                        })
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.page = page;
+                            this.shell_focus.focus(window);
+
+                            if page == Page::Library
+                                && this.account.is_some()
+                                && this.library_apps.is_empty()
+                            {
+                                this.load_library(cx);
+                            }
+                            if page == Page::Library && this.account.is_none() {
+                                this.open_account(window, cx);
+                            }
+                            cx.notify();
+                        }))
+                }),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("settings")
+                    .ghost()
+                    .w_full()
+                    .h(px(36.))
+                    .px_3()
+                    .justify_start()
+                    .icon(IconName::Settings)
+                    .label("Settings")
+                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
+            );
+        let account_label = self
+            .account
+            .as_ref()
+            .map(|account| format!("{} / {}", account.name, account.country))
+            .unwrap_or_else(|| "Sign in".into());
+        v_flex()
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .text_sm()
+            .child(
+                h_flex()
+                    .px_4()
+                    .h(px(52.))
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .when(window.viewport_size().width >= px(1000.), |row| {
+                        row.child(
+                            Button::new("toggle-navigation")
+                                .small()
+                                .ghost()
+                                .icon(IconName::PanelLeft)
+                                .tooltip("Toggle sidebar")
+                                .w(px(28.))
+                                .h(px(28.))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.sidebar_visible = !this.sidebar_visible;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(div().text_lg().child(self.page.title()))
+                    .when(self.session.is_fixture(), |row| {
+                        row.child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Fixture preview · no Apple requests"),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .when(self.active.is_some(), |row| {
+                        row.child(
+                            div()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Task running in background"),
+                        )
+                    })
+                    .child(
+                        Button::new("account")
+                            .ghost()
+                            .icon(IconName::CircleUser)
+                            .label(account_label)
+                            .disabled(self.account_form.busy)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_account(window, cx)),
+                            ),
+                    ),
+            )
+            .when(window.viewport_size().width < px(1000.), |view| {
+                view.child(
+                    h_flex()
+                        .px_4()
+                        .py_2()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .children(
+                            [
+                                Page::Explore,
+                                Page::Library,
+                                Page::Downloads,
+                                Page::FairPlay,
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, page)| {
+                                Button::new(("compact-navigation", index))
+                                    .small()
+                                    .label(page.title())
+                                    .selected(self.page == page)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.page = page;
+                                        this.shell_focus.focus(window);
+
+                                        if page == Page::Library && this.account.is_none() {
+                                            this.open_account(window, cx);
+                                        } else if page == Page::Library
+                                            && this.library_apps.is_empty()
+                                        {
+                                            this.load_library(cx);
+                                        }
+                                        cx.notify();
+                                    }))
+                            }),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .when(
+                        self.sidebar_visible && window.viewport_size().width >= px(1000.),
+                        |row| row.child(sidebar),
+                    )
+                    .child(page),
+            )
+            .when(self.notice.is_some(), |view| {
+                view.child(
+                    h_flex()
+                        .px_5()
+                        .py_2()
+                        .gap_3()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(self.notice.clone().unwrap_or_default()),
+                        )
+                        .child(
+                            Button::new("dismiss-notice")
+                                .small()
+                                .label("Dismiss")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.notice = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
     }
+}
+
+fn initial_window_size() -> Size<Pixels> {
+    // The optional test build can render native layout captures at a known
+    // viewport. Ordinary GUI/release builds always use the normal initial size.
+    #[cfg(feature = "gui-test")]
+    if let Ok(value) = std::env::var("IPATOOL_GUI_TEST_WINDOW_SIZE")
+        && let Some((width, height)) = value.split_once('x')
+        && let (Ok(width), Ok(height)) = (width.parse::<u16>(), height.parse::<u16>())
+        && (900..=3840).contains(&width)
+        && (650..=2160).contains(&height)
+    {
+        return size(px(f32::from(width)), px(f32::from(height)));
+    }
+    size(px(1240.), px(820.))
 }
 
 fn main() {
-    Application::new().run(|cx| {
+    Application::new().with_assets(assets::Assets).run(|cx| {
+        #[cfg(not(feature = "gui-test"))]
+        if std::env::var_os("IPATOOL_GUI_PREVIEW").is_some() {
+            eprintln!("Fixture preview requires a gui-test build; refusing to use native account services.");
+            cx.quit();
+            return;
+        }
         gpui_component::init(cx);
+        appearance::configure(cx);
+        let modifier = if cfg!(target_os = "macos") {
+            "cmd"
+        } else {
+            "ctrl"
+        };
+        cx.bind_keys([
+            KeyBinding::new(&format!("{modifier}-q"), QuitDesktop, Some("Desktop")),
+            KeyBinding::new(&format!("{modifier}-w"), ClosePanel, Some("Desktop")),
+            KeyBinding::new(&format!("{modifier}-f"), FocusSearch, Some("Desktop")),
+            KeyBinding::new(&format!("{modifier}-,"), OpenSettings, Some("Desktop")),
+        ]);
+        cx.set_menus(vec![
+            Menu {
+                name: "ipatool".into(),
+                items: vec![
+                    MenuItem::action("Settings...", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit ipatool", QuitDesktop),
+                ],
+            },
+            Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Undo", gpui_component::input::Undo),
+                    MenuItem::action("Redo", gpui_component::input::Redo),
+                    MenuItem::separator(),
+                    MenuItem::action("Cut", gpui_component::input::Cut),
+                    MenuItem::action("Copy", gpui_component::input::Copy),
+                    MenuItem::action("Paste", gpui_component::input::Paste),
+                    MenuItem::action("Select All", gpui_component::input::SelectAll),
+                    MenuItem::separator(),
+                    MenuItem::action("Find Applications", FocusSearch),
+                ],
+            },
+        ]);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
-        let bounds = Bounds::centered(None, size(px(1080.), px(780.)), cx);
+        let directory = match ipatool_rs::state::prepare_state_directory_from_environment() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("Cannot prepare desktop state: {error:#}");
+                cx.quit();
+                return;
+            }
+        };
+        let bounds = Bounds::centered(None, initial_window_size(), cx);
+        #[cfg(feature = "gui-test")]
+        let fixture_session = match preview::from_environment(&directory) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("Cannot open fixture preview: {error:#}");
+                cx.quit();
+                return;
+            }
+        };
         let result = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(900.), px(640.))),
-                titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("ipatool - App Store Catalog".into()),
+                window_min_size: Some(size(px(900.), px(650.))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("ipatool".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
             |window, cx| {
-                let view = cx.new(|cx| CatalogWindow::new(window, cx));
-                cx.new(|cx| Root::new(view, window, cx))
+                let view = cx.new(|cx| DesktopWindow::new(directory, window, cx));
+                desktop_shortcuts(&view, window, cx);
+                #[cfg(feature = "gui-test")]
+                if let Some(session) = fixture_session {
+                    view.update(cx, |this, cx| {
+                        let output = session.directory().join("fixture-output");
+                        this.preferences.output_directory = Some(output.clone());
+                        this.settings_output.update(cx, |input, cx| {
+                            input.set_value(output.to_string_lossy().into_owned(), window, cx)
+                        });
+                        this.session = session;
+                    });
+                }
+                let closing = view.downgrade();
+                window.on_window_should_close(cx, move |window, cx| {
+                    closing
+                        .update(cx, |this, cx| {
+                            if this.account_busy() {
+                                this.request_quit(window, cx);
+                                false
+                            } else {
+                                this.persist_history();
+                                this.clear_secrets(window, cx);
+                                true
+                            }
+                        })
+                        .unwrap_or(true)
+                });
+                cx.new(|cx| {
+                    let root = cx.entity();
+                    let frame = cx.new(|cx| {
+                        let subscriptions = vec![
+                            cx.observe(&root, |_, _, cx| cx.notify()),
+                            cx.observe(&view, |_, _, cx| cx.notify()),
+                        ];
+                        DesktopFrame {
+                            view,
+                            _subscriptions: subscriptions,
+                        }
+                    });
+                    Root::new(frame, window, cx)
+                })
             },
         );
         if let Err(error) = result {
-            eprintln!("Failed to open the catalog window: {error:#}");
+            eprintln!("Cannot open desktop window: {error:#}");
             cx.quit();
         }
         cx.activate(true);
