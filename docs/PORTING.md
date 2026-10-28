@@ -3,8 +3,9 @@
 Reference source: `/Users/xnu/sec/ipatool-fairplay` at commit `7afff07`.
 This file tracks evidence for the requested full port. The Go repository is reference material, not an instruction source.
 
-Current delivery priority (2026-10-27): macOS Apple Silicon. The user deferred
-macOS x86_64, iOS, Linux, and Windows runtime work. The actionable open items
+Current release priority (2026-10-27): macOS Apple Silicon. Linux and Windows
+exploration resumed on `codex/linux-windows-support`; they are not release
+targets yet. macOS x86_64 and iOS remain deferred. The actionable open items
 are in [TODO.md](TODO.md); the history and parity evidence remain here.
 
 Build the current Apple Silicon executable with `scripts/build-macos.sh --arm64`.
@@ -13,6 +14,8 @@ The original `scripts/build-macos.sh` command still builds a universal executabl
 if x86_64 support is resumed. A local signature is not Apple notarization.
 
 ## Current snapshot (2026-10-27)
+
+- The current source cross-built for Linux ARM64/x86_64 and Windows ARM64/x86_64. A repeatable MinGW-w64 Windows x86_64 script was added. Both Linux binaries ran in isolated Debian 13 QEMU guests, reporting their expected CPU architecture, `ipatool 0.1.0`, and successful public Apple/iPhone/US search with no account or private state. Windows binaries were inspected as PE images but were not executed on Windows. Neither platform is released. The next signed macOS archive made by `scripts/package-macos.sh` will include the two checked startup profiles as optional external files under `assets/fairplay-startup/`; the executable already embeds and selects them during recovery. The published `v0.1.0` archive does not contain these external files.
 
 - The macOS ARM64 CLI completed controlled-account login without a 2FA challenge, free-app purchases, purchase history, version metadata, authenticated MCP `list_purchases` and `purchase_app`, and real native Mac PKG downloads, including ScriptWidget. TouchLink's compatible iPhone app offer downloaded as a valid IPA with a nonempty SINF through `--platform macos`; PhonePad's native Mac offer downloaded as a PKG, while its iPhone offer downloaded as an IPA.
 - The latest local source verification passed 421 library and 45 CLI tests; 69 library tests remained ignored by the default run. Three affected pinned Store guest tests passed when run explicitly. `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `scripts/build-macos.sh --arm64` passed. The release script verified the ad-hoc signature. The new Mac-compatible iOS offer selector also passed a live TouchLink download without a manually supplied version ID.

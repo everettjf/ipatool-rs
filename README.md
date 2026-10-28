@@ -9,7 +9,7 @@
 
 Thank you to both projects and their maintainers. `ipatool-rs` brings these two areas together in a Rust CLI. The sibling `ipatool-fairplay` Go source tree served as a reference for the port. The CLI implements its command paths, including an MCP server and FairPlay diagnostics. Full parity is still being validated; see the [porting record](docs/PORTING.md) for evidence and the [TODO list](docs/TODO.md) for remaining work.
 
-The current delivery target is **macOS on Apple Silicon**. Work on macOS x86_64, iOS, Linux, and Windows is deferred at the user's request.
+The current release target is **macOS on Apple Silicon**. Linux and Windows builds are under investigation; neither has an official release or complete runtime validation. macOS x86_64 and iOS remain deferred.
 
 ## Install the experimental Rust rewrite
 
@@ -37,6 +37,8 @@ scripts/build-macos.sh --arm64
 The build script creates a signed `target/release/ipatool-macos-arm64` executable. The signature is ad hoc; it is not Apple notarization. The executable does not launch a separate Go, Python, or Swift binary. Store and SAP operations still run selected, pinned Apple framework code inside the Rust emulator.
 
 Release archives use a Developer ID signature and an Apple notarization check. The release procedure is in [docs/RELEASING.md](docs/RELEASING.md).
+
+The next macOS archive built by `scripts/package-macos.sh` also exports the two checked, account-independent FairPlay startup profiles under `assets/fairplay-startup/`. They remain embedded in the executable for automatic recovery, so the external copies are optional. The published `v0.1.0` archive predates this packaging change.
 
 ## Public catalog commands
 

@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 struct FileKeychainOptions {
     passphrase: std::sync::Mutex<Option<Zeroizing<String>>>,
     interactive: bool,
+    #[cfg(not(target_os = "windows"))]
     force_file: bool,
 }
 
@@ -76,8 +77,11 @@ pub fn configure_file_keychain(passphrase: Option<String>, interactive: bool, fo
         let _ = FILE_KEYCHAIN_OPTIONS.set(FileKeychainOptions {
             passphrase: std::sync::Mutex::new(passphrase.map(Zeroizing::new)),
             interactive,
+            #[cfg(not(target_os = "windows"))]
             force_file,
         });
+        #[cfg(target_os = "windows")]
+        let _ = force_file;
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {

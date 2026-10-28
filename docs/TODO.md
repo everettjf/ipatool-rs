@@ -2,6 +2,8 @@
 
 Status as of 2026-10-27. The current delivery target is macOS on Apple Silicon. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
 
+Linux and Windows support is being explored on `codex/linux-windows-support`. Cross-builds are available for Linux ARM64/x86_64 and Windows ARM64/x86_64. The two Linux binaries passed account-free version and public-search smoke checks in Debian 13 QEMU guests. No Windows runtime was available locally. These targets have not been released.
+
 ## Verified so far
 
 - Controlled-account login without a 2FA challenge, an already owned purchase, a new free-app purchase, purchase history, version metadata, and authenticated MCP `list_purchases` and `purchase_app`.
@@ -24,10 +26,16 @@ Status as of 2026-10-27. The current delivery target is macOS on Apple Silicon. 
 
 Do not commit credentials, cookies, downloaded packages, private captures, or enrollment models. Use an isolated state directory for live account tests.
 
-## Deferred until those targets are requested
+## Linux and Windows investigation
+
+- [x] Cross-build Linux ARM64/x86_64 and Windows ARM64/x86_64; add a repeatable Windows x86_64 build script.
+- [x] Run account-free version and public-search smoke checks for both Linux architectures in Debian 13 QEMU guests.
+- [ ] Run Windows x86_64 and ARM64 binaries on their target systems and verify public catalog behavior.
+- [ ] Validate real authenticated Store, account migration, and package workflows in Linux desktop sessions and on Windows. Existing Linux QEMU and synthetic Secret Service checks do not cover a real account.
+- [ ] Decide whether to package Linux/Windows builds only after the target runtime checks and release limitations are reviewed.
+
+## Deferred targets and package offers
 
 - [ ] Validate the final iOS ARM64 binary on a compatible device, including authenticated Store and package flows.
 - [ ] Resume macOS x86_64 release and runtime verification.
-- [ ] Validate real authenticated Store, account migration, and package workflows in Linux desktop sessions. Existing QEMU and synthetic Secret Service checks do not cover a real account.
-- [ ] Run Windows x86_64 and ARM64 binaries on their target systems and validate account and package workflows.
 - [ ] Inspect real IPA and PKG outputs for the remaining platform offers, beyond the TouchLink Mac IPA and Mac PKGs already checked.
