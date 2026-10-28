@@ -11,6 +11,7 @@ Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and r
 - A compatible iPhone app's Mac offer: TouchLink downloaded as a valid IPA with a nonempty SINF on Apple Silicon. PhonePad's Mac offer was a PKG, while its iPhone offer downloaded as an IPA.
 - The published `v0.1.0` Apple Silicon macOS archive is Developer ID signed and Apple notarization returned `Accepted` with zero issues. Its signed executable is byte-identical to the notarized ZIP payload and passed a public catalog search and controlled-account purchase-history request. The Homebrew tap fetched and installed the archive, passed style, strict audit, and `brew test`, retained a valid signature, and completed an account-backed purchase-history request. Preview.2 previously passed TouchLink version listing, version metadata, and IPA download. Preview.1's hardened runtime blocked the cached Unicorn library and its JIT; later versions include the two required runtime entitlements. The 0.1.0 release does not close the gates below.
 - The published `v0.2.0` release has macOS ARM64, Linux x86_64/ARM64, and Windows x86_64/ARM64 archives and companion SHA-256 files. The release workflow passed native tests, release builds, version and public catalog smoke checks, package checksums, and signed macOS archive verification. Main and PR platform CI also passed all four portable jobs. The macOS archive was notarized with zero issues. The updated Homebrew tap passed strict audit, installation, `brew test`, code-signature verification, and public search. These account-free portable checks do not establish account or FairPlay parity.
+- The published `v0.2.1` release has only macOS ARM64, Linux x86_64, and Windows x86_64 archives with companion SHA-256 files. Main and release CI passed native tests and packaging for both portable targets; the macOS archive was signed and notarized with zero issues. All three public archive checksums passed after download. The Homebrew tap passed strict audit, installation, `brew test`, signature verification, and public search. Linux and Windows authenticated workflows remain untested.
 - The macOS ARM64 release build and signature check, 421 active library tests, 45 CLI tests, and Clippy. Three affected pinned Store guest tests also passed explicitly. The 69 ignored library tests are opt-in checks, not a count of known failures.
 
 ## Current macOS Apple Silicon gates
@@ -35,7 +36,7 @@ Do not commit credentials, cookies, downloaded packages, private captures, or en
 - [x] Confirm native CI version and public-catalog checks for Linux x86_64 and Windows x86_64 on the 0.2.0 release commit.
 - [ ] Validate real authenticated Store, account migration, and package workflows in Linux desktop sessions and on Windows. Existing Linux QEMU and synthetic Secret Service checks do not cover a real account.
 - [x] Verify Linux x86_64 and Windows x86_64 archives, checksums, and published links from the 0.2.0 release workflow. Document them as experimental until account-backed workflows are validated.
-- [ ] Publish and verify v0.2.1 with only macOS ARM64, Linux x86_64, and Windows x86_64 archives and checksums.
+- [x] Publish and verify v0.2.1 with only macOS ARM64, Linux x86_64, and Windows x86_64 archives and checksums.
 
 ## Deferred targets and package offers
 
