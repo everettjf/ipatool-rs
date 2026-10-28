@@ -38,6 +38,50 @@ The 2026-10-27 help-only audit compared long flags on the root command, `auth` a
 | FairPlay | Doctor, collection, checkpoint execution, oracle evaluation, native SIDB recovery, model construction, and IPA decryption paths have offline tests. Full public SIDB recovery matched the Go fixture in release mode. The current host's `fairplayd` arm64e slice matches the supported 26A428 profile and loads into Unicorn. The 26B118 Rust evaluator matched 208 Go vectors on the public synthetic model, covering 64 normal inputs and 48 fault sites at three XOR values. | Run private enrollment/decryption and 26B118 differential checks against paired data. The system's private FairPlay state is inaccessible to the present unprivileged process. |
 | MCP | Six tools initialize and list over stdio. Their names, descriptions, output schemas, and annotations match the Go server. The public `search_apps` input adds an optional `country` so an account is not required to select a storefront. Thirty-five invalid-call cases were compared; the Go and Rust results now have the same error envelope, including no `structuredContent` on tool failures. Rust now advertises the same logging and tool-list-change capabilities as Go and accepts `logging/setLevel`; three valid levels returned the same empty result on both servers. SDK diagnostics still differ in wording for some invalid arguments. Authenticated `list_purchases` and an already owned `purchase_app` returned structured success. `--keychain-passphrase-file` permits an encrypted file store with MCP stdio without placing the passphrase in process arguments. | Successful live results for `list_app_versions`, `get_version_metadata`, and `download_app` remain outstanding; the latest requests encountered Store errors and a failed token refresh. |
 
+## GPUI desktop preview (2026-10-28)
+
+An optional `ipatool-gui` binary uses GPUI 0.2.2 and GPUI Component 0.5.1.
+Enable it with `cargo run --locked --features gui --bin ipatool-gui`. The default
+feature set remains empty, the default run target remains `ipatool`, and the
+CLI-only normal dependency tree does not include GPUI. GPUI pins
+`core-foundation` to 0.10.0, so the shared lockfile moves that binding from 0.10.1
+to 0.10.0; no other existing package version was removed.
+
+The window calls the existing public `CatalogClient` in a background executor;
+it does not invoke a shell, another executable, the Keychain, or Store account
+workflows. It supports search and lookup by numeric App ID or bundle identifier,
+all six catalog offer platforms, country codes, result selection, metadata, and
+clipboard actions. Search is capped at 25 results, or 12 for visionOS. Copied
+commands retain the platform and country submitted with the result, even after
+editing controls. Download commands leave storefront selection to the saved CLI
+account, matching the existing command contract.
+
+Local Apple Silicon macOS verification passed:
+
+- `cargo fmt --check`, four GUI request-validation and command-construction tests,
+  and `cargo test --all-targets --quiet` (421 library tests and 45 CLI tests passed;
+  69 opt-in library tests remained ignored).
+- `cargo clippy --all-targets -- -D warnings` and the same check with
+  `--locked --features gui`, plus a linked debug GUI build and native window launch.
+- Manual public catalog search for ScriptWidget on macOS / US (17 results),
+  App ID lookup for `1555600758`, and bundle lookup for
+  `com.everettjf.scriptwidget`. Enter submission, invalid-country feedback,
+  details scrolling, and copying the original US lookup command after editing
+  the country control to GB were checked in the running window.
+
+The full test suite needs localhost fixture servers and Unicorn JIT access;
+the sandboxed attempt failed on those restrictions and the unrestricted rerun
+passed. GPUI's Metal build also needed write access to the compiler cache. Its
+dependencies currently emit future-Rust compatibility warnings for `block` and
+`proc-macro-error2`; the project's Clippy checks pass with warnings denied.
+
+This is a source-only desktop experiment. It does not add a GUI to release
+archives or establish Linux / Windows GUI support, account UI, or FairPlay parity.
+The macOS accessibility tree exposes window chrome but not the custom controls;
+accessibility and broader keyboard validation remain open in [TODO.md](TODO.md).
+A macOS GUI CI job builds, tests the request model, and checks Clippy with the
+feature enabled; existing Linux and Windows jobs continue to verify the CLI.
+
 ## Historical build and test evidence
 
 Entries below record the result at the time each change was made. The current state is summarized above and in [TODO.md](TODO.md).

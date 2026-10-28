@@ -12,6 +12,22 @@ permissions:
   contents: read
 
 jobs:
+  gui-macos:
+    name: GPUI desktop preview (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust components
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - name: Check formatting
+        run: cargo +stable fmt --check
+      - name: Test desktop request handling
+        run: cargo +stable test --locked --features gui --bin ipatool-gui
+      - name: Check desktop warnings
+        run: cargo +stable clippy --locked --features gui --all-targets -- -D warnings
+      - name: Build desktop executable
+        run: cargo +stable build --locked --features gui --bin ipatool-gui
+
   native:
     name: ${{ matrix.name }}
     strategy:

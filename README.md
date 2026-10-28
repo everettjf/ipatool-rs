@@ -10,13 +10,14 @@ Built on the work of [ipatool](https://github.com/majd/ipatool), [UnfairPlay](ht
 
 > **Experimental Rust rewrite.** This project was created to use otherwise-unused Codex quota and explore whether Codex could carry a substantial port through implementation, testing, and release. For practical use, prefer the original projects. Full parity remains under validation; see [known limitations](#known-limitations).
 
-[Install](#install) · [Quick start](#quick-start) · [Commands](#commands) · [Architecture](#architecture) · [MCP](#mcp) · [Development](#development) · [Documentation](#documentation)
+[Install](#install) · [Quick start](#quick-start) · [Commands](#commands) · [Desktop preview](#desktop-preview-gpui) · [Architecture](#architecture) · [MCP](#mcp) · [Development](#development) · [Documentation](#documentation)
 
 ## Features
 
 | Area | Capabilities |
 | --- | --- |
 | Public catalog | Search applications, look up details, and find the latest external version ID without signing in. |
+| Desktop preview | Optional GPUI catalog browser with search, ID / bundle lookup, platform and country controls, and copy actions. |
 | Account and Store | Sign in, inspect or revoke saved credentials, obtain free-app licenses, and query purchases and version metadata. |
 | Packages | Download entitled IPA or Mac PKG packages, with package metadata and SINF handling. |
 | MCP | Expose six App Store tools to compatible clients over standard input and output. |
@@ -136,6 +137,33 @@ Selected Store and SAP signing paths load pinned Apple framework images and exec
 FairPlay processing uses exact-build `fairplayd` images, startup profiles, and matched private inputs. The bundled startup profiles do not establish support for arbitrary system builds. Private enrollment and decryption still need end-to-end validation.
 
 The editable diagram is available as [SVG](docs/images/architecture.svg). Implementation and parity evidence are recorded in [PORTING.md](docs/PORTING.md).
+
+## Desktop preview (GPUI)
+
+Build and run the optional native catalog browser from source:
+
+```sh
+cargo run --locked --features gui --bin ipatool-gui
+```
+
+The preview supports public search, lookup by App ID or bundle identifier, six
+offer platforms, and two-letter country codes. Select a result to inspect its
+metadata or copy identifiers, JSON, and CLI commands. Press Enter in either input
+to submit. Queries run in the background and report loading, empty, and error
+states. No request is sent until you submit.
+
+The GUI is a source-only experiment, initially validated on Apple Silicon macOS.
+It is not included in release archives or Homebrew. Linux and Windows GUI builds
+and desktop sessions remain unverified; their CLI release status is unchanged.
+GPUI requires a graphical desktop and graphics support; macOS builds need Xcode
+with the Metal compiler tools. See the pinned [GPUI crate](https://docs.rs/crate/gpui/0.2.2)
+for platform dependencies.
+
+Account login, purchases, downloads, and FairPlay operations remain available
+through the CLI. A copied download command uses the saved account's storefront
+and requires the appropriate entitlement. The desktop preview does not load
+account credentials. Building without `--features gui` keeps the CLI-only build;
+plain `cargo run` still selects `ipatool`.
 
 ## Credentials and local state
 

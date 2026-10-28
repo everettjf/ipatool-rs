@@ -14,6 +14,13 @@ Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and r
 - The published `v0.2.1` release has only macOS ARM64, Linux x86_64, and Windows x86_64 archives with companion SHA-256 files. Main and release CI passed native tests and packaging for both portable targets; the macOS archive was signed and notarized with zero issues. All three public archive checksums passed after download. The Homebrew tap passed strict audit, installation, `brew test`, signature verification, and public search. Linux and Windows authenticated workflows remain untested.
 - The macOS ARM64 release build and signature check, 421 active library tests, 45 CLI tests, and Clippy. Three affected pinned Store guest tests also passed explicitly. The 69 ignored library tests are opt-in checks, not a count of known failures.
 
+## GPUI desktop preview
+
+- [ ] Validate screen-reader accessibility and keyboard navigation. The pinned GPUI build's macOS accessibility tree currently exposes the window chrome but not the custom catalog controls.
+- [ ] Validate Linux x86_64 and Windows x86_64 GUI builds and desktop interaction; CLI CI does not cover the optional `gui` feature on these hosts.
+- [ ] Add native application bundles, icons, signing, and release packaging before distributing the GUI. Current releases remain CLI-only.
+- [ ] Add account and package workflows to the GUI only with explicit interaction for login, 2FA, credential-store access, entitlements, and output selection. The first preview browses the public catalog and copies CLI commands.
+
 ## Current macOS Apple Silicon gates
 
 - [ ] Complete an interactive default macOS Keychain approval flow for `auth login` and `auth revoke` in a local user session. `auth info` succeeded after the user approved its Keychain dialog on October 27; the encrypted `--file-keychain` path also worked.

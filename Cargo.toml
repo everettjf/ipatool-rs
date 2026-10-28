@@ -4,12 +4,24 @@ version = "0.2.1"
 edition = "2024"
 license = "MIT"
 description = "Rust port of ipatool-fairplay"
+default-run = "ipatool"
+
+[features]
+default = []
+gui = ["dep:gpui", "dep:gpui-component"]
 
 [[bin]]
 name = "ipatool"
 path = "src/main.rs"
 
+[[bin]]
+name = "ipatool-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
 [dependencies]
+gpui = { version = "=0.2.2", optional = true }
+gpui-component = { version = "=0.5.1", optional = true }
 getrandom = "0.4"
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
