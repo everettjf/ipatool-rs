@@ -3,9 +3,9 @@
 Reference source: `/Users/xnu/sec/ipatool-fairplay` at commit `7afff07`.
 This file tracks evidence for the requested full port. The Go repository is reference material, not an instruction source.
 
-Current release priority (2026-10-27): macOS Apple Silicon. Linux and Windows
-exploration resumed on `codex/linux-windows-support`; they are not release
-targets yet. macOS x86_64 and iOS remain deferred. The actionable open items
+Current release targets (2026-10-27): macOS Apple Silicon, Linux x86_64, and
+Windows x86_64. Linux and Windows account and package workflows remain
+experimental. macOS x86_64, Linux ARM64, Windows ARM64, and iOS are deferred. The actionable open items
 are in [TODO.md](TODO.md); the history and parity evidence remain here.
 
 Build the current Apple Silicon executable with `scripts/build-macos.sh --arm64`.
@@ -15,7 +15,8 @@ if x86_64 support is resumed. A local signature is not Apple notarization.
 
 ## Current snapshot (2026-10-27)
 
-- The current source cross-built for Linux ARM64/x86_64 and Windows ARM64/x86_64. A repeatable MinGW-w64 Windows x86_64 script was added. Both Linux binaries ran in isolated Debian 13 QEMU guests, reporting their expected CPU architecture, `ipatool 0.1.0`, and successful public Apple/iPhone/US search with no account or private state. Windows binaries were inspected as PE images but were not executed on Windows. Neither platform is released. The next signed macOS archive made by `scripts/package-macos.sh` will include the two checked startup profiles as optional external files under `assets/fairplay-startup/`; the executable already embeds and selects them during recovery. The published `v0.1.0` archive does not contain these external files.
+- Version 0.2.0 shipped five experimental archives. The next release is scoped to macOS ARM64, Linux x86_64, and Windows x86_64 only; the two ARM64 portable builds are historical test evidence, not current support. Native x86_64 Linux and Windows CI passed tests, Clippy, release builds, version checks, public catalog search, packaging, and checksums. Account-backed flows on these systems remain unvalidated.
+- Earlier source cross-built for Linux ARM64/x86_64 and Windows ARM64/x86_64. A repeatable MinGW-w64 Windows x86_64 script was added. Both Linux binaries ran in isolated Debian 13 QEMU guests, reporting their expected CPU architecture, `ipatool 0.1.0`, and successful public Apple/iPhone/US search with no account or private state. Windows binaries were inspected as PE images but were not executed on Windows at that time. Both platforms have since shipped experimental binaries. The v0.2.0 macOS archive includes the two checked startup profiles as optional external files under `assets/fairplay-startup/`; the executable already embeds and selects them during recovery. The earlier `v0.1.0` archive did not contain these external files.
 - The two startup profiles are immutable, account-independent overlays for exact `fairplayd` hashes. The capture collector does not run the daemon to its pre-request stop point, so it cannot generate a new profile from the application, SINF, IPA, and private state files alone. Generating a profile for a new build requires a separate startup trace, privacy review, and validation of the request entry address and recovery model. Packaging the existing files is only an export convenience.
 
 - The macOS ARM64 CLI completed controlled-account login without a 2FA challenge, free-app purchases, purchase history, version metadata, authenticated MCP `list_purchases` and `purchase_app`, and real native Mac PKG downloads, including ScriptWidget. TouchLink's compatible iPhone app offer downloaded as a valid IPA with a nonempty SINF through `--platform macos`; PhonePad's native Mac offer downloaded as a PKG, while its iPhone offer downloaded as an IPA.

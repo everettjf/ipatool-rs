@@ -1,8 +1,8 @@
 # Remaining work
 
-Status as of 2026-10-27. The 0.2.0 delivery targets are macOS on Apple Silicon, Linux x86_64/ARM64, and Windows x86_64/ARM64. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
+Status as of 2026-10-27. The 0.2.1 delivery targets are macOS on Apple Silicon, Linux x86_64, and Windows x86_64. Linux ARM64 and Windows ARM64 are no longer release targets. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
 
-Linux and Windows now have native CI test, build, catalog smoke, and release packaging jobs. The two Linux binaries also passed account-free version and public-search smoke checks in Debian 13 QEMU guests. The native CI results and release artifact checks are recorded in [PORTING.md](PORTING.md); account-backed workflows remain open.
+Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and release packaging jobs. Both Linux architectures previously passed account-free version and public-search smoke checks in Debian 13 QEMU guests; ARM64 is now deferred. The native CI results and release artifact checks are recorded in [PORTING.md](PORTING.md); account-backed workflows remain open.
 
 ## Verified so far
 
@@ -30,14 +30,16 @@ Do not commit credentials, cookies, downloaded packages, private captures, or en
 
 ## Linux and Windows gates
 
-- [x] Cross-build Linux ARM64/x86_64 and Windows ARM64/x86_64; add a repeatable Windows x86_64 build script.
-- [x] Run account-free version and public-search smoke checks for both Linux architectures in Debian 13 QEMU guests.
-- [x] Confirm native CI version and public-catalog checks for both Windows architectures and both Linux architectures on the 0.2.0 release commit.
+- [x] Build Linux x86_64 and Windows x86_64; add a repeatable Windows x86_64 build script. Historical ARM64 cross-builds do not define current release support.
+- [x] Run account-free version and public-search smoke checks for Linux x86_64 in a Debian 13 QEMU guest.
+- [x] Confirm native CI version and public-catalog checks for Linux x86_64 and Windows x86_64 on the 0.2.0 release commit.
 - [ ] Validate real authenticated Store, account migration, and package workflows in Linux desktop sessions and on Windows. Existing Linux QEMU and synthetic Secret Service checks do not cover a real account.
-- [x] Verify all four portable archives, checksums, and published release links from the CI workflow. Document them as experimental until account-backed workflows are validated.
+- [x] Verify Linux x86_64 and Windows x86_64 archives, checksums, and published links from the 0.2.0 release workflow. Document them as experimental until account-backed workflows are validated.
+- [ ] Publish and verify v0.2.1 with only macOS ARM64, Linux x86_64, and Windows x86_64 archives and checksums.
 
 ## Deferred targets and package offers
 
 - [ ] Validate the final iOS ARM64 binary on a compatible device, including authenticated Store and package flows.
 - [ ] Resume macOS x86_64 release and runtime verification.
+- [ ] Resume Linux ARM64 and Windows ARM64 releases only if their platform scope is requested again.
 - [ ] Inspect real IPA and PKG outputs for the remaining platform offers, beyond the TouchLink Mac IPA and Mac PKGs already checked.
