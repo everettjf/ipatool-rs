@@ -9,7 +9,7 @@
 
 Thank you to both projects and their maintainers. `ipatool-rs` brings these two areas together in a Rust CLI. The sibling `ipatool-fairplay` Go source tree served as a reference for the port. The CLI implements its command paths, including an MCP server and FairPlay diagnostics. Full parity is still being validated; see the [porting record](docs/PORTING.md) for evidence and the [TODO list](docs/TODO.md) for remaining work.
 
-The current release target is **macOS on Apple Silicon**. Linux and Windows builds are under investigation; neither has an official release or complete runtime validation. macOS x86_64 and iOS remain deferred.
+Version 0.2.0 provides experimental binaries for **macOS on Apple Silicon, Linux x86_64/ARM64, and Windows x86_64/ARM64**. Public catalog behavior is checked on native CI runners for each portable target. Authenticated Store and private FairPlay workflows on Linux and Windows still need end-to-end validation. macOS x86_64 and iOS remain deferred.
 
 ## Install the experimental Rust rewrite
 
@@ -21,9 +21,9 @@ brew install everettjf/tap/ipatool-rs
 ipatool-rs --version
 ```
 
-Alternatively, download the macOS ARM64 archive and its SHA-256 file from the [GitHub release](https://github.com/everettjf/ipatool-rs/releases/tag/v0.1.0). Verify the archive with `shasum -a 256 -c ipatool-rs-0.1.0-macos-arm64.tar.gz.sha256`, extract it, and place the `ipatool-rs` executable in a directory on your `PATH`. The installed command is `ipatool-rs`, so it can coexist with the original `ipatool`.
+Alternatively, download the matching archive and SHA-256 file from the [v0.2.0 GitHub release](https://github.com/everettjf/ipatool-rs/releases/tag/v0.2.0). The available archives are `macos-arm64.tar.gz`, `linux-x86_64.tar.gz`, `linux-aarch64.tar.gz`, `windows-x86_64.zip`, and `windows-arm64.zip`, each prefixed with `ipatool-rs-0.2.0-`. Verify a tarball with `sha256sum -c FILE.sha256` on Linux or `shasum -a 256 -c FILE.sha256` on macOS. On Windows, compare `Get-FileHash FILE -Algorithm SHA256` with the companion `.sha256` file. Extract the archive and put `ipatool-rs` (or `ipatool-rs.exe`) on your `PATH`. The command can coexist with the original `ipatool`.
 
-Version 0.1.0 is an experimental release for macOS on Apple Silicon. It includes the signed runtime fix for Unicorn library loading and JIT access. Real 2FA, successful recovery from a rejected Store token, interactive Keychain login and revoke, and private FairPlay decryption still need end-to-end validation. See [remaining work](docs/TODO.md). The 0.1.0 version number does not assert full parity with the reference projects.
+The macOS archive is Developer ID signed and notarized. Real 2FA, successful recovery from a rejected Store token, interactive Keychain login and revoke, and private FairPlay decryption still need end-to-end validation. Linux and Windows account, credential-store, and package flows have not yet been validated with a real account. See [remaining work](docs/TODO.md). The 0.2.0 version number does not assert full parity with the reference projects.
 
 ## Build and check
 
@@ -38,7 +38,7 @@ The build script creates a signed `target/release/ipatool-macos-arm64` executabl
 
 Release archives use a Developer ID signature and an Apple notarization check. The release procedure is in [docs/RELEASING.md](docs/RELEASING.md).
 
-The next macOS archive built by `scripts/package-macos.sh` also exports the two checked, account-independent FairPlay startup profiles under `assets/fairplay-startup/`. They remain embedded in the executable for automatic recovery, so the external copies are optional. The published `v0.1.0` archive predates this packaging change.
+The 0.2.0 archives include external copies of the two checked, account-independent FairPlay startup profiles under `assets/fairplay-startup/`. They remain embedded in the executable for automatic recovery. Automatic generation of a new profile during collection is still planned; see [the export design](docs/STARTUP_PROFILE_EXPORT.md).
 
 ## Public catalog commands
 

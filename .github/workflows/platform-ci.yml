@@ -21,18 +21,26 @@ jobs:
           - name: Linux x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            family: linux
+            arch: x86_64
             executable: target/x86_64-unknown-linux-gnu/release/ipatool
           - name: Linux ARM64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            family: linux
+            arch: aarch64
             executable: target/aarch64-unknown-linux-gnu/release/ipatool
           - name: Windows x86_64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
+            family: windows
+            arch: x86_64
             executable: target/x86_64-pc-windows-msvc/release/ipatool.exe
           - name: Windows ARM64
             runner: windows-11-arm
             target: aarch64-pc-windows-msvc
+            family: windows
+            arch: arm64
             executable: target/aarch64-pc-windows-msvc/release/ipatool.exe
     runs-on: ${{ matrix.runner }}
     defaults:
@@ -57,3 +65,16 @@ jobs:
           executable='${{ matrix.executable }}'
           "$executable" --version
           "$executable" --non-interactive --format json search ScriptWidget --platform macos --country US --limit 1
+      - name: Package Linux archive
+        if: matrix.family == 'linux'
+        run: |
+          scripts/package-linux.sh '${{ matrix.arch }}' dist
+          (cd dist && sha256sum -c ./*.sha256)
+      - name: Package Windows archive
+        if: matrix.family == 'windows'
+        shell: pwsh
+        run: |
+          ./scripts/package-windows.ps1 -Architecture '${{ matrix.arch }}' -OutputDirectory dist
+          $checksum = Get-Content (Get-ChildItem dist/*.sha256 | Select-Object -First 1).FullName
+          $archive = Get-ChildItem dist/*.zip | Select-Object -First 1
+          if ((Get-FileHash $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant() -ne $checksum.Split(' ')[0]) { throw 'Archive checksum mismatch' }

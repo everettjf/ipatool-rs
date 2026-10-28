@@ -1,8 +1,8 @@
 # Remaining work
 
-Status as of 2026-10-27. The current delivery target is macOS on Apple Silicon. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
+Status as of 2026-10-27. The 0.2.0 delivery targets are macOS on Apple Silicon, Linux x86_64/ARM64, and Windows x86_64/ARM64. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
 
-Linux and Windows support is being explored on `codex/linux-windows-support`. Cross-builds are available for Linux ARM64/x86_64 and Windows ARM64/x86_64. The two Linux binaries passed account-free version and public-search smoke checks in Debian 13 QEMU guests. No Windows runtime was available locally. These targets have not been released.
+Linux and Windows now have native CI test, build, catalog smoke, and release packaging jobs. The two Linux binaries also passed account-free version and public-search smoke checks in Debian 13 QEMU guests. The native CI results and release artifact checks are recorded in [PORTING.md](PORTING.md); account-backed workflows remain open.
 
 ## Verified so far
 
@@ -27,13 +27,13 @@ Linux and Windows support is being explored on `codex/linux-windows-support`. Cr
 
 Do not commit credentials, cookies, downloaded packages, private captures, or enrollment models. Use an isolated state directory for live account tests.
 
-## Linux and Windows investigation
+## Linux and Windows gates
 
 - [x] Cross-build Linux ARM64/x86_64 and Windows ARM64/x86_64; add a repeatable Windows x86_64 build script.
 - [x] Run account-free version and public-search smoke checks for both Linux architectures in Debian 13 QEMU guests.
-- [ ] Run Windows x86_64 and ARM64 binaries on their target systems and verify public catalog behavior.
+- [ ] Confirm native CI version and public-catalog checks for both Windows architectures and both Linux architectures on the 0.2.0 release commit.
 - [ ] Validate real authenticated Store, account migration, and package workflows in Linux desktop sessions and on Windows. Existing Linux QEMU and synthetic Secret Service checks do not cover a real account.
-- [ ] Decide whether to package Linux/Windows builds only after the target runtime checks and release limitations are reviewed.
+- [ ] Verify all four portable archives, checksums, and published release links from the CI workflow. Document them as experimental until account-backed workflows are validated.
 
 ## Deferred targets and package offers
 
