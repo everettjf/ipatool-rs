@@ -19,7 +19,9 @@ STAGE=$(mktemp -d "${TMPDIR:-/tmp}/ipatool-rs-package.XXXXXX")
 trap 'test ! -d "$STAGE" || rm -r "$STAGE"' EXIT HUP INT TERM
 
 "$ROOT/scripts/build-macos.sh" --arm64 "$STAGE/ipatool-rs"
-codesign --force --options runtime --timestamp --sign "$IPATOOL_CODESIGN_IDENTITY" "$STAGE/ipatool-rs"
+codesign --force --options runtime --timestamp \
+  --entitlements "$ROOT/scripts/macos-release.entitlements" \
+  --sign "$IPATOOL_CODESIGN_IDENTITY" "$STAGE/ipatool-rs"
 codesign --verify --strict "$STAGE/ipatool-rs"
 "$STAGE/ipatool-rs" --version
 cp "$ROOT/LICENSE" "$STAGE/LICENSE"

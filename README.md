@@ -21,9 +21,9 @@ brew install everettjf/tap/ipatool-rs
 ipatool-rs --version
 ```
 
-Alternatively, download the macOS ARM64 archive and its SHA-256 file from the [GitHub release](https://github.com/everettjf/ipatool-rs/releases/tag/v0.1.0-preview.1). Verify the archive with `shasum -a 256 -c ipatool-rs-0.1.0-preview.1-macos-arm64.tar.gz.sha256`, extract it, and place the `ipatool-rs` executable in a directory on your `PATH`. The installed command is `ipatool-rs`, so it can coexist with the original `ipatool`.
+Alternatively, download the macOS ARM64 archive and its SHA-256 file from the [GitHub release](https://github.com/everettjf/ipatool-rs/releases/tag/v0.1.0-preview.2). Verify the archive with `shasum -a 256 -c ipatool-rs-0.1.0-preview.2-macos-arm64.tar.gz.sha256`, extract it, and place the `ipatool-rs` executable in a directory on your `PATH`. The installed command is `ipatool-rs`, so it can coexist with the original `ipatool`.
 
-This is a preview for testing. Real 2FA, successful recovery from a rejected Store token, default Keychain approval, and private FairPlay decryption still need end-to-end validation. See [remaining work](docs/TODO.md).
+This is a preview for testing. Preview.2 fixes the signed runtime's Unicorn library loading and JIT access; preview.1 cannot complete account-backed Store operations. Real 2FA, successful recovery from a rejected Store token, interactive Keychain login and revoke, and private FairPlay decryption still need end-to-end validation. See [remaining work](docs/TODO.md).
 
 ## Build and check
 
