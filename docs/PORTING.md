@@ -268,6 +268,14 @@ check also passed explicitly against the pinned runtime. Full
 localhost/pinned-JIT tests run outside the execution sandbox; an in-sandbox
 attempt cannot supply that evidence.
 
+The first expanded portable CI run caught a Linux-only transitive dependency
+error: GPUI's zed-async-tar uses xattr 0.2.3, whose libc::ENOATTR alias is no longer
+available on Linux. A local patch retains upstream source/licenses/tests and
+maps only Linux/Android missing-attribute handling to ENODATA. It does not
+change the public API or pin libc backward. Provenance and the exact change are
+recorded in `vendor/xattr/PATCH.md`; CI runs its upstream tests on Linux.
+The follow-up CI run determines current portable build status.
+
 The local feature remains a source-only experimental preview. Its public search,
 controller fixtures and synthetic native walkthroughs do not close live account,
 Keychain approval, signed-bundle Store/JIT, real IPA/PKG, or private FairPlay gates.

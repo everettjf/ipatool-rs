@@ -93,3 +93,4 @@ tar = "0.4"
 [patch.crates-io]
 apfs = { path = "vendor/apfs" }
 apple-xar = { path = "vendor/apple-xar" }
+xattr = { path = "vendor/xattr" }
