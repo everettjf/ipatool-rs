@@ -471,6 +471,7 @@ pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<Enrollme
     serde_json::to_writer_pretty(&mut output, &manifest)?;
     output.write_all(b"\n")?;
     output.sync_all()?;
+    drop(output);
     fs::rename(root, &options.output)
         .with_context(|| format!("publish capture {}", options.output.display()))?;
     Ok(manifest)

@@ -1,0 +1,129 @@
+name: Publish experimental release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag and draft release with signed macOS assets
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  portable:
+    name: Package ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            family: linux
+          - name: Linux ARM64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            family: linux
+          - name: Windows x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            arch: x86_64
+            family: windows
+          - name: Windows ARM64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            arch: arm64
+            family: windows
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Check release tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          grep -Fqx "version = \"${RELEASE_TAG#v}\"" Cargo.toml
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup +stable target add '${{ matrix.target }}'
+      - name: Run tests
+        run: scripts/test-portable.sh '${{ matrix.target }}'
+      - name: Build release executable
+        run: cargo +stable build --locked --release --target '${{ matrix.target }}'
+      - name: Native smoke test
+        run: |
+          if [[ '${{ matrix.family }}' == windows ]]; then suffix=.exe; else suffix=; fi
+          executable="target/${{ matrix.target }}/release/ipatool$suffix"
+          "$executable" --version
+          "$executable" --non-interactive --format json search ScriptWidget --platform macos --country US --limit 1
+      - name: Package Linux
+        if: matrix.family == 'linux'
+        run: scripts/package-linux.sh '${{ matrix.arch }}' dist
+      - name: Package Windows
+        if: matrix.family == 'windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1 -Architecture '${{ matrix.arch }}' -OutputDirectory dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.family }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: Verify signed macOS archive
+    runs-on: macos-15
+    steps:
+      - name: Download draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p dist
+          gh release download "$RELEASE_TAG" --dir dist --pattern "ipatool-rs-*-macos-arm64.tar.gz*"
+      - name: Verify checksum, signature, and public search
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version=${RELEASE_TAG#v}
+          archive="ipatool-rs-$version-macos-arm64.tar.gz"
+          cd dist
+          shasum -a 256 -c "$archive.sha256"
+          mkdir extracted
+          tar -xzf "$archive" -C extracted
+          codesign --verify --strict extracted/ipatool-rs
+          extracted/ipatool-rs --version
+          extracted/ipatool-rs --non-interactive --format json search ScriptWidget --platform macos --country US --limit 1
+
+  publish:
+    name: Publish draft release
+    needs: [portable, macos]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Verify package checksums and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -name '*.sha256' | wc -l)" -eq 4
+          (cd dist && sha256sum -c ./*.sha256)
+          gh release upload "$RELEASE_TAG" dist/*
+          gh release edit "$RELEASE_TAG" --draft=false --latest
