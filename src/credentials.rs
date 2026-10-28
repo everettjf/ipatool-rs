@@ -111,6 +111,64 @@ impl<T: CredentialStore + ?Sized> CredentialStore for Box<T> {
     }
 }
 
+impl<T: CredentialStore + ?Sized> CredentialStore for std::sync::Arc<T> {
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        (**self).get(key)
+    }
+    fn set(&self, key: &str, data: &[u8]) -> Result<()> {
+        (**self).set(key, data)
+    }
+    fn remove(&self, key: &str) -> Result<bool> {
+        (**self).remove(key)
+    }
+}
+
+#[derive(Debug)]
+pub struct CredentialUnlockRequired;
+
+impl std::fmt::Display for CredentialUnlockRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unlock encrypted credential storage to continue")
+    }
+}
+
+impl std::error::Error for CredentialUnlockRequired {}
+
+/// Open a store with instance configuration. This never prompts on stdin or
+/// changes the legacy CLI's process-wide credential configuration.
+pub fn open_configured_keychain(
+    directory: &std::path::Path,
+    allow_ui: bool,
+    force_file: bool,
+    passphrase: Option<String>,
+) -> Result<Box<dyn CredentialStore + Send + Sync>> {
+    #[cfg(target_os = "windows")]
+    let _ = allow_ui;
+    if !force_file && passphrase.is_none() {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        return Ok(Box::new(AppleKeychain { allow_ui }));
+        #[cfg(target_os = "linux")]
+        if let Some(service) = LinuxSecretService::probe(allow_ui) {
+            return Ok(Box::new(service));
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        let passphrase = passphrase.ok_or(CredentialUnlockRequired)?;
+        let store = FileKeychain::new(directory.to_path_buf(), passphrase)?;
+        // Verify an existing item before accepting an unlock attempt.
+        if let Some(data) = store.get(ACCOUNT_KEY)? {
+            drop(Zeroizing::new(data));
+        }
+        Ok(Box::new(store))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (directory, allow_ui, force_file, passphrase);
+        bail!("configured file credential storage is unavailable on this platform")
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub struct AppleKeychain {
     allow_ui: bool,

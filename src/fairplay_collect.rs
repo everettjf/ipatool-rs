@@ -100,6 +100,7 @@ fn copy_private(root: &Path, relative: &Path, source: &Path) -> Result<CaptureFi
     let mut size = 0u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
+        crate::application::operation::check()?;
         let count = input.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -137,6 +138,7 @@ fn copy_tree(root: &Path, source: &Path, relative: &Path) -> Result<Vec<CaptureF
     entries.sort_by_key(|entry| entry.file_name());
     let mut files = Vec::new();
     for entry in entries {
+        crate::application::operation::check()?;
         let kind = entry.file_type()?;
         if kind.is_symlink() {
             bail!(
@@ -294,6 +296,7 @@ fn capture_ipa(
     }
     let mut roots = Vec::new();
     for (name, bytes) in &sinfs {
+        crate::application::operation::check()?;
         if parse_sinf_selector(bytes).ok() == Some(selector) {
             roots.push(name.split("/SC_Info/").next().unwrap().to_owned());
         }
@@ -472,8 +475,10 @@ pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<Enrollme
     output.write_all(b"\n")?;
     output.sync_all()?;
     drop(output);
-    fs::rename(root, &options.output)
-        .with_context(|| format!("publish capture {}", options.output.display()))?;
+    crate::application::operation::publish(|| {
+        fs::rename(root, &options.output)
+            .with_context(|| format!("publish capture {}", options.output.display()))
+    })?;
     Ok(manifest)
 }
 

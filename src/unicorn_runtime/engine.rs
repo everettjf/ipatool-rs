@@ -494,6 +494,7 @@ impl Engine {
         timeout: Duration,
         instruction_limit: usize,
     ) -> Result<()> {
+        crate::application::operation::check()?;
         if timeout.is_zero() {
             bail!("Unicorn timeout must be positive");
         }
@@ -504,6 +505,7 @@ impl Engine {
         let timed_out = AtomicBool::new(false);
         let handle = self.handle as usize;
         let stop = self.api.emu_stop;
+        let operation = crate::application::operation::current();
         let (done, receiver) = mpsc::channel::<()>();
         // Unicorn 2.1.4 has reported a 120-second timeout after only a few
         // milliseconds under parallel Store tests. Use a host monotonic clock
@@ -511,16 +513,33 @@ impl Engine {
         let code = thread::scope(|scope| {
             let timeout_flag = &timed_out;
             let watchdog = scope.spawn(move || {
-                let remaining = timeout.saturating_sub(started.elapsed());
-                if matches!(
-                    receiver.recv_timeout(remaining),
-                    Err(mpsc::RecvTimeoutError::Timeout)
-                ) {
-                    timeout_flag.store(true, Ordering::Release);
+                loop {
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    let wait = if operation.is_some() || remaining.is_zero() {
+                        remaining
+                            .min(Duration::from_millis(100))
+                            .max(Duration::from_millis(1))
+                    } else {
+                        remaining
+                    };
+                    match receiver.recv_timeout(wait) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let expired = started.elapsed() >= timeout;
+                    let cancelled = operation.as_ref().is_some_and(|value| value.is_cancelled());
+                    if !expired && !cancelled {
+                        continue;
+                    }
+                    if expired {
+                        timeout_flag.store(true, Ordering::Release);
+                    }
                     // SAFETY: the Engine owns this handle until the scoped
                     // watchdog joins; Unicorn's timer also calls uc_emu_stop
                     // from its timer thread.
                     unsafe { stop(handle as Handle) };
+                    // Keep watching until execution acknowledges the stop. A
+                    // request racing emu_start must not leave it unwatched.
                 }
             });
             // SAFETY: the exclusive Engine borrow keeps the handle valid;
@@ -531,6 +550,7 @@ impl Engine {
             watchdog.join().expect("Unicorn watchdog thread panicked");
             code
         });
+        crate::application::operation::check()?;
         if let Some(failure) = self.hooks.iter().find_map(|hook| hook.data.failure()) {
             bail!("{failure}");
         }
@@ -802,6 +822,37 @@ fn api_error(api: &Api, code: i32) -> anyhow::Error {
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    #[ignore = "requires the cached pinned Unicorn runtime and JIT execution"]
+    fn application_cancellation_stops_an_active_guest_before_its_timeout() {
+        use crate::application::operation::{Cancelled, Operation};
+        let mut engine = Engine::new().unwrap();
+        engine.mem_map(0x1000, 4096).unwrap();
+        engine.mem_write(0x1000, &[0x00, 0x00, 0x00, 0x14]).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let sent = Cell::new(false);
+        engine
+            .add_code_hook(0x1000, 0x1000, move |_, _, _| {
+                if !sent.replace(true) {
+                    started_tx.send(()).unwrap();
+                }
+            })
+            .unwrap();
+        let operation = Operation::default();
+        let cancellation = operation.clone();
+        let cancel = thread::spawn(move || {
+            started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            cancellation.cancel();
+        });
+        let started = Instant::now();
+        let error = operation
+            .run(|| engine.start_bounded(0x1000, 0x2000, Duration::from_secs(10), usize::MAX))
+            .unwrap_err();
+        assert!(error.is::<Cancelled>());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        cancel.join().unwrap();
+    }
 
     #[test]
     fn scalar_register_calls_reject_vector_registers() {

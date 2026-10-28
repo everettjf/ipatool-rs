@@ -64,6 +64,7 @@ impl<'a> SidbTarget<'a> {
         }
         jobs.iter()
             .map(|job| {
+                crate::application::operation::check()?;
                 let fault = fault_for_metadata(job.metadata)?;
                 evaluate_in_state(&mut self.state, &self.frame, &job.block, fault)
             })

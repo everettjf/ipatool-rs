@@ -621,31 +621,29 @@ pub fn doctor_fairplay(
 }
 
 pub fn write_doctor_report(path: &Path, report: &FairPlayDoctorReport) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
     }
-    let mut output = options
-        .open(path)
-        .with_context(|| format!("create private report: {}", path.display()))?;
+    #[cfg(not(unix))]
+    fs::create_dir_all(parent)?;
+    let mut output = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("stage private report: {}", path.display()))?;
     serde_json::to_writer_pretty(&mut output, report)?;
     output.write_all(b"\n")?;
-    output.flush()?;
+    output.as_file().sync_all()?;
+    output
+        .persist_noclobber(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish private report: {}", path.display()))?;
     Ok(())
 }
 

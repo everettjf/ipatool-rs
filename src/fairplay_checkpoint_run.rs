@@ -5,7 +5,6 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet, HashMap},
-    io::Write,
     path::Path,
     rc::Rc,
     time::Duration,
@@ -2275,6 +2274,7 @@ impl CheckpointRunner {
             unreachable!();
         };
         for &address in &addresses {
+            crate::application::operation::check()?;
             let bytes = self
                 .engine
                 .mem_read(address, PAGE_BYTES as usize)
@@ -2382,9 +2382,11 @@ impl CheckpointRunner {
         if serialized.len() > 128 * 1024 * 1024 {
             bail!("FairPlay output checkpoint exceeds decompressed size limit");
         }
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&serialized)?;
-        let compressed = Zeroizing::new(encoder.finish()?);
+        crate::application::operation::check()?;
+        let mut compressed = Zeroizing::new(Vec::new());
+        let mut encoder = GzEncoder::new(&mut *compressed, Compression::fast());
+        crate::application::operation::copy(&mut serialized.as_slice(), &mut encoder)?;
+        encoder.finish()?;
         write_private_binary(output, &compressed)?;
         Ok(addresses.len())
     }
@@ -2393,6 +2395,7 @@ impl CheckpointRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     const SYNTHETIC_BINARY: &[u8] =
         include_bytes!("../tests/fixtures/fairplay-checkpoint-run-synthetic.macho");

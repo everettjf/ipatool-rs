@@ -8,20 +8,21 @@ use std::{
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
-use ipatool_rs::catalog::AppNotFound;
-use ipatool_rs::credentials::{
-    Account, AccountStore, configure_apple_keychain_ui, configure_file_keychain,
-    open_system_keychain,
+use ipatool_rs::application::fairplay::{
+    collect as collect_enrollment, decrypt as decrypt_ipa_with_options, inspect as doctor_fairplay,
+    recover as recover_capture,
 };
-use ipatool_rs::fairplay::{SinfSelector, doctor_fairplay, write_doctor_report};
+use ipatool_rs::credentials::{
+    AccountStore, configure_apple_keychain_ui, configure_file_keychain, open_system_keychain,
+};
+use ipatool_rs::fairplay::{SinfSelector, write_doctor_report};
 use ipatool_rs::fairplay_26a428;
 use ipatool_rs::fairplay_checkpoint::FairplayCheckpoint;
 use ipatool_rs::fairplay_checkpoint_run::{CheckpointRunner, MemoryTraceOptions, VirtualFileStat};
-use ipatool_rs::fairplay_collect::{EnrollmentCollectOptions, collect_enrollment};
-use ipatool_rs::fairplay_download_capture::write_download_capture;
+use ipatool_rs::fairplay_collect::EnrollmentCollectOptions;
 use ipatool_rs::fairplay_enrollment_model::{FIRST_TRANSFORM_BYTES, build_fpsenr2};
 use ipatool_rs::fairplay_enrollment_v3::{V3Material, build_fpsenr3};
-use ipatool_rs::fairplay_ipa::{decrypt_ipa_with_options, require_model_diagnostic};
+use ipatool_rs::fairplay_ipa::require_model_diagnostic;
 use ipatool_rs::fairplay_key::CurrentSinfModel;
 use ipatool_rs::fairplay_oracle_domains::{
     learn_26b118_domains, validate_26a428_model, validate_26b118_model,
@@ -31,7 +32,7 @@ use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
 use ipatool_rs::fairplay_raw_source::run_kernel;
 use ipatool_rs::fairplay_recover_capture::{
-    RecoverCaptureOptions, RecoverFromAccountOptions, RecoverFromSinfCopyOptions, recover_capture,
+    RecoverCaptureOptions, RecoverFromAccountOptions, RecoverFromSinfCopyOptions,
     recover_from_account, recover_from_sinf_copy,
 };
 use ipatool_rs::fairplay_recovery;
@@ -41,14 +42,17 @@ use ipatool_rs::fairplay_recovery_output::{
 };
 use ipatool_rs::fairplay_recovery_target::{OracleJob, OracleTarget, SidbTarget, WhiteboxTarget};
 use ipatool_rs::fairplay_startup::seed_request_checkpoint;
-use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
-use ipatool_rs::store_login::{self, AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
-use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
-use ipatool_rs::store_purchase::{
-    self, LicenseAlreadyExists, NativePurchaseBackend, PasswordTokenExpired,
-};
-use ipatool_rs::storefront::country_code_from_storefront;
+use ipatool_rs::store_login::{AuthCodeRequired, LoginInput, NativeAuthenticationBackend};
+use ipatool_rs::store_owned::{DEFAULT_LIMIT, MAX_LIMIT};
+#[cfg(test)]
+use ipatool_rs::store_purchase::PasswordTokenExpired;
 use ipatool_rs::{App, CatalogClient, Platform, SearchOutput};
+#[cfg(test)]
+use ipatool_rs::{
+    application::download::{fairplay_download_paths, retry_download},
+    credentials::Account,
+    store_download_product::LicenseRequired,
+};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -714,7 +718,7 @@ fn run() -> Result<()> {
                     let backend = NativeAuthenticationBackend::open()?;
                     let mut code_prompts = 0;
                     let account = loop {
-                        let result = store_login::login(
+                        let result = ipatool_rs::application::account::login(
                             &backend,
                             &account_store,
                             LoginInput {
@@ -814,55 +818,17 @@ fn run() -> Result<()> {
             bundle_identifier,
             platform,
         } => {
-            if app_id.is_none_or(|id| id <= 0)
-                && bundle_identifier.as_deref().is_none_or(str::is_empty)
-            {
-                bail!("either the app ID or the bundle identifier must be specified");
-            }
-            let platform = parse_platform(platform.as_deref())?;
-            let account_store = AccountStore::new(open_system_keychain()?);
-            let mut account = account_store.load()?;
-            let backend = NativePurchaseBackend::open()?;
-            let mut refreshed = false;
-            loop {
-                let app = if let Some(bundle_id) =
-                    bundle_identifier.as_deref().filter(|id| !id.is_empty())
-                {
-                    let country = country_code_from_storefront(&account.store_front)?;
-                    CatalogClient::new()?.lookup(None, Some(bundle_id), country, platform)?
-                } else {
-                    App {
-                        id: app_id.context("app ID is required")?,
-                        ..App::default()
-                    }
-                };
-                match store_purchase::purchase(&backend, &account, &app, platform) {
-                    Ok(()) => {
-                        print_purchase_success(false, cli.format)?;
-                        break;
-                    }
-                    Err(error) if error.downcast_ref::<LicenseAlreadyExists>().is_some() => {
-                        print_purchase_success(true, cli.format)?;
-                        break;
-                    }
-                    Err(error)
-                        if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
-                    {
-                        let authentication_backend = NativeAuthenticationBackend::open()?;
-                        account = store_login::login(
-                            &authentication_backend,
-                            &account_store,
-                            LoginInput {
-                                email: account.email.clone(),
-                                password: account.password.clone(),
-                                auth_code: String::new(),
-                            },
-                        )?;
-                        refreshed = true;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
+            let identity = ipatool_rs::application::library::AppIdentity {
+                app_id,
+                bundle_identifier,
+                platform: parse_platform(platform.as_deref())?,
+            };
+            identity.validate()?;
+            let already_owned = ipatool_rs::application::library::purchase(
+                &ipatool_rs::application::context::ApplicationContext::legacy()?,
+                &identity,
+            )?;
+            print_purchase_success(already_owned, cli.format)?;
         }
         Command::Download {
             app_id,
@@ -878,177 +844,37 @@ fn run() -> Result<()> {
             fairplay_force,
             fairplay_capture_dir,
         } => {
-            if app_id.is_none_or(|id| id <= 0)
-                && bundle_identifier.as_deref().is_none_or(str::is_empty)
-            {
-                bail!("either the app ID or the bundle identifier must be specified");
-            }
-            let requested_platform = parse_platform(platform.as_deref())?;
-            let platform = requested_platform.unwrap_or(Platform::Iphone);
-            let account_store = AccountStore::new(open_system_keychain()?);
-            let mut account = account_store.load()?;
-            let backend = DownloadProductClient::open()?;
-            let catalog = CatalogClient::new()?;
-            let ((app, path, captured_download), purchased) = retry_download(
-                &mut account,
+            let request = ipatool_rs::application::download::DownloadRequest {
+                app_id,
+                bundle_identifier,
+                output,
+                external_version_id,
+                platform: parse_platform(platform.as_deref())?,
                 purchase,
-                |account| {
-                    let authentication_backend = NativeAuthenticationBackend::open()?;
-                    store_login::login(
-                        &authentication_backend,
-                        &account_store,
-                        LoginInput {
-                            email: account.email.clone(),
-                            password: account.password.clone(),
-                            auth_code: String::new(),
-                        },
-                    )
-                },
-                |account, purchase_required, purchased| {
-                    let mut app = App {
-                        id: app_id.unwrap_or_default(),
-                        bundle_id: bundle_identifier.clone().unwrap_or_default(),
-                        ..App::default()
-                    };
-                    if let Some(bundle_id) =
-                        bundle_identifier.as_deref().filter(|id| !id.is_empty())
-                    {
-                        let country = country_code_from_storefront(&account.store_front)?;
-                        match catalog.lookup(None, Some(bundle_id), country, requested_platform) {
-                            Ok(found) => app = found,
-                            Err(error)
-                                if app.id > 0 && error.downcast_ref::<AppNotFound>().is_some() => {}
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    if *purchase_required {
-                        let purchase_backend = NativePurchaseBackend::open()?;
-                        match store_purchase::purchase(
-                            &purchase_backend,
-                            account,
-                            &app,
-                            requested_platform,
-                        ) {
-                            Ok(()) => {}
-                            Err(error)
-                                if error.downcast_ref::<LicenseAlreadyExists>().is_some() => {}
-                            Err(error) => return Err(error),
-                        }
-                        *purchase_required = false;
-                        *purchased = true;
-                    }
-                    let mut captured_download = None;
-                    let result = if platform == Platform::Macos && fairplay_capture_dir.is_some() {
-                        match backend.download_macos_ipa_with_capture(
-                            &catalog,
-                            account,
-                            &app,
-                            &external_version_id,
-                            output.as_deref(),
-                        ) {
-                            Ok(download) => {
-                                let path = download.path.clone();
-                                captured_download = Some(download);
-                                Ok(path)
-                            }
-                            Err(error) => Err(error),
-                        }
-                    } else if platform == Platform::Macos {
-                        backend.download_macos(
-                            &catalog,
-                            account,
-                            &app,
-                            &external_version_id,
-                            output.as_deref(),
-                        )
-                    } else if fairplay_capture_dir.is_some() {
-                        match backend.download_ipa_with_capture(
-                            &catalog,
-                            account,
-                            &app,
-                            &external_version_id,
-                            platform,
-                            output.as_deref(),
-                        ) {
-                            Ok(download) => {
-                                let path = download.path.clone();
-                                captured_download = Some(download);
-                                Ok(path)
-                            }
-                            Err(error) => Err(error),
-                        }
-                    } else {
-                        backend.download_ipa(
-                            &catalog,
-                            account,
-                            &app,
-                            &external_version_id,
-                            platform,
-                            output.as_deref(),
-                        )
-                    };
-                    result.map(|path| (app, path, captured_download))
-                },
+                fairplay_decrypt,
+                fairplay_model,
+                fairplay_output,
+                fairplay_report,
+                fairplay_force,
+                fairplay_capture_dir,
+            };
+            request.validate()?;
+            let result = ipatool_rs::application::download::download(
+                &ipatool_rs::application::context::ApplicationContext::legacy()?,
+                request,
             )?;
-            {
-                let capture_output = if let Some(directory) = fairplay_capture_dir.as_deref() {
-                    let download = captured_download
-                        .as_ref()
-                        .context("missing paired FairPlay download capture")?;
-                    Some(write_download_capture(
-                        directory,
-                        download,
-                        &app,
-                        &external_version_id,
-                        platform,
-                    )?)
-                } else {
-                    None
-                };
-                let decrypted = if fairplay_decrypt {
-                    let model = match fairplay_model.as_deref() {
-                        Some(model) => model,
-                        None => bail!("{}", require_model_diagnostic(&path)?),
-                    };
-                    let (decrypted_path, report_path) = fairplay_download_paths(
-                        &path,
-                        fairplay_output.as_deref(),
-                        fairplay_report.as_deref(),
-                    )?;
-                    decrypt_ipa_with_options(
-                        &path,
-                        &decrypted_path,
-                        model,
-                        Some(&report_path),
-                        fairplay_force,
-                    )?;
-                    Some((decrypted_path, report_path))
-                } else {
-                    None
-                };
-                match cli.format {
-                    Format::Json => {
-                        let mut output = serde_json::json!({
-                            "output": path, "purchased": purchased, "success": true
-                        });
-                        if let Some((decrypted_path, report_path)) = &decrypted {
-                            output["decryptedOutput"] = serde_json::json!(decrypted_path);
-                            output["report"] = serde_json::json!(report_path);
-                        }
-                        if let Some(capture_output) = &capture_output {
-                            output["fairplayCapture"] = serde_json::json!(capture_output);
-                        }
-                        println!("{output}");
+            match cli.format {
+                Format::Json => println!("{}", serde_json::to_string(&result)?),
+                Format::Text => {
+                    println!("{}", result.output.display());
+                    if let Some(path) = result.decrypted_output {
+                        println!("decrypted: {}", path.display());
                     }
-                    Format::Text => {
-                        println!("{}", path.display());
-                        if let Some((decrypted_path, report_path)) = decrypted {
-                            println!("decrypted: {}", decrypted_path.display());
-                            println!("report: {}", report_path.display());
-                        }
-                        if let Some(capture_output) = capture_output {
-                            println!("fairplay capture: {}", capture_output.display());
-                        }
+                    if let Some(path) = result.report {
+                        println!("report: {}", path.display());
+                    }
+                    if let Some(path) = result.fairplay_capture {
+                        println!("fairplay capture: {}", path.display());
                     }
                 }
             }
@@ -1062,42 +888,21 @@ fn run() -> Result<()> {
                 bail!("page must be positive and max results must be between 1 and {MAX_LIMIT}");
             }
             let platform = parse_platform(platform.as_deref())?;
-            let account_store = AccountStore::new(open_system_keychain()?);
-            let mut account = account_store.load()?;
-            let backend = NativeOwnedBackend::open()?;
-            let mut refreshed = false;
-            loop {
-                match store_owned::owned_apps(&backend, &account, page, max_results, platform) {
-                    Ok(output) => {
-                        match cli.format {
-                            Format::Json => println!("{}", serde_json::to_string(&output)?),
-                            Format::Text => {
-                                println!("count: {}", output.count);
-                                println!("totalCount: {}", output.total_count);
-                                println!("page: {}", output.page);
-                                for app in &output.apps {
-                                    print_app(app, Format::Text)?;
-                                }
-                            }
-                        }
-                        break;
+            let output = ipatool_rs::application::library::purchases(
+                &ipatool_rs::application::context::ApplicationContext::legacy()?,
+                page,
+                max_results,
+                platform,
+            )?;
+            match cli.format {
+                Format::Json => println!("{}", serde_json::to_string(&output)?),
+                Format::Text => {
+                    println!("count: {}", output.count);
+                    println!("totalCount: {}", output.total_count);
+                    println!("page: {}", output.page);
+                    for app in &output.apps {
+                        print_app(app, Format::Text)?;
                     }
-                    Err(error)
-                        if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
-                    {
-                        let authentication_backend = NativeAuthenticationBackend::open()?;
-                        account = store_login::login(
-                            &authentication_backend,
-                            &account_store,
-                            LoginInput {
-                                email: account.email.clone(),
-                                password: account.password.clone(),
-                                auth_code: String::new(),
-                            },
-                        )?;
-                        refreshed = true;
-                    }
-                    Err(error) => return Err(error),
                 }
             }
         }
@@ -1126,62 +931,26 @@ fn run() -> Result<()> {
             bundle_identifier,
             platform,
         } => {
-            if app_id.is_none_or(|id| id <= 0)
-                && bundle_identifier.as_deref().is_none_or(str::is_empty)
-            {
-                bail!("either the app ID or the bundle identifier must be specified");
-            }
-            let requested_platform = parse_platform(platform.as_deref())?;
-            let platform = requested_platform.unwrap_or(Platform::Iphone);
-            let account_store = AccountStore::new(open_system_keychain()?);
-            let mut account = account_store.load()?;
-            let backend = DownloadProductClient::open()?;
-            let catalog = CatalogClient::new()?;
-            let mut refreshed = false;
-            loop {
-                let app = if let Some(bundle_id) =
-                    bundle_identifier.as_deref().filter(|id| !id.is_empty())
-                {
-                    let country = country_code_from_storefront(&account.store_front)?;
-                    catalog.lookup(None, Some(bundle_id), country, requested_platform)?
-                } else {
-                    App {
-                        id: app_id.context("app ID is required")?,
-                        ..App::default()
+            let identity = ipatool_rs::application::library::AppIdentity {
+                app_id,
+                bundle_identifier,
+                platform: parse_platform(platform.as_deref())?,
+            };
+            identity.validate()?;
+            let output = ipatool_rs::application::library::versions(
+                &ipatool_rs::application::context::ApplicationContext::legacy()?,
+                &identity,
+            )?;
+            match cli.format {
+                Format::Json => println!("{}", serde_json::to_string(&output)?),
+                Format::Text => {
+                    println!(
+                        "latestExternalVersionID: {}",
+                        output.latest_external_version_id
+                    );
+                    for id in output.external_version_identifiers {
+                        println!("{id}");
                     }
-                };
-                match backend.list_versions(&catalog, &account, &app, platform) {
-                    Ok(output) => {
-                        match cli.format {
-                            Format::Json => println!("{}", serde_json::to_string(&output)?),
-                            Format::Text => {
-                                println!(
-                                    "latestExternalVersionID: {}",
-                                    output.latest_external_version_id
-                                );
-                                for id in output.external_version_identifiers {
-                                    println!("{id}");
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    Err(error)
-                        if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
-                    {
-                        let authentication_backend = NativeAuthenticationBackend::open()?;
-                        account = store_login::login(
-                            &authentication_backend,
-                            &account_store,
-                            LoginInput {
-                                email: account.email.clone(),
-                                password: account.password.clone(),
-                                auth_code: String::new(),
-                            },
-                        )?;
-                        refreshed = true;
-                    }
-                    Err(error) => return Err(error),
                 }
             }
         }
@@ -1191,59 +960,25 @@ fn run() -> Result<()> {
             external_version_id,
             platform,
         } => {
-            if app_id.is_none_or(|id| id <= 0)
-                && bundle_identifier.as_deref().is_none_or(str::is_empty)
-            {
-                bail!("either the app ID or the bundle identifier must be specified");
-            }
+            let identity = ipatool_rs::application::library::AppIdentity {
+                app_id,
+                bundle_identifier,
+                platform: parse_platform(platform.as_deref())?,
+            };
+            identity.validate()?;
             if external_version_id.is_empty() {
                 bail!("an external version ID is required");
             }
-            let platform = parse_platform(platform.as_deref())?;
-            let account_store = AccountStore::new(open_system_keychain()?);
-            let mut account = account_store.load()?;
-            let backend = DownloadProductClient::open()?;
-            let catalog = CatalogClient::new()?;
-            let mut refreshed = false;
-            loop {
-                let app = if let Some(bundle_id) =
-                    bundle_identifier.as_deref().filter(|id| !id.is_empty())
-                {
-                    let country = country_code_from_storefront(&account.store_front)?;
-                    catalog.lookup(None, Some(bundle_id), country, platform)?
-                } else {
-                    App {
-                        id: app_id.context("app ID is required")?,
-                        ..App::default()
-                    }
-                };
-                match backend.get_version_metadata(&account, &app, &external_version_id, platform) {
-                    Ok(metadata) => {
-                        match cli.format {
-                            Format::Json => println!("{}", serde_json::to_string(&metadata)?),
-                            Format::Text => {
-                                println!("displayVersion: {}", metadata.display_version);
-                                println!("releaseDate: {}", metadata.release_date);
-                            }
-                        }
-                        break;
-                    }
-                    Err(error)
-                        if !refreshed && error.downcast_ref::<PasswordTokenExpired>().is_some() =>
-                    {
-                        let authentication_backend = NativeAuthenticationBackend::open()?;
-                        account = store_login::login(
-                            &authentication_backend,
-                            &account_store,
-                            LoginInput {
-                                email: account.email.clone(),
-                                password: account.password.clone(),
-                                auth_code: String::new(),
-                            },
-                        )?;
-                        refreshed = true;
-                    }
-                    Err(error) => return Err(error),
+            let metadata = ipatool_rs::application::library::version_metadata(
+                &ipatool_rs::application::context::ApplicationContext::legacy()?,
+                &identity,
+                &external_version_id,
+            )?;
+            match cli.format {
+                Format::Json => println!("{}", serde_json::to_string(&metadata)?),
+                Format::Text => {
+                    println!("displayVersion: {}", metadata.display_version);
+                    println!("releaseDate: {}", metadata.release_date);
                 }
             }
         }
@@ -2443,27 +2178,6 @@ fn catalog_country(explicit: Option<&str>) -> String {
     explicit.unwrap_or("US").to_owned()
 }
 
-fn fairplay_download_paths(
-    package: &std::path::Path,
-    output: Option<&std::path::Path>,
-    report: Option<&std::path::Path>,
-) -> Result<(PathBuf, PathBuf)> {
-    if !package
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("ipa"))
-    {
-        bail!("FairPlay post-processing requires an IPA download");
-    }
-    Ok((
-        output
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| package.with_extension("decrypted.ipa")),
-        report
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| package.with_extension("decrypted.json")),
-    ))
-}
-
 fn print_search(output: &SearchOutput, format: Format) -> Result<()> {
     match format {
         Format::Json => println!(
@@ -2506,41 +2220,6 @@ fn print_purchase_success(already_owned: bool, format: Format) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn retry_download<T>(
-    account: &mut Account,
-    acquire_license: bool,
-    mut refresh: impl FnMut(&Account) -> Result<Account>,
-    mut attempt: impl FnMut(&Account, &mut bool, &mut bool) -> Result<T>,
-) -> Result<(T, bool)> {
-    let mut purchase_required = false;
-    let mut purchased = false;
-    let mut token_expired = false;
-    for attempt_index in 0..3 {
-        let result = (|| {
-            if token_expired {
-                *account = refresh(account)?;
-            }
-            attempt(account, &mut purchase_required, &mut purchased)
-        })();
-        match result {
-            Ok(output) => return Ok((output, purchased)),
-            Err(error) if attempt_index < 2 => {
-                if error.downcast_ref::<PasswordTokenExpired>().is_some() {
-                    token_expired = true;
-                } else if acquire_license && error.downcast_ref::<LicenseRequired>().is_some() {
-                    purchase_required = true;
-                    token_expired = false;
-                } else {
-                    return Err(error);
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("download retry loop always returns on its final attempt")
 }
 
 #[cfg(test)]

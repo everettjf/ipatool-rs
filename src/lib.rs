@@ -1,3 +1,4 @@
+pub mod application;
 pub mod arm64_compat;
 pub mod auth;
 mod buy_params;

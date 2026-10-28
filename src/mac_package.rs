@@ -230,19 +230,38 @@ fn download_mac_package_with(
     }
     let encrypted = suffixed(destination, ".ipatool-encrypted");
     let decrypted = suffixed(destination, ".ipatool-decrypted");
-    remove_if_present(&encrypted).context("prepare encrypted package staging")?;
+    let desktop = crate::application::operation::transfer_identity().is_some();
+    if !desktop {
+        remove_if_present(&encrypted).context("prepare encrypted package staging")?;
+    }
     remove_if_present(&decrypted).context("prepare decrypted package staging")?;
     let result: Result<()> = (|| {
         download(&item.url, &encrypted).context("download encrypted macOS package")?;
+        crate::application::operation::stage(crate::application::operation::Stage::Processing)?;
         decrypt(hardware_id, &dp_info, &encrypted, &decrypted)?;
+        crate::application::operation::stage(crate::application::operation::Stage::Verifying)?;
         validate_mac_package(&decrypted).context("validate decrypted macOS package")?;
-        publish_mac_package(&decrypted, destination)?;
+        crate::application::operation::publish(|| {
+            if desktop {
+                fs::hard_link(&decrypted, destination)
+                    .context("publish new macOS package without replacing existing output")?;
+                let _ = remove_if_present(&decrypted);
+                Ok(())
+            } else {
+                publish_mac_package(&decrypted, destination)
+            }
+        })?;
         for suffix in [".dpInfo", ".hwInfo"] {
             let _ = remove_if_present(&suffixed(destination, suffix));
         }
         Ok(())
     })();
-    let cleanup_encrypted = remove_if_present(&encrypted);
+    let cleanup_encrypted = if desktop && result.is_err() {
+        Ok(())
+    } else {
+        let _ = remove_if_present(&crate::download_file::resume_checkpoint_path(&encrypted));
+        remove_if_present(&encrypted)
+    };
     let cleanup_decrypted = remove_if_present(&decrypted);
     match result {
         Ok(()) => Ok(()),
@@ -866,6 +885,38 @@ mod tests {
         assert!(!suffixed(&destination, ".ipatool-encrypted").exists());
         assert!(!suffixed(&destination, ".ipatool-decrypted").exists());
         assert!(!suffixed(&destination, ".dpInfo").exists());
+    }
+
+    #[test]
+    fn desktop_publication_preserves_existing_pkg_and_retains_transfer_for_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("existing.pkg");
+        fs::write(&destination, b"original package").unwrap();
+        let package = xar(b"decrypted payload", false);
+        let result = crate::application::operation::Operation::default()
+            .with_transfer_identity("fixture".into())
+            .run(|| {
+                download_mac_package_with(
+                    &item("https://example.invalid/app.pkg".into(), b"session"),
+                    &destination,
+                    b"hardware",
+                    |_, target| {
+                        fs::write(target, b"encrypted package")?;
+                        Ok(17)
+                    },
+                    |_, _, _, target| {
+                        fs::write(target, &package)?;
+                        Ok(())
+                    },
+                )
+            });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"original package");
+        assert_eq!(
+            fs::read(suffixed(&destination, ".ipatool-encrypted")).unwrap(),
+            b"encrypted package"
+        );
+        assert!(!suffixed(&destination, ".ipatool-decrypted").exists());
     }
 
     #[test]
