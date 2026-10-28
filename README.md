@@ -11,9 +11,9 @@ Thank you to both projects and their maintainers. `ipatool-rs` brings these two 
 
 The current delivery target is **macOS on Apple Silicon**. Work on macOS x86_64, iOS, Linux, and Windows is deferred at the user's request.
 
-## Install the experimental preview
+## Install the experimental Rust rewrite
 
-On an Apple Silicon Mac, install the preview through the project's Homebrew tap:
+On an Apple Silicon Mac, install the release through the project's Homebrew tap:
 
 ```sh
 brew tap everettjf/tap
@@ -21,9 +21,9 @@ brew install everettjf/tap/ipatool-rs
 ipatool-rs --version
 ```
 
-Alternatively, download the macOS ARM64 archive and its SHA-256 file from the [GitHub release](https://github.com/everettjf/ipatool-rs/releases/tag/v0.1.0-preview.3). Verify the archive with `shasum -a 256 -c ipatool-rs-0.1.0-preview.3-macos-arm64.tar.gz.sha256`, extract it, and place the `ipatool-rs` executable in a directory on your `PATH`. The installed command is `ipatool-rs`, so it can coexist with the original `ipatool`.
+Alternatively, download the macOS ARM64 archive and its SHA-256 file from the [GitHub release](https://github.com/everettjf/ipatool-rs/releases/tag/v0.1.0). Verify the archive with `shasum -a 256 -c ipatool-rs-0.1.0-macos-arm64.tar.gz.sha256`, extract it, and place the `ipatool-rs` executable in a directory on your `PATH`. The installed command is `ipatool-rs`, so it can coexist with the original `ipatool`.
 
-This is a preview for testing. Preview.3 includes the signed runtime fix from preview.2 for Unicorn library loading and JIT access; preview.1 cannot complete account-backed Store operations. Real 2FA, successful recovery from a rejected Store token, interactive Keychain login and revoke, and private FairPlay decryption still need end-to-end validation. See [remaining work](docs/TODO.md).
+Version 0.1.0 is an experimental release for macOS on Apple Silicon. It includes the signed runtime fix for Unicorn library loading and JIT access. Real 2FA, successful recovery from a rejected Store token, interactive Keychain login and revoke, and private FairPlay decryption still need end-to-end validation. See [remaining work](docs/TODO.md). The 0.1.0 version number does not assert full parity with the reference projects.
 
 ## Build and check
 
