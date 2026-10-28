@@ -425,6 +425,10 @@ fn account_completion_preserves_quit_confirmation_and_pending_download(cx: &mut 
         view.update(cx, |this, cx| {
             this.pending_download = Some((FixtureSession::app(), Platform::Iphone, "US".into()));
             this.open_account(window, cx);
+            this.account_form.force_file = true;
+            this.account_form.passphrase.update(cx, |input, cx| {
+                input.set_value("fixture-store-passphrase", window, cx)
+            });
             this.submit_account(true, window, cx);
             this.request_quit(window, cx);
         })
@@ -925,6 +929,10 @@ fn expired_job_pauses_queue_and_same_account_unlock_resumes_each_request_once(
             assert_eq!(this.journal.tasks[0].state, TaskState::AwaitingInput);
             assert_eq!(this.journal.tasks[1].state, TaskState::Queued);
             this.open_account(window, cx);
+            this.account_form.force_file = true;
+            this.account_form.passphrase.update(cx, |input, cx| {
+                input.set_value("fixture-store-passphrase", window, cx)
+            });
             this.submit_account(true, window, cx);
         })
     });

@@ -274,7 +274,13 @@ available on Linux. A local patch retains upstream source/licenses/tests and
 maps only Linux/Android missing-attribute handling to ENODATA. It does not
 change the public API or pin libc backward. Provenance and the exact change are
 recorded in `vendor/xattr/PATCH.md`; CI runs its upstream tests on Linux.
-The follow-up CI run determines current portable build status.
+The follow-up Linux run passed shared/desktop fixtures and the upstream xattr
+tests before proceeding to Clippy/build. The first Windows MSVC GUI run compiled
+and passed shared tests, then exposed two controller fixtures that omitted the
+file-store passphrase despite Windows' file-storage default. Those scenarios now
+explicitly select file storage and provide the synthetic passphrase on every
+host; production defaults are unchanged. All 31 local controller tests pass.
+The latest CI run determines complete portable build status.
 
 The local feature remains a source-only experimental preview. Its public search,
 controller fixtures and synthetic native walkthroughs do not close live account,
