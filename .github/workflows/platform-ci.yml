@@ -1,0 +1,59 @@
+name: Platform CI
+
+on:
+  push:
+    branches: [main, codex/linux-windows-support]
+    paths-ignore: [web/**]
+  pull_request:
+    paths-ignore: [web/**]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable: target/x86_64-unknown-linux-gnu/release/ipatool
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            executable: target/aarch64-unknown-linux-gnu/release/ipatool
+          - name: Windows x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable: target/x86_64-pc-windows-msvc/release/ipatool.exe
+          - name: Windows ARM64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            executable: target/aarch64-pc-windows-msvc/release/ipatool.exe
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust target and components
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup +stable target add '${{ matrix.target }}'
+      - name: Check formatting
+        run: cargo +stable fmt --check
+      - name: Run tests
+        run: cargo +stable test --locked --target '${{ matrix.target }}' --all-targets --quiet
+      - name: Check warnings
+        run: cargo +stable clippy --locked --target '${{ matrix.target }}' --all-targets -- -D warnings
+      - name: Build release executable
+        run: cargo +stable build --locked --release --target '${{ matrix.target }}'
+      - name: Smoke test the native executable
+        run: |
+          executable='${{ matrix.executable }}'
+          "$executable" --version
+          "$executable" --non-interactive --format json search ScriptWidget --platform macos --country US --limit 1
