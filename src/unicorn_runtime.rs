@@ -234,18 +234,46 @@ fn ensure_library(
     fs::create_dir_all(&directory).context("failed to create Unicorn cache")?;
     let archive = download_archive(&directory, selected, client)?;
     let library = extract_library(&directory, archive.path(), selected)?;
-    // Drop the temporary file handle before renaming it. Windows cannot
-    // replace an already loaded DLL, and concurrent callers may have installed
-    // the same verified bytes while this caller was extracting its copy.
-    if let Err(error) = library.into_temp_path().persist_noclobber(&destination)
-        && !file_matches_sha256(&destination, selected.library_sha256)?
-    {
-        return Err(error).context("failed to install Unicorn library");
-    }
+    install_verified_library(library, &destination, selected.library_sha256)?;
     if !file_matches_sha256(&destination, selected.library_sha256)? {
         bail!("cached Unicorn library failed integrity verification");
     }
     Ok(destination)
+}
+
+fn install_verified_library(
+    library: NamedTempFile,
+    destination: &Path,
+    expected_sha256: &str,
+) -> Result<()> {
+    // A hard link publishes the checked bytes without replacing an already
+    // loaded Windows DLL. Retry transient access-denied errors from concurrent
+    // installation or antivirus inspection, and accept only the pinned hash.
+    let library = library.into_temp_path();
+    for attempt in 0..8 {
+        match fs::hard_link(&library, destination) {
+            Ok(()) => break,
+            Err(error) => {
+                if file_matches_sha256(destination, expected_sha256).unwrap_or(false) {
+                    return Ok(());
+                }
+                if attempt == 7
+                    || !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    )
+                {
+                    return Err(error).context("failed to install Unicorn library");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+    drop(library);
+    if !file_matches_sha256(destination, expected_sha256)? {
+        bail!("cached Unicorn library failed integrity verification");
+    }
+    Ok(())
 }
 
 fn download_archive(
@@ -512,6 +540,34 @@ mod tests {
         let path = directory.path().join("libunicorn.2.dylib");
         fs::write(&path, b"tampered").unwrap();
         assert!(!file_matches_sha256(&path, "0").unwrap());
+    }
+
+    #[test]
+    fn concurrent_install_keeps_one_verified_library() {
+        use std::sync::{Arc, Barrier};
+
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("libunicorn.dll");
+        let expected = format!("{:x}", Sha256::digest(b"checked library"));
+        let barrier = Arc::new(Barrier::new(8));
+        std::thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for _ in 0..8 {
+                let barrier = Arc::clone(&barrier);
+                let destination = &destination;
+                let expected = &expected;
+                workers.push(scope.spawn(move || {
+                    let mut library = NamedTempFile::new_in(destination.parent().unwrap()).unwrap();
+                    library.write_all(b"checked library").unwrap();
+                    barrier.wait();
+                    install_verified_library(library, destination, expected).unwrap();
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        assert!(file_matches_sha256(&destination, &expected).unwrap());
     }
 
     #[test]
