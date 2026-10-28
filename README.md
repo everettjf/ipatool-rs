@@ -155,8 +155,10 @@ states. No request is sent until you submit.
 
 The GUI is a source-only experiment, initially validated on Apple Silicon macOS.
 It is not included in release archives or Homebrew. The Windows GNU x86_64 GUI
-cross-build links successfully on macOS. Native Linux/Windows desktop sessions
-and the Windows MSVC GUI build remain unverified; CLI release status is unchanged.
+cross-build links successfully on macOS. Native CI also passes GUI builds,
+controller fixtures and Clippy on Linux x86_64 and Windows MSVC x86_64.
+Interactive Linux/Windows desktop and account checks remain open; CLI release
+status is unchanged.
 GPUI requires a graphical desktop and graphics support; macOS builds need Xcode
 with the Metal compiler tools. See the pinned [GPUI crate](https://docs.rs/crate/gpui/0.2.2)
 for platform dependencies.

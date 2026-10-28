@@ -1,6 +1,6 @@
 # Remaining work
 
-Status as of 2026-10-27. The 0.2.1 delivery targets are macOS on Apple Silicon, Linux x86_64, and Windows x86_64. Linux ARM64 and Windows ARM64 are no longer release targets. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
+Status as of 2026-10-28. The 0.2.1 delivery targets are macOS on Apple Silicon, Linux x86_64, and Windows x86_64. Linux ARM64 and Windows ARM64 are no longer release targets. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
 
 Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and release packaging jobs. Both Linux architectures previously passed account-free version and public-search smoke checks in Debian 13 QEMU guests; ARM64 is now deferred. The native CI results and release artifact checks are recorded in [PORTING.md](PORTING.md); account-backed workflows remain open.
 
@@ -18,11 +18,12 @@ Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and r
 
 The shared CLI/GUI workflow architecture, implementation milestones,
 and acceptance criteria are in [CLI_GUI_IMPLEMENTATION_PLAN.md](CLI_GUI_IMPLEMENTATION_PLAN.md).
-Rust package publication and a workspace split are deferred; this plan does not
-mark any implementation or live-validation gate complete.
+Rust package publication and a workspace split are deferred. Implementation
+checkboxes and local/CI evidence do not close the separate live-validation gates.
 
 - [ ] Validate screen-reader accessibility and keyboard navigation. The pinned GPUI build's macOS accessibility tree currently exposes the window chrome but not the custom catalog controls.
-- [ ] Validate Linux x86_64 and Windows x86_64 GUI builds and desktop interaction. Windows GNU GUI cross-build and strict all-targets Clippy pass on macOS; native MSVC/Linux builds and desktop sessions remain separate gates. Native GUI build/fixture jobs have been added locally; their execution remains pending submission. CLI CI is separate evidence.
+- [x] Validate native Linux x86_64 and Windows MSVC x86_64 GUI builds, deterministic controllers and strict all-targets Clippy in CI. Windows GNU GUI cross-build and strict all-targets Clippy also pass on macOS. The successful CI run is linked in [PORTING.md](PORTING.md).
+- [ ] Validate Linux x86_64 and Windows x86_64 GUI desktop interaction and account workflows. Headless controller tests and CLI CI do not establish these gates.
 - [ ] Complete distribution signing/notarization and release packaging before distributing the GUI. A repeatable, ad hoc signed macOS bundle build now passes locally; current releases remain CLI-only.
 - [ ] Finish fixture and live validation of the implemented account, download, and FairPlay desktop workflows, including 2FA, credential-store access, task recovery, safe cancellation, and output selection. Keep manual account/private-data checks last.
 - [ ] Complete private FairPlay processing and interruption walkthroughs. Refined dark normal/narrow, synthetic selector mismatch/matched prerequisites, report collision/retry, model pickers, and decryption-input handoff have native screenshot/interaction evidence. Light/system themes are out of scope at the user's request. Native synthetic challenge continuation, populated Library/filter/version selection, expired-session queue continuation, cancellation/completion, restart/download retry, and active-work quit handling now have observed evidence in `screenshots/fixtures/`; these do not close live account gates.

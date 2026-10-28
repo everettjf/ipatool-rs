@@ -233,6 +233,12 @@ The signed release app repeated real Mac/US public search (17 results with publi
 artwork), clear-query/result removal, sidebar collapse/restore, Down/Enter/
 Command-W selection retention, and Command-Comma settings checks. The current
 visual reference is [refined dark Explore](screenshots/explore-refined-dark.png).
+The final signed release also verified Tab and Shift-Tab through search controls
+and account fields, Enter activation of mode/download/Cancel buttons, restored
+download-button focus after cancellation, Command-F, Command-Comma, Escape and
+Command-W. Reopening after Escape showed an empty password control. Only an
+unsubmitted `.invalid` sample identity was entered; no account request ran.
+This keyboard evidence does not change the upstream custom-control AX gap.
 
 A native 900×650 walkthrough verified the revised shell and populated Library,
 and found that an encrypted saved-account load still exposed the ordinary
@@ -263,8 +269,8 @@ GUI-test suite passed the same 453/45 plus 31 desktop tests. Both retain 70
 explicitly ignored library checks. Strict default, production-GUI and GUI-test
 all-targets Clippy passed. Formatting and diff whitespace checks passed. The
 Windows GNU x86_64 final-source GUI cross-build linked a PE32+ GUI executable and
-passed strict all-targets Clippy. Native Linux/Windows execution and the MSVC
-build remain separate gates. Debug/release Apple Silicon app bundles rebuilt and
+passed strict all-targets Clippy. Native Linux/Windows desktop interaction
+remains a separate gate. Debug/release Apple Silicon app bundles rebuilt and
 passed strict ad hoc signatures; the rebuilt signed CLI returns 0.2.1 and passed
 an isolated account-free public search. The active synthetic guest cancellation
 check also passed explicitly against the pinned runtime. Full
@@ -283,7 +289,17 @@ and passed shared tests, then exposed two controller fixtures that omitted the
 file-store passphrase despite Windows' file-storage default. Those scenarios now
 explicitly select file storage and provide the synthetic passphrase on every
 host; production defaults are unchanged. All 31 local controller tests pass.
-The latest CI run determines complete portable build status.
+[Platform CI run 40782053570](https://github.com/everettjf/ipatool-rs/actions/runs/40782053570)
+passed all five jobs at `9d7fc66`: native Linux x86_64 and Windows MSVC x86_64
+GUI builds, deterministic controllers and strict Clippy; the macOS shared/GUI
+tests, Clippy and signed application-bundle build; and Linux/Windows release
+CLI builds, public catalog smoke checks and archive checksums. Portable CI
+explicitly skips 20 pinned-Apple-image checks unavailable on its runners; the
+complete local suites above cover those cached-image paths. Headless GUI tests
+and linking do not establish native portable desktop/account interaction.
+The subsequent heading-only shell change at `d0c8183` has complete local
+regression and signed release/native keyboard evidence; its CI rerun is
+[40783409188](https://github.com/everettjf/ipatool-rs/actions/runs/40783409188).
 
 The local feature remains a source-only experimental preview. Its public search,
 controller fixtures and synthetic native walkthroughs do not close live account,

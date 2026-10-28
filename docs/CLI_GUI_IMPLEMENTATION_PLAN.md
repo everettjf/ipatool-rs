@@ -304,6 +304,11 @@ authorized matched inputs are available and actually pass.
   notices; add concise recovery actions and redacted technical details.
 - [x] Verify close-window/quit behavior for active jobs and cancellation.
 
+Keyboard traversal, primary-button activation, modal focus restoration and
+shortcuts now have native walkthrough evidence. The first item remains open
+because pinned GPUI does not expose custom controls through macOS AX; keyboard
+success does not establish accessible names or screen-reader support.
+
 Exit evidence: observed end-to-end task walkthroughs and screenshots of the
 actual implemented states, with accessibility gaps explicitly recorded.
 
@@ -314,9 +319,9 @@ actual implemented states, with accessibility gaps explicitly recorded.
 - [ ] Validate existing guest/JIT entitlements and signing requirements when
   preparing a distributable GUI. Local ad hoc signing is not notarization.
 - [x] Extend GUI CI beyond catalog validation to fixture-backed workflows.
-- [ ] Build/check the GUI on Linux x86_64 and Windows x86_64, recording desktop
+- [x] Build/check the GUI on Linux x86_64 and Windows x86_64, recording desktop
   and account checks separately. Keep unverified support labeled experimental.
-- [ ] Update README, PORTING, TODO, and PR #7 around the actual final scope.
+- [x] Update README, PORTING, TODO, and PR #7 around the actual final scope.
 
 Exit evidence: reproducible macOS bundle, current CI results, local verification
 record, screenshots, and an accurate list of unverified live/platform gates.
