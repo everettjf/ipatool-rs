@@ -84,6 +84,9 @@ struct Cli {
     /// Passphrase for encrypted file storage (also selects it on macOS and Linux).
     #[arg(long, global = true)]
     keychain_passphrase: Option<String>,
+    /// Read the encrypted file-store passphrase from a private file (useful for MCP stdio).
+    #[arg(long, global = true, conflicts_with = "keychain_passphrase")]
+    keychain_passphrase_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -652,9 +655,15 @@ fn run() -> Result<()> {
             && matches!(cli.format, Format::Text)
             && io::stderr().is_terminal(),
     );
-    let force_file_keychain = cli.file_keychain || cli.keychain_passphrase.is_some();
+    let force_file_keychain = cli.file_keychain
+        || cli.keychain_passphrase.is_some()
+        || cli.keychain_passphrase_file.is_some();
+    let keychain_passphrase = match cli.keychain_passphrase_file.take() {
+        Some(path) => Some(read_file_keychain_passphrase(&path)?),
+        None => cli.keychain_passphrase.take(),
+    };
     configure_file_keychain(
-        cli.keychain_passphrase.take(),
+        keychain_passphrase,
         !cli.non_interactive && io::stdin().is_terminal(),
         force_file_keychain,
     );
@@ -2234,6 +2243,35 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+fn read_file_keychain_passphrase(path: &Path) -> Result<String> {
+    const MAX_PASSPHRASE_BYTES: u64 = 4096;
+    let file =
+        File::open(path).with_context(|| format!("open passphrase file {}", path.display()))?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_PASSPHRASE_BYTES {
+        bail!("passphrase file must be a regular file of at most 4096 bytes");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("passphrase file must not be accessible to group or other users");
+        }
+    }
+    let mut passphrase = String::new();
+    file.take(MAX_PASSPHRASE_BYTES + 1)
+        .read_to_string(&mut passphrase)
+        .context("read passphrase file")?;
+    if passphrase.len() as u64 > MAX_PASSPHRASE_BYTES {
+        bail!("passphrase file exceeds 4096 bytes");
+    }
+    passphrase.truncate(passphrase.trim_end_matches(['\r', '\n']).len());
+    if passphrase.is_empty() {
+        bail!("passphrase file is empty");
+    }
+    Ok(passphrase)
+}
+
 fn parse_enrollment_selector(value: &str) -> Result<SinfSelector> {
     let (user, key) = value
         .split_once(':')
@@ -3522,5 +3560,44 @@ mod tests {
         assert!(cli.file_keychain);
         assert!(cli.keychain_passphrase.is_none());
         assert!(matches!(cli.command, Command::Auth { .. }));
+    }
+
+    #[test]
+    fn file_keychain_passphrase_file_parses_without_secret_in_arguments() {
+        let cli = Cli::try_parse_from([
+            "ipatool",
+            "--keychain-passphrase-file",
+            "/tmp/ipatool-passphrase",
+            "mcp",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.keychain_passphrase_file,
+            Some(PathBuf::from("/tmp/ipatool-passphrase"))
+        );
+        assert!(cli.keychain_passphrase.is_none());
+        assert!(matches!(cli.command, Command::Mcp));
+    }
+
+    #[test]
+    fn file_keychain_passphrase_file_reads_private_single_line() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("passphrase");
+        std::fs::write(&path, "example secret\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            read_file_keychain_passphrase(&path).unwrap(),
+            "example secret"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(read_file_keychain_passphrase(&path).is_err());
+        }
     }
 }
