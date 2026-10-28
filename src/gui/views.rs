@@ -159,6 +159,7 @@ impl DesktopWindow {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Dialog {
+        let dialog = dialog.bg(cx.theme().popover);
         let output = self.settings_output.clone();
         let body = v_flex().gap_4()
             .child(label("DEFAULT DOWNLOAD DIRECTORY", cx))
@@ -337,7 +338,13 @@ impl DesktopWindow {
                                     } else {
                                         cx.theme().background
                                     })
-                                    .hover(|style| style.bg(cx.theme().accent))
+                                    .hover(|style| {
+                                        style.bg(if selected == Some(index) {
+                                            cx.theme().accent
+                                        } else {
+                                            cx.theme().secondary
+                                        })
+                                    })
                                     .child(
                                         div()
                                             .flex_shrink_0()
@@ -628,6 +635,7 @@ impl DesktopWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Dialog {
+        let dialog = dialog.bg(cx.theme().popover);
         let busy = self.account_form.busy;
         let verifying = self.account_form.verifying;
         let unlocking = self.account_form.unlocking_saved;
@@ -773,6 +781,7 @@ impl DesktopWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Dialog {
+        let dialog = dialog.bg(cx.theme().popover);
         let Some(form) = &self.download_form else {
             return dialog.title("Download");
         };
@@ -851,7 +860,7 @@ impl DesktopWindow {
             content = content.child(v_flex().p_4().gap_2().child(div().text_color(cx.theme().danger).child(error.clone()))
                 .child(Button::new("recover-history").label("Preserve unreadable history and start a new journal...").disabled(self.active.is_some()).on_click(cx.listener(|_this, _, window, cx| {
                     let weak = cx.entity().downgrade();
-                    window.open_dialog(cx, move |dialog, _, _| { let weak = weak.clone(); dialog.title("Recover task history?").child("The previous journal will be moved to a uniquely named backup. No downloaded files or private materials will be deleted.").confirm().on_ok(move |_, _, cx| { let _ = weak.update(cx, |this, cx| {
+                    window.open_dialog(cx, move |dialog, _, cx| { let weak = weak.clone(); dialog.bg(cx.theme().popover).title("Recover task history?").child("The previous journal will be moved to a uniquely named backup. No downloaded files or private materials will be deleted.").confirm().on_ok(move |_, _, cx| { let _ = weak.update(cx, |this, cx| {
                         let path = this.session.directory().join("desktop-tasks.json");
                         match Journal::preserve_existing(&path) {
                             Ok(_) => { this.journal_error = None; this.persist_history(); }

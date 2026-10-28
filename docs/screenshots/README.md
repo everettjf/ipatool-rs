@@ -6,7 +6,7 @@ for public browsing and empty-form validation. The separate
 [fixture captures](fixtures/README.md) show the same native controls with
 explicitly synthetic account, Library, version, and download services. They are
 not live account evidence. The refined dark and collapsed captures show the
-current `🦀IPATOOL-RS 🦀` native title. The refined dark capture is the current
+current `🦀IPATOOL-RS 🦀` native title and neutral graphite palette. The refined dark capture is the current
 visual reference. Earlier images are
 historical interaction evidence and may show superseded controls. Light/system
 themes are no longer supported; subsequent interaction changes require refreshing
@@ -14,8 +14,10 @@ affected captures.
 
 | Capture | Observed state | Evidence limit |
 | --- | --- | --- |
-| [Explore, refined dark](explore-refined-dark.png) | Signed release app without a top toolbar; account/settings/sidebar controls sit at the bottom of navigation. Full-height details and 17 real public Mac / US results. | Public browsing only; no account operation. |
+| [Explore, refined dark](explore-refined-dark.png) | Signed release app with neutral gray content, brighter sidebar, gray selections and blue primary actions; no top toolbar. Full-height details and 17 real public Mac / US results. | Public browsing only; no account operation. |
 | [Collapsed sidebar](explore-footer-collapsed.png) | The same signed release app retains navigation, account, settings and expand controls in a narrow icon rail. | Public browsing and empty account/settings sheets only; no account request. |
+| [Sign in, graphite](sign-in-graphite.png) | The current neutral gray dialog is raised above the content, with inset inputs and a blue primary action. | Empty fields; no authentication request or credential access. |
+| [FairPlay, graphite](fairplay-graphite.png) | Current neutral surfaces, gray mode selection and blue primary action. | No private input was selected and no processing ran. |
 | [Explore, dark](explore-dark.png) | Public ScriptWidget search, Mac / US, 17 results; real public artwork; keyboard-selected Widgy details; fixed sign-in/download action. | No account or download was exercised. |
 | [Explore release build, dark](explore-release-dark.png) | Signed release app, real public Mac / US search and artwork; metadata scrolled to the end with all copy actions visible inside the window. | Launch and public browsing evidence only. |
 | [Historical light appearance](explore-light.png) | Superseded appearance option, captured before the dark-only scope decision. | Historical evidence; no longer a supported mode. |

@@ -146,8 +146,10 @@ Build and run the optional native desktop from source:
 cargo run --locked --features gui --bin ipatool-gui
 ```
 
-The desktop is titled **🦀IPATOOL-RS 🦀** and uses a focused dark theme and a
-full-height workspace. Account, settings and sidebar controls sit at the bottom
+The desktop is titled **🦀IPATOOL-RS 🦀** and uses a macOS-inspired graphite dark
+palette: neutral gray surfaces, a brighter sidebar and dialogs, gray selections,
+and blue primary actions and focus rings. It has a full-height workspace.
+Account, settings and sidebar controls sit at the bottom
 of the aligned navigation;
 narrow or collapsed windows use a compact icon rail. It supports public search,
 lookup by App ID or bundle identifier, six

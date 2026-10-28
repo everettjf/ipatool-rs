@@ -501,9 +501,9 @@ impl DesktopWindow {
             return;
         }
         let view = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, _, cx| {
             let view = view.clone();
-            dialog.title("Remove saved credentials?").child("This removes the local account and KBSync cache. It does not revoke this device through Apple's account service or delete downloaded files.")
+            dialog.bg(cx.theme().popover).title("Remove saved credentials?").child("This removes the local account and KBSync cache. It does not revoke this device through Apple's account service or delete downloaded files.")
                 .confirm().on_ok(move |_, window, cx| {
                     let _ = view.update(cx, |this, cx| {
                         this.account_form.busy = true; let session = Arc::clone(&this.session);
@@ -1313,10 +1313,10 @@ impl DesktopWindow {
         }
         self.quit_prompt_open = true;
         let view = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, _, cx| {
             let view = view.clone();
             let close = view.clone();
-            dialog.title("Stop work and quit?")
+            dialog.bg(cx.theme().popover).title("Stop work and quit?")
                 .child("Queued tasks will be cancelled. Running work will stop at a safe boundary before the application quits. Output publication and outstanding system credential prompts may need to finish first.")
                 .confirm().on_ok(move |_, window, cx| {
                     let _ = view.update(cx, |this, cx| {

@@ -589,6 +589,7 @@ impl Render for DesktopWindow {
                 .into_any_element()
         };
         let sidebar = v_flex()
+            .bg(cx.theme().sidebar)
             .w(px(if expanded { 200. } else { 56. }))
             .flex_shrink_0()
             .h_full()

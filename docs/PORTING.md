@@ -328,6 +328,20 @@ and GUI-test suites (453/45/32), three strict Clippy configurations, formatting
 and debug/release signed bundle checks passed again for this display-only change.
 Bundle identifiers, executable names and CLI commands retain their existing names.
 
+The next appearance refinement replaces blue-tinted backgrounds, controls,
+dividers and large selection fills with neutral graphite gray. Content uses
+`#1e1e1e`, navigation `#282828`, and raised dialogs/popovers `#2b2b2b`; primary
+actions and focus retain blue. This is an opaque GPUI approximation inspired by
+[Apple's Dark Mode guidance](https://developer.apple.com/design/human-interface-guidelines/dark-mode),
+not dynamic AppKit vibrancy. Hovered results remain distinct from selected rows.
+Calculated contrast is 5.65:1 for white primary-button text, 6.75:1 for secondary
+dialog text, and 4.95:1 for secondary text on selected rows. All 453/45/32 local
+tests, three strict Clippy configurations, formatting and debug/release signed
+bundle builds passed again. Native release checks covered real public search
+(17 Mac/US results), empty sign-in/settings dialogs, FairPlay navigation and
+sidebar collapse/restore. Current normal/collapsed, sign-in and FairPlay captures
+are in the native gallery; older captures retain their historical palettes.
+
 The local feature remains a source-only experimental preview. Its public search,
 controller fixtures and synthetic native walkthroughs do not close live account,
 Keychain approval, signed-bundle Store/JIT, real IPA/PKG, or private FairPlay gates.

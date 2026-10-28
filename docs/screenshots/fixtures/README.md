@@ -7,10 +7,12 @@ versions, downloads, and progress are synthetic. The screenshots demonstrate
 rendered controls and observed interaction, not successful Apple authentication,
 real package transfers, or private FairPlay compatibility. See
 [the harness instructions](../../GUI_FIXTURE_PREVIEW.md).
+These interaction captures predate the neutral graphite palette; use the
+[current native gallery](../README.md) for appearance review.
 
 | Capture | Observed interaction |
 | --- | --- |
-| [Refined narrow shell](explore-refined-narrow.png) | The current full-height dark shell fits 900×650 with an icon rail and bottom account/settings actions; only the synthetic fixture banner remains above the workspace. |
+| [Refined narrow shell](explore-refined-narrow.png) | The full-height shell fits 900×650 with an icon rail and bottom account/settings actions; only the synthetic fixture banner remains above the workspace. |
 | [Advanced FairPlay after toolbar removal](fairplay-footer-narrow.png) | After scrolling to the end, the entire Build version field remains visible while Add collection task stays fixed. No collection was submitted or private input selected. |
 | [Refined narrow Library](library-refined-narrow.png) | Six-page synthetic Library retains aligned selection and a visible download action at the minimum window size. |
 | [Saved-account unlock](unlock-narrow.png) | A failed encrypted-store load opens a focused passphrase-only sheet with Unlock and continue; clicking the primary action with the fixture passphrase returned to the workspace. |
