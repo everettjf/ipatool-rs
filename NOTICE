@@ -1,0 +1,15 @@
+ipatool-rs is an experimental Rust rewrite informed by ipatool and UnfairPlay.
+The project is distributed under the MIT License; see LICENSE. The original
+ipatool MIT copyright notice is retained there.
+
+UnfairPlay contains code developed in the ipatool project and its DrWhax
+FairPlay research fork. Its main license is MIT. See
+https://github.com/DrWhax/unfairplay and its LICENSE and NOTICE files.
+
+The in-process AES differential-fault recovery code was adapted from the
+Apache-2.0 DarkPhoenix subset in UnfairPlay. The modified Rust source files
+carry attribution notices. See licenses/LICENSE-DARKPHOENIX.txt for the
+Apache-2.0 license text.
+
+Apple, FairPlay, macOS, iOS, and App Store are trademarks of Apple Inc. This
+project is independent and is not affiliated with or endorsed by Apple.

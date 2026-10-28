@@ -23,12 +23,15 @@ codesign --force --options runtime --timestamp --sign "$IPATOOL_CODESIGN_IDENTIT
 codesign --verify --strict "$STAGE/ipatool-rs"
 "$STAGE/ipatool-rs" --version
 cp "$ROOT/LICENSE" "$STAGE/LICENSE"
+cp "$ROOT/NOTICE" "$STAGE/NOTICE"
+mkdir -p "$STAGE/licenses"
+cp "$ROOT/licenses/LICENSE-DARKPHOENIX.txt" "$STAGE/licenses/LICENSE-DARKPHOENIX.txt"
 cp "$ROOT/README.md" "$STAGE/README.md"
 
 BASE="ipatool-rs-$VERSION-macos-arm64"
 ARCHIVE="$OUTPUT_DIR/$BASE.tar.gz"
 NOTARY_ZIP="$OUTPUT_DIR/$BASE-notary.zip"
-COPYFILE_DISABLE=1 tar -C "$STAGE" -czf "$ARCHIVE" ipatool-rs LICENSE README.md
+COPYFILE_DISABLE=1 tar -C "$STAGE" -czf "$ARCHIVE" ipatool-rs LICENSE NOTICE licenses/LICENSE-DARKPHOENIX.txt README.md
 ditto -c -k --keepParent "$STAGE/ipatool-rs" "$NOTARY_ZIP"
 (cd "$OUTPUT_DIR" && shasum -a 256 "$BASE.tar.gz" > "$BASE.tar.gz.sha256")
 tar -tzf "$ARCHIVE" >/dev/null
