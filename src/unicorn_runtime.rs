@@ -234,9 +234,14 @@ fn ensure_library(
     fs::create_dir_all(&directory).context("failed to create Unicorn cache")?;
     let archive = download_archive(&directory, selected, client)?;
     let library = extract_library(&directory, archive.path(), selected)?;
-    library
-        .persist(&destination)
-        .context("failed to install Unicorn library")?;
+    // Drop the temporary file handle before renaming it. Windows cannot
+    // replace an already loaded DLL, and concurrent callers may have installed
+    // the same verified bytes while this caller was extracting its copy.
+    if let Err(error) = library.into_temp_path().persist_noclobber(&destination)
+        && !file_matches_sha256(&destination, selected.library_sha256)?
+    {
+        return Err(error).context("failed to install Unicorn library");
+    }
     if !file_matches_sha256(&destination, selected.library_sha256)? {
         bail!("cached Unicorn library failed integrity verification");
     }

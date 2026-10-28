@@ -57,7 +57,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup +stable target add '${{ matrix.target }}'
       - name: Run tests
-        run: cargo +stable test --locked --target '${{ matrix.target }}' --all-targets --quiet
+        run: scripts/test-portable.sh '${{ matrix.target }}'
       - name: Build release executable
         run: cargo +stable build --locked --release --target '${{ matrix.target }}'
       - name: Native smoke test
