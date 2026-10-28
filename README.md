@@ -2,7 +2,7 @@
 
 App Store search, account management, IPA / PKG downloads, and FairPlay tooling in Rust.
 
-[![Release](https://img.shields.io/github/v/release/everettjf/ipatool-rs?style=flat-square&color=178c82)](https://github.com/everettjf/ipatool-rs/releases)
+[![Release](https://img.shields.io/badge/releases-download-178c82?style=flat-square)](https://github.com/everettjf/ipatool-rs/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-487bc4?style=flat-square)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20arm64%20%7C%20Linux%20x86__64%20%7C%20Windows%20x86__64-7356a8?style=flat-square)](#platforms)
 
@@ -24,7 +24,7 @@ Built on the work of [ipatool](https://github.com/majd/ipatool), [UnfairPlay](ht
 
 ## Platforms
 
-Version **0.2.1** provides the following release targets:
+The following release targets are available:
 
 | Operating system | Architecture | Distribution | Current scope |
 | --- | --- | --- | --- |
@@ -48,37 +48,37 @@ For an existing installation, use `brew upgrade everettjf/tap/ipatool-rs`.
 
 ### Release archives
 
-Download the matching archive and its companion `.sha256` file from [GitHub Releases](https://github.com/everettjf/ipatool-rs/releases/tag/v0.2.1):
+Download the matching archive and its companion `.sha256` file from [GitHub Releases](https://github.com/everettjf/ipatool-rs/releases/latest):
 
 | Platform | Archive |
 | --- | --- |
-| macOS arm64 | [ipatool-rs-0.2.1-macos-arm64.tar.gz](https://github.com/everettjf/ipatool-rs/releases/download/v0.2.1/ipatool-rs-0.2.1-macos-arm64.tar.gz) |
-| Linux x86_64 | [ipatool-rs-0.2.1-linux-x86_64.tar.gz](https://github.com/everettjf/ipatool-rs/releases/download/v0.2.1/ipatool-rs-0.2.1-linux-x86_64.tar.gz) |
-| Windows x86_64 | [ipatool-rs-0.2.1-windows-x86_64.zip](https://github.com/everettjf/ipatool-rs/releases/download/v0.2.1/ipatool-rs-0.2.1-windows-x86_64.zip) |
+| macOS arm64 | [Latest release](https://github.com/everettjf/ipatool-rs/releases/latest) — choose `*-macos-arm64.tar.gz` |
+| Linux x86_64 | [Latest release](https://github.com/everettjf/ipatool-rs/releases/latest) — choose `*-linux-x86_64.tar.gz` |
+| Windows x86_64 | [Latest release](https://github.com/everettjf/ipatool-rs/releases/latest) — choose `*-windows-x86_64.zip` |
 
 Verify the checksum, extract the archive, and put the directory containing `ipatool-rs` on your `PATH`. On Windows, the executable is `ipatool-rs.exe`. The installed command is **`ipatool-rs`** and can coexist with the original `ipatool`.
 
 <details>
 <summary>Checksum verification</summary>
 
-Run the check from the directory containing both the archive and its checksum file.
+Run the check from the directory containing both the archive and its checksum file. Keep only the release you want to verify in that directory; the wildcards below match its downloaded filenames.
 
 macOS:
 
 ```sh
-shasum -a 256 -c ipatool-rs-0.2.1-macos-arm64.tar.gz.sha256
+shasum -a 256 -c ipatool-rs-*-macos-arm64.tar.gz.sha256
 ```
 
 Linux:
 
 ```sh
-sha256sum -c ipatool-rs-0.2.1-linux-x86_64.tar.gz.sha256
+sha256sum -c ipatool-rs-*-linux-x86_64.tar.gz.sha256
 ```
 
 Windows PowerShell: compare the resulting hash with the companion `.sha256` file.
 
 ```powershell
-Get-FileHash .\ipatool-rs-0.2.1-windows-x86_64.zip -Algorithm SHA256
+Get-FileHash .\ipatool-rs-*-windows-x86_64.zip -Algorithm SHA256
 ```
 
 </details>
