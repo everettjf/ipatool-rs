@@ -2,7 +2,7 @@ name: Platform CI
 
 on:
   push:
-    branches: [main, codex/linux-windows-support]
+    branches: [main]
     paths-ignore: [web/**]
   pull_request:
     paths-ignore: [web/**]
@@ -24,24 +24,12 @@ jobs:
             family: linux
             arch: x86_64
             executable: target/x86_64-unknown-linux-gnu/release/ipatool
-          - name: Linux ARM64
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            family: linux
-            arch: aarch64
-            executable: target/aarch64-unknown-linux-gnu/release/ipatool
           - name: Windows x86_64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             family: windows
             arch: x86_64
             executable: target/x86_64-pc-windows-msvc/release/ipatool.exe
-          - name: Windows ARM64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            family: windows
-            arch: arm64
-            executable: target/aarch64-pc-windows-msvc/release/ipatool.exe
     runs-on: ${{ matrix.runner }}
     defaults:
       run:

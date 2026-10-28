@@ -23,20 +23,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
             arch: x86_64
             family: linux
-          - name: Linux ARM64
-            runner: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            arch: aarch64
-            family: linux
           - name: Windows x86_64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             arch: x86_64
-            family: windows
-          - name: Windows ARM64
-            runner: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            arch: arm64
             family: windows
     runs-on: ${{ matrix.runner }}
     defaults:
@@ -123,7 +113,7 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          test "$(find dist -maxdepth 1 -name '*.sha256' | wc -l)" -eq 4
+          test "$(find dist -maxdepth 1 -name '*.sha256' | wc -l)" -eq 2
           (cd dist && sha256sum -c ./*.sha256)
           gh release upload "$RELEASE_TAG" dist/*
           gh release edit "$RELEASE_TAG" --draft=false --latest
