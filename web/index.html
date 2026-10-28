@@ -35,11 +35,11 @@
 
         <div class="terminal" aria-label="Example ipatool-rs commands">
           <div class="terminal-bar"><span class="terminal-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>terminal / ipatool-rs</span></div>
-          <pre><code><span class="prompt">$</span> ipatool search ScriptWidget --platform macos
+          <pre><code><span class="prompt">$</span> ipatool-rs search ScriptWidget --platform macos
 
-<span class="prompt">$</span> ipatool auth login
+<span class="prompt">$</span> ipatool-rs auth login
 
-<span class="prompt">$</span> ipatool fairplay-doctor --help<span class="cursor" aria-hidden="true">_</span></code></pre>
+<span class="prompt">$</span> ipatool-rs fairplay-doctor --help<span class="cursor" aria-hidden="true">_</span></code></pre>
         </div>
       </section>
 
@@ -62,11 +62,10 @@
       </section>
 
       <section class="section shell start-section" id="start" aria-labelledby="start-title">
-        <div class="section-heading"><p class="eyebrow">02 / GET STARTED</p><h2 id="start-title">Build. Run. Explore.</h2><p>Current release target: macOS on Apple Silicon. You need a Rust toolchain and macOS signing tools.</p></div>
-        <div class="command-block"><div class="command-label">QUICK START <span>macOS arm64</span></div><pre><code>git clone https://github.com/everettjf/ipatool-rs.git
-cd ipatool-rs
-scripts/build-macos.sh --arm64
-./target/release/ipatool-macos-arm64 search ScriptWidget --platform macos</code></pre></div>
+        <div class="section-heading"><p class="eyebrow">02 / GET STARTED</p><h2 id="start-title">Install. Run. Explore.</h2><p>Experimental preview for macOS on Apple Silicon. <a href="https://github.com/everettjf/ipatool-rs/releases/tag/v0.1.0-preview.1">Download the release and checksum ↗</a></p></div>
+        <div class="command-block"><div class="command-label">QUICK START <span>macOS arm64</span></div><pre><code>brew tap everettjf/tap
+brew install everettjf/tap/ipatool-rs
+ipatool-rs search ScriptWidget --platform macos</code></pre></div>
       </section>
 
       <section class="section shell status-section" id="status" aria-labelledby="status-title">

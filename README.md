@@ -11,6 +11,20 @@ Thank you to both projects and their maintainers. `ipatool-rs` brings these two 
 
 The current delivery target is **macOS on Apple Silicon**. Work on macOS x86_64, iOS, Linux, and Windows is deferred at the user's request.
 
+## Install the experimental preview
+
+On an Apple Silicon Mac, install the preview through the project's Homebrew tap:
+
+```sh
+brew tap everettjf/tap
+brew install everettjf/tap/ipatool-rs
+ipatool-rs --version
+```
+
+Alternatively, download the macOS ARM64 archive and its SHA-256 file from the [GitHub release](https://github.com/everettjf/ipatool-rs/releases/tag/v0.1.0-preview.1). Verify the archive with `shasum -a 256 -c ipatool-rs-0.1.0-preview.1-macos-arm64.tar.gz.sha256`, extract it, and place the `ipatool-rs` executable in a directory on your `PATH`. The installed command is `ipatool-rs`, so it can coexist with the original `ipatool`.
+
+This is a preview for testing. Real 2FA, successful recovery from a rejected Store token, default Keychain approval, and private FairPlay decryption still need end-to-end validation. See [remaining work](docs/TODO.md).
+
 ## Build and check
 
 ```sh
@@ -21,6 +35,8 @@ scripts/build-macos.sh --arm64
 ```
 
 The build script creates a signed `target/release/ipatool-macos-arm64` executable. The signature is ad hoc; it is not Apple notarization. The executable does not launch a separate Go, Python, or Swift binary. Store and SAP operations still run selected, pinned Apple framework code inside the Rust emulator.
+
+Release archives use a Developer ID signature and an Apple notarization check. The release procedure is in [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Public catalog commands
 

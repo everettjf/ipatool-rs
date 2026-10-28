@@ -1,4 +1,5 @@
 /target/
+/dist/
 /ipatool-ios-arm64
 /vendor/apfs/target/
 /vendor/apfs/Cargo.lock
