@@ -520,11 +520,77 @@ impl Render for DesktopWindow {
             .iter()
             .filter(|task| task.state.is_active())
             .count();
+        let can_expand = window.viewport_size().width >= px(1000.);
+        let expanded = self.sidebar_visible && can_expand;
+        let account_label = self
+            .account
+            .as_ref()
+            .map(|account| format!("{} / {}", account.name, account.country))
+            .unwrap_or_else(|| "Sign in".into());
+        let account = Button::new("account")
+            .debug_selector(|| "shell-account".into())
+            .ghost()
+            .w_full()
+            .h(px(36.))
+            .icon(IconName::CircleUser)
+            .tooltip(account_label.clone())
+            .when(expanded, |button| {
+                button.px_3().justify_start().child(
+                    div()
+                        .w(px(120.))
+                        .truncate()
+                        .text_left()
+                        .child(account_label),
+                )
+            })
+            .disabled(self.account_form.busy)
+            .on_click(cx.listener(|this, _, window, cx| this.open_account(window, cx)));
+        let settings = Button::new("settings")
+            .debug_selector(|| "shell-settings".into())
+            .ghost()
+            .w_full()
+            .h(px(36.))
+            .icon(IconName::Settings)
+            .tooltip("Settings")
+            .when(expanded, |button| {
+                button.flex_1().px_3().justify_start().label("Settings")
+            })
+            .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)));
+        let toggle = Button::new("toggle-navigation")
+            .debug_selector(|| "shell-toggle".into())
+            .small()
+            .ghost()
+            .icon(IconName::PanelLeft)
+            .tooltip(if expanded {
+                "Collapse sidebar"
+            } else {
+                "Expand sidebar"
+            })
+            .w(px(28.))
+            .h(px(28.))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.sidebar_visible = !this.sidebar_visible;
+                cx.notify();
+            }));
+        let footer_controls = if expanded {
+            h_flex()
+                .gap_1()
+                .child(settings)
+                .child(toggle)
+                .into_any_element()
+        } else {
+            v_flex()
+                .items_center()
+                .gap_1()
+                .child(settings)
+                .when(can_expand, |column| column.child(toggle))
+                .into_any_element()
+        };
         let sidebar = v_flex()
-            .w(px(200.))
+            .w(px(if expanded { 200. } else { 56. }))
             .flex_shrink_0()
             .h_full()
-            .px_3()
+            .px(px(if expanded { 12. } else { 8. }))
             .py_4()
             .gap_1()
             .border_r_1()
@@ -539,23 +605,34 @@ impl Render for DesktopWindow {
                 .into_iter()
                 .enumerate()
                 .map(|(index, page)| {
+                    let label = if page == Page::Downloads && active_count > 0 {
+                        format!("Downloads  {active_count}")
+                    } else {
+                        page.title().into()
+                    };
                     Button::new(("navigation", index))
                         .ghost()
                         .w_full()
                         .h(px(36.))
-                        .px_3()
-                        .justify_start()
+                        .px(px(if expanded { 12. } else { 0. }))
                         .icon(match page {
                             Page::Explore => IconName::Globe,
                             Page::Library => IconName::Inbox,
                             Page::Downloads => IconName::ArrowDown,
                             Page::FairPlay => IconName::CircleCheck,
                         })
-                        .label(if page == Page::Downloads && active_count > 0 {
-                            format!("Downloads  {active_count}")
-                        } else {
-                            page.title().into()
-                        })
+                        .tooltip(label.clone())
+                        .when(expanded, |button| button.justify_start().label(label))
+                        .when(
+                            !expanded && page == Page::Downloads && active_count > 0,
+                            |button| {
+                                button.child(div().text_xs().child(if active_count > 9 {
+                                    "9+".to_owned()
+                                } else {
+                                    active_count.to_string()
+                                }))
+                            },
+                        )
                         .selected(self.page == page)
                         .when(self.page == page, |button| {
                             button
@@ -581,127 +658,36 @@ impl Render for DesktopWindow {
             )
             .child(div().flex_1())
             .child(
-                Button::new("settings")
-                    .ghost()
-                    .w_full()
-                    .h(px(36.))
-                    .px_3()
-                    .justify_start()
-                    .icon(IconName::Settings)
-                    .label("Settings")
-                    .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
+                v_flex()
+                    .gap_1()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .child(account)
+                    .child(footer_controls),
             );
-        let account_label = self
-            .account
-            .as_ref()
-            .map(|account| format!("{} / {}", account.name, account.country))
-            .unwrap_or_else(|| "Sign in".into());
         v_flex()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .text_sm()
-            .child(
-                h_flex()
-                    .px_4()
-                    .h(px(52.))
-                    .gap_3()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .when(window.viewport_size().width >= px(1000.), |row| {
-                        row.child(
-                            Button::new("toggle-navigation")
-                                .small()
-                                .ghost()
-                                .icon(IconName::PanelLeft)
-                                .tooltip("Toggle sidebar")
-                                .w(px(28.))
-                                .h(px(28.))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.sidebar_visible = !this.sidebar_visible;
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .when(
-                        window.viewport_size().width >= px(1000.) && !self.sidebar_visible,
-                        |row| row.child(div().text_lg().child(self.page.title())),
-                    )
-                    .when(self.session.is_fixture(), |row| {
-                        row.child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Fixture preview · no Apple requests"),
-                        )
-                    })
-                    .child(div().flex_1())
-                    .when(self.active.is_some(), |row| {
-                        row.child(
-                            div()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("Task running in background"),
-                        )
-                    })
-                    .child(
-                        Button::new("account")
-                            .ghost()
-                            .icon(IconName::CircleUser)
-                            .label(account_label)
-                            .disabled(self.account_form.busy)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.open_account(window, cx)),
-                            ),
-                    ),
-            )
-            .when(window.viewport_size().width < px(1000.), |view| {
+            .when(self.session.is_fixture(), |view| {
                 view.child(
-                    h_flex()
-                        .px_4()
-                        .py_2()
-                        .gap_2()
-                        .border_b_1()
-                        .border_color(cx.theme().border)
-                        .children(
-                            [
-                                Page::Explore,
-                                Page::Library,
-                                Page::Downloads,
-                                Page::FairPlay,
-                            ]
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, page)| {
-                                Button::new(("compact-navigation", index))
-                                    .small()
-                                    .label(page.title())
-                                    .selected(self.page == page)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.page = page;
-                                        this.shell_focus.focus(window);
-
-                                        if page == Page::Library && this.account.is_none() {
-                                            this.open_account(window, cx);
-                                        } else if page == Page::Library
-                                            && this.library_apps.is_empty()
-                                        {
-                                            this.load_library(cx);
-                                        }
-                                        cx.notify();
-                                    }))
-                            }),
-                        ),
+                    div()
+                        .px_3()
+                        .py_1()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Fixture preview · no Apple requests"),
                 )
             })
             .child(
                 div()
                     .flex()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
-                    .when(
-                        self.sidebar_visible && window.viewport_size().width >= px(1000.),
-                        |row| row.child(sidebar),
-                    )
+                    .child(sidebar)
                     .child(page),
             )
             .when(self.notice.is_some(), |view| {

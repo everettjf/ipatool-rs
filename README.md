@@ -146,8 +146,10 @@ Build and run the optional native desktop from source:
 cargo run --locked --features gui --bin ipatool-gui
 ```
 
-The desktop uses a focused dark theme, compact sidebar controls, and aligned
-icon/label navigation. It supports public search, lookup by App ID or bundle identifier, six
+The desktop uses a focused dark theme and a full-height workspace. Account,
+settings and sidebar controls sit at the bottom of the aligned navigation;
+narrow or collapsed windows use a compact icon rail. It supports public search,
+lookup by App ID or bundle identifier, six
 offer platforms, and two-letter country codes. Select a result to inspect its
 metadata or copy identifiers, JSON, and CLI commands. Press Enter in either input
 to submit. Queries run in the background and report loading, empty, and error

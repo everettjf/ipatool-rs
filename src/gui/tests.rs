@@ -7,7 +7,7 @@ use super::{
 };
 use anyhow::Result;
 use gpui::{AppContext, Entity, IntoElement, TestAppContext, VisualTestContext};
-use gpui_component::Root;
+use gpui_component::{Root, WindowExt};
 use ipatool_rs::{
     application::tasks::{Artifact, JobOutcome},
     ipa_metadata::VersionMetadata,
@@ -201,6 +201,57 @@ fn setup_with_history(
     // Keep no test-global environment or credential configuration.
     visual.update(|_, _| {});
     (directory, desktop.unwrap(), session, visual)
+}
+
+#[gpui::test]
+fn sidebar_footer_actions_remain_usable_in_narrow_and_collapsed_windows(cx: &mut TestAppContext) {
+    let (_directory, view, session, mut cx) = setup(cx);
+    for (width, height, expanded) in [
+        (900., 650., true),
+        (1240., 820., true),
+        (1240., 820., false),
+    ] {
+        cx.simulate_resize(gpui::size(gpui::px(width), gpui::px(height)));
+        cx.update(|_, cx| {
+            view.update(cx, |this, cx| {
+                this.sidebar_visible = expanded;
+                cx.notify();
+            });
+        });
+        for selector in ["shell-account", "shell-settings"] {
+            cx.draw(
+                Default::default(),
+                gpui::size(gpui::px(width), gpui::px(height)),
+                |window, _| window.root::<Root>().unwrap().unwrap().into_any_element(),
+            );
+            let bounds = cx
+                .debug_bounds(selector)
+                .expect("footer action was painted");
+            assert!(bounds.origin.x >= gpui::px(0.) && bounds.right() <= gpui::px(width));
+            assert!(bounds.origin.y >= gpui::px(0.) && bounds.bottom() <= gpui::px(height));
+            cx.simulate_click(bounds.center(), Default::default());
+            cx.run_until_parked();
+            cx.update(|window, cx| assert!(window.has_active_dialog(cx)));
+            assert!(session.login_calls.lock().unwrap().is_empty());
+            cx.simulate_keystrokes("escape");
+            cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+        }
+        if width >= 1000. {
+            for expected in [!expanded, expanded] {
+                cx.draw(
+                    Default::default(),
+                    gpui::size(gpui::px(width), gpui::px(height)),
+                    |window, _| window.root::<Root>().unwrap().unwrap().into_any_element(),
+                );
+                let toggle = cx.debug_bounds("shell-toggle").expect("toggle was painted");
+                cx.simulate_click(toggle.center(), Default::default());
+                cx.run_until_parked();
+                cx.update(|_, cx| {
+                    view.update(cx, |this, _| assert_eq!(this.sidebar_visible, expected));
+                });
+            }
+        }
+    }
 }
 
 #[gpui::test]

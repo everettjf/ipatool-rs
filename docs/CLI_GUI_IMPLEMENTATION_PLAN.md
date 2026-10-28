@@ -36,8 +36,9 @@ protocol, platform, or FairPlay parity.
   automatic startup-profile generation, and unrestricted task concurrency.
 - The current desktop targets one dark theme. Keep navigation compact with
   left-aligned icon/label columns, an icon-only sidebar toggle, and no project
-  recommendation copy in the primary workspace. Project positioning stays in
-  the README and documentation.
+  recommendation copy in the primary workspace. Account/settings/sidebar controls
+  belong at the bottom of navigation, without a separate top toolbar. Narrow
+  windows use an icon rail. Project positioning stays in the README and documentation.
 
 ## Current implementation anchors
 
@@ -151,8 +152,9 @@ Do not expose Pause until retained transfer state and resumption are validated.
 Use four primary pages: Explore, Library, Downloads, and FairPlay. Keep account
 status and its action in the top-level shell. Settings hold non-secret
 preferences such as default output directory and last-used catalog filters.
-Use resizable list/detail regions and a collapsible navigation pane for narrow
-windows. Keep primary actions visible without scrolling the metadata panel.
+Use resizable list/detail regions and a collapsible navigation pane. Narrow
+windows automatically use an icon rail with navigation, account and settings
+actions. Keep primary actions visible without scrolling the metadata panel.
 All product strings remain English.
 
 ### Explore and application details

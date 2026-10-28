@@ -1229,7 +1229,7 @@ impl DesktopWindow {
 
     pub(super) fn fairplay_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.fair.mode;
-        let controls = h_flex().flex_1().gap_2().flex_wrap().children(
+        let controls = h_flex().flex_1().min_w_0().gap_2().flex_wrap().children(
             [
                 (FairMode::Inspect, "Inspect materials"),
                 (FairMode::Decrypt, "Decrypt with model"),
@@ -1247,7 +1247,7 @@ impl DesktopWindow {
                     }))
             }),
         );
-        let mut form = v_flex().w_full().flex_shrink_0().gap_4().max_w(px(820.))
+        let mut form = v_flex().flex_shrink_0().gap_4()
             .child(div().text_2xl().child(match mode { FairMode::Inspect => "Start with a compatibility check", FairMode::Decrypt => "Decrypt an IPA using a matching model", FairMode::Collect => "Collect matching enrollment materials", FairMode::Recover => "Recover from an existing capture" }))
             .child(muted("Experimental, exact-build FairPlay workflows. Prerequisite checks and successful processing do not authenticate plaintext or establish support for arbitrary builds.", cx));
         if matches!(
@@ -1448,7 +1448,14 @@ impl DesktopWindow {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(v_flex().w_full().flex_shrink_0().p_6().child(form)),
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(px(868.))
+                            .flex_shrink_0()
+                            .p_6()
+                            .child(form),
+                    ),
             )
             .into_any_element()
     }

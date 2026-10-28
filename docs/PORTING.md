@@ -265,10 +265,10 @@ checks only: no private recovery or decryption ran. Updated captures are in the
 separate [fixture gallery](screenshots/fixtures/README.md).
 
 The current default suite passed 453 library and 45 CLI tests; the final
-GUI-test suite passed the same 453/45 plus 31 desktop tests. Both retain 70
+GUI-test suite passed the same 453/45 plus 32 desktop tests. Both retain 70
 explicitly ignored library checks. Strict default, production-GUI and GUI-test
 all-targets Clippy passed. Formatting and diff whitespace checks passed. The
-Windows GNU x86_64 final-source GUI cross-build linked a PE32+ GUI executable and
+Windows GNU x86_64 GUI cross-build linked a PE32+ GUI executable and
 passed strict all-targets Clippy. Native Linux/Windows desktop interaction
 remains a separate gate. Debug/release Apple Silicon app bundles rebuilt and
 passed strict ad hoc signatures; the rebuilt signed CLI returns 0.2.1 and passed
@@ -298,8 +298,27 @@ explicitly skips 20 pinned-Apple-image checks unavailable on its runners; the
 complete local suites above cover those cached-image paths. Headless GUI tests
 and linking do not establish native portable desktop/account interaction.
 The subsequent heading-only shell change at `d0c8183` has complete local
-regression and signed release/native keyboard evidence; its CI rerun is
+regression and signed release/native keyboard evidence; all five jobs also passed in
 [40783409188](https://github.com/everettjf/ipatool-rs/actions/runs/40783409188).
+
+A further user-requested refinement removes the entire 52-point top toolbar.
+Account/settings/sidebar actions are anchored at the bottom of navigation.
+Narrow and collapsed windows use a 56-point icon rail, retaining those actions,
+tooltips and active-download counts; the production workspace starts directly
+below the native title bar. The synthetic preview alone retains its small
+persistent fixture banner. Long account labels are clipped within the sidebar
+and remain available in a tooltip. The signed release repeated real public search,
+footer account/settings entry, and collapse/restore without an account request.
+The 900×650 synthetic preview repeated both footer actions and advanced FairPlay
+scrolling: the complete final Build version input and fixed primary action were
+visible. Constraining the padded form container rather than its inner percentage
+width fixed a wrapped-text/scroll-extent regression exposed by the icon rail.
+An added rendered interaction regression covers account/settings and repeated
+collapse/restore at narrow and normal sizes. The current local 453/45/32 suites,
+three strict Clippy configurations, debug/release signed bundle rebuilds and
+Windows GNU GUI cross-build/strict all-targets Clippy all pass. Revised
+normal/collapsed and clearly labeled narrow captures are in the native galleries.
+Portable CI for this subsequent layout is separate from the completed runs above.
 
 The local feature remains a source-only experimental preview. Its public search,
 controller fixtures and synthetic native walkthroughs do not close live account,
