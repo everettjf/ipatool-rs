@@ -6,19 +6,19 @@ Status as of 2026-10-27. The current delivery target is macOS on Apple Silicon. 
 
 - Controlled-account login without a 2FA challenge, an already owned purchase, a new free-app purchase, purchase history, version metadata, and authenticated MCP `list_purchases`.
 - Real native Mac PKG downloads, including ScriptWidget, with package and application inspection. ScriptWidget's Mac offer was a PKG.
-- The macOS ARM64 release build and signature check, 420 active library tests, 43 CLI tests, and Clippy. Three affected pinned Store guest tests also passed explicitly. The 69 ignored library tests are opt-in checks, not a count of known failures.
+- A compatible iPhone app's Mac offer: TouchLink downloaded as a valid IPA with a nonempty SINF on Apple Silicon. PhonePad's Mac offer was a PKG, while its iPhone offer downloaded as an IPA.
+- The macOS ARM64 release build and signature check, 421 active library tests, 43 CLI tests, and Clippy. Three affected pinned Store guest tests also passed explicitly. The 69 ignored library tests are opt-in checks, not a count of known failures.
 
 ## Current macOS Apple Silicon gates
 
 - [ ] Complete an interactive default macOS Keychain approval flow for `auth login`, `auth info`, and `auth revoke` in a local user session. The unattended run could only confirm that `--non-interactive` returns an actionable authorization error; the encrypted `--file-keychain` path worked.
 - [ ] Complete an actual 2FA challenge during account login. The controlled-account logins did not trigger one.
 - [ ] Verify live expired-token recovery in purchase and download flows. Retry behavior has fixture tests, but the controlled account did not encounter an expired token.
-- [ ] Obtain an iPhone or iPad app offer that returns an IPA on Apple Silicon Mac, then validate package download and SINF injection end to end. Native Mac PKGs, including ScriptWidget, do not exercise this branch.
 - [ ] Verify authenticated MCP `purchase_app`, `list_app_versions`, `get_version_metadata`, and `download_app` outputs with a controlled account. Authenticated `list_purchases` has already passed.
 - [ ] Validate private FairPlay enrollment and real IPA decryption with matched device, app, SINF, and private enrollment data on a supported macOS host. The current unprivileged process cannot read the required private FairPlay state.
 - [ ] If matched 26B118 private data becomes available, compare its oracle/model results with the Go reference. Public synthetic vectors already matched; they do not establish private-data parity.
 - [ ] Determine whether the remaining live Store workflows reach the Swift preawaited continuation flag rejected by the current Go and Rust guests; implement and verify immediate suspension only if one does.
-- [ ] Investigate intermittent Apple HTTP 403 responses during ScriptWidget downloads if they recur under a controlled run. A later ordinary download succeeded, and the earlier 403s were not attributed to a client defect.
+- [ ] Investigate Air Sketch Free's repeated HTTP 403 download-product responses after a successful free purchase, and ScriptWidget's intermittent 403 responses if they recur. Successful downloads of TouchLink and PhonePad show that the issue is not a general account download failure; its cause remains unproven.
 - [ ] Fix any differences found in the above checks, rerun focused and full verification, and update this list and [PORTING.md](PORTING.md).
 
 Do not commit credentials, cookies, downloaded packages, private captures, or enrollment models. Use an isolated state directory for live account tests.
@@ -29,4 +29,4 @@ Do not commit credentials, cookies, downloaded packages, private captures, or en
 - [ ] Resume macOS x86_64 release and runtime verification.
 - [ ] Validate real authenticated Store, account migration, and package workflows in Linux desktop sessions. Existing QEMU and synthetic Secret Service checks do not cover a real account.
 - [ ] Run Windows x86_64 and ARM64 binaries on their target systems and validate account and package workflows.
-- [ ] Inspect real IPA and PKG outputs for the remaining platform offers, beyond the Mac PKGs already checked.
+- [ ] Inspect real IPA and PKG outputs for the remaining platform offers, beyond the TouchLink Mac IPA and Mac PKGs already checked.
