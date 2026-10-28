@@ -7,6 +7,7 @@ Status as of 2026-10-27. The current delivery target is macOS on Apple Silicon. 
 - Controlled-account login without a 2FA challenge, an already owned purchase, a new free-app purchase, purchase history, version metadata, and authenticated MCP `list_purchases` and `purchase_app`.
 - Real native Mac PKG downloads, including ScriptWidget, with package and application inspection. ScriptWidget's Mac offer was a PKG.
 - A compatible iPhone app's Mac offer: TouchLink downloaded as a valid IPA with a nonempty SINF on Apple Silicon. PhonePad's Mac offer was a PKG, while its iPhone offer downloaded as an IPA.
+- The `v0.1.0-preview.1` Apple Silicon macOS prerelease is Developer ID signed and Apple notarization returned `Accepted` with zero issues. Its SHA-256 archive and `everettjf/tap/ipatool-rs` Homebrew formula passed local install, test, and public catalog checks.
 - The macOS ARM64 release build and signature check, 421 active library tests, 45 CLI tests, and Clippy. Three affected pinned Store guest tests also passed explicitly. The 69 ignored library tests are opt-in checks, not a count of known failures.
 
 ## Current macOS Apple Silicon gates

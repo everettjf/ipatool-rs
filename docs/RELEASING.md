@@ -8,7 +8,7 @@ The current distribution target is macOS ARM64. Keep the CLI name `ipatool-rs` s
 2. Run `cargo fmt --check`, `cargo test --all-targets --quiet`, and `cargo clippy --all-targets -- -D warnings`.
 3. Set `IPATOOL_CODESIGN_IDENTITY` to a local Developer ID Application identity and run `scripts/package-macos.sh`. The script rebuilds the ARM64 executable, signs it with the hardened runtime and secure timestamp, and creates a tarball, a SHA-256 file, and a ZIP for notarization under `dist/`.
 4. Check the archive with `shasum -a 256 -c dist/ipatool-rs-VERSION-macos-arm64.tar.gz.sha256`. Extract it into a temporary directory, run `codesign --verify --strict` on `ipatool-rs`, and exercise `--version` and a public catalog search.
-5. Submit the ZIP with `xcrun notarytool submit dist/ipatool-rs-VERSION-macos-arm64-notary.zip --keychain-profile PROFILE --wait`. Create the profile with `xcrun notarytool store-credentials PROFILE --apple-id APPLE_ID --team-id TEAM_ID`; let it prompt securely for the app-specific password. Do not pass the password in command arguments or commit it. Verify an accepted result before publishing. The ZIP is only for notarization; attach the tarball and its checksum to the release.
+5. Submit the ZIP with `xcrun notarytool submit dist/ipatool-rs-VERSION-macos-arm64-notary.zip --keychain-profile PROFILE --wait`. Create the profile with `xcrun notarytool store-credentials PROFILE` and use its interactive credential prompts. Do not pass passwords in command arguments or commit them. Verify an accepted result and inspect the submission log for issues before publishing. The ZIP is only for notarization; attach the tarball and its checksum to the release. A standalone CLI executable cannot have the ticket stapled directly, so macOS retrieves its ticket online.
 
 ## Publish
 
@@ -18,3 +18,5 @@ The current distribution target is macOS ARM64. Keep the CLI name `ipatool-rs` s
 4. Confirm the GitHub Pages install link and release links, and compare the Homebrew-installed binary version with the release tag.
 
 Developer ID signing and notarization are release steps. The ordinary `scripts/build-macos.sh --arm64` development build remains ad hoc signed.
+
+The first preview (`v0.1.0-preview.1`) was signed with a Developer ID Application certificate, accepted by Apple notarization with zero reported issues, and published with its SHA-256 file. The `everettjf/tap/ipatool-rs` formula passed Homebrew style and audit checks, installed the published archive, passed `brew test`, and completed a public catalog search on macOS 27.0.1 ARM64. These distribution checks do not validate the outstanding authenticated Store and FairPlay flows.
