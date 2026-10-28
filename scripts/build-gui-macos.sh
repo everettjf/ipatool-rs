@@ -42,8 +42,8 @@ cat > "$BUNDLE/Contents/Info.plist" <<EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleIdentifier</key><string>dev.ipatool.rust</string>
-  <key>CFBundleName</key><string>ipatool</string>
-  <key>CFBundleDisplayName</key><string>ipatool</string>
+  <key>CFBundleName</key><string>&#x1F980;IPATOOL-RS &#x1F980;</string>
+  <key>CFBundleDisplayName</key><string>&#x1F980;IPATOOL-RS &#x1F980;</string>
   <key>CFBundleExecutable</key><string>ipatool-gui</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>ipatool.icns</string>

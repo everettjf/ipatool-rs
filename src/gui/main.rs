@@ -51,6 +51,8 @@ actions!(
     [QuitDesktop, ClosePanel, FocusSearch, OpenSettings]
 );
 
+const DESKTOP_TITLE: &str = "\u{1f980}IPATOOL-RS \u{1f980}";
+
 const PLATFORMS: [(Platform, &str); 6] = [
     (Platform::Iphone, "iPhone"),
     (Platform::Ipad, "iPad"),
@@ -755,13 +757,13 @@ fn main() {
         ]);
         cx.set_menus(vec![
             Menu {
-                name: "ipatool".into(),
+                name: DESKTOP_TITLE.into(),
                 items: vec![
                     MenuItem::action("Settings...", OpenSettings),
                     MenuItem::separator(),
                     MenuItem::os_submenu("Services", SystemMenuType::Services),
                     MenuItem::separator(),
-                    MenuItem::action("Quit ipatool", QuitDesktop),
+                    MenuItem::action("Quit IPATOOL-RS", QuitDesktop),
                 ],
             },
             Menu {
@@ -808,7 +810,7 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(900.), px(650.))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("ipatool".into()),
+                    title: Some(DESKTOP_TITLE.into()),
                     ..Default::default()
                 }),
                 ..Default::default()

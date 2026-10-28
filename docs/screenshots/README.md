@@ -5,7 +5,9 @@ macOS Apple Silicon on 2026-10-28. The top-level images below use native service
 for public browsing and empty-form validation. The separate
 [fixture captures](fixtures/README.md) show the same native controls with
 explicitly synthetic account, Library, version, and download services. They are
-not live account evidence. The refined dark capture is the current visual reference. Earlier images are
+not live account evidence. The refined dark and collapsed captures show the
+current `🦀IPATOOL-RS 🦀` native title. The refined dark capture is the current
+visual reference. Earlier images are
 historical interaction evidence and may show superseded controls. Light/system
 themes are no longer supported; subsequent interaction changes require refreshing
 affected captures.

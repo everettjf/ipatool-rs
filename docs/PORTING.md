@@ -320,6 +320,14 @@ Windows GNU GUI cross-build/strict all-targets Clippy all pass. Revised
 normal/collapsed and clearly labeled narrow captures are in the native galleries.
 Portable CI for this subsequent layout is separate from the completed runs above.
 
+The desktop window, application menu and macOS bundle display name now use
+`🦀IPATOOL-RS 🦀`. The native signed release visibly renders both crab symbols
+and retains the full-height workspace. Public Mac/US search again returned 17
+results; expanded/collapsed captures were refreshed. The complete local default
+and GUI-test suites (453/45/32), three strict Clippy configurations, formatting
+and debug/release signed bundle checks passed again for this display-only change.
+Bundle identifiers, executable names and CLI commands retain their existing names.
+
 The local feature remains a source-only experimental preview. Its public search,
 controller fixtures and synthetic native walkthroughs do not close live account,
 Keychain approval, signed-bundle Store/JIT, real IPA/PKG, or private FairPlay gates.
