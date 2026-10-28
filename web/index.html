@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#050a06">
-    <meta name="description" content="ipatool-rs brings App Store workflows and FairPlay research together in a Rust CLI, with macOS Apple Silicon as the current focus.">
+    <meta name="description" content="ipatool-rs 0.1.0 is an experimental Rust rewrite of App Store and FairPlay tools for macOS on Apple Silicon.">
     <title>ipatool-rs — App Store and FairPlay tools in Rust</title>
     <link rel="icon" href="./favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="./styles.css">
@@ -24,11 +24,11 @@
     <main id="main">
       <section class="hero shell" id="top" aria-labelledby="hero-title">
         <div class="hero-copy">
-          <p class="eyebrow"><span class="status-light" aria-hidden="true"></span> RUST CLI <span class="slash">/</span> MACOS APPLE SILICON</p>
+          <p class="eyebrow"><span class="status-light" aria-hidden="true"></span> V0.1.0 <span class="slash">/</span> MACOS APPLE SILICON</p>
           <h1 id="hero-title">App Store tools.<br><span>FairPlay research.</span><br>One Rust CLI.</h1>
-          <p class="intro">Search the App Store, manage an account, download app packages, and inspect FairPlay data from one command line.</p>
+          <p class="intro">An experimental Rust rewrite that brings App Store workflows and FairPlay research into one CLI. Built to see how far Codex could take the port.</p>
           <div class="hero-actions">
-            <a class="button" href="https://github.com/everettjf/ipatool-rs">View source <span aria-hidden="true">↗</span></a>
+            <a class="button" href="https://github.com/everettjf/ipatool-rs/releases/tag/v0.1.0">Download v0.1.0 <span aria-hidden="true">↗</span></a>
             <a class="text-link" href="#start">Quick start <span aria-hidden="true">↓</span></a>
           </div>
         </div>
@@ -62,14 +62,15 @@
       </section>
 
       <section class="section shell start-section" id="start" aria-labelledby="start-title">
-        <div class="section-heading"><p class="eyebrow">02 / GET STARTED</p><h2 id="start-title">Install. Run. Explore.</h2><p>Experimental Rust rewrite for macOS on Apple Silicon. <a href="https://github.com/everettjf/ipatool-rs/releases/tag/v0.1.0">Download the release and checksum ↗</a></p></div>
-        <div class="command-block"><div class="command-label">QUICK START <span>macOS arm64</span></div><pre><code>brew tap everettjf/tap
+        <div class="section-heading"><p class="eyebrow">02 / GET STARTED</p><h2 id="start-title">Install. Run. Explore.</h2><p>Version 0.1.0 is available for Apple Silicon macOS through Homebrew or as a <a href="https://github.com/everettjf/ipatool-rs/releases/tag/v0.1.0">signed, notarized archive with a SHA-256 checksum ↗</a>.</p></div>
+        <div class="command-block"><div class="command-label">QUICK START <span>macOS arm64 · v0.1.0</span></div><pre><code>brew tap everettjf/tap
 brew install everettjf/tap/ipatool-rs
+ipatool-rs --version
 ipatool-rs search ScriptWidget --platform macos</code></pre></div>
       </section>
 
       <section class="section shell status-section" id="status" aria-labelledby="status-title">
-        <div><p class="eyebrow">03 / STATUS</p><h2 id="status-title">Working, with clear limits.</h2><p>Live macOS checks covered account login, free purchases, purchase history, MCP listing and an already owned purchase, native Mac PKG downloads, and a compatible iPhone app's Mac IPA with SINF. Real 2FA, successful token recovery, and private FairPlay decryption still need live validation.</p></div>
+        <div><p class="eyebrow">03 / STATUS</p><h2 id="status-title">Working, with clear limits.</h2><p>The 0.1.0 release passed signing, notarization, public search, and an account-backed purchase-history check on Apple Silicon macOS. Real 2FA, expired-token recovery, interactive Keychain login and revoke, authenticated MCP version and download calls, and private FairPlay decryption still need end-to-end validation. For practical use, prefer the original projects.</p></div>
         <div class="status-links"><a href="https://github.com/everettjf/ipatool-rs/blob/main/README.md">README <span aria-hidden="true">↗</span></a><a href="https://github.com/everettjf/ipatool-rs/blob/main/docs/TODO.md">Remaining work <span aria-hidden="true">↗</span></a></div>
       </section>
     </main>
