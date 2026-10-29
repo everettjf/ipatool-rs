@@ -245,7 +245,7 @@ impl Session {
                 }
                 let country = ipatool_rs::storefront::country_code_from_storefront(&account.store_front)?;
                 ipatool_rs::application::operation::stage(ipatool_rs::application::operation::Stage::Metadata)?;
-                ipatool_rs::CatalogClient::new()?.lookup(request.app_id, request.bundle_identifier.as_deref(), country, request.platform)?;
+                ipatool_rs::application::catalog::lookup_for_account(&ipatool_rs::CatalogClient::new()?, request.app_id, request.bundle_identifier.as_deref(), country, request.platform)?;
                 let result = download::download(&context, request)?;
                 let mut artifacts = vec![Artifact { kind: ArtifactKind::Package, path: result.output }];
                 if let Some(path) = result.decrypted_output { artifacts.push(Artifact { kind: ArtifactKind::DecryptedIpa, path }); }

@@ -26,6 +26,7 @@ struct FixtureSession {
     generation: AtomicU64,
     login_calls: Mutex<Vec<(bool, bool)>>,
     purchases: Mutex<Vec<(usize, Option<Platform>)>>,
+    catalogs: Mutex<Vec<ipatool_rs::application::catalog::Query>>,
     jobs: Mutex<Vec<JobRequest>>,
     expire_next_job: AtomicBool,
 }
@@ -37,6 +38,7 @@ impl FixtureSession {
             generation: AtomicU64::new(1),
             login_calls: Mutex::new(Vec::new()),
             purchases: Mutex::new(Vec::new()),
+            catalogs: Mutex::new(Vec::new()),
             jobs: Mutex::new(Vec::new()),
             expire_next_job: AtomicBool::new(false),
         }
@@ -61,6 +63,7 @@ impl FixtureSession {
 
 impl DesktopSession for FixtureSession {
     fn catalog(&self, query: &ipatool_rs::application::catalog::Query) -> Result<Vec<CatalogApp>> {
+        self.catalogs.lock().unwrap().push(query.clone());
         let mut app = Self::app();
         app.id = if query.term == "second" { 2 } else { 1 };
         app.name = query.term.clone();
@@ -1279,4 +1282,135 @@ fn retry_restores_editable_download_parameters_and_preserves_existing_output(
     assert_eq!(request.external_version_id, "100");
     assert!(request.purchase);
     assert_eq!(std::fs::read(existing).unwrap(), b"original fixture output");
+}
+
+#[gpui::test(iterations = 20)]
+fn changing_catalog_filters_refreshes_without_reusing_the_previous_download_selection(
+    cx: &mut TestAppContext,
+) {
+    let (_directory, view, session, mut cx) = setup(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            this.platform = Platform::Macos;
+            this.term
+                .update(cx, |input, cx| input.set_value("second", window, cx));
+            this.search(cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            assert_eq!(this.query.as_ref().unwrap().platform, Platform::Macos);
+            assert!(this.selected_app().is_some());
+            this.set_platform(Platform::Iphone, cx);
+            assert!(this.searching);
+            assert!(this.selected_app().is_none());
+            assert!(this.query.is_none());
+            this.set_country("CN", window, cx);
+            assert!(this.apps.is_empty());
+            assert!(this.query.is_none());
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |this, cx| {
+            let query = this.query.as_ref().unwrap();
+            assert_eq!(query.country, "CN");
+            assert_eq!(query.platform, Platform::Iphone);
+            assert_eq!(this.selected_country(cx), "CN");
+            assert_eq!(this.apps[0].id, 2);
+        });
+    });
+    let catalogs = session.catalogs.lock().unwrap();
+    assert_eq!(catalogs.len(), 3);
+    assert!(
+        catalogs
+            .iter()
+            .any(|query| query.country == "CN" && query.platform == Platform::Iphone)
+    );
+    assert!(session.jobs.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn searchable_region_menu_confirms_by_keyboard_and_escape_preserves_selection(
+    cx: &mut TestAppContext,
+) {
+    let (_directory, view, _session, mut cx) = setup(cx);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(650.)));
+    for (search, confirm, expected) in [
+        ("China", false, "US"),
+        ("China", true, "CN"),
+        ("GB", false, "CN"),
+        ("GB", true, "GB"),
+        ("US", true, "US"),
+    ] {
+        cx.draw(
+            Default::default(),
+            gpui::size(gpui::px(900.), gpui::px(650.)),
+            |window, _| window.root::<Root>().unwrap().unwrap().into_any_element(),
+        );
+        let bounds = cx
+            .debug_bounds("catalog-region")
+            .expect("region selector was painted");
+        assert!(bounds.right() <= gpui::px(900.));
+        cx.simulate_click(bounds.center(), Default::default());
+        cx.run_until_parked();
+        cx.simulate_input(search);
+        cx.run_until_parked();
+        cx.simulate_keystrokes(if confirm { "enter" } else { "escape" });
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            view.update(cx, |this, cx| {
+                assert_eq!(this.selected_country(cx), expected)
+            })
+        });
+    }
+}
+
+#[gpui::test]
+fn editing_download_platform_resets_version_data_and_queues_the_reviewed_platform(
+    cx: &mut TestAppContext,
+) {
+    let (_directory, view, session, mut cx) = setup(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            this.account = Some(FixtureSession::account());
+            this.open_download(
+                FixtureSession::app(),
+                Platform::Macos,
+                "US".into(),
+                window,
+                cx,
+            );
+            let form = this.download_form.as_mut().unwrap();
+            form.version
+                .update(cx, |input, cx| input.set_value("100", window, cx));
+            form.versions = vec!["100".into()];
+            form.metadata = Some((
+                "100".into(),
+                VersionMetadata {
+                    display_version: "1.0".into(),
+                    release_date: "fixture".into(),
+                },
+            ));
+            let output = form.output.read(cx).value();
+            let previous_generation = this.download_generation;
+            this.set_download_platform(Platform::Iphone, window, cx);
+            let form = this.download_form.as_ref().unwrap();
+            assert!(this.download_generation > previous_generation);
+            assert!(form.version.read(cx).value().is_empty());
+            assert!(form.versions.is_empty());
+            assert!(form.metadata.is_none());
+            assert_eq!(form.output.read(cx).value(), output);
+            this.submit_download(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let jobs = session.jobs.lock().unwrap();
+    assert_eq!(jobs.len(), 1);
+    let JobRequest::Download(request) = &jobs[0] else {
+        panic!("expected download");
+    };
+    assert_eq!(request.platform, Some(Platform::Iphone));
+    assert!(request.external_version_id.is_empty());
 }

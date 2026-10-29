@@ -7,7 +7,11 @@ for public browsing and empty-form validation. The separate
 explicitly synthetic account, Library, version, and download services. They are
 not live account evidence. The refined dark and collapsed captures show the
 current `🦀IPATOOL-RS 🦀` native title and neutral graphite palette. The refined dark capture is the current
-visual reference. Earlier images are
+visual reference for the palette. The latest
+[iOS/region controls](fixtures/catalog-ios-region-narrow.png),
+[region dropdown](fixtures/catalog-region-menu-narrow.png), and
+[download target sheet](fixtures/download-region-target-narrow.png) are shown in
+the explicitly synthetic narrow gallery. Earlier images are
 historical interaction evidence and may show superseded controls. Light/system
 themes are no longer supported; subsequent interaction changes require refreshing
 affected captures.

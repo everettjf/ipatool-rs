@@ -90,6 +90,7 @@ mod tests {
     fn preferences_round_trip_and_reject_invalid_country_and_relative_output() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("preferences.json");
+        assert_eq!(Preferences::load(&path).unwrap().platform, Platform::Iphone);
         let mut preferences = Preferences {
             country: "GB".into(),
             platform: Platform::Macos,

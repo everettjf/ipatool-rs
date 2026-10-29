@@ -1,5 +1,16 @@
 use super::*;
 
+fn task_display_title(title: &str, request: &JobRequest) -> String {
+    if let JobRequest::Download(request) = request {
+        let platform = request.platform.unwrap_or(Platform::Iphone);
+        let suffix = format!(" / {}", platform_name(platform));
+        if let Some(name) = title.strip_suffix(&suffix) {
+            return format!("{} / {}", name, platform_label(platform));
+        }
+    }
+    title.to_owned()
+}
+
 pub(super) fn request_description(request: &JobRequest) -> String {
     let path = |path: &std::path::Path| path.display().to_string();
     let optional = |value: &Option<PathBuf>| {
@@ -10,8 +21,8 @@ pub(super) fn request_description(request: &JobRequest) -> String {
     };
     match request {
         JobRequest::Download(value) => format!(
-            "Offer: {}\nVersion: {}\nSave to: {}\nAcquire free license if needed: {}",
-            platform_name(value.platform.unwrap_or(Platform::Iphone)),
+            "Download for: {}\nVersion: {}\nSave to: {}\nAcquire free license if needed: {}",
+            platform_label(value.platform.unwrap_or(Platform::Iphone)),
             if value.external_version_id.is_empty() {
                 "Latest"
             } else {
@@ -447,7 +458,7 @@ impl DesktopWindow {
             .map(|platforms| {
                 platforms
                     .iter()
-                    .map(|platform| platform_name(*platform))
+                    .map(|platform| platform_label(*platform))
                     .collect::<Vec<_>>()
                     .join(", ")
             })
@@ -456,7 +467,7 @@ impl DesktopWindow {
             .child(v_flex().p_6().gap_3().border_b_1().border_color(cx.theme().border)
                 .child(label("APPLICATION DETAILS", cx))
                 .child(div().text_2xl().child(app.name.clone()))
-                .child(muted(format!("{} / {}", platform_name(platform), country), cx))
+                .child(muted(format!("{} / {}", platform_label(platform), regions::label(&country)), cx))
                 .child(h_flex().gap_2()
                     .child(Button::new("download-application").primary().icon(IconName::ArrowDown).label(if self.account.is_some() { "Download..." } else { "Sign in to download..." })
                         .on_click(cx.listener(move |this, _, window, cx| this.open_download(download_app.clone(), platform, download_country.clone(), window, cx))))))
@@ -487,11 +498,17 @@ impl DesktopWindow {
                     .child(Button::new("search").primary().label(if self.searching { "Search again" } else { "Search" }).on_click(cx.listener(|this, _, _, cx| this.search(cx)))))
                 .child(h_flex().gap_2().flex_wrap()
                     .children([Mode::Auto, Mode::Search, Mode::AppId, Mode::BundleId].into_iter().enumerate().map(|(index, mode)| Button::new(("mode", index)).small().label(mode.label()).selected(self.mode == mode).on_click(cx.listener(move |this, _, _, cx| { this.mode = mode; cx.notify(); }))))
-                    .child(div().flex_1()).child(label("STORE", cx)).child(div().w(px(68.)).child(Input::new(&self.country).small())))
-                .child(h_flex().gap_1().flex_wrap().child(label("OFFER", cx)).children(PLATFORMS.into_iter().enumerate().map(|(index, (platform, name))| Button::new(("platform", index)).small().label(name).selected(self.platform == platform).on_click(cx.listener(move |this, _, _, cx| { this.platform = platform; cx.notify(); })))))
+                    .child(div().flex_1()).child(label("REGION", cx)).child(div().debug_selector(|| "catalog-region".into()).w(px(200.)).child(self.country.clone())))
+                .child(h_flex().gap_1().flex_wrap().child(label("DOWNLOAD FOR", cx)).children(PLATFORMS.into_iter().enumerate().map(|(index, (platform, name))| Button::new(("platform", index)).debug_selector(move || format!("catalog-platform-{}", platform_name(platform))).small().label(name).selected(self.platform == platform).when(self.platform == platform, |button| button.icon(IconName::Check)).on_click(cx.listener(move |this, _, _, cx| this.set_platform(platform, cx))))))
+                .when_some(self.account.as_ref().filter(|account| account.country != self.selected_country(cx)), |view, account| {
+                    let country = account.country.clone();
+                    view.child(h_flex().gap_2().flex_wrap()
+                        .child(muted(format!("Browsing {}. Downloads use {}.", regions::label(&self.selected_country(cx)), regions::label(&country)), cx))
+                        .child(Button::new("browse-account-region").small().label(format!("Browse {}", country)).on_click(cx.listener(move |this, _, window, cx| this.set_country(&country, window, cx)))))
+                })
                 .when(self.searching, |view| view.child(muted("Searching in the background. You can refine the next query.", cx)))
                 .when_some(self.search_error.as_ref(), |view, error| view.child(failure_view(error, cx))))
-            .when(self.apps.is_empty(), |view| view.child(empty(if self.query.is_some() { "No matching applications" } else { "Browse without an account" }, "Search by name, ID, bundle identifier, or App Store link. Adjust the offer platform or storefront if needed.", cx)))
+            .when(self.apps.is_empty(), |view| view.child(empty(if self.searching { "Searching applications..." } else if self.query.is_some() { "No matching applications" } else { "Browse applications" }, "Search by name, ID, bundle identifier, or App Store link. Platform and region changes refresh the results automatically.", cx)))
             .when(!self.apps.is_empty(), |view| view.child(div().flex_1().min_h_0().child(h_resizable("catalog-panels").child(resizable_panel().size(px(310.)).size_range(px(220.)..px(600.)).child(list)).child(resizable_panel().child(details)))))
             .into_any_element()
     }
@@ -793,8 +810,10 @@ impl DesktopWindow {
             .unwrap_or_default();
         let body = v_flex().gap_3()
             .child(div().text_lg().child(form.app.name.clone()))
-            .child(muted(format!("Offer: {} / Account storefront: {}", platform_name(form.platform), account_country), cx))
-            .when(form.source_country != account_country, |view| view.child(muted("This differs from the browsing storefront. Availability will be checked in the account storefront before downloading.", cx)))
+            .child(label("DOWNLOAD FOR", cx))
+            .child(h_flex().gap_1().flex_wrap().children(PLATFORMS.into_iter().enumerate().map(|(index, (platform, name))| Button::new(("download-platform", index)).small().label(name).selected(form.platform == platform).disabled(self.account_busy() || form.loading_versions).on_click(cx.listener(move |this, _, window, cx| this.set_download_platform(platform, window, cx))))))
+            .child(muted(format!("Account region: {}", regions::label(&account_country)), cx))
+            .when(form.source_country != account_country, |view| view.child(muted(format!("This result is from {}. Downloads require availability and a license in the account region. Changing the browsing region does not change your Apple account's region.", regions::label(&form.source_country)), cx)))
             .child(label("SAVE TO", cx)).child(h_flex().gap_2().child(div().flex_1().child(Input::new(&form.output))).child(Button::new("choose-output").label("Choose...").on_click(cx.listener(move |this, _, window, cx| this.choose_path(output.clone(), true, false, window, cx)))))
             .child(label("VERSION", cx)).child(Input::new(&form.version))
             .child(Button::new("check-version").small().label("Check version details").disabled(self.account_busy() || form.version.read(cx).value().trim().is_empty()).on_click(cx.listener(|this, _, window, cx| this.load_version_metadata(window, cx))))
@@ -916,7 +935,9 @@ impl DesktopWindow {
                                     h_flex()
                                         .justify_between()
                                         .gap_3()
-                                        .child(div().child(task.title.clone()))
+                                        .child(
+                                            div().child(task_display_title(&task.title, &request)),
+                                        )
                                         .child(muted(
                                             if task.state == TaskState::Succeeded
                                                 && matches!(

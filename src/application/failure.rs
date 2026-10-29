@@ -30,6 +30,17 @@ impl Failure {
     /// this allowlisted summary; the CLI retains its existing error formatter.
     pub fn from_error(error: &anyhow::Error) -> Self {
         use FailureKind::*;
+        if let Some(region) = error.downcast_ref::<super::catalog::AccountRegionUnavailable>() {
+            return Self {
+                kind: NotFound,
+                title: format!("Application unavailable in {}", region.country()),
+                message: format!(
+                    "The application was not found for the selected platform in your account's {} region. Search can show applications from other regions; changing the browsing region does not change your Apple account's region. No package download started.",
+                    region.country()
+                ),
+                action: "Review platform and account region".into(),
+            };
+        }
         let verification_rejected = error.chain().any(|cause| {
             cause
                 .to_string()

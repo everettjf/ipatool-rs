@@ -1,6 +1,67 @@
 use super::*;
 
 impl DesktopWindow {
+    pub(super) fn selected_country(&self, cx: &App) -> String {
+        self.country.read(cx).value().to_owned()
+    }
+
+    pub(super) fn set_country(&mut self, code: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        self.country
+            .update(cx, |state, cx| state.set_value(code, cx));
+        self.refresh_catalog_filters(cx);
+    }
+
+    pub(super) fn set_platform(&mut self, platform: Platform, cx: &mut Context<Self>) {
+        if self.platform != platform {
+            self.platform = platform;
+            self.refresh_catalog_filters(cx);
+        }
+    }
+
+    fn refresh_catalog_filters(&mut self, cx: &mut Context<Self>) {
+        let refresh = self.query.is_some() || self.searching || self.search_error.is_some();
+        self.query_id = self.query_id.wrapping_add(1);
+        self.searching = false;
+        self.search_error = None;
+        self.apps.clear();
+        self.selected = None;
+        self.query = None;
+        self.details_scroll.set_offset(Default::default());
+        if refresh && !self.term.read(cx).value().trim().is_empty() {
+            self.search(cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn set_download_platform(
+        &mut self,
+        platform: Platform,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.account_busy() {
+            return;
+        }
+        let Some(form) = &mut self.download_form else {
+            return;
+        };
+        if form.platform == platform {
+            return;
+        }
+        if let Some(operation) = self.version_operation.take() {
+            operation.cancel();
+        }
+        self.download_generation = self.download_generation.wrapping_add(1);
+        form.platform = platform;
+        form.versions.clear();
+        form.metadata = None;
+        form.error = None;
+        form.loading_versions = false;
+        form.version
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+    }
+
     pub(super) fn set_fair_mode(
         &mut self,
         mode: FairMode,
@@ -89,7 +150,7 @@ impl DesktopWindow {
         let query = match Query::new(
             self.mode,
             &self.term.read(cx).value(),
-            &self.country.read(cx).value(),
+            &self.selected_country(cx),
             self.platform,
         ) {
             Ok(query) => query,
@@ -1358,7 +1419,7 @@ impl DesktopWindow {
     ) -> bool {
         let preferences = Preferences {
             schema: 1,
-            country: self.country.read(cx).value().trim().to_ascii_uppercase(),
+            country: self.selected_country(cx),
             platform: self.platform,
             mode: self.mode,
             output_directory: Some(PathBuf::from(self.settings_output.read(cx).value().trim())),

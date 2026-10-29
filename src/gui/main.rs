@@ -9,6 +9,7 @@ mod assets;
 mod preferences;
 #[cfg(feature = "gui-test")]
 mod preview;
+mod regions;
 mod session;
 #[cfg(all(test, feature = "gui-test"))]
 mod tests;
@@ -54,13 +55,20 @@ actions!(
 const DESKTOP_TITLE: &str = "\u{1f980}IPATOOL-RS \u{1f980}";
 
 const PLATFORMS: [(Platform, &str); 6] = [
-    (Platform::Iphone, "iPhone"),
-    (Platform::Ipad, "iPad"),
-    (Platform::Macos, "Mac"),
-    (Platform::Appletv, "Apple TV"),
-    (Platform::Watchos, "Watch"),
-    (Platform::Visionos, "Vision"),
+    (Platform::Iphone, "iOS (iPhone)"),
+    (Platform::Ipad, "iPadOS"),
+    (Platform::Macos, "macOS"),
+    (Platform::Appletv, "tvOS"),
+    (Platform::Watchos, "watchOS"),
+    (Platform::Visionos, "visionOS"),
 ];
+
+fn platform_label(platform: Platform) -> &'static str {
+    PLATFORMS
+        .iter()
+        .find(|(value, _)| *value == platform)
+        .map_or("Unknown", |(_, label)| label)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -147,7 +155,7 @@ struct DesktopWindow {
     account: Option<AccountView>,
     account_form: Form,
     term: Entity<InputState>,
-    country: Entity<InputState>,
+    country: Entity<regions::Picker>,
     mode: Mode,
     platform: Platform,
     apps: Vec<CatalogApp>,
@@ -346,7 +354,7 @@ impl DesktopWindow {
             "",
             false,
         );
-        let country = field(window, cx, "Country", &preferences.country, false);
+        let country = cx.new(|cx| regions::Picker::new(&preferences.country, window, cx));
         let library_filter = field(
             window,
             cx,
@@ -354,7 +362,7 @@ impl DesktopWindow {
             "",
             false,
         );
-        let mut subscriptions: Vec<_> = [&term, &country]
+        let mut subscriptions: Vec<_> = [&term]
             .into_iter()
             .map(|input| {
                 cx.subscribe_in(input, window, |this, _, event, _, cx| {
@@ -367,6 +375,13 @@ impl DesktopWindow {
                 })
             })
             .collect();
+        subscriptions.push(cx.subscribe_in(
+            &country,
+            window,
+            |this, _, event: &regions::Changed, window, cx| {
+                this.set_country(&event.0, window, cx);
+            },
+        ));
         subscriptions.push(
             cx.subscribe(&library_filter, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {

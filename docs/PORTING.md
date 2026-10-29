@@ -342,6 +342,48 @@ bundle builds passed again. Native release checks covered real public search
 sidebar collapse/restore. Current normal/collapsed, sign-in and FairPlay captures
 are in the native gallery; older captures retain their historical palettes.
 
+Manual GUI feedback exposed two catalog interaction problems: a platform change
+did not refresh the selected result, and a region code input obscured the
+difference between public browsing and the saved account's storefront. Platform
+and region changes now clear the obsolete result/selection and refresh an
+already submitted search. Late completions remain guarded by query generation.
+Fresh preferences select iPhone, now labeled `iOS (iPhone)`; explicit saved
+platform preferences are preserved. The manual-check bundle's earlier Mac
+selection came from the preceding public-search test configuration, not host
+platform detection. Download dialogs expose all six targets and clear version
+metadata when the target changes. Journals retain their existing serialized
+platform values; visible task titles and parameters use human-readable names.
+
+The region dropdown supports searching English names and codes, based on the
+repository's known account-storefront mapping and public-domain IANA region
+names. Previously saved codes outside that mapping remain selectable. The
+committed country is independent of the menu's provisional search index:
+GPUI Component 0.5.1 otherwise displays a filtered item or an empty title after
+Escape. A separate popover/list creates a fresh search session on each open and
+commits only explicit confirmation. Exact code matches precede name fragments
+(for example US precedes Australia). The account-region browsing shortcut
+is explicit; neither region selection nor catalog filtering changes the account.
+
+A public-only lookup on 2026-10-28 found Muse from Meta (`6760173601`) in US/iOS
+but returned zero results in CN/iOS. WhatsApp (`310633997`) likewise returned one
+US/Mac result and zero CN/Mac results. This explains the reported GUI failures
+at its account-region catalog preflight, before the authenticated download
+workflow. It does not establish whether Apple's authenticated Store endpoint
+would grant an already-held entitlement. Preflight misses now identify the
+account region and explain that browsing another region does not switch the
+Apple account. The typed summary retains only a validated two-letter code,
+preserving the failure kind/journal schema and excluding raw private error chains.
+No account request or private material was used for this diagnosis.
+
+The changed source passed 454 library, 45 CLI and 36 desktop tests, with 70
+opt-in library tests ignored; formatting and all three strict all-targets Clippy
+configurations passed. Native 900×650 fixtures verified repeated region search
+after Escape, Enter confirmation, platform-triggered refresh, account-region
+browsing, and the editable target/region explanation with a fixed download
+footer. The new captures are explicitly synthetic. Signed local GUI debug/release
+bundles and the Apple Silicon CLI were rebuilt; live account and FairPlay gates
+remain open.
+
 The local feature remains a source-only experimental preview. Its public search,
 controller fixtures and synthetic native walkthroughs do not close live account,
 Keychain approval, signed-bundle Store/JIT, real IPA/PKG, or private FairPlay gates.

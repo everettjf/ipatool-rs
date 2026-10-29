@@ -7,11 +7,15 @@ versions, downloads, and progress are synthetic. The screenshots demonstrate
 rendered controls and observed interaction, not successful Apple authentication,
 real package transfers, or private FairPlay compatibility. See
 [the harness instructions](../../GUI_FIXTURE_PREVIEW.md).
-These interaction captures predate the neutral graphite palette; use the
-[current native gallery](../README.md) for appearance review.
+The first three captures below show the current graphite platform/region
+controls. Older interaction captures predate these controls and may retain the
+previous palette; see the [native gallery](../README.md) for public-service captures.
 
 | Capture | Observed interaction |
 | --- | --- |
+| [iOS and browsing region](catalog-ios-region-narrow.png) | Switching Mac to iOS (iPhone) refreshed the result and detail snapshot without another Search click. |
+| [Searchable region menu](catalog-region-menu-narrow.png) | Searching a country code filters named regions; Enter commits and Escape preserves the previous region. Exact code matches appear first. |
+| [Download target and account region](download-region-target-narrow.png) | The download sheet exposes all six targets, explains the difference between browsing and the synthetic account region, and retains fixed footer actions at 900×650. No task was submitted. |
 | [Refined narrow shell](explore-refined-narrow.png) | The full-height shell fits 900×650 with an icon rail and bottom account/settings actions; only the synthetic fixture banner remains above the workspace. |
 | [Advanced FairPlay after toolbar removal](fairplay-footer-narrow.png) | After scrolling to the end, the entire Build version field remains visible while Add collection task stays fixed. No collection was submitted or private input selected. |
 | [Refined narrow Library](library-refined-narrow.png) | Six-page synthetic Library retains aligned selection and a visible download action at the minimum window size. |

@@ -152,11 +152,13 @@ and blue primary actions and focus rings. It has a full-height workspace.
 Account, settings and sidebar controls sit at the bottom
 of the aligned navigation;
 narrow or collapsed windows use a compact icon rail. It supports public search,
-lookup by App ID or bundle identifier, six
-offer platforms, and two-letter country codes. Select a result to inspect its
-metadata or copy identifiers, JSON, and CLI commands. Press Enter in either input
-to submit. Queries run in the background and report loading, empty, and error
-states. No request is sent until you submit.
+lookup by App ID or bundle identifier, six download targets, and a region dropdown
+searchable by English name or two-letter code. Fresh preferences select
+**iOS (iPhone)**; saved platform choices are restored. Submit the search field
+with Enter or Search. Subsequent platform or region changes refresh results
+automatically and clear the previous selection while loading. Select a result to
+inspect metadata or copy identifiers, JSON, and CLI commands. Queries run in the
+background and report loading, empty, and error states.
 
 The GUI is a source-only experiment, initially validated on Apple Silicon macOS.
 It is not included in release archives or Homebrew. The Windows GNU x86_64 GUI
@@ -173,7 +175,11 @@ purchase history, version selection, background downloads, and FairPlay
 inspection/collection/recovery/model decryption through shared Rust application
 workflows. Browsing does not open credential storage. Account access starts only
 through an explicit account/download action; downloads check the account's
-storefront and entitlement. Task history contains request metadata and artifact
+storefront and entitlement. The download dialog allows changing the target
+platform and explains when the browsing region differs from the account region.
+Browsing another region does not change the Apple account's storefront. A catalog
+miss during download preflight reports the account region before any package
+transfer starts. Task history contains request metadata and artifact
 paths, without credentials or signed download URLs. Interrupted tasks require
 explicit review and retry. See [current evidence and remaining gates](docs/PORTING.md#shared-cli--gpui-implementation-in-progress-2026-10-28).
 

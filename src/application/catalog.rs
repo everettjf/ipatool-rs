@@ -4,6 +4,56 @@ use crate::{App, CatalogClient, Platform};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// Safe context for a catalog miss during account-region download preflight.
+/// Only a validated region code is retained in desktop task history.
+#[derive(Debug)]
+pub struct AccountRegionUnavailable {
+    country: String,
+}
+
+impl AccountRegionUnavailable {
+    pub fn country(&self) -> &str {
+        &self.country
+    }
+}
+
+impl std::fmt::Display for AccountRegionUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "application unavailable in account region {}",
+            self.country
+        )
+    }
+}
+
+impl std::error::Error for AccountRegionUnavailable {}
+
+pub fn lookup_for_account(
+    client: &CatalogClient,
+    id: Option<i64>,
+    bundle: Option<&str>,
+    country: &str,
+    platform: Option<Platform>,
+) -> Result<App> {
+    // Validate before retaining input in a user-visible error summary.
+    let country = country.to_ascii_uppercase();
+    if country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        bail!("account region must be a two-letter code");
+    }
+    account_lookup_result(client.lookup(id, bundle, &country, platform), country)
+}
+
+fn account_lookup_result(result: Result<App>, country: String) -> Result<App> {
+    result.map_err(|error| {
+        if error.is::<crate::catalog::AppNotFound>() {
+            error.context(AccountRegionUnavailable { country })
+        } else {
+            error
+        }
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
     Auto,
@@ -156,6 +206,28 @@ pub fn platform_name(platform: Platform) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_lookup_misses_explain_the_account_region_without_persisting_private_context() {
+        use crate::application::failure::{Failure, FailureKind};
+        let miss = anyhow::Error::new(crate::catalog::AppNotFound)
+            .context("https://example.invalid/?token=private-fixture");
+        let error = account_lookup_result(Err(miss), "CN".into())
+            .unwrap_err()
+            .context("private-account@example.invalid");
+        let failure = Failure::from_error(&error);
+        assert_eq!(failure.kind, FailureKind::NotFound);
+        assert!(failure.title.contains("CN"));
+        assert!(failure.message.contains("account's CN region"));
+        assert!(failure.message.contains("No package download started"));
+        let serialized = serde_json::to_string(&failure).unwrap();
+        assert!(!serialized.contains("private-fixture"));
+        assert!(!serialized.contains("private-account"));
+        let other =
+            account_lookup_result(Err(anyhow::anyhow!("decode error")), "CN".into()).unwrap_err();
+        assert_eq!(Failure::from_error(&other).kind, FailureKind::Unavailable);
+        assert!(account_lookup_result(Ok(App::default()), "US".into()).is_ok());
+    }
 
     #[test]
     fn automatic_identity_detection_can_be_overridden_without_changing_storefront() {
