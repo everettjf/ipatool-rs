@@ -811,4 +811,20 @@ The preceding account-region revision's CI run 40819067700 passed four jobs but
 failed its Windows GUI test because that fixture inherited Windows file-store
 selection without supplying its synthetic unlock phrase. The account-region test
 now explicitly selects its synthetic backend on every platform; production
-credential defaults are unchanged. CI for this correction is tracked separately.
+credential defaults are unchanged. Source `0758f8b` subsequently passed
+[all five native CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/40822892531),
+including the corrected Windows GUI fixture and all 39 desktop tests on each GUI
+host. That run predates the direct downloaded-IPA shortcut.
+
+## Direct desktop handoff from downloaded IPA
+
+Completed IPA package artifacts now provide Decrypt IPA... without requiring the
+inspection/collection/model-creation pages first. This opens a review form rather
+than starting private processing. It clears a previously selected model and old
+output/report paths; a matching model is still required. PKGs and already decrypted
+artifacts are excluded, and missing inputs produce an actionable notice. The CLI
+and decryption engine behavior are unchanged. A rendered 900×650 synthetic test
+verified the shortcut and subsequent explicit request, including preservation of
+the original bytes. Full local checks passed 454 library, 45 CLI, and 40 GUI-test
+cases (70 ignored library checks), formatting, three strict Clippy configurations,
+and ad hoc signed debug/release GUI bundles. Private FairPlay gates remain open.

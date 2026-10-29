@@ -43,6 +43,13 @@ offers explicit step 2/3/4 input-review actions. Successful collection provides
 Create decryption model; model output provides Use for decryption. These actions
 populate forms without starting another task.
 
+Completed IPA downloads also offer **Decrypt IPA...** in Downloads. This opens
+step 4 with the IPA selected, clears any previous model and output/report paths,
+and requires explicit model selection and submission. Missing or moved IPA files
+produce a notice instead of changing the form. PKG downloads and already decrypted
+IPA artifacts do not offer this shortcut. An IPA by itself is not sufficient for
+decryption; no model is derived automatically.
+
 Completed IPA, capture, and model artifacts can populate the next appropriate
 form. Handoff does not start another operation. Output fields are reset for
 review. Retry restores editable parameters; interrupted jobs never auto-start.

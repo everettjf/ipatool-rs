@@ -175,6 +175,32 @@ impl DesktopWindow {
         cx.notify();
     }
 
+    pub(super) fn prepare_ipa_decryption(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !path.is_file()
+            || !path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ipa"))
+        {
+            self.show_notice(
+                "IPA not found. Choose its current location in FairPlay.",
+                cx,
+            );
+            return;
+        }
+        self.use_fairplay_artifact(ArtifactKind::Package, path, window, cx);
+        self.set_fair_mode(FairMode::Decrypt, window, cx);
+        // A model selected for a different download must not be reused silently.
+        self.fair
+            .model
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.show_notice("IPA selected. Choose a matching model to continue.", cx);
+    }
+
     pub(super) fn search(&mut self, cx: &mut Context<Self>) {
         let query = match Query::new(
             self.mode,

@@ -30,7 +30,7 @@ checkboxes and local/CI evidence do not close the separate live-validation gates
 - [ ] Finish fixture and live validation of the implemented account, download, and FairPlay desktop workflows, including 2FA, credential-store access, task recovery, safe cancellation, and output selection. Keep manual account/private-data checks last.
 - [ ] Complete private FairPlay processing and interruption walkthroughs. Refined dark normal/narrow, synthetic selector mismatch/matched prerequisites, report collision/retry, model pickers, and decryption-input handoff have native screenshot/interaction evidence. Light/system themes are out of scope at the user's request. Native synthetic challenge continuation, populated Library/filter/version selection, expired-session queue continuation, cancellation/completion, restart/download retry, and active-work quit handling now have observed evidence in `screenshots/fixtures/`; these do not close live account gates.
 
-- [x] Guide desktop FairPlay preparation with numbered steps, required/optional input help, explicit outputs, plain-language inspection results, collapsed advanced controls, and fixed actions at 900×650. Synthetic navigation/readiness checks and native captures pass; this does not close private processing gates.
+- [x] Guide desktop FairPlay preparation with numbered steps, required/optional input help, explicit outputs, plain-language inspection results, collapsed advanced controls, and fixed actions at 900×650. Completed IPA downloads also provide a direct decryption-review entry that requires a matching model. Synthetic navigation/readiness checks and native captures pass; this does not close private processing gates.
 
 ## Current macOS Apple Silicon gates
 

@@ -1087,6 +1087,7 @@ impl DesktopWindow {
                                                 let path = artifact.path.clone();
                                                 let reveal = path.clone();
                                                 let use_path = path.clone();
+                                                let decrypt_path = path.clone();
                                                 let kind = artifact.kind;
                                                 h_flex()
                                                     .gap_2()
@@ -1147,6 +1148,15 @@ impl DesktopWindow {
                                                     )
                                                         },
                                                     )
+                                                    .when(artifact.kind == ArtifactKind::Package && path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("ipa")), |row| {
+                                                        row.child(Button::new(("decrypt-ipa", index))
+                                                            .small()
+                                                            .label("Decrypt IPA...")
+                                                            .debug_selector(move || format!("decrypt-ipa-{id}-{index}"))
+                                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                                this.prepare_ipa_decryption(decrypt_path.clone(), window, cx);
+                                                            })))
+                                                    })
                                             },
                                         ),
                                     );

@@ -113,7 +113,9 @@ Native Mac applications such as ScriptWidget download as PKGs. A compatible iPho
 
 The desktop FairPlay page guides preparation through **Check files → Collect files →
 Create model → Decrypt IPA**. Each step explains what to prepare and what comes next;
-existing materials let you skip steps. Progress and results appear in Downloads.
+existing materials let you skip steps. Completed IPA downloads also offer **Decrypt
+IPA...** to open the final step directly; a matching model is still required.
+Progress and results appear in Downloads.
 See the [FairPlay guide](docs/GUI_FAIRPLAY.md) for prerequisites and limitations.
 
 ## Commands

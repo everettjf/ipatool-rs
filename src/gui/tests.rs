@@ -717,6 +717,96 @@ fn restart_displays_interrupted_history_without_executing_any_saved_request(
 }
 
 #[gpui::test]
+fn downloaded_ipa_opens_decryption_without_reusing_a_model_or_starting_work(
+    cx: &mut TestAppContext,
+) {
+    let (directory, view, session, mut cx) = setup(cx);
+    let ipa = directory.path().join("downloaded.IPA");
+    let pkg = directory.path().join("downloaded.pkg");
+    let model = directory.path().join("matching-model.bin");
+    std::fs::write(&ipa, b"synthetic IPA").unwrap();
+    std::fs::write(&model, b"synthetic model").unwrap();
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(650.)));
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            let mut task = TaskRecord::new(
+                1,
+                "Fixture download".into(),
+                JobRequest::Download(DownloadRequest::default()),
+                1,
+            );
+            task.state = TaskState::Succeeded;
+            task.outcome = Some(JobOutcome {
+                summary: "Synthetic outputs".into(),
+                artifacts: vec![
+                    Artifact {
+                        kind: ArtifactKind::Package,
+                        path: ipa.clone(),
+                    },
+                    Artifact {
+                        kind: ArtifactKind::Package,
+                        path: pkg.clone(),
+                    },
+                ],
+                details: None,
+            });
+            this.journal.tasks.push(task);
+            this.page = Page::Downloads;
+            for field in [&this.fair.model, &this.fair.output, &this.fair.report] {
+                field.update(cx, |input, cx| {
+                    input.set_value("previous-selection", window, cx)
+                });
+            }
+            cx.notify();
+        })
+    });
+    cx.draw(
+        Default::default(),
+        gpui::size(gpui::px(900.), gpui::px(650.)),
+        |window, _| window.root::<Root>().unwrap().unwrap().into_any_element(),
+    );
+    assert!(
+        cx.debug_bounds("decrypt-ipa-1-1").is_none(),
+        "PKG downloads do not offer IPA decryption"
+    );
+    let button = cx
+        .debug_bounds("decrypt-ipa-1-0")
+        .expect("downloaded IPA has a direct action");
+    assert!(button.bottom() <= gpui::px(650.));
+    cx.simulate_click(button.center(), Default::default());
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            assert!(this.page == Page::FairPlay);
+            assert!(this.fair.mode == super::FairMode::Decrypt);
+            assert_eq!(
+                this.fair.input.read(cx).value().as_str(),
+                ipa.to_str().unwrap()
+            );
+            assert!(this.fair.model.read(cx).value().is_empty());
+            assert!(this.fair.output.read(cx).value().is_empty());
+            assert!(this.fair.report.read(cx).value().is_empty());
+            this.submit_fairplay(window, cx);
+            assert_eq!(
+                this.journal.tasks.len(),
+                1,
+                "a matching model is still required"
+            );
+            assert!(session.jobs.lock().unwrap().is_empty());
+            this.fair.model.update(cx, |input, cx| {
+                input.set_value(model.to_string_lossy().into_owned(), window, cx)
+            });
+            this.submit_fairplay(window, cx);
+        })
+    });
+    cx.run_until_parked();
+    let jobs = session.jobs.lock().unwrap();
+    assert!(
+        matches!(&jobs[..], [JobRequest::FairPlay(super::FairPlayRequest::Decrypt { input, model: selected, output, report, force: false })] if input == &ipa && selected == &model && output == &ipa.with_extension("decrypted.ipa") && report == &ipa.with_extension("decrypted.json"))
+    );
+    assert_eq!(std::fs::read(&ipa).unwrap(), b"synthetic IPA");
+}
+
+#[gpui::test]
 fn completed_capture_and_model_handoff_prefills_inputs_without_starting_private_work(
     cx: &mut TestAppContext,
 ) {

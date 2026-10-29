@@ -13,6 +13,8 @@ previous palette; see the [native gallery](../README.md) for public-service capt
 
 | Capture | Observed interaction |
 | --- | --- |
+| [Direct IPA decryption entry](download-decrypt-entry-narrow.png) | A synthetic completed IPA offers Decrypt IPA... next to compatibility inspection; clicking it opens step 4 with the IPA filled and a matching model still required. No decryption ran. |
+| [Direct decryption review](download-decrypt-handoff-narrow.png) | The shortcut preselects only the downloaded IPA, leaves model selection explicit, preserves the original, and keeps the short notice and Dismiss button inside 900×650. |
 | [Guided FairPlay, normal](fairplay-guided-check.png) | Numbered preparation order, explained optional materials, and fixed results/action footer. |
 | [Check files, narrow](fairplay-guided-check-narrow.png) | Step 1 explains that inspection does not decrypt and existing materials permit skipping steps. |
 | [Collect files, narrow](fairplay-guided-collect-narrow.png) | Step 2 states installed-app and permission prerequisites and explains the private output folder. |
