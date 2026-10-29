@@ -34,6 +34,9 @@ pub struct AccountView {
 /// Front-end services are replaceable in controller tests. The native
 /// implementation remains the same shared application layer used by the CLI.
 pub trait DesktopSession: Send + Sync {
+    fn saved_model_count(&self) -> Result<usize> {
+        Ok(0)
+    }
     fn is_fixture(&self) -> bool {
         false
     }
@@ -253,12 +256,15 @@ impl Session {
                 if let Some(path) = result.fairplay_capture { artifacts.push(Artifact { kind: ArtifactKind::Capture, path }); }
                 Ok(JobOutcome { summary: "Package downloaded, processed, and published. An account entitlement was required.".into(), artifacts, details: None })
             }
-            JobRequest::FairPlay(request) => fairplay::execute(request),
+            JobRequest::FairPlay(request) => fairplay::execute_in(request, &self.directory),
         })
     }
 }
 
 impl DesktopSession for Session {
+    fn saved_model_count(&self) -> Result<usize> {
+        ipatool_rs::application::fairplay_setup::SavedModels::new(&self.directory).count()
+    }
     fn catalog(
         &self,
         query: &ipatool_rs::application::catalog::Query,

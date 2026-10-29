@@ -30,6 +30,7 @@ struct FixtureSession {
     account_country: Mutex<String>,
     jobs: Mutex<Vec<JobRequest>>,
     expire_next_job: AtomicBool,
+    managed_models_ready: AtomicBool,
 }
 
 impl FixtureSession {
@@ -43,6 +44,7 @@ impl FixtureSession {
             account_country: Mutex::new("US".into()),
             jobs: Mutex::new(Vec::new()),
             expire_next_job: AtomicBool::new(false),
+            managed_models_ready: AtomicBool::new(false),
         }
     }
     fn account() -> AccountView {
@@ -70,6 +72,11 @@ impl FixtureSession {
 }
 
 impl DesktopSession for FixtureSession {
+    fn saved_model_count(&self) -> Result<usize> {
+        Ok(usize::from(
+            self.managed_models_ready.load(Ordering::SeqCst),
+        ))
+    }
     fn catalog(&self, query: &ipatool_rs::application::catalog::Query) -> Result<Vec<CatalogApp>> {
         self.catalogs.lock().unwrap().push(query.clone());
         let mut app = Self::app();
@@ -137,8 +144,32 @@ impl DesktopSession for FixtureSession {
         generation: u64,
         operation: &Operation,
     ) -> Result<JobOutcome> {
-        assert_eq!(generation, self.generation());
+        if matches!(request, JobRequest::Download(_)) {
+            assert_eq!(generation, self.generation());
+        }
+        let managed_setup = matches!(
+            request,
+            JobRequest::FairPlay(super::FairPlayRequest::Setup(_))
+        );
+        let saved = matches!(
+            request,
+            JobRequest::FairPlay(super::FairPlayRequest::DecryptSaved { .. })
+        );
         self.jobs.lock().unwrap().push(request);
+        if managed_setup {
+            self.managed_models_ready.store(true, Ordering::SeqCst);
+            return Ok(JobOutcome {
+                summary: "Synthetic preparation finished".into(),
+                artifacts: vec![Artifact {
+                    kind: ArtifactKind::Model,
+                    path: self.directory.join("fairplay-models/fixture/model.bin"),
+                }],
+                details: None,
+            });
+        }
+        if saved && !self.managed_models_ready.load(Ordering::SeqCst) {
+            return Err(ipatool_rs::application::fairplay_setup::ModelProblem::Missing.into());
+        }
         if self.expire_next_job.swap(false, Ordering::SeqCst) {
             return Err(ipatool_rs::store_purchase::PasswordTokenExpired.into());
         }
@@ -151,8 +182,16 @@ impl DesktopSession for FixtureSession {
             Ok(JobOutcome {
                 summary: "Fixture processing completed".into(),
                 artifacts: vec![Artifact {
-                    kind: ArtifactKind::Package,
-                    path: self.directory.join("fixture.ipa"),
+                    kind: if saved {
+                        ArtifactKind::DecryptedIpa
+                    } else {
+                        ArtifactKind::Package
+                    },
+                    path: self.directory.join(if saved {
+                        "fixture.decrypted.ipa"
+                    } else {
+                        "fixture.ipa"
+                    }),
                 }],
                 details: None,
             })
@@ -195,7 +234,10 @@ fn setup_with_history(
     let window = cx.add_window(|window, cx| {
         let view = cx.new(|cx| DesktopWindow::new(directory.path().to_path_buf(), window, cx));
         super::desktop_shortcuts(&view, window, cx);
-        view.update(cx, |this, _| this.session = session.clone());
+        view.update(cx, |this, _| {
+            this.session = session.clone();
+            this.preferences.auto_decrypt = false;
+        });
         desktop = Some(view.clone());
         let root = cx.entity();
         let frame = cx.new(|cx| DesktopFrame {
@@ -392,6 +434,217 @@ fn narrow_account_error_keeps_both_footer_actions_inside_the_window(cx: &mut Tes
         assert!(bounds.size.height > gpui::px(20.));
     }
     assert!(session.login_calls.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn first_time_model_wizard_reviews_before_starting_and_keeps_narrow_actions_visible(
+    cx: &mut TestAppContext,
+) {
+    let (directory, view, session, mut cx) = setup(cx);
+    let app = directory.path().join("Fixture.app");
+    let ipa = directory.path().join("fixture.ipa");
+    std::fs::create_dir(&app).unwrap();
+    std::fs::write(&ipa, b"synthetic sample").unwrap();
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(650.)));
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            this.open_setup(Some(ipa.clone()), window, cx)
+        })
+    });
+    for step in 0..=2 {
+        cx.draw(
+            Default::default(),
+            gpui::size(gpui::px(900.), gpui::px(650.)),
+            |window, _| window.root::<Root>().unwrap().unwrap().into_any_element(),
+        );
+        for selector in ["fairplay-submit", "fairplay-results"] {
+            let bounds = cx.debug_bounds(selector).unwrap();
+            assert!(bounds.top() >= gpui::px(0.) && bounds.bottom() <= gpui::px(650.));
+        }
+        assert!(session.jobs.lock().unwrap().is_empty());
+        cx.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                assert_eq!(this.fair.setup_step, step);
+                assert!(!this.fair.advanced && !this.fair.tools);
+                if step == 1 {
+                    this.setup_next(cx);
+                    assert_eq!(
+                        this.fair.setup_step, 1,
+                        "missing installed app cannot advance"
+                    );
+                    this.notice = None;
+                    this.fair.app.update(cx, |field, cx| {
+                        field.set_value(app.to_string_lossy().into_owned(), window, cx)
+                    });
+                }
+            })
+        });
+        let button = cx.debug_bounds("fairplay-submit").unwrap();
+        cx.simulate_click(button.center(), Default::default());
+    }
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            assert!(this.page == Page::Downloads);
+            assert_eq!(this.journal.tasks.len(), 1);
+            assert_eq!(this.journal.tasks[0].state, TaskState::Succeeded);
+            assert!(matches!(this.fair.saved_models, Some(Ok(1))));
+            let artifact = this.journal.tasks[0].outcome.as_ref().unwrap().artifacts[0].clone();
+            this.use_fairplay_artifact(artifact.kind, artifact.path, window, cx);
+            assert!(this.fair.mode == super::FairMode::Saved);
+        })
+    });
+    let jobs = session.jobs.lock().unwrap();
+    assert!(
+        matches!(&jobs[..], [JobRequest::FairPlay(super::FairPlayRequest::Setup(request))] if request.app == app && request.ipa == ipa && request.options.existing_model.is_none() && request.options.timeout_seconds == 600)
+    );
+}
+
+#[gpui::test]
+fn automatic_decryption_is_a_separate_idempotent_snapshot_and_restart_never_replays_it(
+    cx: &mut TestAppContext,
+) {
+    let (directory, view, session, mut visual) = setup(cx);
+    session.managed_models_ready.store(true, Ordering::SeqCst);
+    visual.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            this.account = Some(FixtureSession::account());
+            this.preferences.auto_decrypt = true;
+            this.enqueue(
+                "Fixture download".into(),
+                JobRequest::Download(DownloadRequest {
+                    app_id: Some(42),
+                    ..Default::default()
+                }),
+                window,
+                cx,
+            );
+            this.preferences.auto_decrypt = false; // The queued request retains its explicit choice.
+        })
+    });
+    visual.run_until_parked();
+    let mut history = None;
+    visual.update(|_, cx| {
+        view.update(cx, |this, _| {
+            assert_eq!(this.journal.tasks.len(), 2);
+            assert_eq!(this.journal.tasks[0].state, TaskState::Succeeded);
+            assert_eq!(this.journal.tasks[1].state, TaskState::Succeeded);
+            assert_eq!(this.journal.tasks[1].parent_task, Some(1));
+            this.queue_download_decryption(1);
+            assert_eq!(this.journal.tasks.len(), 2);
+            history = Some(Journal {
+                tasks: this.journal.tasks.clone(),
+            });
+        })
+    });
+    let jobs = session.jobs.lock().unwrap();
+    assert!(
+        matches!(&jobs[..], [JobRequest::Download(_), JobRequest::FairPlay(super::FairPlayRequest::DecryptSaved { input, output: None, report: None })] if input == &directory.path().join("fixture.ipa"))
+    );
+    drop(jobs);
+    let (_restart_directory, restarted, restarted_session, mut restarted_cx) =
+        setup_with_history(cx, history);
+    restarted_cx
+        .update(|_, cx| restarted.update(cx, |this, _| assert_eq!(this.journal.tasks.len(), 2)));
+    assert!(restarted_session.jobs.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn missing_model_keeps_download_success_and_cancellation_never_starts_a_followup(
+    cx: &mut TestAppContext,
+) {
+    let (_directory, view, session, mut cx) = setup(cx);
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            this.account = Some(FixtureSession::account());
+            this.preferences.auto_decrypt = true;
+            this.enqueue(
+                "Fixture download".into(),
+                JobRequest::Download(DownloadRequest::default()),
+                window,
+                cx,
+            );
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            assert_eq!(this.journal.tasks[0].state, TaskState::Succeeded);
+            assert_eq!(this.journal.tasks[1].state, TaskState::Failed);
+            assert_eq!(
+                this.journal.tasks[1].failure.as_ref().unwrap().kind,
+                super::FailureKind::ModelRequired
+            );
+            this.enqueue(
+                "Cancelled download".into(),
+                JobRequest::Download(DownloadRequest {
+                    app_id: Some(7),
+                    ..Default::default()
+                }),
+                window,
+                cx,
+            );
+            this.cancel_task(3, cx);
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |this, _| {
+            assert_eq!(this.journal.tasks.len(), 3);
+            assert_eq!(this.journal.tasks[2].state, TaskState::Cancelled);
+        })
+    });
+    assert_eq!(session.jobs.lock().unwrap().len(), 3);
+}
+
+#[gpui::test]
+fn automatic_choice_persists_and_pkg_or_already_decrypted_outputs_do_not_chain(
+    cx: &mut TestAppContext,
+) {
+    let (directory, view, session, mut cx) = setup(cx);
+    assert!(super::Preferences::default().auto_decrypt);
+    cx.update(|_, cx| {
+        view.update(cx, |this, cx| {
+            this.toggle_auto_decrypt(cx);
+            assert!(this.preferences.auto_decrypt);
+            assert!(
+                super::Preferences::load(&directory.path().join("desktop-preferences.json"))
+                    .unwrap()
+                    .auto_decrypt
+            );
+            for (id, extension, kind) in [
+                (1, "pkg", ArtifactKind::Package),
+                (2, "ipa", ArtifactKind::DecryptedIpa),
+            ] {
+                let mut task = TaskRecord::new(
+                    id,
+                    "Synthetic completed package".into(),
+                    JobRequest::Download(DownloadRequest::default()),
+                    1,
+                );
+                task.state = TaskState::Succeeded;
+                task.decrypt_after_download = true;
+                task.outcome = Some(JobOutcome {
+                    summary: "Fixture".into(),
+                    artifacts: vec![Artifact {
+                        kind,
+                        path: directory.path().join(format!("output.{extension}")),
+                    }],
+                    details: None,
+                });
+                this.journal.tasks.push(task);
+                this.queue_download_decryption(id);
+                assert_eq!(this.journal.tasks.len(), id as usize);
+            }
+            this.toggle_auto_decrypt(cx);
+            assert!(
+                !super::Preferences::load(&directory.path().join("desktop-preferences.json"))
+                    .unwrap()
+                    .auto_decrypt
+            );
+        })
+    });
+    assert!(session.jobs.lock().unwrap().is_empty());
 }
 
 #[gpui::test]
@@ -723,9 +976,7 @@ fn downloaded_ipa_opens_decryption_without_reusing_a_model_or_starting_work(
     let (directory, view, session, mut cx) = setup(cx);
     let ipa = directory.path().join("downloaded.IPA");
     let pkg = directory.path().join("downloaded.pkg");
-    let model = directory.path().join("matching-model.bin");
     std::fs::write(&ipa, b"synthetic IPA").unwrap();
-    std::fs::write(&model, b"synthetic model").unwrap();
     cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(650.)));
     cx.update(|window, cx| {
         view.update(cx, |this, cx| {
@@ -777,7 +1028,7 @@ fn downloaded_ipa_opens_decryption_without_reusing_a_model_or_starting_work(
     cx.update(|window, cx| {
         view.update(cx, |this, cx| {
             assert!(this.page == Page::FairPlay);
-            assert!(this.fair.mode == super::FairMode::Decrypt);
+            assert!(this.fair.mode == super::FairMode::Saved);
             assert_eq!(
                 this.fair.input.read(cx).value().as_str(),
                 ipa.to_str().unwrap()
@@ -785,23 +1036,15 @@ fn downloaded_ipa_opens_decryption_without_reusing_a_model_or_starting_work(
             assert!(this.fair.model.read(cx).value().is_empty());
             assert!(this.fair.output.read(cx).value().is_empty());
             assert!(this.fair.report.read(cx).value().is_empty());
-            this.submit_fairplay(window, cx);
-            assert_eq!(
-                this.journal.tasks.len(),
-                1,
-                "a matching model is still required"
-            );
+            assert_eq!(this.journal.tasks.len(), 1);
             assert!(session.jobs.lock().unwrap().is_empty());
-            this.fair.model.update(cx, |input, cx| {
-                input.set_value(model.to_string_lossy().into_owned(), window, cx)
-            });
             this.submit_fairplay(window, cx);
         })
     });
     cx.run_until_parked();
     let jobs = session.jobs.lock().unwrap();
     assert!(
-        matches!(&jobs[..], [JobRequest::FairPlay(super::FairPlayRequest::Decrypt { input, model: selected, output, report, force: false })] if input == &ipa && selected == &model && output == &ipa.with_extension("decrypted.ipa") && report == &ipa.with_extension("decrypted.json"))
+        matches!(&jobs[..], [JobRequest::FairPlay(super::FairPlayRequest::DecryptSaved { input, output: None, report: None })] if input == &ipa)
     );
     assert_eq!(std::fs::read(&ipa).unwrap(), b"synthetic IPA");
 }
@@ -827,7 +1070,7 @@ fn completed_capture_and_model_handoff_prefills_inputs_without_starting_private_
             );
             assert!(this.fair.output.read(cx).value().is_empty());
             this.use_fairplay_artifact(ArtifactKind::Model, model.clone(), window, cx);
-            assert!(this.fair.mode == super::FairMode::Decrypt);
+            assert!(this.fair.mode == super::FairMode::Setup);
             assert_eq!(
                 this.fair.model.read(cx).value().as_str(),
                 model.to_string_lossy()

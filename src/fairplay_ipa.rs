@@ -913,7 +913,7 @@ fn publish_staged(files: &[(&tempfile::NamedTempFile, &Path)], force: bool) -> R
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::fairplay_decrypt::tests::encrypted_fixture;
     use crate::fairplay_supf::PAGE_BYTES;
@@ -931,7 +931,7 @@ mod tests {
         result
     }
 
-    fn model_and_sinf(logical: [u8; 16]) -> (Vec<u8>, Vec<u8>) {
+    pub(crate) fn model_and_sinf(logical: [u8; 16]) -> (Vec<u8>, Vec<u8>) {
         let mut model = vec![0u8; 8 + 4 + 4 + 32 + 16 + 16 + 4096];
         let model_size = model.len() as u32;
         model[..8].copy_from_slice(b"FPSENR1\0");
@@ -987,7 +987,7 @@ mod tests {
         (model, sinf)
     }
 
-    fn supf(record: [u8; 32]) -> Vec<u8> {
+    pub(crate) fn supf(record: [u8; 32]) -> Vec<u8> {
         let mut arch = Vec::new();
         arch.extend_from_slice(&0x0100_000cu32.to_be_bytes());
         arch.extend_from_slice(&2u32.to_be_bytes());

@@ -48,7 +48,7 @@ account/private-data gates. All work remains on `codex/gpui-catalog` / PR #7.
 | Native macOS bundle | Debug and release bundles built; Info.plist linted; strict ad hoc signatures passed; actual launch succeeded; application icon decoded natively. | Final debug/release rebuilds and strict signatures passed. Public release launch and native controls passed. Guest execution under the bundle identity still needs the controlled-account gate. |
 | Release CLI | Apple Silicon release script built a signed executable returning 0.2.1. | Current source rebuilt; signed executable returns 0.2.1. |
 | Portable desktop builds | Native Linux x86_64 and Windows MSVC x86_64 CI passed shared fixtures, deterministic GUI controllers, strict Clippy and GUI linking. macOS CI also passed its app-bundle build/signature checks. Windows GNU GUI cross-build and strict all-targets Clippy passed locally. See the exact run in PORTING. | Native Linux/Windows desktop and account interaction remain open. GUI CI builds are debug executables; GUI distribution/release packaging is separate. |
-| Complete local regression | Current default suite: 454 library + 45 CLI passed, 70 ignored. Current gui-test suite adds 40 passing desktop tests, including account-region defaults, preserved overrides, platform/region refresh, region search/cancellation, target/version reset and narrow layout. Strict default, production-GUI, and gui-test all-targets Clippy passed; debug/release signed bundles rebuilt. The earlier graphite source passed Windows GNU linking/Clippy. Runtime source `db63141` passed [all five native CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/40811697728), including all 36 desktop tests on each GUI host. That run predates the subsequent account-first default/warning revision; its new CI is tracked separately in PR #7. | Native desktop interaction, account checks and distribution remain distinct gates. Formatting and whitespace checks passed. Repeat affected checks if source changes. |
+| Complete local regression | Current default suite: 459 library + 45 CLI passed, 70 ignored. Current gui-test suite adds 44 passing desktop tests, including account-region defaults, preserved overrides, platform/region refresh, region search/cancellation, target/version reset and narrow layout. Strict default, production-GUI, and gui-test all-targets Clippy passed; debug/release signed bundles rebuilt. The earlier graphite source passed Windows GNU linking/Clippy. Runtime source `db63141` passed [all five native CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/40811697728), including all 36 desktop tests on each GUI host. That run predates the subsequent account-first default/warning revision; its new CI is tracked separately in PR #7. | Native desktop interaction, account checks and distribution remain distinct gates. Formatting and whitespace checks passed. Repeat affected checks if source changes. |
 | Reviewable PR, no main merge | Reviewed changes and current native screenshot pushed to `codex/gpui-catalog` / PR #7 after local verification. Shared workflows and desktop changes are recorded separately. | Keep remaining gates explicit; never merge main in this task. |
 | Final controlled-account/private gates | User manual testing reached a signed-in account and reported catalog-preflight misses. Public-only diagnosis reproduced the relevant region difference; no authenticated package transfer or private FairPlay success has been reported. | Continue only the remaining authorized manual checks after autonomous verification. User-reported sign-in does not close live 2FA, entitlement, package, or private processing gates. |
 
@@ -120,3 +120,31 @@ paths; the original fixture bytes remain unchanged. Local default tests passed
 454 library + 45 CLI cases (70 ignored); GUI-test passed 40 tests. Strict default,
 GUI, and GUI-test Clippy, formatting, and signed GUI bundle builds passed. Native
 screenshots remain synthetic and do not establish successful private decryption.
+
+## Reusable FairPlay setup and automatic download follow-up
+
+The new primary journey is one-time preparation, then automatic saved-model reuse.
+Four synthetic crypto/service tests cover real sample import/decryption, reuse for
+another application key within the same enrollment, missing/mismatched models,
+conflicting candidates, receipt/model tampering, private permissions/symlinks,
+output collision, mid-validation cancellation/cleanup, and conservative report
+validation. They contain no real account material. Four additional desktop tests
+cover review-before-start, model readiness, independent download/decryption tasks,
+setting snapshots/persistence, idempotent parent links, no restart replay,
+cancellation suppression, PKG/already-decrypted exclusion and missing-model handoff.
+An allowlisted-failure test excludes private causes from history.
+
+Local checks passed **459 library + 45 CLI + 44 desktop = 548 active tests**,
+with 70 opt-in library tests ignored. Formatting and strict all-targets Clippy
+passed for default, production GUI and GUI-test configurations. Apple Silicon CLI
+and ad hoc signed debug/release GUI bundles rebuilt successfully. Native 900×650
+fixture captures verified the home, all setup stages, final advanced timeout field,
+fixed footer, successful synthetic download and separate missing-model task.
+The native harness disables private setup; positive cryptographic reuse is tested
+in the synthetic service suite. New-head portable CI is tracked in PR #7.
+
+Remaining manual gates: prepare/import with authorized matching real materials,
+then download another matching IPA and verify independent automatic decryption,
+content/report, collision behavior, cancellation and relaunch. Windows managed
+private storage awaits ACL support. No actual account/private FairPlay gate is
+closed by the synthetic suite or screenshots.

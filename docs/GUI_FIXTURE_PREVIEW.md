@@ -30,7 +30,11 @@ Only the fixture harness accepts the documented synthetic account:
   unencrypted fixture ZIP under the harness's own `fixture-output` directory.
   They ignore the requested output destination and never replace existing files.
 - Inspecting the generated IPA uses the real shared diagnostic adapter on the
-  synthetic file. Other private FairPlay processing is disabled in this harness.
+  synthetic file. An automatic saved-model follow-up returns the safe missing-model
+  failure so the original successful download and preparation handoff can be
+  tested. Setup/import/collection/recovery and actual decryption are disabled in
+  this native harness. Positive model import/reuse uses synthetic encrypted data
+  in the shared-service unit suite, separately from native screenshots.
 
 The harness never writes its sample account/password/code to credential storage
 or task history. Outputs are test artifacts, not usable downloaded applications.

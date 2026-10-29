@@ -7,55 +7,96 @@ For practical use, prefer the original ipatool and UnfairPlay projects.
 
 ## Primary journeys
 
-The four numbered steps follow the user's material preparation order, not the
-CLI command order. Existing materials allow direct entry to step 3 or 4; selecting
-a step never starts work. Each step explains prerequisites, how to select inputs,
-what is optional, and the output or next action. Primary actions and View results
-stay in a fixed footer while the form scrolls at 900×650.
+The default page is **Decrypt IPAs**, with saved-model readiness, a persisted
+Automatic decryption switch (on by default), and an optional existing IPA input.
+Advanced output/report paths and expert tools are collapsed. Main actions and
+View results stay in a fixed footer while the form scrolls at 900×650.
 
-1. **Check files:** choose a downloaded IPA and any existing decryption model or
-   collected materials folder. At least one input is required. A model is a
-   FairPlay parameter file, not an AI model. Native pickers and single-item drops
-   only populate inputs. Inspection does not decrypt the IPA. Report selection
-   is under Advanced options; without a report path, detailed results are transient.
-2. **Collect files:** choose the installed `.app`, an optional matching IPA, and
-   a new materials output folder. An IPA alone is insufficient. The supported
-   Mac must have readable local FairPlay data; the GUI cannot grant permissions.
-   Host/build overrides stay under Advanced options. Keep collected files private.
-3. **Create model:** choose the complete collected materials folder and a new
-   output folder. Run step 1 if support is unknown. Any matching system files
-   requested by diagnostics are selected under Advanced options. The phase
-   timeout remains 1–3600 seconds and differential checks remain enabled.
-4. **Decrypt IPA:** choose the downloaded IPA and matching model file or folder.
-   A separate `.decrypted.ipa` and `.decrypted.json` are created by default.
-   Existing files are preserved. An optional custom report path is advanced.
+### Prepare once
 
-Results appear in Downloads. Inspection is labeled Check complete even when
-requirements need attention; a successful IPA-only check explicitly says a model
-is still needed. Check names, warnings, and common input errors are presented as
-plain-language explanations. Raw protocol details are available under Show task
-details. Finding a matching model prioritizes the decryption review action over
-unnecessary collection. Inspection is not plaintext authentication.
+**First-time preparation** follows the setup/reuse pattern in
+[UnfairPlay](https://github.com/DrWhax/unfairplay#usage). A model is reusable
+FairPlay authorization data, not an AI model or a separate model for each app.
+Reuse follows an App Store enrollment; the same Apple ID alone does not prove
+that an IPA and model belong together.
 
-Installed-application, IPA, materials-folder, decrypted-file, and output-folder
-controls retain independent meanings when steps change. The inspection result
-offers explicit step 2/3/4 input-review actions. Successful collection provides
-Create decryption model; model output provides Use for decryption. These actions
-populate forms without starting another task.
+1. **Prepare this Mac:** sign in to the Mac App Store with the account that owns
+   the IPA, install an offered iPhone/iPad app, and open it once. Download the same
+   app/version's personalized IPA. Signing in only inside IPATOOL-RS does not
+   prepare the Mac's authorization. Current recovery assumes a fresh account
+   enrolled through this Mac's App Store; older/migrated profiles are unsupported,
+   and a fresh account alone does not guarantee success. The system build and
+   readable private authorization data must also be supported. The GUI does not
+   grant permissions or elevate itself.
+2. **Choose sample files:** select the installed `.app` and matching IPA. The app
+   creates a private disposable working directory automatically. Under Advanced
+   options, an existing selector-bound model can instead be imported with a
+   matching IPA; import skips collection and does not require an installed app.
+   System-image/profile/state overrides, interface, build/version and the
+   1–3600-second phase timeout remain advanced.
+3. **Review and prepare:** review the selected filenames and explicitly start.
+   Fresh setup collects, recovers with differential checks enabled, validates the
+   sample's processing report, and saves the model. Import runs the same sample
+   processing/structure gate before saving. Merely changing steps never starts
+   private work. A model without a binding selector is not eligible for managed
+   reuse; the manual expert workflow remains available.
 
-Completed IPA downloads also offer **Decrypt IPA...** in Downloads. This opens
-step 4 with the IPA selected, clears any previous model and output/report paths,
-and requires explicit model selection and submission. Missing or moved IPA files
-produce a notice instead of changing the form. PKG downloads and already decrypted
-IPA artifacts do not offer this shortcut. An IPA by itself is not sufficient for
-decryption; no model is derived automatically.
+The sample gate requires processed encrypted images/pages, zero final cryptids,
+exact mutation scope, plausible ARM64 first-page structure, and complete matching
+embedded CodeDirectory page audits. It is conservative and can reject unsupported
+samples. Passing it does **not** authenticate plaintext or Apple's signature.
+Original inputs are preserved. Temporary captures and sample plaintext are
+removed after normal completion, failure, or cooperative cancellation. A hard
+process crash may leave hidden private staging directories; they are ignored,
+never activated as models, and never replayed on restart.
 
-Completed IPA, capture, and model artifacts can populate the next appropriate
-form. Handoff does not start another operation. Output fields are reset for
-review. Retry restores editable parameters; interrupted jobs never auto-start.
-Cancelled recovery may leave private intermediate files inside the selected
-output directory. Choose a new directory or inspect them through the expert
-checkpoint commands before attempting continuation.
+### Download and reuse
+
+Each new download captures the Automatic decryption preference when enqueued.
+A successful IPA download queues an independent saved-model decryption task with
+a parent link; duplicate completion delivery does not create another task.
+PKGs and already decrypted results do not trigger it. Cancellation or quitting
+suppresses the follow-up. Full task history explains how to retry manually.
+Restart restores history for review without inventing or replaying operations.
+
+The downloaded IPA remains a successful, separate artifact even if decryption
+cannot run. No model, a different enrollment, ambiguous candidates, or invalid
+storage produces an actionable failure. Missing/mismatched models offer
+**Prepare reusable decryption**, with the IPA prefilled. Collection still requires
+an explicit final review and start. Completed IPA downloads also offer **Decrypt
+IPA...**, which opens automatic matching with stale model/output/report fields
+cleared; it does not start another task. Missing files produce a notice.
+
+Matching uses the IPA's SINF authorization selectors, not the account display
+name or application title. Every selector must have exactly one validated saved
+candidate. Default outputs are separate `.decrypted.ipa` and `.decrypted.json`
+files beside the original. Existing files cause a stop, never replacement.
+Custom paths stay under Advanced options. Results and reports appear in Downloads.
+
+### Private saved models
+
+Managed models live in `IPATOOL_STATE_DIR/fairplay-models/<model-sha256>/`.
+Directories are mode 0700 and files 0600 on Unix. A model and bounded receipt are
+published together from private staging. Reuse rechecks the envelope, SHA-256,
+selector, receipt schema and permissions, and rejects symlinked/tampered entries
+or conflicting models. Receipts record sample processing and structural validation;
+they are not cryptographic attestations of plaintext. Model bytes, captures,
+sample plaintext, and raw private errors are excluded from preferences/history;
+reviewable request paths remain there.
+
+Managed storage/reuse is disabled on Windows until equivalent private ACL support
+is implemented. Unix storage is not evidence that collection/recovery works on
+arbitrary Linux hosts or macOS builds. No private platform parity gate is closed.
+
+### Expert tools
+
+**Advanced tools** retains manual Check files, Collect files, Create model and
+Choose model workflows plus access to the private model folder. Inspection explains
+prerequisites and never decrypts an IPA. Raw diagnostic details are collapsed and
+transient. Explicit output paths, file/directory pickers, artifact handoff and
+editable retry remain available. Legacy manual recovery may retain private
+intermediates in its explicitly selected output directory after cancellation;
+use a new output or inspect it with the CLI checkpoint tools before continuation.
 
 ## Command disposition
 
@@ -66,9 +107,9 @@ data or arbitrary-build parity.
 | CLI entry | Desktop disposition |
 | --- | --- |
 | `fairplay-doctor` | Check files and optional private report. |
-| `fairplay-decrypt` | Step 4: decrypt with a checked model into new output/report paths. |
-| `fairplay-enroll collect` | Step 2: collect files with explicit paths and supported overrides. |
-| `fairplay-enroll recover` / `recover-capture` | Step 3: create a model with matching inputs and bounded phases. |
+| `fairplay-decrypt` | Saved-model reuse by default; Choose model under Advanced tools retains explicit model decryption. |
+| `fairplay-enroll collect` | One-time preparation internally; explicit collection under Advanced tools. |
+| `fairplay-enroll recover` / `recover-capture` | One-time preparation internally; explicit model creation under Advanced tools. |
 | `recover-from-account`, `recover-from-sinf-copy` | CLI-only expert checkpoint entry points. |
 | `seed-request-checkpoint`, `continue-checkpoint` | CLI-only checkpoint preparation and execution. |
 | `export-oracle-model`, `learn-index-domains`, `validate-oracle-model` | CLI-only oracle research and differential analysis; guided recovery retains its required internal checks. |

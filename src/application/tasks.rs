@@ -83,6 +83,10 @@ pub struct TaskRecord {
     pub request: JobRequest,
     pub state: TaskState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task: Option<u64>,
+    #[serde(default)]
+    pub decrypt_after_download: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_stage: Option<super::operation::Stage>,
     pub account_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,6 +105,8 @@ impl TaskRecord {
             title,
             request,
             state: TaskState::Queued,
+            parent_task: None,
+            decrypt_after_download: false,
             last_stage: None,
             account_generation,
             account_identity: None,

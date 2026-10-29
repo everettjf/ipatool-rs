@@ -14,6 +14,12 @@ use std::{path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FairPlayRequest {
+    Setup(super::fairplay_setup::SetupRequest),
+    DecryptSaved {
+        input: PathBuf,
+        output: Option<PathBuf>,
+        report: Option<PathBuf>,
+    },
     Inspect {
         ipa: Option<PathBuf>,
         model: Option<PathBuf>,
@@ -53,6 +59,8 @@ pub enum FairPlayRequest {
 impl FairPlayRequest {
     pub fn label(&self) -> &'static str {
         match self {
+            Self::Setup(_) => "Prepare reusable decryption",
+            Self::DecryptSaved { .. } => "Decrypt with saved model",
             Self::Inspect { .. } => "Inspect FairPlay materials",
             Self::Decrypt { .. } => "Decrypt IPA",
             Self::Collect { .. } => "Collect enrollment",
@@ -64,6 +72,9 @@ impl FairPlayRequest {
 pub fn execute(request: FairPlayRequest) -> Result<JobOutcome> {
     operation::check()?;
     match request {
+        FairPlayRequest::Setup(_) | FairPlayRequest::DecryptSaved { .. } => {
+            bail!("saved FairPlay workflows require an application state directory")
+        }
         FairPlayRequest::Inspect {
             ipa,
             model,
@@ -227,4 +238,21 @@ pub fn decrypt(
 ) -> Result<crate::fairplay_ipa::IpaDecryptResult> {
     operation::stage(Stage::Decrypting)?;
     crate::fairplay_ipa::decrypt_ipa_with_options(input, output, model, report, force)
+}
+
+/// Managed workflows keep model storage separate from credentials and CLI defaults.
+pub fn execute_in(
+    request: FairPlayRequest,
+    state_directory: &std::path::Path,
+) -> Result<JobOutcome> {
+    let store = super::fairplay_setup::SavedModels::new(state_directory);
+    match request {
+        FairPlayRequest::Setup(request) => store.setup(request),
+        FairPlayRequest::DecryptSaved {
+            input,
+            output,
+            report,
+        } => store.decrypt_saved(&input, output.as_deref(), report.as_deref()),
+        other => execute(other),
+    }
 }

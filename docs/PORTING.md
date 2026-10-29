@@ -828,3 +828,40 @@ verified the shortcut and subsequent explicit request, including preservation of
 the original bytes. Full local checks passed 454 library, 45 CLI, and 40 GUI-test
 cases (70 ignored library checks), formatting, three strict Clippy configurations,
 and ad hoc signed debug/release GUI bundles. Private FairPlay gates remain open.
+
+## One-time desktop setup and reusable model matching
+
+On 2026-10-28, the GUI adopted UnfairPlay's prepare-once/reuse journey. The shared
+Rust application layer now combines collection, conservative recovery and sample
+processing checks into one reviewed setup operation. An advanced existing-model
+import validates a matching sample without local collection. Only selector-bound
+models that pass processing, mutation, ARM64 structure and CodeDirectory page
+checks enter the private managed cache. Passing these checks does not authenticate
+plaintext or Apple's signature. Reuse is enrollment-based and not per application
+or inferred from an Apple ID display name.
+
+Unix storage uses private staging and atomic model/receipt directory publication,
+0700 directories and 0600 files. Inventory validates bounded receipts, envelope,
+selector, hashes, permissions and non-symlink files. Missing, conflicting,
+unverified or tampered models stop automatic selection. Temporary captures and
+sample plaintext are removed on normal exit/failure/cooperative cancellation;
+crash leftovers remain hidden and are never selected or replayed. Windows managed
+storage/reuse rejects before writing private models until private ACL support is
+implemented; original explicit CLI/model workflows are unchanged.
+
+New IPA download completions snapshot a persisted automatic-decryption preference
+and queue an independent child task with a parent link. A missing/mismatched model
+preserves the successful download and offers setup. PKGs, already decrypted
+artifacts, cancellations, quitting and restored history do not auto-start work.
+Original IPAs and existing output/report files are preserved.
+
+Local verification passed 459 library + 45 CLI + 44 desktop tests (548 active;
+70 opt-in library cases ignored), formatting, default/GUI/GUI-test strict Clippy,
+Apple Silicon CLI rebuilding and signed debug/release GUI bundles. Four new core
+synthetic tests exercised real import/decryption/reuse across application keys,
+selector mismatch, conflicting model, cache tampering, permissions/symlinks,
+cancellation cleanup, collision and report gates. Desktop tests verified the
+wizard, independent child tasks, persistence and restart behavior. Native narrow
+fixture screenshots show all setup stages and a successful synthetic download
+followed by a missing-model task. The harness does not collect private materials.
+Real setup, authorization compatibility and private decryption gates remain open.

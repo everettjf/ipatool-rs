@@ -17,6 +17,7 @@ pub struct Preferences {
     pub platform: Platform,
     pub mode: Mode,
     pub output_directory: Option<PathBuf>,
+    pub auto_decrypt: bool,
 }
 
 impl Default for Preferences {
@@ -27,6 +28,7 @@ impl Default for Preferences {
             platform: Platform::Iphone,
             mode: Mode::Auto,
             output_directory: None,
+            auto_decrypt: true,
         }
     }
 }

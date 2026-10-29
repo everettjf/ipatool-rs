@@ -6,7 +6,9 @@ mod actions;
 mod appearance;
 mod artwork;
 mod assets;
+mod fairplay_actions;
 mod fairplay_ui;
+mod fairplay_views;
 mod preferences;
 #[cfg(feature = "gui-test")]
 mod preview;
@@ -90,6 +92,8 @@ impl Page {
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FairMode {
+    Setup,
+    Saved,
     Inspect,
     Decrypt,
     Collect,
@@ -147,6 +151,12 @@ struct FairForm {
     product_version: Entity<InputState>,
     build_version: Entity<InputState>,
     advanced: bool,
+    tools: bool,
+    setup_step: u8,
+    saved_models: Option<Result<usize, String>>,
+    checking_models: bool,
+    model_status_generation: u64,
+    compat: Entity<InputState>,
 }
 
 struct DesktopWindow {
@@ -393,7 +403,7 @@ impl DesktopWindow {
             }),
         );
         let fair = FairForm {
-            mode: FairMode::Inspect,
+            mode: FairMode::Saved,
             app: field(window, cx, "Installed application (.app)", "", false),
             input: field(
                 window,
@@ -431,6 +441,12 @@ impl DesktopWindow {
             product_version: field(window, cx, "Product version", "", false),
             build_version: field(window, cx, "Build version", "", false),
             advanced: false,
+            tools: false,
+            setup_step: 0,
+            saved_models: None,
+            checking_models: false,
+            model_status_generation: 0,
+            compat: field(window, cx, "Matching compatibility system file", "", false),
         };
         term.update(cx, |input, cx| input.focus(window, cx));
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, Some(window), cx);
@@ -678,6 +694,9 @@ impl Render for DesktopWindow {
                         })
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.page = page;
+                            if page == Page::FairPlay {
+                                this.refresh_saved_models(cx);
+                            }
                             this.shell_focus.focus(window);
 
                             if page == Page::Library

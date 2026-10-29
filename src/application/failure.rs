@@ -15,6 +15,7 @@ pub enum FailureKind {
     PermissionDenied,
     OutputExists,
     Unavailable,
+    ModelRequired,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,6 +31,60 @@ impl Failure {
     /// this allowlisted summary; the CLI retains its existing error formatter.
     pub fn from_error(error: &anyhow::Error) -> Self {
         use FailureKind::*;
+        if super::operation::is_cancellation(error) {
+            return Self {
+                kind: Cancelled,
+                title: "Cancelled".into(),
+                message: "The operation stopped at a safe boundary.".into(),
+                action: "Retry".into(),
+            };
+        }
+        if let Some(problem) = error.downcast_ref::<super::fairplay_setup::ModelProblem>() {
+            use super::fairplay_setup::ModelProblem;
+            let (kind, message, action) = match problem {
+                ModelProblem::Missing | ModelProblem::NoMatch => (
+                    ModelRequired,
+                    "Your original IPA is preserved. Prepare reusable decryption for this App Store enrollment, or import a matching model in Advanced options.",
+                    "Prepare decryption",
+                ),
+                ModelProblem::Ambiguous => (
+                    Unavailable,
+                    "Several models conflict for this authorization. No model was guessed. Review the saved model folder in Advanced tools.",
+                    "Review saved models",
+                ),
+                ModelProblem::Collection => (
+                    Unavailable,
+                    "Confirm that you installed and opened an iPhone or iPad app through this Mac's App Store using the same Apple account as the sample IPA. Collection needs readable local FairPlay data; the app cannot elevate its permissions. Check system support in Advanced tools.",
+                    "Review preparation",
+                ),
+                ModelProblem::Recovery => (
+                    Unavailable,
+                    "The collected authorization or system build could not use the supported recovery path. Review matching system files in Advanced options and compatibility diagnostics. No model was saved.",
+                    "Review preparation",
+                ),
+                ModelProblem::Validation => (
+                    Unavailable,
+                    "The selected model or generated materials did not pass the sample IPA checks. Nothing was activated. Review that the app, IPA, and materials belong to the same enrollment.",
+                    "Review preparation",
+                ),
+                ModelProblem::InvalidStore => (
+                    Unavailable,
+                    "Saved model files are missing, changed, or not private. No model was selected. Review the saved model folder in Advanced tools.",
+                    "Review saved models",
+                ),
+                ModelProblem::UnsupportedPlatform => (
+                    Unavailable,
+                    "Managed model storage currently requires macOS or Linux private-file permissions. Windows preparation and automatic decryption remain unavailable.",
+                    "Review platform support",
+                ),
+            };
+            return Self {
+                kind,
+                title: problem.to_string(),
+                message: message.into(),
+                action: action.into(),
+            };
+        }
         if let Some(region) = error.downcast_ref::<super::catalog::AccountRegionUnavailable>() {
             return Self {
                 kind: NotFound,
@@ -158,6 +213,16 @@ impl Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn managed_model_failures_keep_private_context_out_of_history() {
+        use crate::application::fairplay_setup::ModelProblem;
+        let error = anyhow::anyhow!("private fixture-model-bytes and /private/fixture/path")
+            .context(ModelProblem::NoMatch);
+        let failure = Failure::from_error(&error);
+        assert_eq!(failure.kind, FailureKind::ModelRequired);
+        let text = serde_json::to_string(&failure).unwrap();
+        assert!(!text.contains("fixture-model-bytes") && !text.contains("/private/fixture/path"));
+    }
     #[test]
     fn private_protocol_details_do_not_enter_serialized_history() {
         let error = anyhow::anyhow!(

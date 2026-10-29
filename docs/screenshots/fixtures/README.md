@@ -7,14 +7,22 @@ versions, downloads, and progress are synthetic. The screenshots demonstrate
 rendered controls and observed interaction, not successful Apple authentication,
 real package transfers, or private FairPlay compatibility. See
 [the harness instructions](../../GUI_FIXTURE_PREVIEW.md).
-The guided FairPlay captures and first five catalog captures below show the current
-graphite controls. Older interaction captures predate these controls and may retain the
+The reusable-model captures show the current primary FairPlay journey. Earlier
+four-step captures below document the retained expert forms and historical handoff.
+The FairPlay and first five catalog captures show graphite controls. Older interaction captures predate these controls and may retain the
 previous palette; see the [native gallery](../README.md) for public-service captures.
 
 | Capture | Observed interaction |
 | --- | --- |
-| [Direct IPA decryption entry](download-decrypt-entry-narrow.png) | A synthetic completed IPA offers Decrypt IPA... next to compatibility inspection; clicking it opens step 4 with the IPA filled and a matching model still required. No decryption ran. |
-| [Direct decryption review](download-decrypt-handoff-narrow.png) | The shortcut preselects only the downloaded IPA, leaves model selection explicit, preserves the original, and keeps the short notice and Dismiss button inside 900×650. |
+| [Reusable decryption home](fairplay-reusable-home-narrow.png) | Saved-model readiness, persisted automatic processing, optional existing IPA and collapsed advanced controls at 900×650. |
+| [Prepare this Mac](fairplay-setup-prepare-narrow.png) | First-time prerequisites explain native App Store authorization, installed app and matching sample IPA. No private work starts on navigation. |
+| [Choose sample files](fairplay-setup-files-narrow.png) | Two primary inputs; work directories and subsequent processing are automatic; advanced parameters/tools stay collapsed. |
+| [Review preparation](fairplay-setup-review-narrow.png) | Explicit review shows selected synthetic filenames and the collect/create/check/save sequence before the final action. No private setup was run. |
+| [Advanced setup controls](fairplay-setup-advanced-narrow.png) | The final timeout field is reachable by scrolling while Back, View results and Review preparation remain fixed. |
+| [Independent automatic follow-up](download-auto-decrypt-missing-model.png) | A synthetic download completes successfully; its separate decryption task explains the missing model and offers preparation. |
+
+| [Direct IPA decryption entry](download-decrypt-entry-narrow.png) | A synthetic completed IPA offers Decrypt IPA... next to compatibility inspection; clicking it historically opened step 4 with the IPA filled and a matching model still required. No decryption ran. |
+| [Direct decryption review](download-decrypt-handoff-narrow.png) | The previous shortcut preselected only the downloaded IPA and left model selection explicit, preserves the original, and keeps the short notice and Dismiss button inside 900×650. |
 | [Guided FairPlay, normal](fairplay-guided-check.png) | Numbered preparation order, explained optional materials, and fixed results/action footer. |
 | [Check files, narrow](fairplay-guided-check-narrow.png) | Step 1 explains that inspection does not decrypt and existing materials permit skipping steps. |
 | [Collect files, narrow](fairplay-guided-collect-narrow.png) | Step 2 states installed-app and permission prerequisites and explains the private output folder. |

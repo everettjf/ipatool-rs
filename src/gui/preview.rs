@@ -185,6 +185,7 @@ impl DesktopSession for PreviewSession {
                 Ok(JobOutcome { summary: "Fixture ZIP published. It is synthetic and contains no encrypted account package.".into(), artifacts: vec![Artifact { kind: ArtifactKind::Package, path }], details: None })
             }
             JobRequest::FairPlay(request @ FairPlayRequest::Inspect { .. }) => ipatool_rs::application::fairplay::execute(request),
+            JobRequest::FairPlay(FairPlayRequest::DecryptSaved { .. }) => Err(ipatool_rs::application::fairplay_setup::ModelProblem::Missing.into()),
             JobRequest::FairPlay(_) => bail!("fixture preview does not run private FairPlay processing"),
         })
     }

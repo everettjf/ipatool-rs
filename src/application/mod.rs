@@ -8,6 +8,7 @@ pub mod context;
 pub mod download;
 pub mod failure;
 pub mod fairplay;
+pub mod fairplay_setup;
 pub mod library;
 pub mod operation;
 pub mod tasks;

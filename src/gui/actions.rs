@@ -154,10 +154,17 @@ impl DesktopWindow {
                     .update(cx, |input, cx| input.set_value(value, window, cx));
             }
             ArtifactKind::Model => {
-                self.set_fair_mode(FairMode::Decrypt, window, cx);
-                self.fair
-                    .model
-                    .update(cx, |input, cx| input.set_value(value, window, cx));
+                if path.starts_with(self.session.directory().join("fairplay-models")) {
+                    self.set_fair_mode(FairMode::Saved, window, cx);
+                    self.refresh_saved_models(cx);
+                } else {
+                    self.set_fair_mode(FairMode::Setup, window, cx);
+                    self.fair.setup_step = 1;
+                    self.fair.advanced = true;
+                    self.fair
+                        .model
+                        .update(cx, |input, cx| input.set_value(value, window, cx));
+                }
             }
             ArtifactKind::Report => return,
         }
@@ -193,12 +200,16 @@ impl DesktopWindow {
             return;
         }
         self.use_fairplay_artifact(ArtifactKind::Package, path, window, cx);
-        self.set_fair_mode(FairMode::Decrypt, window, cx);
+        self.set_fair_mode(FairMode::Saved, window, cx);
+        self.refresh_saved_models(cx);
         // A model selected for a different download must not be reused silently.
         self.fair
             .model
             .update(cx, |input, cx| input.set_value("", window, cx));
-        self.show_notice("IPA selected. Choose a matching model to continue.", cx);
+        self.show_notice(
+            "IPA selected. A saved model will be matched automatically.",
+            cx,
+        );
     }
 
     pub(super) fn search(&mut self, cx: &mut Context<Self>) {
@@ -920,6 +931,8 @@ impl DesktopWindow {
         let show_parameters = matches!(request, JobRequest::Download(_));
         let mut task = TaskRecord::new(id, title, request, self.session.generation());
         task.account_identity = self.session.account_identity();
+        task.decrypt_after_download =
+            matches!(task.request, JobRequest::Download(_)) && self.preferences.auto_decrypt;
         self.journal.tasks.push(task);
         self.selected_task = show_parameters.then_some(id);
         self.page = Page::Downloads;
@@ -987,7 +1000,11 @@ impl DesktopWindow {
                 this.active = None;
                 if let Some(task) = this.journal.tasks.iter_mut().find(|task| task.id == id) {
                     task.last_stage = last_stage.or(task.last_stage);
+                    let cancelled = task.state == TaskState::CancellationRequested;
                     task.finish(result);
+                    if cancelled {
+                        task.decrypt_after_download = false;
+                    }
                     if task.failure.as_ref().is_some_and(|failure| {
                         matches!(
                             failure.kind,
@@ -999,6 +1016,10 @@ impl DesktopWindow {
                         task.state = TaskState::AwaitingInput;
                     }
                 }
+                if !this.quit_requested {
+                    this.queue_download_decryption(id);
+                }
+                this.refresh_saved_models(cx);
                 this.persist_history();
                 if this.quit_requested && !this.account_busy() {
                     cx.quit();
@@ -1155,6 +1176,7 @@ impl DesktopWindow {
             &self.fair.capture,
             &self.fair.report,
             &self.fair.fairplayd,
+            &self.fair.compat,
             &self.fair.startup,
             &self.fair.iokit,
             &self.fair.system_state,
@@ -1167,6 +1189,46 @@ impl DesktopWindow {
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
         match request {
+            FairPlayRequest::Setup(request) => {
+                self.set_fair_mode(FairMode::Setup, window, cx);
+                self.fair.setup_step = 1;
+                let o = request.options;
+                fields.extend([
+                    (self.fair.app.clone(), path(Some(request.app))),
+                    (self.fair.input.clone(), path(Some(request.ipa))),
+                    (self.fair.model.clone(), path(o.existing_model)),
+                    (self.fair.fairplayd.clone(), path(o.fairplayd)),
+                    (self.fair.compat.clone(), path(o.compat_fairplayd)),
+                    (self.fair.startup.clone(), path(o.startup_profile)),
+                    (self.fair.iokit.clone(), path(o.iokit15_output)),
+                    (self.fair.system_state.clone(), path(o.system_state)),
+                    (self.fair.shared_state.clone(), path(o.shared_state)),
+                    (self.fair.adi_state.clone(), path(o.adi_state)),
+                    (self.fair.iomac.clone(), path(o.iomac_file)),
+                    (self.fair.interface.clone(), o.interface),
+                    (
+                        self.fair.product_version.clone(),
+                        o.product_version.unwrap_or_default(),
+                    ),
+                    (
+                        self.fair.build_version.clone(),
+                        o.build_version.unwrap_or_default(),
+                    ),
+                    (self.fair.timeout.clone(), o.timeout_seconds.to_string()),
+                ]);
+            }
+            FairPlayRequest::DecryptSaved {
+                input,
+                output,
+                report,
+            } => {
+                self.set_fair_mode(FairMode::Saved, window, cx);
+                fields.extend([
+                    (self.fair.input.clone(), path(Some(input))),
+                    (self.fair.output.clone(), path(output)),
+                    (self.fair.report.clone(), path(report)),
+                ]);
+            }
             FairPlayRequest::Inspect {
                 ipa,
                 model,
@@ -1252,7 +1314,7 @@ impl DesktopWindow {
         for (input, value) in fields {
             input.update(cx, |input, cx| input.set_value(value, window, cx));
         }
-        self.fair.advanced = matches!(self.fair.mode, FairMode::Collect | FairMode::Recover);
+        self.fair.advanced = true;
         self.page = Page::FairPlay;
         self.shell_focus.focus(window);
         self.show_notice("Saved parameters restored. Review the inputs and choose new output paths where necessary before starting again.", cx);
@@ -1274,6 +1336,37 @@ impl DesktopWindow {
             return;
         }
         let request = match self.fair.mode {
+            FairMode::Setup => {
+                if self.fair.setup_step != 2 {
+                    return;
+                }
+                let Ok(request) = self.setup_request(cx) else {
+                    self.show_notice(
+                        "Review preparation options and timeout (1–3600 seconds).",
+                        cx,
+                    );
+                    return;
+                };
+                if !request.ipa.is_file()
+                    || (request.options.existing_model.is_none() && !request.app.is_dir())
+                {
+                    self.show_notice("Choose the installed app and matching IPA first.", cx);
+                    return;
+                }
+                FairPlayRequest::Setup(request)
+            }
+            FairMode::Saved => {
+                let input = path(&self.fair.input);
+                if !input.is_file() {
+                    self.show_notice("Choose a downloaded IPA first.", cx);
+                    return;
+                }
+                FairPlayRequest::DecryptSaved {
+                    input,
+                    output: optional(&self.fair.output),
+                    report: optional(&self.fair.report),
+                }
+            }
             FairMode::Inspect => FairPlayRequest::Inspect {
                 ipa: optional(&self.fair.input),
                 model: optional(&self.fair.model),
@@ -1487,6 +1580,7 @@ impl DesktopWindow {
             platform: self.platform,
             mode: self.mode,
             output_directory: Some(PathBuf::from(self.settings_output.read(cx).value().trim())),
+            auto_decrypt: self.preferences.auto_decrypt,
         };
         if let Err(error) = preferences.validate() {
             self.settings_error = Some(error.to_string());

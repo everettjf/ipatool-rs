@@ -111,11 +111,21 @@ Enter the Apple ID password and any verification code at the interactive prompts
 
 Native Mac applications such as ScriptWidget download as PKGs. A compatible iPhone or iPad application offered on Apple Silicon Mac can return an IPA instead. Use `--platform iphone` to request an iPhone offer when the account is entitled to it. Package format follows the selected Store offer.
 
-The desktop FairPlay page guides preparation through **Check files → Collect files →
-Create model → Decrypt IPA**. Each step explains what to prepare and what comes next;
-existing materials let you skip steps. Completed IPA downloads also offer **Decrypt
-IPA...** to open the final step directly; a matching model is still required.
-Progress and results appear in Downloads.
+The desktop FairPlay page starts with a **one-time preparation guide**: prepare
+this Mac, choose an installed app and matching sample IPA, then review and start.
+It collects the supported authorization data, creates a model, processes the
+sample, and saves the model privately only after structural checks pass. Advanced
+options also allow importing an existing model with a matching sample.
+
+After preparation, new IPA downloads automatically queue a separate decryption
+task and match saved models using the IPA's authorization. You can turn this off
+or use **Decrypt IPA...** for an existing download. No model selection is needed
+for each app. Missing or mismatched models preserve the original download and
+offer preparation; existing output files are never replaced. PKGs are unaffected.
+Models are enrollment-specific; the same Apple ID does not guarantee a match.
+Managed model storage currently requires macOS/Linux private-file permissions;
+Windows support and real private-processing validation remain open. These checks
+do not authenticate plaintext or Apple's signature.
 See the [FairPlay guide](docs/GUI_FAIRPLAY.md) for prerequisites and limitations.
 
 ## Commands

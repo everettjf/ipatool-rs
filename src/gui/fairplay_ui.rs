@@ -15,6 +15,15 @@ pub(super) struct Guide {
 
 pub(super) fn guide(mode: FairMode) -> Guide {
     match mode {
+        FairMode::Setup | FairMode::Saved => Guide {
+            tab: "Reusable decryption",
+            title: "Reusable decryption",
+            introduction: "Prepare once and reuse matching models.",
+            prepare: "Use the guided preparation.",
+            result: "Models stay private.",
+            action: "Continue",
+            action_hint: "Original IPAs are preserved.",
+        },
         FairMode::Inspect => Guide {
             tab: "1. Check files",
             title: "Find out what you need next",

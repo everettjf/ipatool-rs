@@ -3,6 +3,8 @@ use super::*;
 fn task_display_title(title: &str, request: &JobRequest) -> String {
     if let JobRequest::FairPlay(request) = request {
         return match request {
+            FairPlayRequest::Setup(_) => "FairPlay: Prepare reusable decryption",
+            FairPlayRequest::DecryptSaved { .. } => "FairPlay: Decrypt with saved model",
             FairPlayRequest::Inspect { .. } => "FairPlay: Check compatibility",
             FairPlayRequest::Collect { .. } => "FairPlay: Collect files",
             FairPlayRequest::Recover { .. } => "FairPlay: Create decryption model",
@@ -39,6 +41,22 @@ pub(super) fn request_description(request: &JobRequest) -> String {
             },
             optional(&value.output),
             if value.purchase { "Yes" } else { "No" }
+        ),
+        JobRequest::FairPlay(FairPlayRequest::Setup(request)) => format!(
+            "Prepare reusable decryption\nInstalled app: {}\nSample IPA: {}\nAdvanced options: {}",
+            path(&request.app),
+            path(&request.ipa),
+            serde_json::to_string_pretty(&request.options).unwrap_or_default()
+        ),
+        JobRequest::FairPlay(FairPlayRequest::DecryptSaved {
+            input,
+            output,
+            report,
+        }) => format!(
+            "Decrypt using saved models\nIPA: {}\nOutput: {}\nReport: {}",
+            path(input),
+            optional(output),
+            optional(report)
         ),
         JobRequest::FairPlay(FairPlayRequest::Inspect {
             ipa,
@@ -111,12 +129,12 @@ pub(super) fn request_description(request: &JobRequest) -> String {
     }
 }
 
-fn muted(text: impl Into<SharedString>, cx: &App) -> Div {
+pub(super) fn muted(text: impl Into<SharedString>, cx: &App) -> Div {
     div()
         .text_color(cx.theme().muted_foreground)
         .child(text.into())
 }
-fn label(text: &'static str, cx: &App) -> Div {
+pub(super) fn label(text: &'static str, cx: &App) -> Div {
     muted(text, cx).text_xs()
 }
 
@@ -1163,6 +1181,11 @@ impl DesktopWindow {
                             }
                             if let Some(failure) = &task.failure {
                                 card = card.child(failure_view(failure, cx));
+                                if failure.kind == FailureKind::ModelRequired && let JobRequest::FairPlay(FairPlayRequest::DecryptSaved { input, .. }) = &request {
+                                    let input = input.clone();
+                                    card = card.child(h_flex().child(Button::new(("prepare-model", id as usize)).label("Prepare reusable decryption")
+                                        .on_click(cx.listener(move |this, _, window, cx| this.open_setup(Some(input.clone()), window, cx)))));
+                                }
                             }
                             let mut buttons = h_flex().gap_2().flex_wrap().child(
                                 Button::new("task-parameters")
@@ -1240,7 +1263,7 @@ impl DesktopWindow {
             .into_any_element()
     }
 
-    fn path_control(
+    pub(super) fn path_control(
         &self,
         title: &'static str,
         input: &Entity<InputState>,
@@ -1290,7 +1313,7 @@ impl DesktopWindow {
             )
     }
 
-    fn guided_path(
+    pub(super) fn guided_path(
         &self,
         title: &'static str,
         help: &'static str,
@@ -1304,6 +1327,9 @@ impl DesktopWindow {
     }
 
     pub(super) fn fairplay_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(self.fair.mode, FairMode::Setup | FairMode::Saved) {
+            return self.fairplay_guided_view(cx);
+        }
         let mode = self.fair.mode;
         let guide = fairplay_ui::guide(mode);
         let controls = h_flex().gap_2().flex_wrap().children(
@@ -1347,6 +1373,7 @@ impl DesktopWindow {
             )
             .child(div().child("Choose your files"));
         match mode {
+            FairMode::Setup | FairMode::Saved => {}
             FairMode::Inspect => {
                 form = form
                     .child(self.guided_path("Downloaded IPA", "Start with the .ipa from Downloads. If you only have a materials folder, you can leave this blank.", &self.fair.input, false, false, cx))
@@ -1486,8 +1513,9 @@ impl DesktopWindow {
             .child(
                 v_flex().p_4().gap_2().border_b_1()
                     .border_color(cx.theme().border)
+                    .child(Button::new("guided-fairplay").small().label("Back to automatic decryption").on_click(cx.listener(|this, _, window, cx| { this.set_fair_mode(FairMode::Saved, window, cx); this.refresh_saved_models(cx); })))
                     .child(controls)
-                    .child(muted("Start at step 1. Already have collected materials or a model? Skip to step 3 or 4.", cx).text_sm()),
+                    .child(muted("Advanced tools. Start at step 1. Already have collected materials or a model? Skip to step 3 or 4.", cx).text_sm()),
             )
             .child(
                 v_flex()
