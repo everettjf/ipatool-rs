@@ -849,8 +849,8 @@ crash leftovers remain hidden and are never selected or replayed. Windows manage
 storage/reuse rejects before writing private models until private ACL support is
 implemented; original explicit CLI/model workflows are unchanged.
 
-New IPA download completions snapshot a persisted automatic-decryption preference
-and queue an independent child task with a parent link. A missing/mismatched model
+New IPA downloads snapshot a persisted automatic-decryption preference when
+enqueued and queue an independent child task with a parent link on completion. A missing/mismatched model
 preserves the successful download and offers setup. PKGs, already decrypted
 artifacts, cancellations, quitting and restored history do not auto-start work.
 Original IPAs and existing output/report files are preserved.
@@ -865,3 +865,10 @@ wizard, independent child tasks, persistence and restart behavior. Native narrow
 fixture screenshots show all setup stages and a successful synthetic download
 followed by a missing-model task. The harness does not collect private materials.
 Real setup, authorization compatibility and private decryption gates remain open.
+
+A Windows GNU GUI-test/all-targets cross-Clippy check found and fixed a Unix-only
+mutable directory-builder binding; the same cross-check then passed with warnings
+denied. Complete native macOS regression and strict Clippy passed again after
+that portable compilation fix. Native platform CI for the updated head remains
+separate evidence; the prior direct-IPA source `ca1f433` passed all five jobs in
+[run 40824972940](https://github.com/everettjf/ipatool-rs/actions/runs/40824972940).

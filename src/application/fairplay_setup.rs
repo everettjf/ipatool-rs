@@ -117,7 +117,9 @@ pub struct SavedModels {
 
 fn private_directory(path: &Path) -> Result<()> {
     if fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        let mut builder = builder;
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
