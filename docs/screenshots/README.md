@@ -11,7 +11,10 @@ visual reference for the palette. The latest
 [iOS/region controls](fixtures/catalog-ios-region-narrow.png),
 [region dropdown](fixtures/catalog-region-menu-narrow.png), and
 [download target sheet](fixtures/download-region-target-narrow.png) are shown in
-the explicitly synthetic narrow gallery. Earlier images are
+the explicitly synthetic narrow gallery, alongside the
+[account-region default](fixtures/account-region-default-narrow.png) and
+[persistent cross-region warning](fixtures/cross-region-warning-narrow.png).
+Earlier images are
 historical interaction evidence and may show superseded controls. Light/system
 themes are no longer supported; subsequent interaction changes require refreshing
 affected captures.

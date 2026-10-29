@@ -164,6 +164,12 @@ All product strings remain English.
   can be corrected, not an irreversible guess.
 - Keep platform and searchable country controls compact. Remember the last
   selection; initial offer-platform behavior remains consistent with the CLI.
+- Once an account is loaded or signed in, default browsing to its storefront.
+  Apply that default again if the account identity or storefront changes. Keep
+  manual region switching available, preserve an override during same-account
+  refresh, and show a persistent cross-region download warning with an explicit
+  return-to-account-region action. Preserve any pending download's original
+  application/region snapshot when login changes the browsing default.
 - Allow editing while loading. Retain appropriate prior results and expose the
   new query's loading state without showing obsolete results as current.
 - Display the selected application's identity, version, supported offers, and

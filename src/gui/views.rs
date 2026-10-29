@@ -111,6 +111,14 @@ fn label(text: &'static str, cx: &App) -> Div {
     muted(text, cx).text_xs()
 }
 
+fn region_mismatch_message(browsing: &str, account: &str) -> String {
+    format!(
+        "Apps from {} may be unavailable to download with your {} account. Your account region is unchanged.",
+        regions::label(browsing),
+        regions::label(account)
+    )
+}
+
 fn inspection_next_action(action: &str) -> (&str, Option<FairMode>) {
     match action {
         "collect native enrollment with fairplay-enroll collect" => (
@@ -502,9 +510,12 @@ impl DesktopWindow {
                 .child(h_flex().gap_1().flex_wrap().child(label("DOWNLOAD FOR", cx)).children(PLATFORMS.into_iter().enumerate().map(|(index, (platform, name))| Button::new(("platform", index)).debug_selector(move || format!("catalog-platform-{}", platform_name(platform))).small().label(name).selected(self.platform == platform).when(self.platform == platform, |button| button.icon(IconName::Check)).on_click(cx.listener(move |this, _, _, cx| this.set_platform(platform, cx))))))
                 .when_some(self.account.as_ref().filter(|account| account.country != self.selected_country(cx)), |view, account| {
                     let country = account.country.clone();
-                    view.child(h_flex().gap_2().flex_wrap()
-                        .child(muted(format!("Browsing {}. Downloads use {}.", regions::label(&self.selected_country(cx)), regions::label(&country)), cx))
-                        .child(Button::new("browse-account-region").small().label(format!("Browse {}", country)).on_click(cx.listener(move |this, _, window, cx| this.set_country(&country, window, cx)))))
+                    view.child(v_flex().debug_selector(|| "catalog-region-warning".into()).p_3().gap_2().rounded_md().border_1().border_color(cx.theme().border).bg(cx.theme().secondary)
+                        .child(h_flex().gap_2().flex_wrap()
+                            .child(Icon::new(IconName::Globe).size_4())
+                            .child(div().flex_1().child("Browsing another region"))
+                            .child(Button::new("browse-account-region").debug_selector(|| "browse-account-region".into()).small().label(format!("Use account region ({})", country)).on_click(cx.listener(move |this, _, window, cx| this.set_country(&country, window, cx)))))
+                        .child(muted(region_mismatch_message(&self.selected_country(cx), &account.country), cx)))
                 })
                 .when(self.searching, |view| view.child(muted("Searching in the background. You can refine the next query.", cx)))
                 .when_some(self.search_error.as_ref(), |view, error| view.child(failure_view(error, cx))))
@@ -813,7 +824,9 @@ impl DesktopWindow {
             .child(label("DOWNLOAD FOR", cx))
             .child(h_flex().gap_1().flex_wrap().children(PLATFORMS.into_iter().enumerate().map(|(index, (platform, name))| Button::new(("download-platform", index)).small().label(name).selected(form.platform == platform).disabled(self.account_busy() || form.loading_versions).on_click(cx.listener(move |this, _, window, cx| this.set_download_platform(platform, window, cx))))))
             .child(muted(format!("Account region: {}", regions::label(&account_country)), cx))
-            .when(form.source_country != account_country, |view| view.child(muted(format!("This result is from {}. Downloads require availability and a license in the account region. Changing the browsing region does not change your Apple account's region.", regions::label(&form.source_country)), cx)))
+            .when(form.source_country != account_country, |view| view.child(v_flex().p_3().gap_2().rounded_md().border_1().border_color(cx.theme().border).bg(cx.theme().secondary)
+                .child("Application from another region")
+                .child(muted(region_mismatch_message(&form.source_country, &account_country), cx))))
             .child(label("SAVE TO", cx)).child(h_flex().gap_2().child(div().flex_1().child(Input::new(&form.output))).child(Button::new("choose-output").label("Choose...").on_click(cx.listener(move |this, _, window, cx| this.choose_path(output.clone(), true, false, window, cx)))))
             .child(label("VERSION", cx)).child(Input::new(&form.version))
             .child(Button::new("check-version").small().label("Check version details").disabled(self.account_busy() || form.version.read(cx).value().trim().is_empty()).on_click(cx.listener(|this, _, window, cx| this.load_version_metadata(window, cx))))

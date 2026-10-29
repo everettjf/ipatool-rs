@@ -27,6 +27,7 @@ struct FixtureSession {
     login_calls: Mutex<Vec<(bool, bool)>>,
     purchases: Mutex<Vec<(usize, Option<Platform>)>>,
     catalogs: Mutex<Vec<ipatool_rs::application::catalog::Query>>,
+    account_country: Mutex<String>,
     jobs: Mutex<Vec<JobRequest>>,
     expire_next_job: AtomicBool,
 }
@@ -39,6 +40,7 @@ impl FixtureSession {
             login_calls: Mutex::new(Vec::new()),
             purchases: Mutex::new(Vec::new()),
             catalogs: Mutex::new(Vec::new()),
+            account_country: Mutex::new("US".into()),
             jobs: Mutex::new(Vec::new()),
             expire_next_job: AtomicBool::new(false),
         }
@@ -58,6 +60,12 @@ impl FixtureSession {
             version: "1.2.3".into(),
             ..Default::default()
         }
+    }
+
+    fn account_view(&self) -> AccountView {
+        let mut account = Self::account();
+        account.country = self.account_country.lock().unwrap().clone();
+        account
     }
 }
 
@@ -83,7 +91,7 @@ impl DesktopSession for FixtureSession {
             return Err(ipatool_rs::credentials::CredentialUnlockRequired.into());
         }
         self.generation.fetch_add(1, Ordering::SeqCst);
-        Ok(Some(Self::account()))
+        Ok(Some(self.account_view()))
     }
     fn login(&self, input: LoginInput, _: bool, _: Option<String>) -> Result<AccountView> {
         self.login_calls.lock().unwrap().push((
@@ -96,7 +104,7 @@ impl DesktopSession for FixtureSession {
         assert_eq!(input.auth_code, "123456");
         assert_eq!(input.password, "fixture-password");
         self.generation.fetch_add(1, Ordering::SeqCst);
-        Ok(Self::account())
+        Ok(self.account_view())
     }
     fn revoke(&self) -> Result<()> {
         self.generation.fetch_add(1, Ordering::SeqCst);
@@ -728,6 +736,7 @@ fn verification_continuation_keeps_pending_download_and_replaces_secret_inputs(
     cx: &mut TestAppContext,
 ) {
     let (_directory, view, session, mut cx) = setup(cx);
+    *session.account_country.lock().unwrap() = "CN".into();
     cx.update(|window, cx| {
         view.update(cx, |this, cx| {
             this.open_download(
@@ -751,6 +760,7 @@ fn verification_continuation_keeps_pending_download_and_replaces_secret_inputs(
         view.update(cx, |this, cx| {
             assert!(this.account_form.verifying);
             assert!(this.pending_download.is_some());
+            assert_eq!(this.selected_country(cx), "US");
             assert!(this.account_form.password.read(cx).value().is_empty());
             this.account_form
                 .code
@@ -769,6 +779,11 @@ fn verification_continuation_keeps_pending_download_and_replaces_secret_inputs(
             assert!(!this.account_form.verifying);
             assert!(this.pending_download.is_none());
             assert!(this.download_form.is_some());
+            assert_eq!(this.selected_country(cx), "CN");
+            let download = this.download_form.as_ref().unwrap();
+            assert_eq!(download.app.id, 42);
+            assert_eq!(download.source_country, "US");
+            assert_eq!(download.platform, Platform::Iphone);
             assert!(this.account_form.secret.is_none());
             assert!(this.account_form.code.read(cx).value().is_empty());
         })
@@ -1413,4 +1428,95 @@ fn editing_download_platform_resets_version_data_and_queues_the_reviewed_platfor
     };
     assert_eq!(request.platform, Some(Platform::Iphone));
     assert!(request.external_version_id.is_empty());
+}
+
+#[gpui::test]
+fn account_region_is_the_default_without_overwriting_an_explicit_same_account_override(
+    cx: &mut TestAppContext,
+) {
+    let (_directory, view, session, mut cx) = setup(cx);
+    *session.account_country.lock().unwrap() = "CN".into();
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(650.)));
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            this.term
+                .update(cx, |input, cx| input.set_value("second", window, cx));
+            this.search(cx);
+            this.open_account(window, cx);
+            this.submit_account(true, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            assert_eq!(this.account.as_ref().unwrap().country, "CN");
+            assert_eq!(this.selected_country(cx), "CN");
+            assert_eq!(this.query.as_ref().unwrap().country, "CN");
+            assert_eq!(this.preferences.country, "US");
+            this.set_country("US", window, cx);
+            this.submit_account(true, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |this, cx| {
+            assert_eq!(this.selected_country(cx), "US");
+            assert_eq!(this.query.as_ref().unwrap().country, "US");
+        });
+    });
+    cx.draw(
+        Default::default(),
+        gpui::size(gpui::px(900.), gpui::px(650.)),
+        |window, _| window.root::<Root>().unwrap().unwrap().into_any_element(),
+    );
+    let warning = cx
+        .debug_bounds("catalog-region-warning")
+        .expect("cross-region warning was painted");
+    assert!(warning.right() <= gpui::px(900.) && warning.bottom() <= gpui::px(650.));
+    let back = cx
+        .debug_bounds("browse-account-region")
+        .expect("account-region shortcut was painted");
+    cx.simulate_click(back.center(), Default::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            assert_eq!(this.selected_country(cx), "CN");
+            assert_eq!(this.query.as_ref().unwrap().country, "CN");
+            this.set_country("US", window, cx);
+            // A different account with the same storefront gets its own default.
+            this.account.as_mut().unwrap().email = "other@example.invalid".into();
+            this.submit_account(true, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    *session.account_country.lock().unwrap() = "GB".into();
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            assert_eq!(this.selected_country(cx), "CN");
+            this.set_country("US", window, cx);
+            this.submit_account(true, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            assert_eq!(this.selected_country(cx), "GB");
+            assert_eq!(this.query.as_ref().unwrap().country, "GB");
+            this.set_country("US", window, cx);
+            this.account_form.force_file = true;
+            this.submit_account(true, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |this, cx| {
+            assert_eq!(this.selected_country(cx), "US");
+            assert_eq!(this.account.as_ref().unwrap().country, "GB");
+            assert_eq!(
+                this.account_form.error.as_ref().unwrap().kind,
+                super::FailureKind::UnlockRequired
+            );
+        });
+    });
+    assert!(session.jobs.lock().unwrap().is_empty());
 }

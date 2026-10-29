@@ -23,6 +23,7 @@ checkboxes and local/CI evidence do not close the separate live-validation gates
 
 - [ ] Validate screen-reader accessibility and keyboard navigation. The pinned GPUI build's macOS accessibility tree currently exposes the window chrome but not the custom catalog controls.
 - [x] Clarify iOS/platform selection and browsing versus account regions: refresh catalog results after filter changes, offer a searchable region dropdown and editable download target, and identify account-region catalog misses before package transfer. Real authenticated downloads remain a separate gate.
+- [x] Default public browsing to the loaded account's region, preserve explicit overrides during same-account refresh, and display a persistent cross-region download warning with a return-to-account-region action.
 - [x] Validate native Linux x86_64 and Windows MSVC x86_64 GUI builds, deterministic controllers and strict all-targets Clippy in CI. Windows GNU GUI cross-build and strict all-targets Clippy also pass on macOS. The successful CI run is linked in [PORTING.md](PORTING.md).
 - [ ] Validate Linux x86_64 and Windows x86_64 GUI desktop interaction and account workflows. Headless controller tests and CLI CI do not establish these gates.
 - [ ] Complete distribution signing/notarization and release packaging before distributing the GUI. A repeatable, ad hoc signed macOS bundle build now passes locally; current releases remain CLI-only.

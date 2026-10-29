@@ -177,6 +177,11 @@ workflows. Browsing does not open credential storage. Account access starts only
 through an explicit account/download action; downloads check the account's
 storefront and entitlement. The download dialog allows changing the target
 platform and explains when the browsing region differs from the account region.
+Signing in or loading a saved account defaults browsing to that account's region,
+including when its identity or storefront changes. You can still select another
+region; the catalog and download sheet then warn that some applications may be
+unavailable to download. The catalog offers a return-to-account-region action.
+Same-account reauthentication preserves a manual browsing override.
 Browsing another region does not change the Apple account's storefront. A catalog
 miss during download preflight reports the account region before any package
 transfer starts. Task history contains request metadata and artifact

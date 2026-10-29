@@ -11,6 +11,32 @@ impl DesktopWindow {
         self.refresh_catalog_filters(cx);
     }
 
+    fn accept_account(
+        &mut self,
+        account: Option<AccountView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Default to the account region when it first becomes known or the
+        // account/storefront changes. A same-account refresh must preserve an
+        // explicit browsing override made during this session.
+        let country = account
+            .as_ref()
+            .filter(|next| {
+                self.account.as_ref().is_none_or(|previous| {
+                    !previous.email.eq_ignore_ascii_case(&next.email)
+                        || !previous.country.eq_ignore_ascii_case(&next.country)
+                })
+            })
+            .map(|account| account.country.clone());
+        self.account = account;
+        if let Some(country) = country
+            && !self.selected_country(cx).eq_ignore_ascii_case(&country)
+        {
+            self.set_country(&country, window, cx);
+        }
+    }
+
     pub(super) fn set_platform(&mut self, platform: Platform, cx: &mut Context<Self>) {
         if self.platform != platform {
             self.platform = platform;
@@ -519,7 +545,7 @@ impl DesktopWindow {
                 if this.quit_requested { this.clear_secrets(window, cx); cx.quit(); return; }
                 match result {
                     Ok(account) => {
-                        this.account = account;
+                        this.accept_account(account, window, cx);
                         if this.account.is_none() {
                             this.clear_secrets(window, cx);
                             this.account_form.error = Some(Failure { kind: FailureKind::AuthenticationRequired, title: "No saved account".into(), message: "Credential storage is available. Enter your Apple ID and password to sign in.".into(), action: "Sign in".into() });
