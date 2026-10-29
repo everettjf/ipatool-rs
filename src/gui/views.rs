@@ -1,6 +1,15 @@
 use super::*;
 
 fn task_display_title(title: &str, request: &JobRequest) -> String {
+    if let JobRequest::FairPlay(request) = request {
+        return match request {
+            FairPlayRequest::Inspect { .. } => "FairPlay: Check compatibility",
+            FairPlayRequest::Collect { .. } => "FairPlay: Collect files",
+            FairPlayRequest::Recover { .. } => "FairPlay: Create decryption model",
+            FairPlayRequest::Decrypt { .. } => "FairPlay: Decrypt IPA",
+        }
+        .into();
+    }
     if let JobRequest::Download(request) = request {
         let platform = request.platform.unwrap_or(Platform::Iphone);
         let suffix = format!(" / {}", platform_name(platform));
@@ -122,24 +131,35 @@ fn region_mismatch_message(browsing: &str, account: &str) -> String {
 fn inspection_next_action(action: &str) -> (&str, Option<FairMode>) {
     match action {
         "collect native enrollment with fairplay-enroll collect" => (
-            "Choose the installed application and collect enrollment.",
+            "No model yet? Step 2 collects local materials from the installed app on a supported Mac. An IPA alone is not enough.",
             Some(FairMode::Collect),
         ),
         "recover fairplay-enrollment.bin with fairplay-enroll recover" => (
-            "Recover an enrollment model from the checked capture.",
+            "Use the checked materials folder to create a decryption model in step 3.",
             Some(FairMode::Recover),
         ),
         "recover fairplay-enrollment.bin with fairplay-enroll recover --compat-fairplayd /private/path/fairplayd.arm64e" => {
             (
-                "Recover the checked capture; select the matching compatibility image in Advanced options.",
+                "Create a model in step 3. This build also needs a matching system file; select it in Advanced options.",
                 Some(FairMode::Recover),
             )
         }
         "run fairplay-decrypt with the compatible model" => (
-            "Review the IPA and compatible model before decryption.",
+            "A matching model was found. Review the IPA and output location in step 4.",
             Some(FairMode::Decrypt),
         ),
-        _ => (action, None),
+        "rerun collection with permission to read /private/var/db/fpsd" => (
+            "Collection cannot read this Mac's FairPlay data. Resolve access before running step 2; the app cannot grant permission.",
+            None,
+        ),
+        "add and validate an exact evaluator for this fairplayd hash" => (
+            "Model creation is not supported for this system build. Retrying with the same materials will not resolve it.",
+            None,
+        ),
+        _ => (
+            "Review task details for an additional requirement before continuing.",
+            None,
+        ),
     }
 }
 fn failure_view(failure: &Failure, cx: &App) -> Div {
@@ -1015,67 +1035,53 @@ impl DesktopWindow {
                                     card.child(muted(format!("Last stage: {}", stage.label()), cx));
                             }
                             if let Some(outcome) = &task.outcome {
-                                if let Some(details) = &outcome.details {
-                                    for section in ["errors", "warnings", "next_actions"] {
-                                        if let Some(items) =
-                                            details.get(section).and_then(|value| value.as_array())
-                                        {
-                                            for item in
-                                                items.iter().filter_map(|value| value.as_str())
-                                            {
-                                                if section == "next_actions" {
-                                                    let (text, mode) = inspection_next_action(item);
-                                                    card = card.child(muted(text.to_owned(), cx));
-                                                    if let Some(mode) = mode
-                                                        && let JobRequest::FairPlay(
-                                                            inspect @ FairPlayRequest::Inspect {
-                                                                ..
-                                                            },
-                                                        ) = &request
-                                                    {
-                                                        let inspect = inspect.clone();
-                                                        card = card.child(
-                                                            Button::new((
-                                                                "inspect-next",
-                                                                mode as usize,
-                                                            ))
-                                                            .label(match mode {
-                                                                FairMode::Collect => {
-                                                                    "Review collection inputs"
-                                                                }
-                                                                FairMode::Recover => {
-                                                                    "Review recovery inputs"
-                                                                }
-                                                                _ => "Review decryption inputs",
-                                                            })
-                                                            .on_click(cx.listener(
-                                                                move |this, _, window, cx| {
-                                                                    this.inspection_followup(
-                                                                        inspect.clone(),
-                                                                        mode,
-                                                                        window,
-                                                                        cx,
-                                                                    )
-                                                                },
-                                                            )),
-                                                        );
-                                                    }
-                                                    continue;
-                                                }
-                                                card = card.child(muted(
-                                                    format!(
-                                                        "{}: {}",
-                                                        section.replace('_', " "),
-                                                        item
-                                                    ),
-                                                    cx,
-                                                ));
+                                let inspection = matches!(request, JobRequest::FairPlay(FairPlayRequest::Inspect { .. }));
+                                if inspection && let Some(details) = &outcome.details {
+                                    card = card.child(div().child(fairplay_ui::inspection_summary(details)));
+                                    if let Some(checks) = details.get("checks").and_then(|value| value.as_object()) {
+                                        for (name, passed) in checks {
+                                            let passed = passed.as_bool() == Some(true);
+                                            card = card.child(muted(format!("{} {}", if passed { "✓" } else { "!" }, fairplay_ui::check_description(name, passed)), cx));
+                                        }
+                                    }
+                                    if let Some(errors) = details.get("errors").and_then(|value| value.as_array()) {
+                                        for error in errors.iter().filter_map(|value| value.as_str()) {
+                                            card = card.child(muted(fairplay_ui::inspection_error(error), cx));
+                                        }
+                                    }
+                                    if let Some(warnings) = details.get("warnings").and_then(|value| value.as_array()) {
+                                        for warning in warnings.iter().filter_map(|value| value.as_str()) {
+                                            card = card.child(muted(fairplay_ui::inspection_warning(warning), cx));
+                                        }
+                                    }
+                                    if let Some(items) = details.get("next_actions").and_then(|value| value.as_array()) {
+                                        let has_model = details.get("compatible_model").and_then(|value| value.as_str()).is_some();
+                                        for item in items.iter().filter_map(|value| value.as_str()) {
+                                            let (text, mode) = inspection_next_action(item);
+                                            if has_model && mode != Some(FairMode::Decrypt) { continue; }
+                                            if mode == Some(FairMode::Decrypt) && details.get("ready").and_then(|value| value.as_bool()) != Some(true) { continue; }
+                                            card = card.child(muted(text.to_owned(), cx));
+                                            if let Some(mode) = mode
+                                                && let JobRequest::FairPlay(inspect @ FairPlayRequest::Inspect { .. }) = &request {
+                                                let inspect = inspect.clone();
+                                                card = card.child(h_flex().child(Button::new(("inspect-next", mode as usize))
+                                                    .label(match mode {
+                                                        FairMode::Collect => "Go to step 2: Collect files",
+                                                        FairMode::Recover => "Go to step 3: Create model",
+                                                        _ => "Go to step 4: Decrypt IPA",
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                                        this.inspection_followup(inspect.clone(), mode, window, cx)
+                                                    }))));
                                             }
                                         }
                                     }
+                                } else if inspection {
+                                    card = card.child(muted("This check finished in a previous session. Detailed results are not kept in history. Review the inputs and run the check again before choosing a next step.", cx));
+                                } else {
+                                    card = card.child(muted(outcome.summary.clone(), cx));
                                 }
-                                card =
-                                    card.child(muted(outcome.summary.clone(), cx)).children(
+                                card = card.children(
                                         outcome.artifacts.iter().enumerate().map(
                                             |(index, artifact)| {
                                                 let path = artifact.path.clone();
@@ -1123,10 +1129,10 @@ impl DesktopWindow {
                                                             .small()
                                                             .label(match artifact.kind {
                                                                 ArtifactKind::Capture => {
-                                                                    "Recover capture"
+                                                                    "Create decryption model"
                                                                 }
-                                                                ArtifactKind::Model => "Use model",
-                                                                _ => "Inspect IPA",
+                                                                ArtifactKind::Model => "Use for decryption",
+                                                                _ => "Check IPA compatibility",
                                                             })
                                                             .on_click(cx.listener(
                                                                 move |this, _, window, cx| {
@@ -1152,9 +1158,9 @@ impl DesktopWindow {
                                 Button::new("task-parameters")
                                     .small()
                                     .label(if self.selected_task == Some(id) {
-                                        "Hide parameters"
+                                        "Hide task details"
                                     } else {
-                                        "Show parameters"
+                                        "Show task details"
                                     })
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.selected_task = if this.selected_task == Some(id) {
@@ -1167,6 +1173,10 @@ impl DesktopWindow {
                             );
                             if self.selected_task == Some(id) {
                                 card = card.child(muted(request_description(&request), cx));
+                                if let Some(details) = task.outcome.as_ref().and_then(|outcome| outcome.details.as_ref()) {
+                                    card = card.child(muted("Technical diagnostics (may include private paths and identifiers)", cx).text_sm())
+                                        .child(muted(serde_json::to_string_pretty(details).unwrap_or_default(), cx).text_sm());
+                                }
                             }
                             if task.state.is_active() {
                                 if task.state == TaskState::AwaitingInput {
@@ -1230,7 +1240,7 @@ impl DesktopWindow {
     ) -> Div {
         let target = input.clone();
         let dropped_target = target.clone();
-        let either = title == "Enrollment model (file or directory)";
+        let either = input == &self.fair.model;
         v_flex()
             .gap_1()
             .when(!save, |view| {
@@ -1270,121 +1280,119 @@ impl DesktopWindow {
             )
     }
 
+    fn guided_path(
+        &self,
+        title: &'static str,
+        help: &'static str,
+        input: &Entity<InputState>,
+        directory: bool,
+        save: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        self.path_control(title, input, directory, save, cx)
+            .child(muted(help, cx).text_sm())
+    }
+
     pub(super) fn fairplay_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.fair.mode;
-        let controls = h_flex().flex_1().min_w_0().gap_2().flex_wrap().children(
+        let guide = fairplay_ui::guide(mode);
+        let controls = h_flex().gap_2().flex_wrap().children(
             [
-                (FairMode::Inspect, "Inspect materials"),
-                (FairMode::Decrypt, "Decrypt with model"),
-                (FairMode::Collect, "Collect enrollment"),
-                (FairMode::Recover, "Recover capture"),
+                FairMode::Inspect,
+                FairMode::Collect,
+                FairMode::Recover,
+                FairMode::Decrypt,
             ]
             .into_iter()
             .enumerate()
-            .map(|(index, (mode, title))| {
+            .map(|(index, mode)| {
                 Button::new(("fair-mode", index))
-                    .label(title)
+                    .small()
+                    .label(fairplay_ui::guide(mode).tab)
                     .selected(self.fair.mode == mode)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.set_fair_mode(mode, window, cx);
                     }))
             }),
         );
-        let mut form = v_flex().flex_shrink_0().gap_4()
-            .child(div().text_2xl().child(match mode { FairMode::Inspect => "Start with a compatibility check", FairMode::Decrypt => "Decrypt an IPA using a matching model", FairMode::Collect => "Collect matching enrollment materials", FairMode::Recover => "Recover from an existing capture" }))
-            .child(muted("Experimental, exact-build FairPlay workflows. Prerequisite checks and successful processing do not authenticate plaintext or establish support for arbitrary builds.", cx));
-        if matches!(
-            mode,
-            FairMode::Inspect | FairMode::Decrypt | FairMode::Collect
-        ) {
-            form = form.child(self.path_control(
-                if mode == FairMode::Collect {
-                    "Installed application (.app)"
-                } else {
-                    "Personalized IPA"
-                },
-                if mode == FairMode::Collect {
-                    &self.fair.app
-                } else {
-                    &self.fair.input
-                },
-                mode == FairMode::Collect,
-                false,
-                cx,
-            ));
+        let mut form = v_flex()
+            .flex_shrink_0()
+            .gap_4()
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(div().text_2xl().child(guide.title))
+                    .child(muted(guide.introduction, cx)),
+            )
+            .child(
+                v_flex()
+                    .p_4()
+                    .gap_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(div().child("Before you start"))
+                    .child(muted(guide.prepare, cx))
+                    .child(muted(guide.result, cx)),
+            )
+            .child(div().child("Choose your files"));
+        match mode {
+            FairMode::Inspect => {
+                form = form
+                    .child(self.guided_path("Downloaded IPA", "Start with the .ipa from Downloads. If you only have a materials folder, you can leave this blank.", &self.fair.input, false, false, cx))
+                    .child(self.guided_path("Decryption model (if you already have one)", "A FairPlay parameter file, not an AI model. Select the file or its folder to check whether it matches your IPA. Otherwise leave blank.", &self.fair.model, false, false, cx))
+                    .child(self.guided_path("Collected materials folder (if you have one)", "The folder created in step 2. Leave blank if you have not collected materials yet.", &self.fair.capture, true, false, cx));
+            }
+            FairMode::Collect => {
+                form = form
+                    .child(self.guided_path("Installed app (.app) — required", "Select the installed application on this Mac, not the downloaded IPA. Its version must match the materials you plan to use.", &self.fair.app, true, false, cx))
+                    .child(self.guided_path("Matching IPA (optional)", "Include the downloaded IPA for the same app and version so later steps can check it against the collected materials.", &self.fair.input, false, false, cx))
+                    .child(self.guided_path("Save materials to a new folder — required", "Choose a new folder name in the save dialog. It must not already exist; collection creates it for you.", &self.fair.directory_output, false, true, cx));
+            }
+            FairMode::Recover => {
+                form = form
+                    .child(self.guided_path("Collected materials folder — required", "Choose the complete folder produced in step 2. Keep its files together.", &self.fair.capture, true, false, cx))
+                    .child(self.guided_path("Save decryption model to a new folder — required", "Choose a new folder name. Existing folders are preserved. A successful task provides a model you can use in step 4.", &self.fair.directory_output, false, true, cx));
+            }
+            FairMode::Decrypt => {
+                form = form
+                    .child(self.guided_path("Downloaded IPA — required", "Choose the original IPA downloaded with your account.", &self.fair.input, false, false, cx))
+                    .child(self.guided_path("Matching decryption model — required", "Choose the model file or folder from step 3, or an existing compatible model. An IPA alone is not enough.", &self.fair.model, false, false, cx))
+                    .child(self.guided_path("Save decrypted IPA (optional)", "Leave blank to create a separate .decrypted.ipa beside the original. Existing files are never replaced.", &self.fair.output, false, true, cx));
+            }
         }
-        if matches!(mode, FairMode::Inspect | FairMode::Decrypt) {
-            form = form.child(self.path_control(
-                "Enrollment model (file or directory)",
-                &self.fair.model,
-                false,
-                false,
-                cx,
-            ));
-        }
-        if mode == FairMode::Inspect || mode == FairMode::Recover {
-            form = form.child(self.path_control(
-                "Existing capture directory",
-                &self.fair.capture,
-                true,
-                false,
-                cx,
-            ));
-        }
-        if mode == FairMode::Collect {
-            form = form.child(self.path_control(
-                "Matching IPA (optional)",
-                &self.fair.input,
-                false,
-                false,
-                cx,
-            ));
-        }
-        if mode != FairMode::Inspect {
-            form = form.child(self.path_control(
-                if mode == FairMode::Decrypt {
-                    "New decrypted IPA (blank uses .decrypted.ipa)"
-                } else {
-                    "New output directory"
-                },
-                if mode == FairMode::Decrypt {
-                    &self.fair.output
-                } else {
-                    &self.fair.directory_output
-                },
-                false,
-                true,
-                cx,
-            ));
-        }
-        if mode == FairMode::Inspect || mode == FairMode::Decrypt {
-            form = form.child(self.path_control(
-                "Report path (optional)",
-                &self.fair.report,
-                false,
-                true,
-                cx,
-            ));
-        }
-        if mode == FairMode::Collect {
-            form = form.child(muted("Native collection requires accessible private FairPlay state and matching installed app material. The GUI will not elevate itself or bypass permissions. Captures must remain private.", cx));
-        }
-        if matches!(mode, FairMode::Collect | FairMode::Recover) {
-            form = form.child(
+        form = form.child(
+            h_flex().child(
                 Button::new("fair-advanced")
                     .small()
                     .label(if self.fair.advanced {
-                        "Hide advanced inputs"
+                        "Hide advanced options"
                     } else {
-                        "Show advanced inputs"
+                        "Advanced options"
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.fair.advanced = !this.fair.advanced;
                         cx.notify();
                     })),
-            );
+            ),
+        );
+        if self.fair.advanced && matches!(mode, FairMode::Inspect | FairMode::Decrypt) {
+            form = form.child(self.guided_path(
+                "Save detailed report (optional)",
+                if mode == FairMode::Inspect {
+                    "Leave blank to view results only in Downloads. Choose a new JSON file to keep a local report. It may contain private paths and identifiers."
+                } else {
+                    "Leave blank to save a .decrypted.json report beside the input IPA. Choose a new file if a previous report exists."
+                },
+                &self.fair.report, false, true, cx,
+            ));
         }
         if self.fair.advanced && matches!(mode, FairMode::Collect | FairMode::Recover) {
+            form = form.child(muted(if mode == FairMode::Collect {
+                "Normally use this Mac's detected settings. Only override paths or system versions when you have matching materials; changing a version label does not make an unsupported build compatible. Collection needs permission to read this Mac's FairPlay data. The app cannot grant that permission."
+            } else {
+                "Some system builds need additional matching files. If the compatibility check requests them, select those files here; do not substitute files from a different build. Leave other fields at their defaults."
+            }, cx));
             form = form.child(self.path_control(
                 if mode == FairMode::Collect {
                     "Matching fairplayd image (optional)"
@@ -1448,41 +1456,28 @@ impl DesktopWindow {
                         false,
                         cx,
                     ))
+                    .child(label("System version override (optional)", cx))
                     .child(Input::new(&self.fair.product_version))
                     .child(label("NETWORK INTERFACE", cx))
                     .child(Input::new(&self.fair.interface))
                     .child(
                         v_flex()
                             .debug_selector(|| "fairplay-last-input".into())
+                            .child(label("System build override (optional)", cx))
                             .child(Input::new(&self.fair.build_version)),
                     );
             }
         }
+        form = form.child(muted("Experimental: support depends on the exact system build and matching materials. A passed check or completed task does not prove that the output is correct.", cx).text_sm());
         v_flex()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .child(
-                h_flex()
-                    .p_4()
-                    .gap_3()
-                    .flex_wrap()
-                    .border_b_1()
+                v_flex().p_4().gap_2().border_b_1()
                     .border_color(cx.theme().border)
                     .child(controls)
-                    .child(
-                        Button::new("run-fairplay")
-                            .primary()
-                            .label(match mode {
-                                FairMode::Inspect => "Check materials",
-                                FairMode::Decrypt => "Add decryption task",
-                                FairMode::Collect => "Add collection task",
-                                FairMode::Recover => "Add recovery task",
-                            })
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.submit_fairplay(window, cx)),
-                            ),
-                    ),
+                    .child(muted("Start at step 1. Already have collected materials or a model? Skip to step 3 or 4.", cx).text_sm()),
             )
             .child(
                 v_flex()
@@ -1491,14 +1486,20 @@ impl DesktopWindow {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .max_w(px(868.))
-                            .flex_shrink_0()
-                            .p_6()
-                            .child(form),
-                    ),
+                    .child(v_flex().w_full().max_w(px(868.)).flex_shrink_0().p_6().child(form)),
+            )
+            .child(
+                h_flex().p_4().gap_3().flex_wrap().flex_shrink_0()
+                    .border_t_1().border_color(cx.theme().border)
+                    .child(v_flex().flex_1().min_w(px(180.)).gap_1()
+                        .child(div().text_sm().child(guide.action_hint))
+                        .child(muted("Progress and results appear in Downloads.", cx).text_xs()))
+                    .child(Button::new("fairplay-results").label("View results")
+                        .debug_selector(|| "fairplay-results".into())
+                        .on_click(cx.listener(|this, _, _, cx| { this.page = Page::Downloads; cx.notify(); })))
+                    .child(Button::new("run-fairplay").primary().label(guide.action)
+                        .debug_selector(|| "fairplay-submit".into())
+                        .on_click(cx.listener(|this, _, window, cx| this.submit_fairplay(window, cx)))),
             )
             .into_any_element()
     }

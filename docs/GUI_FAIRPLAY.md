@@ -7,25 +7,41 @@ For practical use, prefer the original ipatool and UnfairPlay projects.
 
 ## Primary journeys
 
-1. **Inspect materials:** choose an IPA, model, or capture. Native pickers and
-   single-file/directory drops populate inputs without starting work. Results
-   and actionable errors appear in Downloads. Detailed diagnostic data is
-   transient unless an explicit private report path was selected.
-2. **Decrypt with model:** use an existing matching model. Default output is a
-   separate `.decrypted.ipa` and JSON report; existing files are preserved.
-3. **Collect enrollment:** select an installed application and matching host
-   material. Collection requires authorized access to private state and does
-   not elevate the GUI. Hardware/interface and build overrides are advanced
-   controls. Captures must remain private.
-4. **Recover capture:** select a supported capture and any required matching
-   compatibility/startup/IOKit material. Phase timeout is 1–3600 seconds;
-   differential checks remain enabled.
+The four numbered steps follow the user's material preparation order, not the
+CLI command order. Existing materials allow direct entry to step 3 or 4; selecting
+a step never starts work. Each step explains prerequisites, how to select inputs,
+what is optional, and the output or next action. Primary actions and View results
+stay in a fixed footer while the form scrolls at 900×650.
 
-Installed-application, IPA, capture-directory, decrypted-file, and capture/recovery
-output-directory controls retain independent meanings when modes change. The
-inspection result offers explicit collection/recovery/decryption input-review
-actions. A completed inspection is labeled Check complete, including when
-prerequisites need attention.
+1. **Check files:** choose a downloaded IPA and any existing decryption model or
+   collected materials folder. At least one input is required. A model is a
+   FairPlay parameter file, not an AI model. Native pickers and single-item drops
+   only populate inputs. Inspection does not decrypt the IPA. Report selection
+   is under Advanced options; without a report path, detailed results are transient.
+2. **Collect files:** choose the installed `.app`, an optional matching IPA, and
+   a new materials output folder. An IPA alone is insufficient. The supported
+   Mac must have readable local FairPlay data; the GUI cannot grant permissions.
+   Host/build overrides stay under Advanced options. Keep collected files private.
+3. **Create model:** choose the complete collected materials folder and a new
+   output folder. Run step 1 if support is unknown. Any matching system files
+   requested by diagnostics are selected under Advanced options. The phase
+   timeout remains 1–3600 seconds and differential checks remain enabled.
+4. **Decrypt IPA:** choose the downloaded IPA and matching model file or folder.
+   A separate `.decrypted.ipa` and `.decrypted.json` are created by default.
+   Existing files are preserved. An optional custom report path is advanced.
+
+Results appear in Downloads. Inspection is labeled Check complete even when
+requirements need attention; a successful IPA-only check explicitly says a model
+is still needed. Check names, warnings, and common input errors are presented as
+plain-language explanations. Raw protocol details are available under Show task
+details. Finding a matching model prioritizes the decryption review action over
+unnecessary collection. Inspection is not plaintext authentication.
+
+Installed-application, IPA, materials-folder, decrypted-file, and output-folder
+controls retain independent meanings when steps change. The inspection result
+offers explicit step 2/3/4 input-review actions. Successful collection provides
+Create decryption model; model output provides Use for decryption. These actions
+populate forms without starting another task.
 
 Completed IPA, capture, and model artifacts can populate the next appropriate
 form. Handoff does not start another operation. Output fields are reset for
@@ -42,10 +58,10 @@ data or arbitrary-build parity.
 
 | CLI entry | Desktop disposition |
 | --- | --- |
-| `fairplay-doctor` | Inspect materials and optional private report. |
-| `fairplay-decrypt` | Decrypt with a checked model into new output/report paths. |
-| `fairplay-enroll collect` | Collect enrollment with explicit paths and supported overrides. |
-| `fairplay-enroll recover` / `recover-capture` | Guided capture recovery with matching inputs and bounded phases. |
+| `fairplay-doctor` | Check files and optional private report. |
+| `fairplay-decrypt` | Step 4: decrypt with a checked model into new output/report paths. |
+| `fairplay-enroll collect` | Step 2: collect files with explicit paths and supported overrides. |
+| `fairplay-enroll recover` / `recover-capture` | Step 3: create a model with matching inputs and bounded phases. |
 | `recover-from-account`, `recover-from-sinf-copy` | CLI-only expert checkpoint entry points. |
 | `seed-request-checkpoint`, `continue-checkpoint` | CLI-only checkpoint preparation and execution. |
 | `export-oracle-model`, `learn-index-domains`, `validate-oracle-model` | CLI-only oracle research and differential analysis; guided recovery retains its required internal checks. |

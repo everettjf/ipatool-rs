@@ -7,12 +7,18 @@ versions, downloads, and progress are synthetic. The screenshots demonstrate
 rendered controls and observed interaction, not successful Apple authentication,
 real package transfers, or private FairPlay compatibility. See
 [the harness instructions](../../GUI_FIXTURE_PREVIEW.md).
-The first five captures below show the current graphite platform/region
-controls. Older interaction captures predate these controls and may retain the
+The guided FairPlay captures and first five catalog captures below show the current
+graphite controls. Older interaction captures predate these controls and may retain the
 previous palette; see the [native gallery](../README.md) for public-service captures.
 
 | Capture | Observed interaction |
 | --- | --- |
+| [Guided FairPlay, normal](fairplay-guided-check.png) | Numbered preparation order, explained optional materials, and fixed results/action footer. |
+| [Check files, narrow](fairplay-guided-check-narrow.png) | Step 1 explains that inspection does not decrypt and existing materials permit skipping steps. |
+| [Collect files, narrow](fairplay-guided-collect-narrow.png) | Step 2 states installed-app and permission prerequisites and explains the private output folder. |
+| [Create model, narrow](fairplay-guided-model-narrow.png) | Step 3 explains the model and matching-file requirements. |
+| [Decrypt IPA, narrow](fairplay-guided-decrypt-narrow.png) | Step 4 explains required matching inputs and separate outputs. No private task was submitted. |
+| [Readable inspection result](fairplay-guided-result-narrow.png) | A synthetic IPA without authorization data produces an actionable explanation with technical details collapsed. The suggested step opens its form without collecting files. |
 | [Account-region default](account-region-default-narrow.png) | Loading the synthetic US account replaces a previously selected CN browsing region and refreshes the existing query. |
 | [Cross-region warning](cross-region-warning-narrow.png) | A subsequent explicit switch back to CN remains available. A persistent notice explains possible download failure and provides a return-to-account-region action. |
 | [iOS and browsing region](catalog-ios-region-narrow.png) | Switching Mac to iOS (iPhone) refreshed the result and detail snapshot without another Search click. |

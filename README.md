@@ -111,6 +111,11 @@ Enter the Apple ID password and any verification code at the interactive prompts
 
 Native Mac applications such as ScriptWidget download as PKGs. A compatible iPhone or iPad application offered on Apple Silicon Mac can return an IPA instead. Use `--platform iphone` to request an iPhone offer when the account is entitled to it. Package format follows the selected Store offer.
 
+The desktop FairPlay page guides preparation through **Check files → Collect files →
+Create model → Decrypt IPA**. Each step explains what to prepare and what comes next;
+existing materials let you skip steps. Progress and results appear in Downloads.
+See the [FairPlay guide](docs/GUI_FAIRPLAY.md) for prerequisites and limitations.
+
 ## Commands
 
 | Task | Commands |

@@ -395,6 +395,58 @@ fn narrow_account_error_keeps_both_footer_actions_inside_the_window(cx: &mut Tes
 }
 
 #[gpui::test]
+fn fairplay_guided_steps_keep_actions_visible_and_navigation_never_starts_work(
+    cx: &mut TestAppContext,
+) {
+    let (_directory, view, session, mut cx) = setup(cx);
+    cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(650.)));
+    for mode in [
+        super::FairMode::Inspect,
+        super::FairMode::Collect,
+        super::FairMode::Recover,
+        super::FairMode::Decrypt,
+    ] {
+        cx.update(|window, cx| {
+            view.update(cx, |this, cx| {
+                this.page = Page::FairPlay;
+                this.set_fair_mode(mode, window, cx);
+                this.fair.advanced = true;
+                cx.notify();
+            })
+        });
+        cx.draw(
+            Default::default(),
+            gpui::size(gpui::px(900.), gpui::px(650.)),
+            |window, _| window.root::<Root>().unwrap().unwrap().into_any_element(),
+        );
+        for selector in ["fairplay-submit", "fairplay-results"] {
+            let bounds = cx
+                .debug_bounds(selector)
+                .expect("footer action was painted");
+            assert!(bounds.top() >= gpui::px(0.));
+            assert!(bounds.bottom() <= gpui::px(650.), "{selector}: {bounds:?}");
+            assert!(bounds.size.height > gpui::px(20.));
+        }
+        let results = cx.debug_bounds("fairplay-results").unwrap();
+        cx.simulate_click(results.center(), Default::default());
+        cx.update(|_, cx| view.update(cx, |this, _| assert!(this.page == Page::Downloads)));
+    }
+    cx.update(|window, cx| {
+        view.update(cx, |this, cx| {
+            this.set_fair_mode(super::FairMode::Inspect, window, cx);
+            this.submit_fairplay(window, cx);
+            assert!(
+                this.notice
+                    .as_ref()
+                    .is_some_and(|message| message.contains("Choose an IPA"))
+            );
+            assert!(this.journal.tasks.is_empty());
+        })
+    });
+    assert!(session.jobs.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
 fn narrow_fairplay_forms_keep_advanced_inputs_scrollable(cx: &mut TestAppContext) {
     let (_directory, view, _session, mut cx) = setup(cx);
     cx.simulate_resize(gpui::size(gpui::px(900.), gpui::px(650.)));
@@ -833,6 +885,10 @@ fn fairplay_mode_changes_keep_app_ipa_capture_and_output_types_separate(cx: &mut
             view.update(cx, |this, cx| {
                 this.set_fair_mode(mode, window, cx);
                 this.submit_fairplay(window, cx);
+                assert!(
+                    this.selected_task.is_none(),
+                    "technical details start collapsed"
+                );
             })
         });
         cx.run_until_parked();
@@ -1443,6 +1499,9 @@ fn account_region_is_the_default_without_overwriting_an_explicit_same_account_ov
                 .update(cx, |input, cx| input.set_value("second", window, cx));
             this.search(cx);
             this.open_account(window, cx);
+            // Select this synthetic backend explicitly on every platform;
+            // Windows otherwise defaults to the separately tested file store.
+            this.account_form.force_file = false;
             this.submit_account(true, window, cx);
         });
     });

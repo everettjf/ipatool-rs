@@ -789,3 +789,26 @@ These Linux and Windows runs establish native execution of the account-free CLI 
 On 2026-10-27 (Pacific time), [PR #5](https://github.com/everettjf/ipatool-rs/pull/5) narrowed the official targets to macOS ARM64, Linux x86_64, and Windows x86_64. Its [two-target PR CI](https://github.com/everettjf/ipatool-rs/actions/runs/40634692295) and the final tagged source's [main CI](https://github.com/everettjf/ipatool-rs/actions/runs/40638352303) passed native tests, Clippy, release builds, public ScriptWidget searches, packaging, and checksums. The [v0.2.1 release CI](https://github.com/everettjf/ipatool-rs/actions/runs/40638453544) verified the signed macOS package, built and tested the two x86_64 portable packages, checked their SHA-256 files, and published exactly three archives and three companion checksums. All six public assets were downloaded and the three checksums passed independently.
 
 The final macOS archive matched its notarization ZIP executable, passed strict code-signature and public-search checks, and Apple notarization accepted submission `ece034ff-f6b2-4777-a086-986974aded18` with no issues. The Homebrew tap upgraded to v0.2.1 and passed style, strict audit, `brew test`, signature verification, and public search. GitHub Pages points to v0.2.1. The tag names the final release source commit `b04acb9`. Real Linux and Windows account, credential-store, and package workflows remain untested. The FairPlay startup candidate writer remains only in [draft PR #6](https://github.com/everettjf/ipatool-rs/pull/6), and [issue #2](https://github.com/everettjf/ipatool-rs/issues/2) stays open.
+
+## Guided desktop FairPlay preparation
+
+On 2026-10-28, the desktop FairPlay form was reorganized into Check files,
+Collect files, Create model, and Decrypt IPA. Each numbered step explains inputs,
+prerequisites, output handling, and the next explicit review action. Advanced
+protocol fields are collapsed; inspection results use plain-language checks and
+keep raw diagnostics under task details. An empty inspection no longer starts a
+host-only diagnostic from the desktop; the CLI retains that capability.
+
+Native synthetic captures at normal and 900×650 sizes show the preparation guides
+and fixed footer. A synthetic missing-authorization IPA exercised the readable result
+and explicit follow-up without private collection. Restarted history requests a
+new check because detailed diagnostics are transient. Local validation passed 454 library tests, 45 CLI tests, and 39
+GUI-test binary tests (70 library checks ignored), formatting, strict default,
+GUI, and GUI-test Clippy, and ad hoc signed debug/release GUI bundles. These are
+UI and fixture checks, not successful private model creation or IPA decryption.
+
+The preceding account-region revision's CI run 40819067700 passed four jobs but
+failed its Windows GUI test because that fixture inherited Windows file-store
+selection without supplying its synthetic unlock phrase. The account-region test
+now explicitly selects its synthetic backend on every platform; production
+credential defaults are unchanged. CI for this correction is tracked separately.

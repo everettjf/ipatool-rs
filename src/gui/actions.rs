@@ -94,6 +94,9 @@ impl DesktopWindow {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.fair.mode != mode {
+            self.fair.advanced = false;
+        }
         self.fair.mode = mode;
         self.fair_scroll.set_offset(Default::default());
         cx.notify();
@@ -888,10 +891,11 @@ impl DesktopWindow {
                 return;
             }
         };
+        let show_parameters = matches!(request, JobRequest::Download(_));
         let mut task = TaskRecord::new(id, title, request, self.session.generation());
         task.account_identity = self.session.account_identity();
         self.journal.tasks.push(task);
-        self.selected_task = Some(id);
+        self.selected_task = show_parameters.then_some(id);
         self.page = Page::Downloads;
         self.shell_focus.focus(window);
         self.persist_history();
@@ -1235,6 +1239,14 @@ impl DesktopWindow {
             let value = value(input);
             (!value.is_empty()).then(|| PathBuf::from(value))
         };
+        if self.fair.mode == FairMode::Inspect
+            && [&self.fair.input, &self.fair.model, &self.fair.capture]
+                .iter()
+                .all(|input| value(input).is_empty())
+        {
+            self.show_notice("Choose an IPA, a decryption model, or a collected materials folder to check first.", cx);
+            return;
+        }
         let request = match self.fair.mode {
             FairMode::Inspect => FairPlayRequest::Inspect {
                 ipa: optional(&self.fair.input),
@@ -1247,7 +1259,7 @@ impl DesktopWindow {
                 let model = path(&self.fair.model);
                 if !input.is_file() || !model.exists() {
                     self.show_notice(
-                        "Choose an existing IPA and matching enrollment model first.",
+                        "Choose the downloaded IPA and its matching decryption model first.",
                         cx,
                     );
                     return;
@@ -1276,7 +1288,7 @@ impl DesktopWindow {
                     || !output.is_absolute()
                     || output.exists()
                 {
-                    self.show_notice("Choose an installed .app directory and a new absolute capture output directory.", cx);
+                    self.show_notice("Select the installed .app, then choose a new materials folder with a full path. The folder must not already exist.", cx);
                     return;
                 }
                 FairPlayRequest::Collect {
@@ -1318,7 +1330,7 @@ impl DesktopWindow {
                     || output.exists()
                 {
                     self.show_notice(
-                        "Choose an existing capture and a new absolute recovery directory.",
+                        "Select the collected materials folder, then choose a new model output folder with a full path. The output folder must not already exist.",
                         cx,
                     );
                     return;

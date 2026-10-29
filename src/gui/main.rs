@@ -6,6 +6,7 @@ mod actions;
 mod appearance;
 mod artwork;
 mod assets;
+mod fairplay_ui;
 mod preferences;
 #[cfg(feature = "gui-test")]
 mod preview;
@@ -394,11 +395,29 @@ impl DesktopWindow {
         let fair = FairForm {
             mode: FairMode::Inspect,
             app: field(window, cx, "Installed application (.app)", "", false),
-            input: field(window, cx, "Personalized IPA", "", false),
-            model: field(window, cx, "Enrollment model or model directory", "", false),
+            input: field(
+                window,
+                cx,
+                "Choose the IPA downloaded with your account",
+                "",
+                false,
+            ),
+            model: field(
+                window,
+                cx,
+                "Choose a decryption model file or folder",
+                "",
+                false,
+            ),
             output: field(window, cx, "New output path", "", false),
             directory_output: field(window, cx, "New output directory", "", false),
-            capture: field(window, cx, "Capture directory", "", false),
+            capture: field(
+                window,
+                cx,
+                "Choose a previously collected materials folder",
+                "",
+                false,
+            ),
             report: field(window, cx, "Optional report path", "", false),
             fairplayd: field(window, cx, "Matching fairplayd image", "", false),
             startup: field(window, cx, "Checked startup profile", "", false),
