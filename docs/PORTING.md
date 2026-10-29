@@ -384,6 +384,8 @@ footer. The new captures are explicitly synthetic. Signed local GUI debug/releas
 bundles and the Apple Silicon CLI were rebuilt; live account and FairPlay gates
 remain open.
 
+Runtime source `db63141` also passed [all five jobs in Platform CI 40811697728](https://github.com/everettjf/ipatool-rs/actions/runs/40811697728): native Linux/Windows CLI tests, release builds, public smoke and archive checks; Linux/Windows GUI tests, strict Clippy and linking; and macOS GUI tests, strict Clippy and signed debug bundle construction. All three GUI jobs passed 36 controller tests and seven production-GUI unit tests. Shared test counts differ by host: Linux passed 430 library and 45 CLI tests, Windows 417/45, and macOS 434/45. The portable scripts explicitly filtered 20 pinned-Apple-image checks, which remain covered by the complete local suite; their filtering does not establish live account or FairPlay parity.
+
 The local feature remains a source-only experimental preview. Its public search,
 controller fixtures and synthetic native walkthroughs do not close live account,
 Keychain approval, signed-bundle Store/JIT, real IPA/PKG, or private FairPlay gates.
