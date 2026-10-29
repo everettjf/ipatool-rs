@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use ipatool_rs::catalog::AppNotFound;
 use ipatool_rs::credentials::{Account, AccountStore, open_system_keychain};
 use ipatool_rs::store_download_product::{DownloadProductClient, LicenseRequired};
-use ipatool_rs::store_login::{self, LoginInput, NativeAuthenticationBackend};
+use ipatool_rs::store_login::{LoginInput, NativeAuthenticationBackend};
 use ipatool_rs::store_owned::{self, DEFAULT_LIMIT, MAX_LIMIT, NativeOwnedBackend};
 use ipatool_rs::store_purchase::{
     self, LicenseAlreadyExists, NativePurchaseBackend, PasswordTokenExpired,
@@ -401,7 +401,7 @@ fn with_account(mut work: impl FnMut(&Account) -> Result<Value>) -> Result<Value
         .context("account unavailable; run 'ipatool auth login' before using MCP")?;
     match work(&account) {
         Err(error) if error.downcast_ref::<PasswordTokenExpired>().is_some() => {
-            account = store_login::login(
+            account = ipatool_rs::application::account::login(
                 &NativeAuthenticationBackend::open()?,
                 &store,
                 LoginInput {

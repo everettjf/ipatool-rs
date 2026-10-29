@@ -4,12 +4,25 @@ version = "0.2.1"
 edition = "2024"
 license = "MIT"
 description = "Rust port of ipatool-fairplay"
+default-run = "ipatool"
+
+[features]
+default = []
+gui = ["dep:gpui", "dep:gpui-component"]
+gui-test = ["gui", "gpui/test-support"]
 
 [[bin]]
 name = "ipatool"
 path = "src/main.rs"
 
+[[bin]]
+name = "ipatool-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
 [dependencies]
+gpui = { version = "=0.2.2", optional = true }
+gpui-component = { version = "=0.5.1", optional = true }
 getrandom = "0.4"
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
@@ -52,7 +65,7 @@ roxmltree = "0.21"
 yaxpeax-arm = { version = "0.5.0", default-features = false, features = ["std", "fmt"] }
 yaxpeax-arch = { version = "0.3.2", default-features = false, features = ["std"] }
 rmcp = { version = "3.7.0", default-features = false, features = ["server", "macros", "transport-io"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }
 schemars = "1"
 flate2 = "1"
 serde-pickle = "1.2.0"
@@ -80,3 +93,4 @@ tar = "0.4"
 [patch.crates-io]
 apfs = { path = "vendor/apfs" }
 apple-xar = { path = "vendor/apple-xar" }
+xattr = { path = "vendor/xattr" }

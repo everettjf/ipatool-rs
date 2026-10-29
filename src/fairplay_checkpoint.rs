@@ -67,7 +67,8 @@ impl FairplayCheckpoint {
         Self::parse_reader(Cursor::new(compressed))
     }
 
-    fn parse_reader<R: Read + Seek>(mut compressed: R) -> Result<Self> {
+    fn parse_reader<R: Read + Seek>(compressed: R) -> Result<Self> {
+        let mut compressed = crate::application::operation::CancellableReader(compressed);
         // The original Python tracer writes schema 1 with the first key set to
         // `schema`. Detect it before allocating the decompressed pickle.
         let mut prefix = [0u8; 32];

@@ -38,6 +38,406 @@ The 2026-10-27 help-only audit compared long flags on the root command, `auth` a
 | FairPlay | Doctor, collection, checkpoint execution, oracle evaluation, native SIDB recovery, model construction, and IPA decryption paths have offline tests. Full public SIDB recovery matched the Go fixture in release mode. The current host's `fairplayd` arm64e slice matches the supported 26A428 profile and loads into Unicorn. The 26B118 Rust evaluator matched 208 Go vectors on the public synthetic model, covering 64 normal inputs and 48 fault sites at three XOR values. | Run private enrollment/decryption and 26B118 differential checks against paired data. The system's private FairPlay state is inaccessible to the present unprivileged process. |
 | MCP | Six tools initialize and list over stdio. Their names, descriptions, output schemas, and annotations match the Go server. The public `search_apps` input adds an optional `country` so an account is not required to select a storefront. Thirty-five invalid-call cases were compared; the Go and Rust results now have the same error envelope, including no `structuredContent` on tool failures. Rust now advertises the same logging and tool-list-change capabilities as Go and accepts `logging/setLevel`; three valid levels returned the same empty result on both servers. SDK diagnostics still differ in wording for some invalid arguments. Authenticated `list_purchases` and an already owned `purchase_app` returned structured success. `--keychain-passphrase-file` permits an encrypted file store with MCP stdio without placing the passphrase in process arguments. | Successful live results for `list_app_versions`, `get_version_metadata`, and `download_app` remain outstanding; the latest requests encountered Store errors and a failed token refresh. |
 
+## Shared CLI / GPUI implementation in progress (2026-10-28)
+
+The working branch adds a shared `application` layer used by the CLI and desktop
+for account, catalog, library, download, and primary FairPlay operations. The
+desktop now includes Explore, Library, Downloads, FairPlay, account interaction,
+and local preferences. This section records intermediate local evidence; the
+implementation plan's exit gates remain open.
+
+- Default tests passed with 439 active library tests and 45 CLI tests; the
+  GUI-enabled suite subsequently passed 441 library, 45 CLI, and four desktop
+  tests. Both configurations retained 70 explicitly ignored library tests.
+  Two new package-publication tests account for the count difference between
+  these runs. Subsequent interaction changes still require a final full run.
+- Fourteen transfer tests passed, including cancellation of a stalled body,
+  checkpoint validation, verified HTTP range resumption, restart after local
+  byte or account/request identity changes, and rejection of a changed ETag
+  before appending. The cancellation fixture stopped in under two seconds and
+  retained a verified checkpoint. The test uses only localhost synthetic data.
+- Desktop-scoped transfers hash account/app/version/offer identity and the full
+  package URL without storing signed URLs. Checkpoints include a strong ETag
+  or Last-Modified validator and a SHA-256 digest of retained bytes. Missing or
+  mismatched identity/digest requires a new transfer. Legacy unscoped CLI range
+  behavior remains unchanged. No Pause control is exposed.
+- GUI-enabled dependency unification enables insertion-ordered JSON maps. The
+  full suite caught three Store request byte-comparison failures caused by
+  arbitrary guest dictionary traversal. Guest JSON export and native Store
+  plist encoding now explicitly sort objects; all three pinned authentication,
+  volume, and ent/download comparisons passed with the GUI feature enabled.
+- Two focused tests proved that desktop IPA and PKG publication preserves an
+  existing destination. CLI replacement semantics are unchanged. Native macOS
+  desktop publication uses a same-filesystem no-replace link; IPA publication
+  uses `persist_noclobber`.
+- The opt-in synthetic active-guest cancellation test was run explicitly and
+  passed against the pinned Unicorn runtime. This is bounded execution evidence,
+  not evidence that private FairPlay processing or a Store account flow passed.
+- `scripts/build-gui-macos.sh --debug` built a native Apple Silicon `.app`,
+  validated its Info.plist, and passed strict ad hoc signature verification with
+  the existing JIT/library-loading entitlements. The bundle launched and public
+  ScriptWidget / Mac / US search returned 17 results; the primary sign-in/download
+  action remained visible above the scrollable metadata. This is not notarization.
+
+Account login/2FA, purchase history, actual IPA/PKG downloads, and private
+FairPlay workflows have not yet been live-tested through this desktop. Linux
+and Windows desktop validation, final interaction screenshots, distribution
+resources/signing, and the final regression run remain outstanding. The pinned
+GPUI macOS accessibility tree exposes window chrome but no custom controls;
+keyboard shortcuts do not establish screen-reader support.
+
+Additional intermediate evidence: a release-mode GUI bundle also built and
+passed strict ad hoc signature verification. Actual light/dark catalog, empty
+sign-in, and FairPlay entry captures are in [screenshots](screenshots/README.md).
+The native keyboard Down/Enter journey selected the next app and opened its
+sign-in interaction; cancel preserved the selection. Appearance preferences
+were changed through the real settings sheet and restored to System. Public
+artwork loads from Apple's CDN independently of account state and is omitted
+from existing CLI/MCP JSON output. A checked-in original vector/application
+icon now supplies bundle artwork; final bundle/launch validation must be rerun
+after these resource and interaction changes.
+
+The subsequent full local runs passed 446 library and 45 CLI tests in both the
+default and GUI-enabled configurations, plus six desktop tests with `gui`;
+70 library tests remained explicitly ignored. Both strict Clippy configurations
+passed. Additional focused fixtures covered refresh identity ownership and
+ZIP-writer cancellation classification. The rebuilt debug bundle includes the
+application icon and passed native ICNS decoding and strict signature checks.
+The updated FairPlay toolbar was captured from that bundle. After navigation,
+Command-Q was checked using the app inventory without requesting another window
+snapshot: the application transitioned to `isRunning: false`. Requesting a new
+targeted UI snapshot can relaunch the app and is not suitable quit evidence.
+
+The next local regression run passed 453 library and 45 CLI tests in both the
+default and `gui-test` configurations, plus 23 desktop tests with `gui-test`;
+70 library tests remained explicitly ignored. Both strict Clippy configurations
+passed. The optional `gui-test` feature enables GPUI's deterministic test runtime;
+its additional dependencies do not enter the default CLI dependency graph.
+The controller fixtures substitute account, catalog, and job services and never
+contact Apple or open native credential storage. They cover challenge continuation
+and expiration, invalid input, replaced secret controls, wrong unlock recovery,
+same-account queue resumption, stale searches, Library selection/pagination,
+editable retry, interrupted history, artifact handoff, and obsolete version results.
+Rendered 900×650 fixtures also cover advanced FairPlay scroll geometry and fixed
+account/download footer bounds when errors and version choices increase content,
+and the last application-detail action after scrolling to the end. Explore and
+Library are rendered at both 900×650 and 1240×820: the detail viewport itself
+must remain inside the window, as must its final actions. This caught a separate
+resizable-group height error: the group previously used the whole page height
+without deducting its toolbar. A constrained remaining-height wrapper now gives
+both catalog and Library splits the correct viewport.
+The signed release app was then launched again and its real public search was
+scrolled to the detail panel's end: all four copy actions were fully visible in
+the native window. Selecting a different app also resets its detail scroll to
+the beginning while keeping the download action fixed.
+Keyboard confirmation/decline tests check quit cancellation and journal state;
+GPUI's TestPlatform quit implementation is a no-op, so these are not native exit
+evidence. Credential-removal completion now honors a pending quit request.
+
+First-time resource preparation now uses cancellation-aware scoped HTTP range
+and FCS waits. Stalled-header/body fixtures acknowledge cancellation in under two
+seconds and preserve typed cancellation through reader adapters. The resource
+suite passed 27 active tests with 16 explicitly ignored; recovery-related fixtures
+passed 113 active tests with six ignored. Recovery stages now reach desktop task
+progress, last stages are journaled, and checkpoint copy/compression loops check
+for cancellation. These fixtures do not establish private capture compatibility.
+CLI account workflows still reject a missing saved account before constructing
+their native backend or starting first-time resource preparation; a focused
+fixture protects this ordering.
+
+Native 900×650 captures and walkthroughs verified public search, compact navigation,
+account file-storage expansion, empty-form errors, and advanced FairPlay scrolling.
+They exposed a clipped account footer after an error; account, download, and
+settings dialogs now bound their height and scroll their content. The native
+account error journey was repeated successfully with both buttons visible.
+Irrelevant advanced-input and sidebar controls are hidden in modes/window sizes
+where they have no effect. FairPlay input hints follow the selected workflow.
+The long FairPlay form also exposed a clipped final input after scrolling to
+the end. The form now has a definite width and its padding belongs to the scroll
+content, so wrapped text contributes the correct height. A rendered regression
+fails on the former arrangement and passes with the final input fully within
+the viewport; the native collection form was then scrolled to the end and its
+complete Build version input and fixed task action were visible. Catalog-detail
+and task-history padding use the same content-wrapper arrangement.
+The release CLI and GUI bundle were rebuilt; the CLI returns `ipatool 0.2.1` and
+both pass strict ad hoc signature checks. Distribution notarization remains open.
+
+The Windows GNU x86_64 GUI passed a cross-target compile, linked executable build,
+and strict all-targets Clippy with `gui-test` from macOS. This check caught and fixed a Unix-only import
+in the new platform-independent IPA collision fixture. It does not prove Windows
+execution, system integration, or the MSVC release target; native
+Linux/Windows CI and desktop interaction remain separate pending gates.
+
+### Native fixture interaction follow-up (2026-10-28)
+
+The optional `gui-test` native preview now substitutes synthetic account,
+catalog, Library, version, and download services behind an explicit environment
+opt-in and a private-state marker. Missing/invalid fixture configuration fails
+startup; ordinary production GUI builds reject the flag. A persistent header
+identifies simulated services. No real account or Keychain item was used.
+[Fixture captures](screenshots/fixtures/README.md) are separate from public-service
+captures and do not close live account/private-data gates.
+
+The native walkthrough verified fake-password/code submission and focus,
+six-page Library navigation, filtering and no-match selection clearing,
+Home/End selection/scrolling, historical-version selection and metadata, an
+expired-session pause, a second queued request, same-account verification and
+serial continuation, cancellation acknowledgement, and completed synthetic ZIP
+publication. The paused request retained version 100/license opt-in while the
+second retained Latest/no opt-in. Cancelling the first allowed the second to run.
+The generated IPA's artifact action filled the FairPlay input and the shared
+diagnostic adapter reported its missing SINF. It is an unencrypted fixture ZIP,
+not a Store download or evidence of FairPlay decryption.
+
+This walkthrough caught a Library selection bug: filtering to application 025
+left application 001's details/download action selected. Selection now reconciles
+with visible results, and no matches clears the details. Version choices also
+no longer silently stop after 12 IDs; all 20 fixture IDs, selected highlighting,
+and version 119 metadata were observed in the native download sheet. The narrow
+footer regression now includes 200 choices and an inline error.
+
+Native modal focus also exposed an ignored Command-Q. Global lifecycle bindings
+now reach deferred dialog layers. Account completion preserves a pending quit
+confirmation and defers pending-action continuation until the decision. Native
+checks covered account completion while the confirmation remained visible,
+declining an active-download quit and observing continued progress, confirming
+a subsequent quit and verifying process termination, and completion of the
+download before confirmation followed by successful termination. The cancellation
+was journaled as Cancelled and survived relaunch without automatic execution.
+Explicit retry restored version 119 and its output/license choices; editing to
+118/license opt-in created a separate task that completed. Native app inventory,
+not TestPlatform quit or a targeted screenshot, established termination.
+
+Current full local suites pass 453 library and 45 CLI tests in both default and
+`gui-test` configurations, plus 30 GUI tests with `gui-test`; 70 library tests
+remain explicitly ignored. Formatting and strict all-targets Clippy pass for
+default, production `gui`, and `gui-test`. Additional controller regressions cover
+direct task reauthentication, checked-material handoff into collection/recovery/
+decryption forms without starting work, modal lifecycle shortcuts, pending
+download continuation after declining quit, and completion-before-confirmation.
+FairPlay inspection results now distinguish Check complete and offer direct GUI
+follow-up input review. Private diagnostic details remain absent from the journal.
+Further source edits still require affected checks and final release rebuilds.
+
+### Refined dark desktop and final local snapshot (2026-10-28)
+
+At the user's request the desktop now supports one dark theme. The sidebar
+uses aligned icon/label columns and a compact icon-only toggle; project
+recommendations remain in documentation instead of the workspace. Search has a
+leading icon and compact clear action, account/download actions have icons, and
+selected controls share one blue accent. Old light captures are historical.
+The native window title provides the app name; the sidebar no longer repeats
+that brand. The toolbar shows a page title only when the wide sidebar is hidden,
+so visible navigation identifies the page without another heading.
+The signed release app repeated real Mac/US public search (17 results with public
+artwork), clear-query/result removal, sidebar collapse/restore, Down/Enter/
+Command-W selection retention, and Command-Comma settings checks. The current
+visual reference is [refined dark Explore](screenshots/explore-refined-dark.png).
+The final signed release also verified Tab and Shift-Tab through search controls
+and account fields, Enter activation of mode/download/Cancel buttons, restored
+download-button focus after cancellation, Command-F, Command-Comma, Escape and
+Command-W. Reopening after Escape showed an empty password control. Only an
+unsubmitted `.invalid` sample identity was entered; no account request ran.
+This keyboard evidence does not change the upstream custom-control AX gap.
+
+A native 900×650 walkthrough verified the revised shell and populated Library,
+and found that an encrypted saved-account load still exposed the ordinary
+sign-in primary action. A dedicated passphrase-only unlock step now retains the
+saved-account intent, focuses its input, clears secret input/history after each
+attempt, and exposes Unlock and continue. Clicking this action with the synthetic
+store passphrase loaded the fixture account. A controller regression includes a
+partially entered email so that the action cannot accidentally become a login.
+
+FairPlay forms now keep installed applications, IPA inputs, capture directories,
+decrypted output files, and collection/recovery output directories separate
+across mode changes. A regression checks the actual queued request variants.
+Native Library, version-query and credential-removal completions preserved a
+pending quit prompt. Declining quit after removal closed stale account sheets.
+The direct expired-task sign-in action opened the correct account/password step.
+Native model pickers accepted a synthetic file and directory. The shared doctor
+ran on synthetic SINF and FPSENR2 fixtures: different selectors produced a
+mismatch, matching selectors passed prerequisites, and both reports were written
+with mode 0600. Reusing an existing report produced Output already exists; Review
+and retry restored editable parameters without executing, and a changed report
+path completed as a separate task. Decryption-input review retained the checked
+IPA/model and cleared output/report paths. These are diagnostic and handoff
+checks only: no private recovery or decryption ran. Updated captures are in the
+separate [fixture gallery](screenshots/fixtures/README.md).
+
+The current default suite passed 453 library and 45 CLI tests; the final
+GUI-test suite passed the same 453/45 plus 32 desktop tests. Both retain 70
+explicitly ignored library checks. Strict default, production-GUI and GUI-test
+all-targets Clippy passed. Formatting and diff whitespace checks passed. The
+Windows GNU x86_64 GUI cross-build linked a PE32+ GUI executable and
+passed strict all-targets Clippy. Native Linux/Windows desktop interaction
+remains a separate gate. Debug/release Apple Silicon app bundles rebuilt and
+passed strict ad hoc signatures; the rebuilt signed CLI returns 0.2.1 and passed
+an isolated account-free public search. The active synthetic guest cancellation
+check also passed explicitly against the pinned runtime. Full
+localhost/pinned-JIT tests run outside the execution sandbox; an in-sandbox
+attempt cannot supply that evidence.
+
+The first expanded portable CI run caught a Linux-only transitive dependency
+error: GPUI's zed-async-tar uses xattr 0.2.3, whose libc::ENOATTR alias is no longer
+available on Linux. A local patch retains upstream source/licenses/tests and
+maps only Linux/Android missing-attribute handling to ENODATA. It does not
+change the public API or pin libc backward. Provenance and the exact change are
+recorded in `vendor/xattr/PATCH.md`; CI runs its upstream tests on Linux.
+The follow-up Linux run passed shared/desktop fixtures and the upstream xattr
+tests before proceeding to Clippy/build. The first Windows MSVC GUI run compiled
+and passed shared tests, then exposed two controller fixtures that omitted the
+file-store passphrase despite Windows' file-storage default. Those scenarios now
+explicitly select file storage and provide the synthetic passphrase on every
+host; production defaults are unchanged. All 31 local controller tests pass.
+[Platform CI run 40782053570](https://github.com/everettjf/ipatool-rs/actions/runs/40782053570)
+passed all five jobs at `9d7fc66`: native Linux x86_64 and Windows MSVC x86_64
+GUI builds, deterministic controllers and strict Clippy; the macOS shared/GUI
+tests, Clippy and signed application-bundle build; and Linux/Windows release
+CLI builds, public catalog smoke checks and archive checksums. Portable CI
+explicitly skips 20 pinned-Apple-image checks unavailable on its runners; the
+complete local suites above cover those cached-image paths. Headless GUI tests
+and linking do not establish native portable desktop/account interaction.
+The subsequent heading-only shell change at `d0c8183` has complete local
+regression and signed release/native keyboard evidence; all five jobs also passed in
+[40783409188](https://github.com/everettjf/ipatool-rs/actions/runs/40783409188).
+
+A further user-requested refinement removes the entire 52-point top toolbar.
+Account/settings/sidebar actions are anchored at the bottom of navigation.
+Narrow and collapsed windows use a 56-point icon rail, retaining those actions,
+tooltips and active-download counts; the production workspace starts directly
+below the native title bar. The synthetic preview alone retains its small
+persistent fixture banner. Long account labels are clipped within the sidebar
+and remain available in a tooltip. The signed release repeated real public search,
+footer account/settings entry, and collapse/restore without an account request.
+The 900×650 synthetic preview repeated both footer actions and advanced FairPlay
+scrolling: the complete final Build version input and fixed primary action were
+visible. Constraining the padded form container rather than its inner percentage
+width fixed a wrapped-text/scroll-extent regression exposed by the icon rail.
+An added rendered interaction regression covers account/settings and repeated
+collapse/restore at narrow and normal sizes. The current local 453/45/32 suites,
+three strict Clippy configurations, debug/release signed bundle rebuilds and
+Windows GNU GUI cross-build/strict all-targets Clippy all pass. Revised
+normal/collapsed and clearly labeled narrow captures are in the native galleries.
+Portable CI for this subsequent layout is separate from the completed runs above.
+
+The desktop window, application menu and macOS bundle display name now use
+`🦀IPATOOL-RS 🦀`. The native signed release visibly renders both crab symbols
+and retains the full-height workspace. Public Mac/US search again returned 17
+results; expanded/collapsed captures were refreshed. The complete local default
+and GUI-test suites (453/45/32), three strict Clippy configurations, formatting
+and debug/release signed bundle checks passed again for this display-only change.
+Bundle identifiers, executable names and CLI commands retain their existing names.
+
+The next appearance refinement replaces blue-tinted backgrounds, controls,
+dividers and large selection fills with neutral graphite gray. Content uses
+`#1e1e1e`, navigation `#282828`, and raised dialogs/popovers `#2b2b2b`; primary
+actions and focus retain blue. This is an opaque GPUI approximation inspired by
+[Apple's Dark Mode guidance](https://developer.apple.com/design/human-interface-guidelines/dark-mode),
+not dynamic AppKit vibrancy. Hovered results remain distinct from selected rows.
+Calculated contrast is 5.65:1 for white primary-button text, 6.75:1 for secondary
+dialog text, and 4.95:1 for secondary text on selected rows. All 453/45/32 local
+tests, three strict Clippy configurations, formatting and debug/release signed
+bundle builds passed again. Native release checks covered real public search
+(17 Mac/US results), empty sign-in/settings dialogs, FairPlay navigation and
+sidebar collapse/restore. Current normal/collapsed, sign-in and FairPlay captures
+are in the native gallery; older captures retain their historical palettes.
+
+Manual GUI feedback exposed two catalog interaction problems: a platform change
+did not refresh the selected result, and a region code input obscured the
+difference between public browsing and the saved account's storefront. Platform
+and region changes now clear the obsolete result/selection and refresh an
+already submitted search. Late completions remain guarded by query generation.
+Fresh preferences select iPhone, now labeled `iOS (iPhone)`; explicit saved
+platform preferences are preserved. The manual-check bundle's earlier Mac
+selection came from the preceding public-search test configuration, not host
+platform detection. Download dialogs expose all six targets and clear version
+metadata when the target changes. Journals retain their existing serialized
+platform values; visible task titles and parameters use human-readable names.
+
+The region dropdown supports searching English names and codes, based on the
+repository's known account-storefront mapping and public-domain IANA region
+names. Previously saved codes outside that mapping remain selectable. The
+committed country is independent of the menu's provisional search index:
+GPUI Component 0.5.1 otherwise displays a filtered item or an empty title after
+Escape. A separate popover/list creates a fresh search session on each open and
+commits only explicit confirmation. Exact code matches precede name fragments
+(for example US precedes Australia). The account-region browsing shortcut
+is explicit; neither region selection nor catalog filtering changes the account.
+
+A public-only lookup on 2026-10-28 found Muse from Meta (`6760173601`) in US/iOS
+but returned zero results in CN/iOS. WhatsApp (`310633997`) likewise returned one
+US/Mac result and zero CN/Mac results. This explains the reported GUI failures
+at its account-region catalog preflight, before the authenticated download
+workflow. It does not establish whether Apple's authenticated Store endpoint
+would grant an already-held entitlement. Preflight misses now identify the
+account region and explain that browsing another region does not switch the
+Apple account. The typed summary retains only a validated two-letter code,
+preserving the failure kind/journal schema and excluding raw private error chains.
+No account request or private material was used for this diagnosis.
+
+The changed source passed 454 library, 45 CLI and 36 desktop tests, with 70
+opt-in library tests ignored; formatting and all three strict all-targets Clippy
+configurations passed. Native 900×650 fixtures verified repeated region search
+after Escape, Enter confirmation, platform-triggered refresh, account-region
+browsing, and the editable target/region explanation with a fixed download
+footer. The new captures are explicitly synthetic. Signed local GUI debug/release
+bundles and the Apple Silicon CLI were rebuilt; live account and FairPlay gates
+remain open.
+
+Runtime source `db63141` also passed [all five jobs in Platform CI 40811697728](https://github.com/everettjf/ipatool-rs/actions/runs/40811697728): native Linux/Windows CLI tests, release builds, public smoke and archive checks; Linux/Windows GUI tests, strict Clippy and linking; and macOS GUI tests, strict Clippy and signed debug bundle construction. All three GUI jobs passed 36 tests in the gui-test binary (29 controllers and seven supporting unit tests); the production-GUI configuration also ran those seven supporting unit tests separately. Shared test counts differ by host: Linux passed 430 library and 45 CLI tests, Windows 417/45, and macOS 434/45. The portable scripts explicitly filtered 20 pinned-Apple-image checks, which remain covered by the complete local suite; their filtering does not establish live account or FairPlay parity.
+
+Subsequent manual feedback requested account-first browsing. Initial login or saved-account load now selects the account region, even when a different public region was previously selected or saved. A changed account identity/storefront reapplies that default; same-account reauthentication preserves an explicit override. The existing query refreshes and any pre-login download retains its original app/platform/source-region snapshot. Both the catalog and download sheet prominently explain that cross-region applications may be unavailable to download, and the catalog provides a return-to-account-region action. A synthetic saved-account regression covers CN defaults, same-account overrides, changed identity/storefront, failed unlock, and the rendered narrow warning/return button; the verification-continuation regression also checks the preserved US download after CN login. The local default suite passed 454 library and 45 CLI tests, and the gui-test binary passed 37 desktop tests. Strict default/GUI/gui-test Clippy and native bundle verification are recorded with the PR. These checks do not establish live account or private FairPlay success.
+
+The local feature remains a source-only experimental preview. Its public search,
+controller fixtures and synthetic native walkthroughs do not close live account,
+Keychain approval, signed-bundle Store/JIT, real IPA/PKG, or private FairPlay gates.
+GUI distribution/notarization and upstream custom-control accessibility remain
+open. The task matrix distinguishes local implementation from these gates.
+
+## Original catalog-only GPUI baseline (2026-10-28)
+
+An optional `ipatool-gui` binary uses GPUI 0.2.2 and GPUI Component 0.5.1.
+Enable it with `cargo run --locked --features gui --bin ipatool-gui`. The default
+feature set remains empty, the default run target remains `ipatool`, and the
+CLI-only normal dependency tree does not include GPUI. GPUI pins
+`core-foundation` to 0.10.0, so the shared lockfile moves that binding from 0.10.1
+to 0.10.0; no other existing package version was removed.
+
+The window calls the existing public `CatalogClient` in a background executor;
+it does not invoke a shell, another executable, the Keychain, or Store account
+workflows. It supports search and lookup by numeric App ID or bundle identifier,
+all six catalog offer platforms, country codes, result selection, metadata, and
+clipboard actions. Search is capped at 25 results, or 12 for visionOS. Copied
+commands retain the platform and country submitted with the result, even after
+editing controls. Download commands leave storefront selection to the saved CLI
+account, matching the existing command contract.
+
+Local Apple Silicon macOS verification passed:
+
+- `cargo fmt --check`, four GUI request-validation and command-construction tests,
+  and `cargo test --all-targets --quiet` (421 library tests and 45 CLI tests passed;
+  69 opt-in library tests remained ignored).
+- `cargo clippy --all-targets -- -D warnings` and the same check with
+  `--locked --features gui`, plus a linked debug GUI build and native window launch.
+- Manual public catalog search for ScriptWidget on macOS / US (17 results),
+  App ID lookup for `1555600758`, and bundle lookup for
+  `com.everettjf.scriptwidget`. Enter submission, invalid-country feedback,
+  details scrolling, and copying the original US lookup command after editing
+  the country control to GB were checked in the running window.
+
+The full test suite needs localhost fixture servers and Unicorn JIT access;
+the sandboxed attempt failed on those restrictions and the unrestricted rerun
+passed. GPUI's Metal build also needed write access to the compiler cache. Its
+dependencies currently emit future-Rust compatibility warnings for `block` and
+`proc-macro-error2`; the project's Clippy checks pass with warnings denied.
+
+This is a source-only desktop experiment. It does not add a GUI to release
+archives or establish Linux / Windows GUI support, account UI, or FairPlay parity.
+The macOS accessibility tree exposes window chrome but not the custom controls;
+accessibility and broader keyboard validation remain open in [TODO.md](TODO.md).
+A macOS GUI CI job builds, tests the request model, and checks Clippy with the
+feature enabled; existing Linux and Windows jobs continue to verify the CLI.
+
 ## Historical build and test evidence
 
 Entries below record the result at the time each change was made. The current state is summarized above and in [TODO.md](TODO.md).
@@ -389,3 +789,86 @@ These Linux and Windows runs establish native execution of the account-free CLI 
 On 2026-10-27 (Pacific time), [PR #5](https://github.com/everettjf/ipatool-rs/pull/5) narrowed the official targets to macOS ARM64, Linux x86_64, and Windows x86_64. Its [two-target PR CI](https://github.com/everettjf/ipatool-rs/actions/runs/40634692295) and the final tagged source's [main CI](https://github.com/everettjf/ipatool-rs/actions/runs/40638352303) passed native tests, Clippy, release builds, public ScriptWidget searches, packaging, and checksums. The [v0.2.1 release CI](https://github.com/everettjf/ipatool-rs/actions/runs/40638453544) verified the signed macOS package, built and tested the two x86_64 portable packages, checked their SHA-256 files, and published exactly three archives and three companion checksums. All six public assets were downloaded and the three checksums passed independently.
 
 The final macOS archive matched its notarization ZIP executable, passed strict code-signature and public-search checks, and Apple notarization accepted submission `ece034ff-f6b2-4777-a086-986974aded18` with no issues. The Homebrew tap upgraded to v0.2.1 and passed style, strict audit, `brew test`, signature verification, and public search. GitHub Pages points to v0.2.1. The tag names the final release source commit `b04acb9`. Real Linux and Windows account, credential-store, and package workflows remain untested. The FairPlay startup candidate writer remains only in [draft PR #6](https://github.com/everettjf/ipatool-rs/pull/6), and [issue #2](https://github.com/everettjf/ipatool-rs/issues/2) stays open.
+
+## Guided desktop FairPlay preparation
+
+On 2026-10-28, the desktop FairPlay form was reorganized into Check files,
+Collect files, Create model, and Decrypt IPA. Each numbered step explains inputs,
+prerequisites, output handling, and the next explicit review action. Advanced
+protocol fields are collapsed; inspection results use plain-language checks and
+keep raw diagnostics under task details. An empty inspection no longer starts a
+host-only diagnostic from the desktop; the CLI retains that capability.
+
+Native synthetic captures at normal and 900×650 sizes show the preparation guides
+and fixed footer. A synthetic missing-authorization IPA exercised the readable result
+and explicit follow-up without private collection. Restarted history requests a
+new check because detailed diagnostics are transient. Local validation passed 454 library tests, 45 CLI tests, and 39
+GUI-test binary tests (70 library checks ignored), formatting, strict default,
+GUI, and GUI-test Clippy, and ad hoc signed debug/release GUI bundles. These are
+UI and fixture checks, not successful private model creation or IPA decryption.
+
+The preceding account-region revision's CI run 40819067700 passed four jobs but
+failed its Windows GUI test because that fixture inherited Windows file-store
+selection without supplying its synthetic unlock phrase. The account-region test
+now explicitly selects its synthetic backend on every platform; production
+credential defaults are unchanged. Source `0758f8b` subsequently passed
+[all five native CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/40822892531),
+including the corrected Windows GUI fixture and all 39 desktop tests on each GUI
+host. That run predates the direct downloaded-IPA shortcut.
+
+## Direct desktop handoff from downloaded IPA
+
+Completed IPA package artifacts now provide Decrypt IPA... without requiring the
+inspection/collection/model-creation pages first. This opens a review form rather
+than starting private processing. It clears a previously selected model and old
+output/report paths; a matching model is still required. PKGs and already decrypted
+artifacts are excluded, and missing inputs produce an actionable notice. The CLI
+and decryption engine behavior are unchanged. A rendered 900×650 synthetic test
+verified the shortcut and subsequent explicit request, including preservation of
+the original bytes. Full local checks passed 454 library, 45 CLI, and 40 GUI-test
+cases (70 ignored library checks), formatting, three strict Clippy configurations,
+and ad hoc signed debug/release GUI bundles. Private FairPlay gates remain open.
+
+## One-time desktop setup and reusable model matching
+
+On 2026-10-28, the GUI adopted UnfairPlay's prepare-once/reuse journey. The shared
+Rust application layer now combines collection, conservative recovery and sample
+processing checks into one reviewed setup operation. An advanced existing-model
+import validates a matching sample without local collection. Only selector-bound
+models that pass processing, mutation, ARM64 structure and CodeDirectory page
+checks enter the private managed cache. Passing these checks does not authenticate
+plaintext or Apple's signature. Reuse is enrollment-based and not per application
+or inferred from an Apple ID display name.
+
+Unix storage uses private staging and atomic model/receipt directory publication,
+0700 directories and 0600 files. Inventory validates bounded receipts, envelope,
+selector, hashes, permissions and non-symlink files. Missing, conflicting,
+unverified or tampered models stop automatic selection. Temporary captures and
+sample plaintext are removed on normal exit/failure/cooperative cancellation;
+crash leftovers remain hidden and are never selected or replayed. Windows managed
+storage/reuse rejects before writing private models until private ACL support is
+implemented; original explicit CLI/model workflows are unchanged.
+
+New IPA downloads snapshot a persisted automatic-decryption preference when
+enqueued and queue an independent child task with a parent link on completion. A missing/mismatched model
+preserves the successful download and offers setup. PKGs, already decrypted
+artifacts, cancellations, quitting and restored history do not auto-start work.
+Original IPAs and existing output/report files are preserved.
+
+Local verification passed 459 library + 45 CLI + 44 desktop tests (548 active;
+70 opt-in library cases ignored), formatting, default/GUI/GUI-test strict Clippy,
+Apple Silicon CLI rebuilding and signed debug/release GUI bundles. Four new core
+synthetic tests exercised real import/decryption/reuse across application keys,
+selector mismatch, conflicting model, cache tampering, permissions/symlinks,
+cancellation cleanup, collision and report gates. Desktop tests verified the
+wizard, independent child tasks, persistence and restart behavior. Native narrow
+fixture screenshots show all setup stages and a successful synthetic download
+followed by a missing-model task. The harness does not collect private materials.
+Real setup, authorization compatibility and private decryption gates remain open.
+
+A Windows GNU GUI-test/all-targets cross-Clippy check found and fixed a Unix-only
+mutable directory-builder binding; the same cross-check then passed with warnings
+denied. Complete native macOS regression and strict Clippy passed again after
+that portable compilation fix. Native platform CI for the updated head remains
+separate evidence; the prior direct-IPA source `ca1f433` passed all five jobs in
+[run 40824972940](https://github.com/everettjf/ipatool-rs/actions/runs/40824972940).

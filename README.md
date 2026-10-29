@@ -10,13 +10,14 @@ Built on the work of [ipatool](https://github.com/majd/ipatool), [UnfairPlay](ht
 
 > **Experimental Rust rewrite.** This project was created to use otherwise-unused Codex quota and explore whether Codex could carry a substantial port through implementation, testing, and release. For practical use, prefer the original projects. Full parity remains under validation; see [known limitations](#known-limitations).
 
-[Install](#install) · [Quick start](#quick-start) · [Commands](#commands) · [Architecture](#architecture) · [MCP](#mcp) · [Development](#development) · [Documentation](#documentation)
+[Install](#install) · [Quick start](#quick-start) · [Commands](#commands) · [Desktop preview](#desktop-preview-gpui) · [Architecture](#architecture) · [MCP](#mcp) · [Development](#development) · [Documentation](#documentation)
 
 ## Features
 
 | Area | Capabilities |
 | --- | --- |
 | Public catalog | Search applications, look up details, and find the latest external version ID without signing in. |
+| Desktop preview | Optional GPUI desktop for public browsing, account interaction, Library, download tasks, and primary FairPlay workflows. Desktop account/private-data validation is in progress. |
 | Account and Store | Sign in, inspect or revoke saved credentials, obtain free-app licenses, and query purchases and version metadata. |
 | Packages | Download entitled IPA or Mac PKG packages, with package metadata and SINF handling. |
 | MCP | Expose six App Store tools to compatible clients over standard input and output. |
@@ -110,6 +111,23 @@ Enter the Apple ID password and any verification code at the interactive prompts
 
 Native Mac applications such as ScriptWidget download as PKGs. A compatible iPhone or iPad application offered on Apple Silicon Mac can return an IPA instead. Use `--platform iphone` to request an iPhone offer when the account is entitled to it. Package format follows the selected Store offer.
 
+The desktop FairPlay page starts with a **one-time preparation guide**: prepare
+this Mac, choose an installed app and matching sample IPA, then review and start.
+It collects the supported authorization data, creates a model, processes the
+sample, and saves the model privately only after structural checks pass. Advanced
+options also allow importing an existing model with a matching sample.
+
+After preparation, new IPA downloads automatically queue a separate decryption
+task and match saved models using the IPA's authorization. You can turn this off
+or use **Decrypt IPA...** for an existing download. No model selection is needed
+for each app. Missing or mismatched models preserve the original download and
+offer preparation; existing output files are never replaced. PKGs are unaffected.
+Models are enrollment-specific; the same Apple ID does not guarantee a match.
+Managed model storage currently requires macOS/Linux private-file permissions;
+Windows support and real private-processing validation remain open. These checks
+do not authenticate plaintext or Apple's signature.
+See the [FairPlay guide](docs/GUI_FAIRPLAY.md) for prerequisites and limitations.
+
 ## Commands
 
 | Task | Commands |
@@ -129,13 +147,74 @@ Use `ipatool-rs --help` or a command's `--help` for its available options.
 
 ![ipatool-rs architecture: CLI and MCP share Rust workflows backed by platform services, Apple endpoints, and build-specific guest execution.](docs/images/architecture.png)
 
-The CLI and MCP server share the same Rust application modules. Public catalog queries use the catalog client directly and do not need a saved account or Apple guest execution.
+The CLI, MCP server, and optional GPUI desktop share Rust application modules. Public catalog queries use the catalog client directly and do not need a saved account or Apple guest execution.
 
 Selected Store and SAP signing paths load pinned Apple framework images and execute ARM64 guest code through Unicorn. Rust supplies the image loaders, execution control, and host-call models. The program does not launch a separate Go, Python, or Swift executable; it still depends on the corresponding Apple guest code and the Unicorn runtime for these paths.
 
 FairPlay processing uses exact-build `fairplayd` images, startup profiles, and matched private inputs. The bundled startup profiles do not establish support for arbitrary system builds. Private enrollment and decryption still need end-to-end validation.
 
 The editable diagram is available as [SVG](docs/images/architecture.svg). Implementation and parity evidence are recorded in [PORTING.md](docs/PORTING.md).
+
+## Desktop preview (GPUI)
+
+Build and run the optional native desktop from source:
+
+```sh
+cargo run --locked --features gui --bin ipatool-gui
+```
+
+The desktop is titled **🦀IPATOOL-RS 🦀** and uses a macOS-inspired graphite dark
+palette: neutral gray surfaces, a brighter sidebar and dialogs, gray selections,
+and blue primary actions and focus rings. It has a full-height workspace.
+Account, settings and sidebar controls sit at the bottom
+of the aligned navigation;
+narrow or collapsed windows use a compact icon rail. It supports public search,
+lookup by App ID or bundle identifier, six download targets, and a region dropdown
+searchable by English name or two-letter code. Fresh preferences select
+**iOS (iPhone)**; saved platform choices are restored. Submit the search field
+with Enter or Search. Subsequent platform or region changes refresh results
+automatically and clear the previous selection while loading. Select a result to
+inspect metadata or copy identifiers, JSON, and CLI commands. Queries run in the
+background and report loading, empty, and error states.
+
+The GUI is a source-only experiment, initially validated on Apple Silicon macOS.
+It is not included in release archives or Homebrew. The Windows GNU x86_64 GUI
+cross-build links successfully on macOS. Native CI also passes GUI builds,
+controller fixtures and Clippy on Linux x86_64 and Windows MSVC x86_64.
+Interactive Linux/Windows desktop and account checks remain open; CLI release
+status is unchanged.
+GPUI requires a graphical desktop and graphics support; macOS builds need Xcode
+with the Metal compiler tools. See the pinned [GPUI crate](https://docs.rs/crate/gpui/0.2.2)
+for platform dependencies.
+
+The in-progress desktop also exposes login/verification and file-store unlock,
+purchase history, version selection, background downloads, and FairPlay
+inspection/collection/recovery/model decryption through shared Rust application
+workflows. Browsing does not open credential storage. Account access starts only
+through an explicit account/download action; downloads check the account's
+storefront and entitlement. The download dialog allows changing the target
+platform and explains when the browsing region differs from the account region.
+Signing in or loading a saved account defaults browsing to that account's region,
+including when its identity or storefront changes. You can still select another
+region; the catalog and download sheet then warn that some applications may be
+unavailable to download. The catalog offers a return-to-account-region action.
+Same-account reauthentication preserves a manual browsing override.
+Browsing another region does not change the Apple account's storefront. A catalog
+miss during download preflight reports the account region before any package
+transfer starts. Task history contains request metadata and artifact
+paths, without credentials or signed download URLs. Interrupted tasks require
+explicit review and retry. See [current evidence and remaining gates](docs/PORTING.md#shared-cli--gpui-implementation-in-progress-2026-10-28).
+
+For a locally signed Apple Silicon application bundle, use
+`scripts/build-gui-macos.sh` (or `--debug`). The generated `.app` is ad hoc signed,
+not notarized or published. Live desktop account and private FairPlay checks
+remain open. Building without `--features gui` keeps the CLI-only build;
+plain `cargo run` still selects `ipatool`.
+
+[Native screenshots](docs/screenshots/README.md) include public browsing and
+separately labeled synthetic account/task walkthroughs. The optional
+[fixture preview](docs/GUI_FIXTURE_PREVIEW.md) supports repeatable interaction
+testing without an Apple account; its simulated results are not live validation.
 
 ## Credentials and local state
 

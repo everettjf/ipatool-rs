@@ -1,6 +1,6 @@
 # Remaining work
 
-Status as of 2026-10-27. The 0.2.1 delivery targets are macOS on Apple Silicon, Linux x86_64, and Windows x86_64. Linux ARM64 and Windows ARM64 are no longer release targets. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
+Status as of 2026-10-28. The 0.2.1 delivery targets are macOS on Apple Silicon, Linux x86_64, and Windows x86_64. Linux ARM64 and Windows ARM64 are no longer release targets. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
 
 Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and release packaging jobs. Both Linux architectures previously passed account-free version and public-search smoke checks in Debian 13 QEMU guests; ARM64 is now deferred. The native CI results and release artifact checks are recorded in [PORTING.md](PORTING.md); account-backed workflows remain open.
 
@@ -13,6 +13,26 @@ Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and r
 - The published `v0.2.0` release has macOS ARM64, Linux x86_64/ARM64, and Windows x86_64/ARM64 archives and companion SHA-256 files. The release workflow passed native tests, release builds, version and public catalog smoke checks, package checksums, and signed macOS archive verification. Main and PR platform CI also passed all four portable jobs. The macOS archive was notarized with zero issues. The updated Homebrew tap passed strict audit, installation, `brew test`, code-signature verification, and public search. These account-free portable checks do not establish account or FairPlay parity.
 - The published `v0.2.1` release has only macOS ARM64, Linux x86_64, and Windows x86_64 archives with companion SHA-256 files. Main and release CI passed native tests and packaging for both portable targets; the macOS archive was signed and notarized with zero issues. All three public archive checksums passed after download. The Homebrew tap passed strict audit, installation, `brew test`, signature verification, and public search. Linux and Windows authenticated workflows remain untested.
 - The macOS ARM64 release build and signature check, 421 active library tests, 45 CLI tests, and Clippy. Three affected pinned Store guest tests also passed explicitly. The 69 ignored library tests are opt-in checks, not a count of known failures.
+
+## GPUI desktop preview
+
+The shared CLI/GUI workflow architecture, implementation milestones,
+and acceptance criteria are in [CLI_GUI_IMPLEMENTATION_PLAN.md](CLI_GUI_IMPLEMENTATION_PLAN.md).
+Rust package publication and a workspace split are deferred. Implementation
+checkboxes and local/CI evidence do not close the separate live-validation gates.
+
+- [ ] Validate screen-reader accessibility and keyboard navigation. The pinned GPUI build's macOS accessibility tree currently exposes the window chrome but not the custom catalog controls.
+- [x] Clarify iOS/platform selection and browsing versus account regions: refresh catalog results after filter changes, offer a searchable region dropdown and editable download target, and identify account-region catalog misses before package transfer. Real authenticated downloads remain a separate gate.
+- [x] Default public browsing to the loaded account's region, preserve explicit overrides during same-account refresh, and display a persistent cross-region download warning with a return-to-account-region action.
+- [x] Validate native Linux x86_64 and Windows MSVC x86_64 GUI builds, deterministic controllers and strict all-targets Clippy in CI. Windows GNU GUI cross-build and strict all-targets Clippy also pass on macOS. The successful CI run is linked in [PORTING.md](PORTING.md).
+- [ ] Validate Linux x86_64 and Windows x86_64 GUI desktop interaction and account workflows. Headless controller tests and CLI CI do not establish these gates.
+- [ ] Complete distribution signing/notarization and release packaging before distributing the GUI. A repeatable, ad hoc signed macOS bundle build now passes locally; current releases remain CLI-only.
+- [ ] Finish fixture and live validation of the implemented account, download, and FairPlay desktop workflows, including 2FA, credential-store access, task recovery, safe cancellation, and output selection. Keep manual account/private-data checks last.
+- [ ] Complete private FairPlay processing and interruption walkthroughs. Refined dark normal/narrow, synthetic selector mismatch/matched prerequisites, report collision/retry, model pickers, and decryption-input handoff have native screenshot/interaction evidence. Light/system themes are out of scope at the user's request. Native synthetic challenge continuation, populated Library/filter/version selection, expired-session queue continuation, cancellation/completion, restart/download retry, and active-work quit handling now have observed evidence in `screenshots/fixtures/`; these do not close live account gates.
+
+- [x] Add a reviewed one-time FairPlay preparation guide, advanced validated-model import, private selector-bound model reuse, and independent automatic decryption after new IPA downloads. Advanced parameters/tools are collapsed and actions remain visible at 900×650. Synthetic crypto/controller tests and native captures pass; this does not close private processing gates.
+- [ ] Validate the complete real one-time setup/import followed by a different matching IPA download, automatic decryption, output/content checks, cancellation and relaunch with authorized materials. Same Apple ID alone does not prove matching enrollment.
+- [ ] Implement equivalent private Windows ACL enforcement before enabling managed FairPlay model storage/reuse there.
 
 ## Current macOS Apple Silicon gates
 

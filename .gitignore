@@ -5,3 +5,5 @@
 /vendor/apfs/Cargo.lock
 /vendor/apfs/.cargo-ok
 /vendor/apfs/.cargo_vcs_info.json
+/vendor/xattr/target/
+/vendor/xattr/Cargo.lock

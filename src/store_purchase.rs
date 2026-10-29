@@ -32,9 +32,12 @@ pub struct NativePurchaseBackend {
 
 impl NativePurchaseBackend {
     pub fn open() -> Result<Self> {
+        Self::open_in(&prepare_state_directory_from_environment()?)
+    }
+
+    pub fn open_in(state_directory: &std::path::Path) -> Result<Self> {
         let hardware_id = hardware_mac_address().context("read Store hardware identity")?;
-        let state_directory = prepare_state_directory_from_environment()?;
-        let transport = Arc::new(Transport::with_cookies(&state_directory)?);
+        let transport = Arc::new(Transport::with_cookies(state_directory)?);
         Ok(Self::with_sender(hardware_id, move |request| {
             transport.send_store(request)
         }))
@@ -87,8 +90,8 @@ impl PurchaseBackend for NativePurchaseBackend {
             "clientCorrelationKey".into(),
             serde_json::Value::String(random_correlation_key()?),
         );
-        let mut body = Vec::new();
-        plist::to_writer_xml(&mut body, &parameters).context("encode native purchase plist")?;
+        let body = crate::transport::encode_store_plist(&parameters)
+            .context("encode native purchase plist")?;
         let mut headers = request.headers.clone();
         headers.insert(USER_AGENT, HeaderValue::from_static(PURCHASE_USER_AGENT));
         headers.insert(

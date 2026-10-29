@@ -1,7 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-TARGET=${1:?Usage: scripts/test-portable.sh RUST-TARGET}
+TARGET=${1:?Usage: scripts/test-portable.sh RUST-TARGET [FEATURES]}
+feature_args=()
+if [[ -n "${2:-}" ]]; then
+  feature_args+=(--features "$2")
+fi
 
 if [[ "$TARGET" == aarch64-pc-windows-msvc ]]; then
   # The native Windows ARM64 test runner uses a smaller default worker stack.
@@ -38,4 +42,4 @@ skip_args=()
 for test_name in "${asset_tests[@]}"; do
   skip_args+=(--skip "$test_name")
 done
-cargo +stable test --locked --target "$TARGET" --all-targets --quiet -- "${skip_args[@]}"
+cargo +stable test --locked --target "$TARGET" "${feature_args[@]}" --all-targets --quiet -- "${skip_args[@]}"

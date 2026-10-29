@@ -135,6 +135,7 @@ pub fn decrypt_pages_in_place(
         .iter_mut()
         .zip(records)
     {
+        crate::application::operation::check()?;
         let key =
             Zeroizing::new(deriver.page_key(record[..16].try_into().unwrap(), absolute_offset));
         let cipher = Aes128::new_from_slice(&key[..]).unwrap();

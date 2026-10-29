@@ -366,7 +366,7 @@ fn full_options(
 }
 
 fn write_reencoded(
-    writer: &mut ZipWriter<File>,
+    writer: &mut ZipWriter<crate::application::operation::CancellableWriter<File>>,
     member: &mut ZipFile<'_, File>,
     name: &str,
     local: &[u8],
@@ -380,7 +380,7 @@ fn write_reencoded(
     if let Some(bytes) = rest {
         writer.write_all(bytes)?;
     } else {
-        std::io::copy(member, writer)?;
+        crate::application::operation::copy(member, writer)?;
     }
     Ok(())
 }
@@ -461,6 +461,7 @@ fn image_report(
     let offset = (slice.offset + layout.crypt_offset) as u64;
     let mut keys_hash = Sha256::new();
     for record in records {
+        crate::application::operation::check()?;
         let key = Zeroizing::new(
             context
                 .deriver
@@ -549,6 +550,7 @@ pub fn decrypt_ipa_with_options(
     report: Option<&Path>,
     force: bool,
 ) -> Result<IpaDecryptResult> {
+    crate::application::operation::stage(crate::application::operation::Stage::Decrypting)?;
     validate_destinations(input, output, model_path, report, force)?;
     let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
     let mut raw_source = File::open(input).context("open IPA ZIP directory handle")?;
@@ -565,11 +567,19 @@ pub fn decrypt_ipa_with_options(
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let temporary = tempfile::NamedTempFile::new_in(parent).context("create temporary IPA")?;
-    let mut writer = ZipWriter::new(temporary.reopen().context("open temporary IPA")?);
+    let mut writer = ZipWriter::new(crate::application::operation::CancellableWriter(
+        temporary.reopen().context("open temporary IPA")?,
+    ));
     let mut images = 0usize;
     let mut pages = 0usize;
     let mut image_reports = Vec::new();
     for index in 0..archive.len() {
+        crate::application::operation::check()?;
+        crate::application::operation::progress(
+            crate::application::operation::Stage::Decrypting,
+            index as u64,
+            Some(archive.len() as u64),
+        );
         let mut member = archive.by_index(index).context("read IPA member")?;
         let name = raw_member_name(&mut raw_source, &member)?;
         let local = local_extra(&mut raw_source, &member)?;
@@ -613,8 +623,7 @@ pub fn decrypt_ipa_with_options(
         }
         let mut blob = Vec::new();
         blob.extend_from_slice(&prefix);
-        member
-            .read_to_end(&mut blob)
+        crate::application::operation::copy(&mut member, &mut blob)
             .with_context(|| format!("read Mach-O IPA member {name}"))?;
         let slices = parse_macho_slices(&blob).with_context(|| format!("inspect {name}"))?;
         let encrypted = slices.iter().any(|slice| slice.layout.crypt_id != 0);
@@ -683,7 +692,11 @@ pub fn decrypt_ipa_with_options(
     if images == 0 {
         bail!("IPA contains no supported encrypted Mach-O images");
     }
-    writer.finish()?.sync_all().context("sync decrypted IPA")?;
+    writer
+        .finish()?
+        .0
+        .sync_all()
+        .context("sync decrypted IPA")?;
     let output_sha256 = sha256_file(temporary.path())?;
     let report_stage = if let Some(report_path) = report {
         let selector = parse_sinf_selector(&sinf)?;
@@ -755,7 +768,7 @@ pub fn decrypt_ipa_with_options(
     if let (Some(staged_report), Some(report_path)) = (&report_stage, report) {
         staged.push((staged_report, report_path));
     }
-    publish_staged(&staged, force)?;
+    crate::application::operation::publish(|| publish_staged(&staged, force))?;
     Ok(IpaDecryptResult {
         encrypted_images: images,
         decrypted_pages: pages,
@@ -768,6 +781,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
+        crate::application::operation::check()?;
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -899,7 +913,7 @@ fn publish_staged(files: &[(&tempfile::NamedTempFile, &Path)], force: bool) -> R
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::fairplay_decrypt::tests::encrypted_fixture;
     use crate::fairplay_supf::PAGE_BYTES;
@@ -917,7 +931,7 @@ mod tests {
         result
     }
 
-    fn model_and_sinf(logical: [u8; 16]) -> (Vec<u8>, Vec<u8>) {
+    pub(crate) fn model_and_sinf(logical: [u8; 16]) -> (Vec<u8>, Vec<u8>) {
         let mut model = vec![0u8; 8 + 4 + 4 + 32 + 16 + 16 + 4096];
         let model_size = model.len() as u32;
         model[..8].copy_from_slice(b"FPSENR1\0");
@@ -973,7 +987,7 @@ mod tests {
         (model, sinf)
     }
 
-    fn supf(record: [u8; 32]) -> Vec<u8> {
+    pub(crate) fn supf(record: [u8; 32]) -> Vec<u8> {
         let mut arch = Vec::new();
         arch.extend_from_slice(&0x0100_000cu32.to_be_bytes());
         arch.extend_from_slice(&2u32.to_be_bytes());

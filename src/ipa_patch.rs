@@ -72,9 +72,18 @@ pub fn patch_ipa(
     ipa_zip_repack::repack(&File::open(source)?, &additions.reopen()?, &mut file)
         .context("repack IPA ZIP")?;
     file.sync_all().context("sync patched IPA")?;
-    output
-        .persist(destination)
-        .with_context(|| format!("publish patched IPA {}", destination.display()))?;
+    let preserve_existing = crate::application::operation::transfer_identity().is_some();
+    crate::application::operation::publish(|| {
+        let published = if preserve_existing {
+            output.persist_noclobber(destination)
+        } else {
+            output.persist(destination)
+        };
+        published
+            .map_err(|error| error.error)
+            .with_context(|| format!("publish patched IPA {}", destination.display()))?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -121,6 +130,7 @@ fn sinf_paths(
     let mut info_index = None;
     let mut manifests = Vec::new();
     for index in 0..archive.len() {
+        crate::application::operation::check()?;
         let entry = archive.by_index(index).context("inspect IPA entry")?;
         let raw_name =
             duplicate_zip::read_raw_central_name(raw_source, entry.central_header_start())?;
@@ -202,6 +212,28 @@ mod tests {
 
     fn metadata(value: serde_json::Value) -> Value {
         serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn desktop_publication_never_replaces_an_existing_ipa() {
+        let (directory, input) = source(None);
+        let output = directory.path().join("existing.ipa");
+        std::fs::write(&output, b"original package").unwrap();
+        let error = crate::application::operation::Operation::default()
+            .with_transfer_identity("fixture".into())
+            .run(|| {
+                patch_ipa(
+                    &input,
+                    &output,
+                    &metadata(serde_json::json!({})),
+                    "fixture",
+                    &[],
+                    &[],
+                )
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("publish patched IPA"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"original package");
     }
 
     #[cfg(unix)]
