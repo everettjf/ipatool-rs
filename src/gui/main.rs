@@ -577,7 +577,7 @@ impl Render for DesktopWindow {
         let account_label = self
             .account
             .as_ref()
-            .map(|account| format!("{} / {}", account.name, account.country))
+            .map(|account| format!("Signed in / {}", account.country))
             .unwrap_or_else(|| "Sign in".into());
         let account = Button::new("account")
             .debug_selector(|| "shell-account".into())

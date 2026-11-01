@@ -14,6 +14,7 @@ previous palette; see the [native gallery](../README.md) for public-service capt
 
 | Capture | Observed interaction |
 | --- | --- |
+| [Private sidebar account status](sidebar-account-status.png) | Loading a synthetic account shows only Signed in / US in navigation; the account display name is absent. |
 | [Reusable decryption home](fairplay-reusable-home-narrow.png) | Saved-model readiness, persisted automatic processing, optional existing IPA and collapsed advanced controls at 900×650. |
 | [Prepare this Mac](fairplay-setup-prepare-narrow.png) | First-time prerequisites explain native App Store authorization, installed app and matching sample IPA. No private work starts on navigation. |
 | [Choose sample files](fairplay-setup-files-narrow.png) | Two primary inputs; work directories and subsequent processing are automatic; advanced parameters/tools stay collapsed. |

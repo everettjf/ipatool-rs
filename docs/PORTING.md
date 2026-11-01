@@ -872,3 +872,21 @@ denied. Complete native macOS regression and strict Clippy passed again after
 that portable compilation fix. Native platform CI for the updated head remains
 separate evidence; the prior direct-IPA source `ca1f433` passed all five jobs in
 [run 40824972940](https://github.com/everettjf/ipatool-rs/actions/runs/40824972940).
+
+## Sidebar account privacy
+
+On 2026-11-01, the navigation account control changed from the account's display
+name to `Signed in / <region>`. Expanded navigation and the tooltip shared by
+expanded/collapsed layouts use the same status-only text. Signed-out navigation
+still offers Sign in. This is a presentation change; account and CLI workflows
+are unchanged. Verification uses the existing sidebar-controller regression and
+an isolated native synthetic-account preview, without reading real credentials
+or FairPlay material. Real private-processing gates remain open.
+
+The existing focused sidebar-controller test passed, as did 459 library, 45 CLI
+and 44 desktop tests (548 active, 70 library opt-in cases ignored), formatting,
+strict default/GUI/GUI-test all-targets Clippy, and signed debug/release GUI bundle
+builds. The native fixture screenshot shows `Signed in / US` with no account name.
+The preceding reusable-model source `91355b9` passed all five native jobs in
+[run 40830013742](https://github.com/everettjf/ipatool-rs/actions/runs/40830013742);
+that result predates this sidebar-only change.

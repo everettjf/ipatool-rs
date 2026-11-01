@@ -167,8 +167,9 @@ The desktop is titled **🦀IPATOOL-RS 🦀** and uses a macOS-inspired graphite
 palette: neutral gray surfaces, a brighter sidebar and dialogs, gray selections,
 and blue primary actions and focus rings. It has a full-height workspace.
 Account, settings and sidebar controls sit at the bottom
-of the aligned navigation;
-narrow or collapsed windows use a compact icon rail. It supports public search,
+of the aligned navigation. The account control shows only signed-in status and
+the account region, including its tooltip. Narrow or collapsed windows use a
+compact icon rail. It supports public search,
 lookup by App ID or bundle identifier, six download targets, and a region dropdown
 searchable by English name or two-letter code. Fresh preferences select
 **iOS (iPhone)**; saved platform choices are restored. Submit the search field
