@@ -48,7 +48,7 @@ account/private-data gates. All work remains on `codex/gpui-catalog` / PR #7.
 | Native macOS bundle | Debug and release bundles built; Info.plist linted; strict ad hoc signatures passed; actual launch succeeded; application icon decoded natively. | Final debug/release rebuilds and strict signatures passed. Public release launch and native controls passed. Guest execution under the bundle identity still needs the controlled-account gate. |
 | Release CLI | Apple Silicon release script built a signed executable returning 0.2.1. | Current source rebuilt; signed executable returns 0.2.1. |
 | Portable desktop builds | Native Linux x86_64 and Windows MSVC x86_64 CI passed shared fixtures, deterministic GUI controllers, strict Clippy and GUI linking. macOS CI also passed its app-bundle build/signature checks. Windows GNU GUI cross-build and strict all-targets Clippy passed locally. See the exact run in PORTING. | Native Linux/Windows desktop and account interaction remain open. GUI CI builds are debug executables; GUI distribution/release packaging is separate. |
-| Complete local regression | Current default suite: 459 library + 45 CLI passed, 70 ignored. GUI-test adds 44 passing desktop tests, including one-time setup and automatic follow-up. Strict default, production-GUI and GUI-test all-targets Clippy passed; debug/release signed bundles and ARM64 CLI rebuilt. The prior source `ca1f433` passed [all five native CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/40824972940); reusable-setup CI is tracked separately in PR #7. | Real desktop/account/private processing and distribution remain distinct gates. Repeat affected checks if source changes. |
+| Complete local regression | Current default suite: 459 library + 45 CLI passed, 70 ignored. GUI-test adds 45 passing desktop tests, including iOS startup over old macOS preferences, one-time setup and automatic follow-up. Strict default, production-GUI and GUI-test all-targets Clippy passed; debug/release signed bundles and ARM64 CLI rebuilt. The prior source `ca1f433` passed [all five native CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/40824972940); reusable-setup CI is tracked separately in PR #7. | Real desktop/account/private processing and distribution remain distinct gates. Repeat affected checks if source changes. |
 | Reviewable PR, no main merge | Reviewed changes and current native screenshot pushed to `codex/gpui-catalog` / PR #7 after local verification. Shared workflows and desktop changes are recorded separately. | Keep remaining gates explicit; never merge main in this task. |
 | Final controlled-account/private gates | User manual testing reached a signed-in account and reported catalog-preflight misses. Public-only diagnosis reproduced the relevant region difference; no authenticated package transfer or private FairPlay success has been reported. | Continue only the remaining authorized manual checks after autonomous verification. User-reported sign-in does not close live 2FA, entitlement, package, or private processing gates. |
 
@@ -148,3 +148,13 @@ then download another matching IPA and verify independent automatic decryption,
 content/report, collision behavior, cancellation and relaunch. Windows managed
 private storage awaits ACL support. No actual account/private FairPlay gate is
 closed by the synthetic suite or screenshots.
+
+## iOS startup default
+
+The desktop starts Explore and Library with iOS (iPhone), overriding the target
+stored by older preferences while retaining the other settings. A constructor
+regression seeded saved macOS settings and a Mac download request, verified iOS
+startup, preserved region/output/automatic-decryption settings and the original
+Mac request, and confirmed manual platform switching remains available. The
+focused test and all 549 active local tests passed, along with formatting,
+strict default/GUI/GUI-test Clippy and signed macOS debug/release bundle builds.

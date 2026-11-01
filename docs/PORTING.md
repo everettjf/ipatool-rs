@@ -890,3 +890,20 @@ builds. The native fixture screenshot shows `Signed in / US` with no account nam
 The preceding reusable-model source `91355b9` passed all five native jobs in
 [run 40830013742](https://github.com/everettjf/ipatool-rs/actions/runs/40830013742);
 that result predates this sidebar-only change.
+
+## iOS as the desktop launch target
+
+On 2026-11-01, Explore and Library were changed to start with iOS (iPhone) on
+every launch, including when older preferences saved macOS or another target.
+Users can still select any supported target during the session. Other saved
+preferences and the explicit platform in restored download requests are retained;
+startup does not rewrite preferences or replay jobs. The settings copy now
+explains the launch behavior. A focused desktop regression seeds saved macOS
+preferences and a Mac download, checks iOS startup and preserved country/output/
+automatic-decryption settings, verifies the saved request remains macOS and
+inactive, and checks that manual switching remains available.
+
+The focused startup test and full local suites passed: 459 library, 45 CLI and
+45 desktop tests (549 active; 70 opt-in library cases ignored). Formatting,
+strict default/GUI/GUI-test Clippy and signed macOS debug/release GUI bundles
+passed. No account or private FairPlay operation was run for this UI change.

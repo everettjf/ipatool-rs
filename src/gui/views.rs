@@ -222,7 +222,7 @@ impl DesktopWindow {
             .child(label("DEFAULT DOWNLOAD DIRECTORY", cx))
             .child(h_flex().gap_2().child(div().flex_1().child(Input::new(&self.settings_output)))
                 .child(Button::new("choose-default-output").label("Choose...").on_click(cx.listener(move |this, _, window, cx| this.choose_path(output.clone(), true, false, window, cx)))))
-            .child(muted("Saving also remembers the current browsing platform, country, and search mode. Account credentials and private FairPlay inputs are never stored in these preferences.", cx))
+            .child(muted("Saving remembers the country, search mode, and download directory. Each launch starts with iOS (iPhone). Account credentials and private FairPlay inputs are never stored in these preferences.", cx))
             .when_some(self.settings_error.as_ref(), |view, error| view.child(div().text_color(cx.theme().danger).child(error.clone())));
         let view = cx.entity().downgrade();
         dialog

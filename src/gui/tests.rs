@@ -257,6 +257,60 @@ fn setup_with_history(
 }
 
 #[gpui::test]
+fn startup_selects_ios_over_saved_mac_preferences_without_changing_saved_jobs(
+    cx: &mut TestAppContext,
+) {
+    let (directory, _view, _session, mut cx) = setup(cx);
+    let preferences = super::Preferences {
+        platform: Platform::Macos,
+        country: "CN".into(),
+        output_directory: Some(directory.path().join("output")),
+        auto_decrypt: false,
+        ..Default::default()
+    };
+    let path = directory.path().join("desktop-preferences.json");
+    preferences.save(&path).unwrap();
+    Journal {
+        tasks: vec![TaskRecord::new(
+            1,
+            "Saved Mac download".into(),
+            JobRequest::Download(DownloadRequest {
+                platform: Some(Platform::Macos),
+                ..Default::default()
+            }),
+            1,
+        )],
+    }
+    .save(&directory.path().join("desktop-tasks.json"))
+    .unwrap();
+    cx.update(|window, cx| {
+        let restarted = cx.new(|cx| DesktopWindow::new(directory.path().to_path_buf(), window, cx));
+        restarted.update(cx, |this, cx| {
+            assert_eq!(this.platform, Platform::Iphone);
+            assert_eq!(this.library_platform, Platform::Iphone);
+            assert_eq!(this.library_result_platform, Platform::Iphone);
+            assert_eq!(this.selected_country(cx), "CN");
+            assert_eq!(
+                this.preferences.output_directory,
+                preferences.output_directory
+            );
+            assert!(!this.preferences.auto_decrypt);
+            assert!(this.active.is_none());
+            assert!(matches!(
+                &this.journal.tasks[0].request,
+                JobRequest::Download(request) if request.platform == Some(Platform::Macos)
+            ));
+            this.set_platform(Platform::Macos, cx);
+            assert_eq!(this.platform, Platform::Macos);
+        });
+    });
+    assert_eq!(
+        super::Preferences::load(&path).unwrap().platform,
+        Platform::Macos
+    );
+}
+
+#[gpui::test]
 fn sidebar_footer_actions_remain_usable_in_narrow_and_collapsed_windows(cx: &mut TestAppContext) {
     let (_directory, view, session, mut cx) = setup(cx);
     for (width, height, expanded) in [

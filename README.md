@@ -171,8 +171,9 @@ of the aligned navigation. The account control shows only signed-in status and
 the account region, including its tooltip. Narrow or collapsed windows use a
 compact icon rail. It supports public search,
 lookup by App ID or bundle identifier, six download targets, and a region dropdown
-searchable by English name or two-letter code. Fresh preferences select
-**iOS (iPhone)**; saved platform choices are restored. Submit the search field
+searchable by English name or two-letter code. Every launch starts Explore and
+Library with **iOS (iPhone)**, including when an older preference saved another
+platform. Other targets remain selectable during the session. Submit the search field
 with Enter or Search. Subsequent platform or region changes refresh results
 automatically and clear the previous selection while loading. Select a result to
 inspect metadata or copy identifiers, JSON, and CLI commands. Queries run in the

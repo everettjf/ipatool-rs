@@ -327,6 +327,7 @@ impl DesktopWindow {
     fn new(directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let preferences_result = Preferences::load(&directory.join("desktop-preferences.json"));
         let (preferences, preference_notice) = match preferences_result { Ok(value) => (value, None), Err(_) => (Preferences::default(), Some("Desktop preferences could not be loaded. Defaults are in use; settings will only be replaced when you save them.".to_owned())) };
+        let initial_platform = Platform::Iphone;
         let settings_output = field(
             window,
             cx,
@@ -459,7 +460,7 @@ impl DesktopWindow {
             term,
             country,
             mode: preferences.mode,
-            platform: preferences.platform,
+            platform: initial_platform,
             apps: vec![],
             artwork: Default::default(),
             selected: None,
@@ -474,8 +475,8 @@ impl DesktopWindow {
             search_error: None,
             library_apps: vec![],
             library_page: 1,
-            library_platform: preferences.platform,
-            library_result_platform: preferences.platform,
+            library_platform: initial_platform,
+            library_result_platform: initial_platform,
             library_operation: None,
             library_filter,
             library_total: 0,
