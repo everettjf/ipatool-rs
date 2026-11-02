@@ -1265,12 +1265,24 @@ The operator subsequently confirmed the fixed read-only access scope. Clicking
 `Allow local access...` submitted registration and the GUI reported that macOS
 requires administrator approval. `Open System Settings` opened Login Items with
 the preview's own background entry disabled. Enabling that entry produced the
-native Touch ID/administrator authentication sheet, which is still pending.
-No administrator credential was entered by the agent. This establishes the
-registration/settings handoff, not an enabled service, protected snapshot or
-successful code-bound exchange. Actual authentication, exchange and removal
-remain open. A matching enrollment sample is also required: accepting a signature
-or granting access cannot repair the observed sample mismatch. Real model
+native Touch ID/administrator authentication sheet. The operator completed that
+authentication: Login Items now shows the preview's background entry enabled,
+and an explicit GUI refresh reports `Local access is approved`. No administrator
+credential was entered by the agent. This establishes registration and approval,
+not a protected snapshot or successful code-bound exchange. Exchange and removal
+remain open.
+
+The same installed preview loaded an existing account from system Keychain
+without entering credentials and completed a fresh iOS download to a separate
+private output directory. Its independent automatic decryption task correctly
+reported no saved model while preserving the completed IPA download. Read-only
+comparison found matching app identity, executable/version/build metadata but
+different main-license user/key selectors from the installed app. Downloaded
+account metadata matches the earlier download; it cannot establish which account
+owns the installed app. No account identifiers, selector values or private bytes
+were printed. Account alignment is being checked rather than weakening the
+preflight or repacking the installed app as substitute acceptance evidence.
+No protected snapshot or real model/plaintext has been collected. Real model
 generation and independent decryption/reuse remain open. The exact `02cb19f`
 platform CI run
 [41424032318](https://github.com/everettjf/ipatool-rs/actions/runs/41424032318)

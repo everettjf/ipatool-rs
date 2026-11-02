@@ -97,9 +97,11 @@ Gatekeeper validation, and a verified copy installed in Applications. The native
 installed preview submitted explicit registration after the operator confirmed
 the fixed read-only scope. The GUI reported `RequiresApproval`, opened Login
 Items, and the OS requested Touch ID or an administrator password when enabling
-this helper's background item. Authentication is still pending; registration is
-not proof of an enabled service or successful exchange. Its existing sample
-fails the distinct enrollment-match preflight before any protected read. Actual
-approval, exchange, denial/cancellation/removal and real recovery/reuse remain
+this helper's background item. The operator completed authentication; Login
+Items now shows that entry enabled, and an explicit GUI refresh reports local
+access approved. This proves registration and approval, not a successful snapshot
+exchange. Its existing sample and a fresh controlled-account download both fail
+the distinct enrollment-match preflight before any protected read. Actual
+exchange, denial/cancellation/removal and real recovery/reuse remain
 unproven; notarization does not close them. Details are in
 [PORTING.md](PORTING.md#notarized-fairplay-preview-acceptance).
