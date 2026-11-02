@@ -15,7 +15,7 @@ use std::{path::PathBuf, time::Duration};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum FairPlayRequest {
-    Setup(super::fairplay_setup::SetupRequest),
+    Setup(Box<super::fairplay_setup::SetupRequest>),
     DecryptSaved {
         input: PathBuf,
         output: Option<PathBuf>,
@@ -279,7 +279,7 @@ pub fn execute_in(
 ) -> Result<JobOutcome> {
     let store = super::fairplay_setup::SavedModels::new(state_directory);
     match request {
-        FairPlayRequest::Setup(request) => store.setup(request),
+        FairPlayRequest::Setup(request) => store.setup(*request),
         FairPlayRequest::DecryptSaved {
             input,
             output,

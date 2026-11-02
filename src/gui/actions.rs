@@ -1356,7 +1356,7 @@ impl DesktopWindow {
                     self.show_notice("Choose the installed app and matching IPA first.", cx);
                     return;
                 }
-                FairPlayRequest::Setup(request)
+                FairPlayRequest::Setup(Box::new(request))
             }
             FairMode::Saved => {
                 let input = path(&self.fair.input);

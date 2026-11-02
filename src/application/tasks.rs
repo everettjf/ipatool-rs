@@ -403,6 +403,40 @@ mod tests {
     }
 
     #[test]
+    fn prior_setup_request_shape_survives_restart_without_replaying_private_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.json");
+        let mut record = task(1);
+        record.request = serde_json::from_value(serde_json::json!({
+            "FairPlay": {"Setup": {"app": "installed.app", "ipa": "sample.ipa", "options": {}}}
+        }))
+        .unwrap();
+        record.state = TaskState::Running;
+        Journal {
+            tasks: vec![record],
+        }
+        .save(&path)
+        .unwrap();
+        let on_disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["tasks"][0]["request"]["FairPlay"]["Setup"]["app"],
+            "installed.app"
+        );
+        let loaded = Journal::load(&path).unwrap();
+        assert_eq!(loaded.tasks[0].state, TaskState::Interrupted);
+        let JobRequest::FairPlay(super::super::fairplay::FairPlayRequest::Setup(request)) =
+            &loaded.tasks[0].request
+        else {
+            panic!("expected restored setup");
+        };
+        assert_eq!(request.app, PathBuf::from("installed.app"));
+        assert_eq!(
+            request.options.engine,
+            crate::fairplay_recover_capture::RecoveryEngine::Current
+        );
+    }
+
+    #[test]
     fn successful_publication_wins_over_late_cancel_but_acknowledged_cancel_is_distinct() {
         let mut task = task(1);
         task.state = TaskState::CancellationRequested;
