@@ -279,7 +279,7 @@ fn validate_legacy_plaintext(plaintext: &[u8]) -> Result<[u8; 16]> {
         (*b"key ", &[24]),
         (*b"iviv", &[24]),
         (*b"tmpr", &[24]),
-        (*b"righ", &[88, 96]),
+        (*b"righ", &[]),
         (*b"name", &[264]),
     ];
     let mut cursor = 0;
@@ -289,7 +289,12 @@ fn validate_legacy_plaintext(plaintext: &[u8]) -> Result<[u8; 16]> {
             bail!("FairPlay plaintext atom is truncated");
         }
         let size = u32::from_be_bytes(plaintext[cursor..cursor + 4].try_into().unwrap()) as usize;
-        if !sizes.contains(&size)
+        let valid_size = if *typ == *b"righ" {
+            (88..=264).contains(&size) && size.is_multiple_of(8)
+        } else {
+            sizes.contains(&size)
+        };
+        if !valid_size
             || size > plaintext.len() - cursor
             || plaintext[cursor + 4..cursor + 8] != *typ
         {

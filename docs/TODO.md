@@ -55,6 +55,16 @@ output preservation pass. The native tag constructor matches 32 synthetic Go
 controls, but canonical recovery is not connected yet. F1/F2/F4/F5 and the
 remaining format/association work in F3 stay open; no private live gate is closed.
 
+The next increment implements the current-format Rust recovery kernel: bounded
+native codec/source derivation, container authentication, deterministic state
+slot selection, direct AES state/payload decoding, hardware tag lookup, strict
+selected-tree/version checks, account-class workspace derivation and selector-
+bound FPSENR2 construction. Two complete synthetic model controls match the
+pinned Go implementation byte-for-byte by hash; metadata fallback is rejected.
+F2 remains open for canonical capture normalization, signed-keyfile validation
+and the shared CLI/GUI adapter. Production setup still calls the old recovery
+path until those prerequisites are connected; private live validation remains open.
+
 ## Current macOS Apple Silicon gates
 
 - [ ] Complete an interactive default macOS Keychain approval flow for `auth login` and `auth revoke` in a local user session. `auth info` succeeded after the user approved its Keychain dialog on October 27; the encrypted `--file-keychain` path also worked.

@@ -13,6 +13,43 @@ The Rust differential test covers signed polynomial remainder, wrapped indexed
 aliasing, CBC chaining and the final affine tag map. These vectors establish
 constructor parity only, not complete enrollment recovery.
 
+`fairplay-current-outer-public-vectors.json` contains 32 complete semantic outer
+iteration digests and one content-selected codec/source control from the same
+pinned UnfairPlay revision. Iteration `n` uses table word `i` equal to
+`((i+1)*0x9e3779b9) XOR (n*0x1234567)` and state word `i` equal to
+`((i+1)*0x31415927) XOR (n*0x1b2b3b4b)`, with uint32 wrapping. Hardware byte `i`
+is `(17*n+37*i) mod 256`, hardware index is `n mod 6`, and codec/source/tail/writer
+byte `i` use `(29*i+13*n)`, `(31*i+19*n)`, `(41*i+3*n)` and `(43*i+5*n)` modulo
+256. The control cycles through the three mapped X1 values and starts its seed
+at `n*0xf1234567+0x0a782fec` with uint32 wrapping. Digests serialize table words,
+state words, hardware bytes/index, codec, source, tail, writer, optional word,
+X1 and seed in that order, with little-endian words. The codec control comes
+from upstream's `syntheticNativeSIDB(t, 64)` helper. It contains invented bytes,
+not a real system database. Regenerate the reviewed Rust arithmetic with
+`go run scripts/port_current_math.go /path/to/pinned/unfairplay`, then rustfmt.
+The development generator refuses another upstream commit or edited selected
+source files; Cargo and the shipped executable do not require Go.
+
+`fairplay-current-recovery-public-vectors.json` contains two entirely synthetic,
+authenticated SIDB/SINF controls created with upstream's `syntheticNativeSIDBMatching`
+and `syntheticProductionRoute`, including a selected slot above the old 14-slot
+limit and extended rights. Model and decoded-state hashes and all selected-route
+fields were produced by the pinned Go implementation. Each control also includes
+a trap SINF that accepts a different metadata record: both implementations must
+reject it instead of changing the selected route. The 32 class-key controls use
+the same invented hardware formula, user `n*0x12345678` and key identifier
+`n*0x87654321+1`, with uint32 wrapping. No account, Mac identity, actual SIDB,
+downloaded IPA or private enrollment model contributed to either fixture file.
+
+To reproduce the latter two fixtures, copy the two Go test files from
+`scripts/reference-current-vectors/` into `internal/recovery/` in a temporary
+checkout of the pinned upstream commit. Create an empty output directory, set
+`IPATOOL_PUBLIC_VECTOR_DIR` to its absolute path, and run
+`go test ./internal/recovery -run '^TestRust(Outer|Recovery)PublicVectors$' -count=1`.
+The exporters refuse existing output files. Checked-in numeric arrays are
+reformatted for review; compare decoded JSON values, not whitespace. This
+optional development procedure is not part of Cargo or the shipped runtime.
+
 `mac-xar-extra-synthetic.pkg` is a 386-byte synthetic XAR with extra XML
 elements in its TOC, file, and data records, plus symlink and FIFO entries.
 The Go XAR reader accepted its single checksummed payload and skipped the

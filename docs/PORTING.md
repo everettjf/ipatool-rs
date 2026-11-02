@@ -950,3 +950,45 @@ used no Apple account, private authorization state, enrollment model or download
 account package. Required real collection, model creation, a different matching
 IPA, interruption and restart gates remain open. No new GUI was launched against
 the user's state, and the existing running bundle was preserved.
+
+## Native current-format recovery kernel
+
+The next increment ports the pinned UnfairPlay current recovery kernel to native
+Rust, without executing an Apple image, constructor profile, Go executable or
+external recovery script. Source derivation follows the content-selected codec
+exit and bounded current layout. The container footer is authenticated before
+decoding its one selected state slot and registry. Hardware-dependent tags,
+complete tree geometry and schema versions bind lookup to one user/key/value
+route; another record is never retried after authentication failure. Typed
+account-class workspace arithmetic constructs a selector-bound FPSENR2 model,
+then validates the installed SINF through that model. This kernel does not yet
+replace the production CLI/GUI capture adapter: canonical normalization and
+signed-keyfile checks must be connected before changing the default path.
+
+The scalar/ANF arithmetic is regenerated from the fixed upstream commit by a
+development-only Go AST generator. It rejects another commit and edited selected
+source files. Cargo builds only the checked-in Rust source. Regeneration followed
+by rustfmt reproduced that source exactly. Test-only Go exporters are included
+under `scripts/reference-current-vectors` so complete synthetic controls can be
+reproduced in a temporary pinned upstream checkout; no real state is read.
+
+Thirty-two complete outer iterations and a content-selected source/layout agree
+with Go. Thirty-two synthetic account-class keys agree as well. Two authenticated
+SIDB/SINF controls, including a state slot above the former 14-slot limit and
+extended rights, recover the exact same model hashes, state hashes and selected
+route fields as Go. Traps that authenticate a different metadata record are
+rejected rather than changing routes. Additional checks reject changed container
+headers/body/footer, hardware, unknown tags and cancellation. A separate OpenSSL
+known-answer control checks the container footer. Bounded extended SINF rights
+geometry now matches the current reference. AES key schedules enable zeroization,
+and footer comparison uses `subtle`'s constant-time equality.
+
+Local verification passed 474 library, 45 CLI and 45 desktop tests (564 active;
+70 library opt-ins ignored), formatting, strict default/GUI/GUI-test all-targets
+Clippy, the Apple Silicon CLI rebuild/version check, and ad hoc signed debug and
+release GUI builds. The preceding validation/tag commit `2dd235f` passed all five
+native jobs in [CI run 41391282029](https://github.com/everettjf/ipatool-rs/actions/runs/41391282029);
+that CI result predates this kernel. The normalizer, signed-keyfile validation,
+shared adapter, scoped macOS permission flow and real setup/reuse checks remain
+open. No real account package, private state, capture or enrollment model was
+read by this increment, and no production desktop was relaunched.

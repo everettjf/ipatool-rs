@@ -156,7 +156,7 @@ pub fn inspect_sinf(bytes: &[u8]) -> Result<SinfDiagnostic> {
         selector_id: selector.identifier(),
         private_bytes,
         atoms: names,
-        current_layout: private_bytes == 440 || private_bytes == 448,
+        current_layout: (440..=616).contains(&private_bytes) && private_bytes.is_multiple_of(8),
         legacy_markers,
     })
 }
