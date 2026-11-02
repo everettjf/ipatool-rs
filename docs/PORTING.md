@@ -1241,3 +1241,30 @@ GUI/GUI-test all-targets Clippy and Windows GNU all-targets workspace cross-Clip
 The ARM64 CLI and Developer ID signed debug/release GUI/helper are rebuilt.
 Real signed lifecycle, matching-sample recovery and independent reuse remain
 required; public fixtures do not close those gates.
+
+## Notarized FairPlay preview acceptance
+
+The release GUI/helper built from `02cb19f` received Apple's accepted notarization
+submission `6289cd98-a7f9-4fb4-9993-e7d4cef96821` with zero issues. The service log
+lists both executables in the ticket contents. Stapling, ticket validation,
+strict deep code-signature verification and Gatekeeper assessment pass;
+Gatekeeper identifies the source as `Notarized Developer ID`. An isolated preview
+was copied to Applications without replacing an existing app, and its executables
+and Info.plist match the accepted source bundle. The copied ticket/signature and
+Gatekeeper assessment also pass. Its state stays in the isolated test directory,
+not the existing controlled account store.
+
+The installed preview opened natively and rechecked the existing sample. It now
+displays `App Store authorization does not match`, with the precise file/account
+guidance, instead of suggesting that matching identity/version fields differ.
+The failure occurs before requesting the protected snapshot. The app is left at
+First-time preparation with local access still unregistered. No system permission
+was granted, no protected SIDB was read and no real model/plaintext was saved.
+
+Actual service registration, administrator approval, code-bound exchange and
+removal still require an explicit operator-confirmed access grant. A matching
+enrollment sample is also required: accepting a signature or granting access
+cannot repair the observed sample mismatch. Real model generation and independent
+decryption/reuse remain open. The exact `02cb19f` platform CI run is
+[41424032318](https://github.com/everettjf/ipatool-rs/actions/runs/41424032318);
+its result must be recorded independently of notarization.

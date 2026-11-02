@@ -90,3 +90,12 @@ registration and code-bound exchange, denial/cancellation/removal, an authorized
 private snapshot, successful real model preparation, complete available plaintext
 hash validation, and independent saved-model reuse after restart. None of these
 is implied by protocol tests or a successful code signature.
+
+The `02cb19f` preview has since passed Apple notarization with zero issues,
+including tickets for the GUI and helper, stapling, strict deep signature and
+Gatekeeper validation, and a verified copy installed in Applications. The native
+installed preview still has no registered access. Its existing sample fails
+the now-distinct enrollment-match preflight before any protected read. Actual
+approval, exchange, denial/cancellation/removal and real recovery/reuse remain
+unproven; notarization does not close them. Details are in
+[PORTING.md](PORTING.md#notarized-fairplay-preview-acceptance).

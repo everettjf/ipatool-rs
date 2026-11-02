@@ -67,10 +67,18 @@ Current synthetic evidence includes 39 pinned Go key-table controls, complete
 signed-SUPP IPA processing with plaintext hashes, private model reopen/reuse,
 wrong-key/final-page rejection and preservation of existing artifacts. These do
 not satisfy real acceptance. F1/F2/F3/F4/F5 remain open for the signed helper's
-notarization and actual lifecycle, an authorized private snapshot/model, real
+actual lifecycle, an authorized private snapshot/model, real
 complete plaintext coverage, and a different matching IPA after restart. The
 existing controlled account/material authorization remains valid; no fresh
 account or material request is needed. See [the boundary design](FAIRPLAY_AUTHORIZATION.md).
+
+The signed `02cb19f` preview has passed notarization (zero issues, GUI/helper
+tickets), stapling, Gatekeeper and verified installation in Applications. The
+installed GUI confirms an enrollment mismatch in the existing sample despite
+matching app/version fields, before any protected read. Local access remains
+unregistered pending the required operator-confirmed permission grant. Resolve
+that specific sample mismatch before claiming model/reuse success; another
+unchanged retry is not acceptance evidence.
 
 ## Current macOS Apple Silicon gates
 
