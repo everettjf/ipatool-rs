@@ -4,6 +4,15 @@ sanitized 26A428 frame, state, and SIDB models from
 state for regression tests, not a user's enrollment. Private oracle models must
 never be added here.
 
+`fairplay-current-tag-public-vectors.json` contains 32 synthetic hardware byte
+arrays and SHA-256 digests of their 44 big-endian tag words. It was generated
+with `internal/recovery/tagengine.GenerateCodebook` at UnfairPlay commit
+`b3a7a432da2047a0d4f1ed5a3152c538a5497183`. Input byte `i` of vector `n` is
+`(17*n + 37*i) mod 256`; no real hardware identity or enrollment was used.
+The Rust differential test covers signed polynomial remainder, wrapped indexed
+aliasing, CBC chaining and the final affine tag map. These vectors establish
+constructor parity only, not complete enrollment recovery.
+
 `mac-xar-extra-synthetic.pkg` is a 386-byte synthetic XAR with extra XML
 elements in its TOC, file, and data records, plus symlink and FIFO entries.
 The Go XAR reader accepted its single checksummed payload and skipped the

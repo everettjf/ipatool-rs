@@ -335,6 +335,141 @@ Exit evidence: reproducible macOS bundle, current CI results, local verification
 record, screenshots, and an accurate list of unverified live/platform gates.
 Public release publication and Rust package publication are separate actions.
 
+## FairPlay completion workstream (2026-11-01)
+
+This is an implementation plan, not a record of completed recovery. The native
+desktop walkthrough reached collection with a matching installed-app/IPA
+selection. Its compatibility check could read the IPA and identify a bundled
+host recovery profile, but could not read the local FairPlay state. No real
+model recovery or plaintext validation has passed through this desktop.
+
+The newer upstream comparison is pinned to
+[UnfairPlay b3a7a432da2047a0d4f1ed5a3152c538a5497183](https://github.com/DrWhax/unfairplay/tree/b3a7a432da2047a0d4f1ed5a3152c538a5497183).
+It supplements, rather than silently replaces, the sibling Go port baseline.
+Its production recovery parses the current SIDB format and authenticates the
+selected enrollment route without executing a native image. Its decryption
+checks available CodeDirectory pre-encryption hashes. Rust currently uses
+exact-build checkpoint recovery and encrypted-source page audits plus structural
+plausibility checks. These are material differences, not missing GUI labels.
+
+### F1: Make collection possible and failures actionable
+
+- Preflight installed-app identity/version, sample IPA, readable authorization
+  state and recovery prerequisites before starting expensive recovery. Distinguish
+  unreadable state, missing enrollment, mismatched sample, unsupported format,
+  denied authorization and recovery failure using typed, redacted errors.
+- Separate "IPA readable", "host profile recognized", "collection permitted"
+  and "model validated" in diagnostics. Recognizing an image hash must not be
+  presented as proof that this enrollment can be recovered.
+- Add a macOS authorization design and packaging spike for a narrowly scoped
+  native helper, using supported Service Management APIs. The normal GUI must
+  remain unprivileged. Before shipping, prove helper registration, peer/code
+  identity checks, user approval, denial, cancellation and removal with the
+  actual signed bundle. An ad hoc debug launch is not distribution evidence.
+- The privileged boundary may read only the required system authorization
+  inputs. Do not accept arbitrary privileged source paths, shell commands or
+  output paths. Validate the requesting process, bound input sizes, reject
+  symlinks and races, and deliver a private snapshot to the requesting user.
+  Recovery, IPA processing and model publication run as that user. Never grant
+  the entire GUI root privileges or make system state world-readable.
+- Keep terminal-based explicit collection/import available as a diagnostic
+  fallback; it does not close the terminal-free desktop gate. Administrator
+  authentication stays in macOS UI and cannot be supplied through chat.
+
+Exit evidence: the authorized desktop creates a readable private snapshot;
+denial and interruption leave no usable partial capture or root-owned model.
+No model-generation claim follows merely from successful collection.
+
+### F2: Port current recovery into the shared Rust service
+
+- Implement bounded canonical capture normalization, current SIDB container and
+  state derivation, deterministic slot/root/tagged-tree selection, selected-value
+  authentication, and selector-bound model construction from the pinned source.
+- Use native Rust implementations and reviewed public algorithm constants.
+  Do not invoke a downloaded Go binary, Python script or separate Swift runtime.
+  Keep the existing exact-build recovery as an explicitly selected legacy path;
+  do not retry unrelated slots, records or legacy engines after authentication
+  failure in the current path.
+- Treat support as format/route support after parsing and authentication. Unknown
+  versions and malformed routes fail closed. Remove the blanket fresh-account
+  prerequisite only when the replacement path and relevant controls pass;
+  do not promise every older or migrated enrollment will work.
+- Expose bounded progress and cooperative cancellation through the existing
+  operation service. CLI and GUI call the same normalizer/recovery service.
+
+Exit evidence: public differential vectors agree with the pinned Go reference;
+an authorized local capture recovers and validates a model without native guest
+execution. Raw captures, selectors, hardware identities and model hashes stay
+in private local evidence, never in public PR logs.
+
+### F3: Validate decrypted bytes and report coverage honestly
+
+- Audit every available CodeDirectory pre-encryption hash slot intersecting each
+  encrypted range. A malformed present table or any mismatch rejects publication,
+  including a wrong final page after a plausible first page.
+- Keep encrypted-source integrity checks separate from plaintext checks. Do not
+  use instruction plausibility or clearing cryptid as proof of correct plaintext.
+- Preserve an explicit "validation unavailable" result for older executables
+  without pre-encryption tables; never label them plaintext-verified. Embedded
+  hash consistency does not establish Apple CMS signature trust.
+- Cover all encrypted images in the IPA, including extensions and frameworks;
+  audit license association and page-table selection against upstream. Classify
+  unsupported architectures or SUPF/SUPP variants explicitly rather than silently
+  omitting images. Older 32-bit/watch layouts need their own controls before a
+  broad parity claim.
+- Version the decryption report and model receipt validation policy. Keep older
+  receipts visibly structure-checked until revalidated; do not silently upgrade
+  their assurance or reinterpret their existing fields.
+
+Exit evidence: first-page/final-page corruption, malformed tables and ambiguous
+license associations fail; valid synthetic outputs and normalized reports agree
+with the pinned reference. Missing coverage remains visible in CLI and GUI.
+
+### F4: Finish the one-time setup and reuse journey
+
+- The primary flow is: check this Mac, obtain required macOS authorization,
+  select matching installed app and IPA, prepare and validate, save privately.
+  Keep model paths, build overrides and raw diagnostics under advanced tools.
+- Publish a model only after selected-license authentication and complete sample
+  processing with applicable validation. Save assurance/coverage separately from
+  the fact that recovery completed. Preserve the original IPA on every outcome.
+- After relaunch, downloaded IPAs match saved models by enrollment selector.
+  Reuse is per enrollment, not per app name or visible Apple ID. A new or
+  unmatched enrollment offers preparation without modifying existing models.
+- Downloads remain successful if their independent decryption task fails.
+  Provide distinct "downloaded", "decrypted and verified", "decrypted with
+  validation unavailable" and actionable failure states. Resolve output collisions
+  without redownloading or overwriting the original.
+- Cancellation and relaunch must not replay authorization requests, repeat a
+  completed child task, or activate an incomplete model. Clean private temporary
+  work on normal failure/cancellation and define crash cleanup explicitly.
+
+### F5: Real acceptance and PR delivery
+
+Run the required Rust/default/GUI/gui-test suites and strict Clippy, rebuild the
+CLI and signed GUI, and exercise the native normal/narrow layouts. Then use the
+already authorized controlled account and private local materials:
+
+1. From no saved model, complete collection, recovery, sample processing and
+   private publication on this Mac. Record each stage separately.
+2. Quit and relaunch. Download a different IPA from the same enrollment and
+   confirm automatic model selection and decryption without another model picker.
+3. Check every encrypted image and all available plaintext hash coverage. At
+   least one real control with complete pre-encryption coverage must pass before
+   claiming verified plaintext. If neither supplied app provides it, report that
+   specific remaining gate rather than assuming success.
+4. Exercise wrong enrollment, denied authorization, output collision, cancellation
+   and restart; preserve original packages and existing valid models throughout.
+5. Compare real outputs with the pinned reference only in private local evidence.
+   Publish a redacted outcome, not app identities, private file measurements or
+   captured data. Update README, PORTING, TODO and PR #7 on the same branch;
+   do not merge or publish a release as part of this workstream.
+
+macOS Apple Silicon is the first live completion target. Linux x86_64 model
+reuse needs separate runtime evidence. Windows managed recovery/decryption
+remains gated on equivalent private-file ACL enforcement. Passing this Mac's
+controls does not establish universal enrollment or cross-platform parity.
+
 ## Verification and evidence
 
 For Rust changes run `cargo fmt --check`, focused behavioral tests,

@@ -1,7 +1,7 @@
 //! One-time preparation and private, selector-bound model reuse.
 //!
-//! Receipts mean the pipeline processed a matching IPA and passed structural
-//! checks, not that plaintext or Apple's signature was authenticated.
+//! Receipts retain the validation policy and coverage of a matching sample IPA.
+//! Embedded plaintext page hashes do not authenticate Apple CMS signatures.
 
 use super::{
     fairplay,
@@ -196,14 +196,14 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Conservative structural gate shared by fresh setup and existing-model import.
-fn check_report(path: &Path) -> Result<()> {
+/// Require complete processing and consistent plaintext coverage evidence.
+fn check_report(path: &Path) -> Result<bool> {
     let bytes = read_private_bytes(path, 8 * 1024 * 1024)?;
     let report: serde_json::Value = serde_json::from_slice(&bytes)?;
     let images = report["images"]
         .as_array()
         .context("missing image validation")?;
-    if report["schema"] != "ipatool-fairplay-decryption-v1"
+    if report["schema"] != "ipatool-fairplay-decryption-v2"
         || report["complete"] != true
         || images.is_empty()
         || report["encrypted_image_count"].as_u64() != Some(images.len() as u64)
@@ -211,29 +211,51 @@ fn check_report(path: &Path) -> Result<()> {
     {
         bail!("incomplete IPA processing report");
     }
+    let mut verified = true;
+    let mut pages = 0u64;
     for image in images {
         if image["cryptid_before"].as_u64().unwrap_or(0) == 0
             || image["cryptid_after"] != 0
             || image["pages"].as_u64().unwrap_or(0) == 0
             || image["exact_mutation_scope"] != true
-            || image["first_page_structurally_plausible"] != true
         {
             bail!("IPA structure checks did not pass");
         }
-        let directories = image["code_directories"]
-            .as_array()
-            .context("missing code directory audit")?;
-        if directories.is_empty() {
-            bail!("no embedded code page audit");
-        }
-        for directory in directories {
-            let count = directory["slot_count"]
-                .as_u64()
-                .filter(|count| *count > 0)
-                .context("missing code page count")?;
-            if directory["matched_slots"].as_u64() != Some(count) {
-                bail!("embedded code page checks did not pass");
+        pages = pages
+            .checked_add(image["pages"].as_u64().unwrap())
+            .context("page count overflow")?;
+        check_page_audits(&image["code_directories"])?;
+        let pre = &image["pre_encryption_code_directories"];
+        match image["plaintext_validation"].as_str() {
+            Some("code-directory-pre-encryption-hashes") => check_page_audits(pre)?,
+            Some("unavailable-no-pre-encryption-hashes")
+                if pre.as_array().is_some_and(Vec::is_empty) =>
+            {
+                verified = false
             }
+            _ => bail!("missing or inconsistent plaintext validation"),
+        }
+    }
+    if report["plaintext_verified"].as_bool() != Some(verified)
+        || report["decrypted_page_count"].as_u64() != Some(pages)
+    {
+        bail!("inconsistent aggregate validation");
+    }
+    Ok(verified)
+}
+
+fn check_page_audits(value: &serde_json::Value) -> Result<()> {
+    let directories = value.as_array().context("missing code directory audit")?;
+    if directories.is_empty() {
+        bail!("no embedded code page audit");
+    }
+    for directory in directories {
+        let count = directory["slot_count"]
+            .as_u64()
+            .filter(|count| *count > 0)
+            .context("missing code page count")?;
+        if directory["matched_slots"].as_u64() != Some(count) {
+            bail!("embedded code page checks did not pass");
         }
     }
     Ok(())
@@ -282,8 +304,16 @@ impl SavedModels {
             let bytes = read_private_bytes(&model, 16 * 1024)?;
             let hash = format!("{:x}", Sha256::digest(&*bytes));
             let info = inspect_enrollment_model(&model)?;
-            if receipt.schema != 1
-                || receipt.validation != "processed-and-structure-checked"
+            let policy_valid = match receipt.schema {
+                1 => receipt.validation == "processed-and-structure-checked",
+                2 => matches!(
+                    receipt.validation.as_str(),
+                    "processed-pre-encryption-hashes-verified"
+                        | "processed-plaintext-validation-unavailable"
+                ),
+                _ => false,
+            };
+            if !policy_valid
                 || receipt.model_sha256 != hash
                 || name != hash
                 || info.sha256 != hash
@@ -342,7 +372,7 @@ impl SavedModels {
         Ok(())
     }
 
-    fn save(&self, model: &Path, ipa: &Path) -> Result<PathBuf> {
+    fn save(&self, model: &Path, ipa: &Path, plaintext_verified: bool) -> Result<PathBuf> {
         operation::check()?;
         let bytes = read_private_bytes(model, 16 * 1024)?;
         let info = inspect_enrollment_model(model)?;
@@ -373,11 +403,16 @@ impl SavedModels {
         let staging = private_work(&self.root, ".publish-")?;
         write_private(&staging.path().join("model.bin"), &bytes)?;
         let receipt = Receipt {
-            schema: 1,
+            schema: 2,
             selector,
             model_sha256: hash.clone(),
             validation_ipa_sha256: digest(ipa)?,
-            validation: "processed-and-structure-checked".into(),
+            validation: if plaintext_verified {
+                "processed-pre-encryption-hashes-verified"
+            } else {
+                "processed-plaintext-validation-unavailable"
+            }
+            .into(),
         };
         write_private(
             &staging.path().join("receipt.json"),
@@ -398,7 +433,7 @@ impl SavedModels {
         let work = private_work(&self.root, ".setup-")?;
         let before = digest(&request.ipa)?;
         let o = &request.options;
-        let model = if let Some(model) = &o.existing_model {
+        let (model, plaintext_verified) = if let Some(model) = &o.existing_model {
             operation::stage(Stage::ValidatingModel)?;
             let candidates =
                 crate::fairplay::inspect_model_registry(model).context(ModelProblem::Validation)?;
@@ -429,8 +464,8 @@ impl SavedModels {
                 false,
             )
             .context(ModelProblem::Validation)?;
-            check_report(&report).context(ModelProblem::Validation)?;
-            copied
+            let verified = check_report(&report).context(ModelProblem::Validation)?;
+            (copied, verified)
         } else {
             fairplay::collect(&EnrollmentCollectOptions {
                 app: request.app,
@@ -467,21 +502,38 @@ impl SavedModels {
             {
                 return Err(ModelProblem::Validation.into());
             }
-            check_report(&output.join("App.decrypted.json")).context(ModelProblem::Validation)?;
-            recovered.enrollment_model
+            let verified = check_report(&output.join("App.decrypted.json"))
+                .context(ModelProblem::Validation)?;
+            (recovered.enrollment_model, verified)
         };
         operation::stage(Stage::ValidatingModel)?;
         if before != digest(&request.ipa)? {
             return Err(ModelProblem::Validation.into());
         }
-        let model = self.save(&model, &request.ipa).map_err(|error| {
-            if error.downcast_ref::<ModelProblem>().is_some() {
-                error
-            } else {
-                error.context(ModelProblem::Validation)
-            }
-        })?;
-        Ok(JobOutcome { summary: "Reusable decryption is prepared. A model passed processing and structural checks with your sample IPA and was saved privately. Matching future downloads can reuse it. Plaintext correctness and Apple signatures are not authenticated.".into(), artifacts: vec![Artifact { kind: ArtifactKind::Model, path: model }], details: None })
+        let model = self
+            .save(&model, &request.ipa, plaintext_verified)
+            .map_err(|error| {
+                if error.downcast_ref::<ModelProblem>().is_some() {
+                    error
+                } else {
+                    error.context(ModelProblem::Validation)
+                }
+            })?;
+        let coverage = if plaintext_verified {
+            "The sample passed all available pre-encryption page hashes with coverage for every image."
+        } else {
+            "The sample was processed, but plaintext validation is unavailable for one or more images."
+        };
+        Ok(JobOutcome {
+            summary: format!(
+                "Reusable decryption is prepared and saved privately. {coverage} Matching future downloads can reuse it. Apple CMS signature trust is not established."
+            ),
+            artifacts: vec![Artifact {
+                kind: ArtifactKind::Model,
+                path: model,
+            }],
+            details: None,
+        })
     }
 
     pub fn decrypt_saved(
@@ -737,7 +789,7 @@ mod tests {
     fn structural_report_gate_rejects_incomplete_or_unchecked_output() {
         let directory = tempfile::tempdir().unwrap();
         let report = directory.path().join("report.json");
-        let mut value = serde_json::json!({"schema":"ipatool-fairplay-decryption-v1","complete":true,"encrypted_image_count":1,"decrypted_page_count":1,"images":[{"cryptid_before":1,"cryptid_after":0,"pages":1,"exact_mutation_scope":true,"first_page_structurally_plausible":true,"code_directories":[{"slot_count":1,"matched_slots":1}]}]});
+        let mut value = serde_json::json!({"schema":"ipatool-fairplay-decryption-v2","complete":true,"plaintext_verified":false,"encrypted_image_count":1,"decrypted_page_count":1,"images":[{"cryptid_before":1,"cryptid_after":0,"pages":1,"exact_mutation_scope":true,"plaintext_validation":"unavailable-no-pre-encryption-hashes","pre_encryption_code_directories":[],"code_directories":[{"slot_count":1,"matched_slots":1}]}]});
         write_private(&report, &serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(check_report(&report).is_ok());
         value["images"][0]["code_directories"][0]["matched_slots"] = 0.into();
@@ -747,5 +799,64 @@ mod tests {
         value["complete"] = false.into();
         fs::write(&report, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(check_report(&report).is_err());
+    }
+
+    #[test]
+    fn report_gate_requires_complete_and_consistent_plaintext_hash_coverage() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("report.json");
+        let mut value = serde_json::json!({
+            "schema":"ipatool-fairplay-decryption-v2", "complete":true,
+            "plaintext_verified":true, "encrypted_image_count":1, "decrypted_page_count":2,
+            "images":[{"cryptid_before":1,"cryptid_after":0,"pages":2,
+                "exact_mutation_scope":true,
+                "plaintext_validation":"code-directory-pre-encryption-hashes",
+                "pre_encryption_code_directories":[{"slot_count":2,"matched_slots":2}],
+                "code_directories":[{"slot_count":2,"matched_slots":2}]}]
+        });
+        write_private(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+        let check = |value: &serde_json::Value| {
+            fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+            check_report(&path)
+        };
+        assert!(check(&value).unwrap());
+        value["images"][0]["pre_encryption_code_directories"][0]["matched_slots"] = 1.into();
+        assert!(check(&value).is_err());
+        value["images"][0]["pre_encryption_code_directories"] = serde_json::json!([]);
+        assert!(check(&value).is_err());
+        value["images"][0]["plaintext_validation"] = "unavailable-no-pre-encryption-hashes".into();
+        assert!(check(&value).is_err());
+        value["plaintext_verified"] = false.into();
+        assert!(!check(&value).unwrap());
+        value["decrypted_page_count"] = 1.into();
+        assert!(check(&value).is_err());
+    }
+
+    #[test]
+    fn legacy_receipt_remains_readable_without_upgrading_its_assurance() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SavedModels::new(directory.path());
+        let (ipa, model) = fixture(directory.path(), "sample", [0x31; 16]);
+        store.setup(import(&ipa, &model)).unwrap();
+        let (mut receipt, path) = store.inventory().unwrap().remove(0);
+        assert_eq!(receipt.schema, 2);
+        assert_eq!(
+            receipt.validation,
+            "processed-plaintext-validation-unavailable"
+        );
+        receipt.schema = 1;
+        receipt.validation = "processed-and-structure-checked".into();
+        let receipt_path = path.parent().unwrap().join("receipt.json");
+        let original = serde_json::to_vec(&receipt).unwrap();
+        fs::write(&receipt_path, &original).unwrap();
+        assert_eq!(store.count().unwrap(), 1);
+        store.decrypt_saved(&ipa, None, None).unwrap();
+        assert_eq!(fs::read(&receipt_path).unwrap(), original);
+        receipt.schema = 2;
+        fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(
+            store.count().is_err(),
+            "schema/policy mismatch must not upgrade legacy evidence"
+        );
     }
 }

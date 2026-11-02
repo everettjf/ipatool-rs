@@ -22,6 +22,7 @@ pub mod fairplay_checkpoint_run;
 mod fairplay_checkpoint_schema1;
 pub mod fairplay_codesign;
 pub mod fairplay_collect;
+pub mod fairplay_current;
 pub mod fairplay_decrypt;
 pub mod fairplay_download_capture;
 pub mod fairplay_enrollment_model;

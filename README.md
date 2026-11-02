@@ -114,8 +114,9 @@ Native Mac applications such as ScriptWidget download as PKGs. A compatible iPho
 The desktop FairPlay page starts with a **one-time preparation guide**: prepare
 this Mac, choose an installed app and matching sample IPA, then review and start.
 It collects the supported authorization data, creates a model, processes the
-sample, and saves the model privately only after structural checks pass. Advanced
-options also allow importing an existing model with a matching sample.
+sample, and saves the model privately only after processing and applicable page
+hash checks pass. Advanced options also allow importing an existing model with
+a matching sample.
 
 After preparation, new IPA downloads automatically queue a separate decryption
 task and match saved models using the IPA's authorization. You can turn this off
@@ -125,7 +126,11 @@ offer preparation; existing output files are never replaced. PKGs are unaffected
 Models are enrollment-specific; the same Apple ID does not guarantee a match.
 Managed model storage currently requires macOS/Linux private-file permissions;
 Windows support and real private-processing validation remain open. These checks
-do not authenticate plaintext or Apple's signature.
+require complete pre-encryption page-hash coverage to report verified plaintext.
+Older executables without these tables remain explicitly unverified; a present
+malformed or mismatching table rejects output. Embedded hashes do not establish
+Apple CMS signature trust. Reports use `ipatool-fairplay-decryption-v2`; older
+model receipts retain their original structural-check assurance.
 See the [FairPlay guide](docs/GUI_FAIRPLAY.md) for prerequisites and limitations.
 
 ## Commands

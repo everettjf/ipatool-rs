@@ -907,3 +907,46 @@ The focused startup test and full local suites passed: 459 library, 45 CLI and
 45 desktop tests (549 active; 70 opt-in library cases ignored). Formatting,
 strict default/GUI/GUI-test Clippy and signed macOS debug/release GUI bundles
 passed. No account or private FairPlay operation was run for this UI change.
+
+## Current UnfairPlay validation and constructor increment
+
+On 2026-11-01, the newer FairPlay workstream was pinned to upstream UnfairPlay
+`b3a7a432da2047a0d4f1ed5a3152c538a5497183`. This is an intentional improvement
+beyond the sibling Go baseline. It is not a claim that current upstream recovery
+has already been integrated or that a private enrollment has passed.
+
+Rust now checks every available CodeDirectory pre-encryption hash slot that
+intersects an encrypted range, after restoring cryptid to zero. Malformed present
+tables and any mismatch reject publication. Absent tables remain explicitly
+unavailable; instruction plausibility no longer decides decryption success.
+Encrypted-source integrity and Apple CMS trust remain separate from plaintext
+hash coverage. The decryption report is `ipatool-fairplay-decryption-v2`, and
+both CLI and desktop summaries expose aggregate plaintext coverage. Schema-2
+model receipts record verified coverage or unavailable validation; old schema-1
+receipts remain readable without upgrading their structural-check assurance.
+
+Comparison with upstream also identified a page-key error: Rust previously used
+the first encrypted page's absolute offset for every page. It now advances the
+offset for each page, including the ordered-page-key report digest. A two-page
+fixture with distinct records and non-instruction plaintext passes complete
+validation. Wrong whole-image or final-page keys fail. Additional controls cover
+larger/unpaged hash pages overlapping the Mach-O header, all four supported hash
+types, missing/truncated tables, existing output/report preservation on failure,
+and consistent managed-report aggregates and receipt migration.
+
+The native current-format tag constructor is ported as direct byte mixing and
+AES-CBC. Its 44 tag words match Go for 32 explicitly synthetic hardware inputs;
+the account-free vector provenance is in `tests/fixtures/README.md`. The pinned
+Go page-key and pre-encryption audit tests also pass. This constructor is a
+building block; production recovery still uses the prior exact-build pipeline
+until canonical normalization and semantic SIDB/route recovery are connected.
+
+Local verification passed 468 library, 45 CLI and 45 desktop tests (558 active;
+70 library opt-ins ignored), formatting, strict default/GUI/GUI-test all-targets
+Clippy, the Apple Silicon CLI rebuild/version check, and signed debug/release
+GUI builds. The first broad sandboxed native-guest test process terminated with
+SIGILL; the complete account-free suite passed outside the sandbox. These runs
+used no Apple account, private authorization state, enrollment model or downloaded
+account package. Required real collection, model creation, a different matching
+IPA, interruption and restart gates remain open. No new GUI was launched against
+the user's state, and the existing running bundle was preserved.

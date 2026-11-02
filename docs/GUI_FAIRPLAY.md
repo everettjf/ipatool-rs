@@ -37,14 +37,19 @@ that an IPA and model belong together.
 3. **Review and prepare:** review the selected filenames and explicitly start.
    Fresh setup collects, recovers with differential checks enabled, validates the
    sample's processing report, and saves the model. Import runs the same sample
-   processing/structure gate before saving. Merely changing steps never starts
+   processing/page-hash gate before saving. Merely changing steps never starts
    private work. A model without a binding selector is not eligible for managed
    reuse; the manual expert workflow remains available.
 
 The sample gate requires processed encrypted images/pages, zero final cryptids,
-exact mutation scope, plausible ARM64 first-page structure, and complete matching
-embedded CodeDirectory page audits. It is conservative and can reject unsupported
-samples. Passing it does **not** authenticate plaintext or Apple's signature.
+exact mutation scope, matching encrypted-source CodeDirectory audits, and all
+available pre-encryption page hashes. The latter cover every intersecting hash
+slot, including final pages and pages overlapping the restored Mach-O header.
+A malformed or mismatching present table rejects publication. Instruction scoring
+is no longer a decryption gate. Every encrypted image needs pre-encryption hash
+coverage for the aggregate `plaintext_verified` result to be true; older images
+without a table remain explicitly unverified. Embedded hash consistency does
+**not** establish Apple CMS signature trust. Unsupported samples still fail.
 Original inputs are preserved. Temporary captures and sample plaintext are
 removed after normal completion, failure, or cooperative cancellation. A hard
 process crash may leave hidden private staging directories; they are ignored,
@@ -79,8 +84,12 @@ Managed models live in `IPATOOL_STATE_DIR/fairplay-models/<model-sha256>/`.
 Directories are mode 0700 and files 0600 on Unix. A model and bounded receipt are
 published together from private staging. Reuse rechecks the envelope, SHA-256,
 selector, receipt schema and permissions, and rejects symlinked/tampered entries
-or conflicting models. Receipts record sample processing and structural validation;
-they are not cryptographic attestations of plaintext. Model bytes, captures,
+or conflicting models. Schema-2 receipts distinguish pre-encryption hash coverage
+from unavailable plaintext validation. Schema-1 receipts retain their original
+structural-check policy and are never upgraded by inventory or reuse. Reports
+use `ipatool-fairplay-decryption-v2`, with per-image validation status and
+pre-encryption audits; instruction-audit fields were removed. Receipts are not
+cryptographic attestations of Apple signature trust. Model bytes, captures,
 sample plaintext, and raw private errors are excluded from preferences/history;
 reviewable request paths remain there.
 

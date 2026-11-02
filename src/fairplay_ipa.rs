@@ -1,7 +1,7 @@
 //! Apply a local enrollment model to all encrypted Mach-O images in an IPA.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -30,6 +30,7 @@ pub struct IpaDecryptResult {
     pub encrypted_images: usize,
     pub decrypted_pages: usize,
     pub output_sha256: String,
+    pub plaintext_verified: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -47,13 +48,8 @@ struct ImageReport {
     cryptsize: usize,
     pages: usize,
     first_plaintext_page_sha256: String,
-    first_page_audit: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    first_page_valid_arm64_words: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    first_page_instruction_words: Option<usize>,
-    first_page_structurally_plausible: bool,
-    first_page_mnemonics: Option<BTreeMap<String, usize>>,
+    plaintext_validation: &'static str,
+    pre_encryption_code_directories: Vec<crate::fairplay_codesign::CodeDirectoryAudit>,
     ordered_page_keys_sha256: String,
     app_mask_sha256: String,
     code_directories: Vec<crate::fairplay_codesign::CodeDirectoryAudit>,
@@ -460,16 +456,14 @@ fn image_report(
         .records_for(layout.cpu_type, layout.cpu_subtype)?;
     let offset = (slice.offset + layout.crypt_offset) as u64;
     let mut keys_hash = Sha256::new();
-    for record in records {
+    for (index, record) in records.iter().enumerate() {
         crate::application::operation::check()?;
-        let key = Zeroizing::new(
-            context
-                .deriver
-                .page_key(record[..16].try_into().unwrap(), offset),
-        );
+        let key = Zeroizing::new(context.deriver.page_key(
+            record[..16].try_into().unwrap(),
+            offset + (index * PAGE_BYTES) as u64,
+        ));
         keys_hash.update(&key[..]);
     }
-    let audit = decrypted.first_page_audit.as_ref();
     Ok(ImageReport {
         member: context.member.to_owned(),
         supf_member: context.supf_member.to_owned(),
@@ -484,19 +478,12 @@ fn image_report(
         cryptsize: layout.crypt_size,
         pages: decrypted.pages,
         first_plaintext_page_sha256: decrypted.first_plaintext_page_sha256,
-        first_page_audit: if audit.is_some() {
-            "arm64-instruction-decode"
+        plaintext_validation: if decrypted.plaintext_verified {
+            "code-directory-pre-encryption-hashes"
         } else {
-            "not-performed"
+            "unavailable-no-pre-encryption-hashes"
         },
-        first_page_valid_arm64_words: audit
-            .map(|value| value.valid_words)
-            .filter(|value| *value != 0),
-        first_page_instruction_words: audit
-            .map(|value| value.instruction_words)
-            .filter(|value| *value != 0),
-        first_page_structurally_plausible: audit.is_some(),
-        first_page_mnemonics: audit.map(|value| value.mnemonics.clone()),
+        pre_encryption_code_directories: decrypted.pre_encryption_code_directories,
         ordered_page_keys_sha256: format!("{:x}", keys_hash.finalize()),
         app_mask_sha256: context.app_mask_sha256.to_owned(),
         code_directories: decrypted.code_directories,
@@ -698,6 +685,9 @@ pub fn decrypt_ipa_with_options(
         .sync_all()
         .context("sync decrypted IPA")?;
     let output_sha256 = sha256_file(temporary.path())?;
+    let plaintext_verified = image_reports
+        .iter()
+        .all(|image| image.plaintext_validation == "code-directory-pre-encryption-hashes");
     let report_stage = if let Some(report_path) = report {
         let selector = parse_sinf_selector(&sinf)?;
         let model_name = format!("external-current-sinf-{}", &model.sha256[..16]);
@@ -707,7 +697,7 @@ pub fn decrypt_ipa_with_options(
             "current-sinf-whitebox-direct-v1"
         };
         let report_data = DecryptionReport {
-            schema: "ipatool-fairplay-decryption-v1",
+            schema: "ipatool-fairplay-decryption-v2",
             model_build: model_name.clone(),
             input: ReportFile {
                 path: fs::canonicalize(input)?.display().to_string(),
@@ -744,12 +734,12 @@ pub fn decrypt_ipa_with_options(
             decrypted_page_count: pages,
             images: image_reports,
             complete: true,
-            plaintext_verified: false,
+            plaintext_verified,
             signature_verified: false,
             warnings: [
-                "Complete means every inventoried encrypted image was processed; plaintext correctness is not authenticated.",
-                "Only ARM64 first pages are checked for instruction plausibility; ARMv7 plaintext, SUPF records, and subsequent plaintext are not authenticated.",
-                "CodeDirectory checks compare encrypted bytes with embedded hashes, not an authenticated Apple signature; those hashes are stale after decryption.",
+                "Complete means every inventoried encrypted image was processed; plaintext_verified requires pre-encryption hash coverage for every image.",
+                "Missing pre-encryption hash tables leave plaintext validation unavailable; present malformed or mismatching tables reject publication.",
+                "Embedded page hash consistency does not establish Apple CMS signature trust; unencrypted pages are outside the plaintext audit.",
                 "Analysis IPA requires recursive re-signing before installation.",
             ],
         };
@@ -773,6 +763,7 @@ pub fn decrypt_ipa_with_options(
         encrypted_images: images,
         decrypted_pages: pages,
         output_sha256,
+        plaintext_verified,
     })
 }
 
@@ -988,17 +979,98 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn supf(record: [u8; 32]) -> Vec<u8> {
+        supf_records(&[record])
+    }
+
+    pub(crate) fn supf_records(records: &[[u8; 32]]) -> Vec<u8> {
         let mut arch = Vec::new();
         arch.extend_from_slice(&0x0100_000cu32.to_be_bytes());
         arch.extend_from_slice(&2u32.to_be_bytes());
-        arch.extend_from_slice(&1u32.to_be_bytes());
-        arch.extend_from_slice(&record);
+        arch.extend_from_slice(&(records.len() as u32).to_be_bytes());
+        for record in records {
+            arch.extend_from_slice(record);
+        }
         let mut bytes = vec![5, 0, 0, 0];
         bytes.extend_from_slice(&(4u32 + 4 + arch.len() as u32).to_be_bytes());
         bytes.extend_from_slice(&1u32.to_be_bytes());
         bytes.extend_from_slice(&(arch.len() as u32).to_be_bytes());
         bytes.extend_from_slice(&arch);
         bytes
+    }
+
+    #[test]
+    fn publishes_plaintext_coverage_and_rejects_wrong_last_page_without_replacing_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("synthetic.ipa");
+        let output = directory.path().join("decrypted.ipa");
+        let report = directory.path().join("report.json");
+        let model_path = directory.path().join("model.bin");
+        let logical = [0x31; 16];
+        let (model, sinf) = model_and_sinf(logical);
+        let (image, mut records, plaintext) =
+            crate::fairplay_decrypt::tests::pre_encryption_fixture(logical);
+        fs::write(&model_path, model).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let make_ipa = |records: &[[u8; 32]]| {
+            let mut writer = ZipWriter::new(File::create(&input).unwrap());
+            for (name, bytes) in [
+                ("Payload/A.app/A", image.clone()),
+                ("Payload/A.app/SC_Info/A.sinf", sinf.clone()),
+                ("Payload/A.app/SC_Info/A.supf", supf_records(records)),
+            ] {
+                writer
+                    .start_file(name, SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(&bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        };
+        make_ipa(&records);
+        let before = fs::read(&input).unwrap();
+        let result =
+            decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), false).unwrap();
+        assert!(result.plaintext_verified);
+        assert_eq!(result.decrypted_pages, 2);
+        assert_eq!(fs::read(&input).unwrap(), before);
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(value["schema"], "ipatool-fairplay-decryption-v2");
+        assert_eq!(value["plaintext_verified"], true);
+        assert_eq!(value["signature_verified"], false);
+        assert_eq!(
+            value["images"][0]["pre_encryption_code_directories"][0]["matched_slots"],
+            2
+        );
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        let mut actual = Vec::new();
+        archive
+            .by_name("Payload/A.app/A")
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(&actual[PAGE_BYTES..3 * PAGE_BYTES], plaintext);
+        drop(archive);
+        let valid_output = fs::read(&output).unwrap();
+        let valid_report = fs::read(&report).unwrap();
+        records[1][0] ^= 1;
+        make_ipa(&records);
+        let bad_input = fs::read(&input).unwrap();
+        assert!(
+            decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), true).is_err()
+        );
+        assert_eq!(fs::read(&output).unwrap(), valid_output);
+        assert_eq!(fs::read(&report).unwrap(), valid_report);
+        assert_eq!(fs::read(&input).unwrap(), bad_input);
+        fs::remove_file(&output).unwrap();
+        fs::remove_file(&report).unwrap();
+        assert!(
+            decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), false).is_err()
+        );
+        assert!(!output.exists());
+        assert!(!report.exists());
     }
 
     fn extras(path: &Path, name: &str) -> (Vec<u8>, Vec<u8>) {
@@ -1097,10 +1169,13 @@ pub(crate) mod tests {
         assert_eq!(report_data["images"][0]["architecture"], "arm64e");
         assert_eq!(report_data["images"][0]["cryptoff"], 4096);
         assert_eq!(report_data["images"][0]["cryptsize"], 4096);
+        assert_eq!(report_data["schema"], "ipatool-fairplay-decryption-v2");
         assert_eq!(
-            report_data["images"][0]["first_page_mnemonics"]["NOP"],
-            1024
+            report_data["images"][0]["plaintext_validation"],
+            "unavailable-no-pre-encryption-hashes"
         );
+        assert!(report_data["images"][0].get("first_page_audit").is_none());
+        assert!(!result.plaintext_verified);
         assert_eq!(
             report_data["images"][0]["ordered_page_keys_sha256"],
             "faae625eb5ec65fddbefe83887fe0535163b7b4653a7fdf5843d39d832182f80"

@@ -1020,11 +1020,16 @@ fn run() -> Result<()> {
             match cli.format {
                 Format::Json => println!("{}", serde_json::to_string_pretty(&result)?),
                 Format::Text => println!(
-                    "Decrypted {} images ({} pages) to {}; report: {}",
+                    "Decrypted {} images ({} pages) to {}; report: {}; plaintext validation: {}",
                     result.encrypted_images,
                     result.decrypted_pages,
                     output.display(),
-                    report.display()
+                    report.display(),
+                    if result.plaintext_verified {
+                        "pre-encryption hashes passed for every image"
+                    } else {
+                        "unavailable for one or more images"
+                    }
                 ),
             }
         }

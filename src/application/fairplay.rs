@@ -125,8 +125,14 @@ pub fn execute(request: FairPlayRequest) -> Result<JobOutcome> {
             Ok(JobOutcome {
                 details: None,
                 summary: format!(
-                    "Processed {} encrypted images / {} pages. Plaintext correctness is not authenticated; see report before further use.",
-                    result.encrypted_images, result.decrypted_pages
+                    "Processed {} encrypted images / {} pages. {} Apple CMS signature trust is not established.",
+                    result.encrypted_images,
+                    result.decrypted_pages,
+                    if result.plaintext_verified {
+                        "Plaintext passed pre-encryption page hashes for every image."
+                    } else {
+                        "Plaintext validation is unavailable for one or more images; see report."
+                    }
                 ),
                 artifacts: vec![
                     Artifact {

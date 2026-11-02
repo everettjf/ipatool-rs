@@ -129,15 +129,19 @@ pub fn decrypt_pages_in_place(
     let absolute_offset = slice_offset
         .checked_add(crypt_offset as u64)
         .ok_or_else(|| anyhow::anyhow!("FairPlay crypt offset overflow"))?;
-    for (page, record) in image[crypt_offset..end]
+    for (index, (page, record)) in image[crypt_offset..end]
         .as_chunks_mut::<PAGE_BYTES>()
         .0
         .iter_mut()
         .zip(records)
+        .enumerate()
     {
         crate::application::operation::check()?;
-        let key =
-            Zeroizing::new(deriver.page_key(record[..16].try_into().unwrap(), absolute_offset));
+        let page_offset = (index as u64)
+            .checked_mul(PAGE_BYTES as u64)
+            .and_then(|offset| absolute_offset.checked_add(offset))
+            .ok_or_else(|| anyhow::anyhow!("FairPlay page offset overflow"))?;
+        let key = Zeroizing::new(deriver.page_key(record[..16].try_into().unwrap(), page_offset));
         let cipher = Aes128::new_from_slice(&key[..]).unwrap();
         let mut previous: [u8; 16] = record[16..32].try_into().unwrap();
         for chunk in page.as_chunks_mut::<16>().0 {

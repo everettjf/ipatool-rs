@@ -34,6 +34,27 @@ checkboxes and local/CI evidence do not close the separate live-validation gates
 - [ ] Validate the complete real one-time setup/import followed by a different matching IPA download, automatic decryption, output/content checks, cancellation and relaunch with authorized materials. Same Apple ID alone does not prove matching enrollment.
 - [ ] Implement equivalent private Windows ACL enforcement before enabling managed FairPlay model storage/reuse there.
 
+### FairPlay completion sequence (2026-11-01)
+
+The detailed dependencies and exit evidence are in the
+[FairPlay completion workstream](CLI_GUI_IMPLEMENTATION_PLAN.md#fairplay-completion-workstream-2026-11-01).
+The latest native walkthrough confirmed readable IPA input but inaccessible local
+authorization state. Collection, real model recovery and verified decryption
+are separate gates; none is established by recognizing a host image hash.
+
+- [ ] F1: Add typed setup preflight and a signed, scoped macOS authorization/collection path; verify denial, cancellation, ownership and private cleanup.
+- [ ] F2: Port the pinned current UnfairPlay canonical/semantic recovery path into shared Rust, including deterministic route selection and selected-license authentication; retain the old exact-build path explicitly.
+- [ ] F3: Add complete available pre-encryption CodeDirectory hash validation, missing-coverage reporting, versioned receipts/reports and corrupt-final-page rejection. Audit per-image license/page-table associations and unsupported formats.
+- [ ] F4: Complete terminal-free first setup, private model publication, relaunch reuse and independent automatic decryption of another matching IPA; make unavailable validation and failures actionable.
+- [ ] F5: Pass full regressions and signed builds, then authorized real setup plus a different matching IPA, complete plaintext-coverage control, mismatch, denial, collision, cancellation and restart. Update PR #7 on the same branch without merging.
+
+The first implementation increment adds pre-encryption hash audits, schema-2
+reports/receipts, explicit unavailable coverage, and the per-page absolute-offset
+key derivation used by the pinned upstream. Synthetic final-page rejection and
+output preservation pass. The native tag constructor matches 32 synthetic Go
+controls, but canonical recovery is not connected yet. F1/F2/F4/F5 and the
+remaining format/association work in F3 stay open; no private live gate is closed.
+
 ## Current macOS Apple Silicon gates
 
 - [ ] Complete an interactive default macOS Keychain approval flow for `auth login` and `auth revoke` in a local user session. `auth info` succeeded after the user approved its Keychain dialog on October 27; the encrypted `--file-keychain` path also worked.
