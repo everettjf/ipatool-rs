@@ -94,8 +94,12 @@ is implied by protocol tests or a successful code signature.
 The `02cb19f` preview has since passed Apple notarization with zero issues,
 including tickets for the GUI and helper, stapling, strict deep signature and
 Gatekeeper validation, and a verified copy installed in Applications. The native
-installed preview still has no registered access. Its existing sample fails
-the now-distinct enrollment-match preflight before any protected read. Actual
+installed preview submitted explicit registration after the operator confirmed
+the fixed read-only scope. The GUI reported `RequiresApproval`, opened Login
+Items, and the OS requested Touch ID or an administrator password when enabling
+this helper's background item. Authentication is still pending; registration is
+not proof of an enabled service or successful exchange. Its existing sample
+fails the distinct enrollment-match preflight before any protected read. Actual
 approval, exchange, denial/cancellation/removal and real recovery/reuse remain
 unproven; notarization does not close them. Details are in
 [PORTING.md](PORTING.md#notarized-fairplay-preview-acceptance).

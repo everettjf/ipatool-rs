@@ -1257,15 +1257,22 @@ not the existing controlled account store.
 The installed preview opened natively and rechecked the existing sample. It now
 displays `App Store authorization does not match`, with the precise file/account
 guidance, instead of suggesting that matching identity/version fields differ.
-The failure occurs before requesting the protected snapshot. The app is left at
-First-time preparation with local access still unregistered. No system permission
+The failure occurred before requesting the protected snapshot. At that stage the
+app remained at First-time preparation with local access unregistered. No system permission
 was granted, no protected SIDB was read and no real model/plaintext was saved.
 
-Actual service registration, administrator approval, code-bound exchange and
-removal still require an explicit operator-confirmed access grant. A matching
-enrollment sample is also required: accepting a signature or granting access
-cannot repair the observed sample mismatch. Real model generation and independent
-decryption/reuse remain open. The exact `02cb19f` platform CI run is
+The operator subsequently confirmed the fixed read-only access scope. Clicking
+`Allow local access...` submitted registration and the GUI reported that macOS
+requires administrator approval. `Open System Settings` opened Login Items with
+the preview's own background entry disabled. Enabling that entry produced the
+native Touch ID/administrator authentication sheet, which is still pending.
+No administrator credential was entered by the agent. This establishes the
+registration/settings handoff, not an enabled service, protected snapshot or
+successful code-bound exchange. Actual authentication, exchange and removal
+remain open. A matching enrollment sample is also required: accepting a signature
+or granting access cannot repair the observed sample mismatch. Real model
+generation and independent decryption/reuse remain open. The exact `02cb19f`
+platform CI run
 [41424032318](https://github.com/everettjf/ipatool-rs/actions/runs/41424032318)
 passed all five native jobs: Linux and Windows CLI, Linux and Windows GPUI,
 and the macOS GPUI preview. This includes native Windows MSVC desktop fixtures,

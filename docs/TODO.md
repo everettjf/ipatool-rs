@@ -75,8 +75,10 @@ account or material request is needed. See [the boundary design](FAIRPLAY_AUTHOR
 The signed `02cb19f` preview has passed notarization (zero issues, GUI/helper
 tickets), stapling, Gatekeeper and verified installation in Applications. The
 installed GUI confirms an enrollment mismatch in the existing sample despite
-matching app/version fields, before any protected read. Local access remains
-unregistered pending the required operator-confirmed permission grant. Resolve
+matching app/version fields, before any protected read. The operator confirmed
+the read-only scope and explicit registration reached `RequiresApproval`;
+enabling its Login Items entry now awaits macOS administrator authentication.
+No protected snapshot or model has been collected. Resolve
 that specific sample mismatch before claiming model/reuse success; another
 unchanged retry is not acceptance evidence.
 
