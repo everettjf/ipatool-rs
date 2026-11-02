@@ -46,6 +46,184 @@ pub struct EnrollmentCollectOptions {
     pub build_version: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum SampleProblem {
+    InstalledApp,
+    MissingIpa,
+    Mismatch,
+    UnsupportedIpa,
+}
+impl std::fmt::Display for SampleProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InstalledApp=>"Choose an installed iPhone or iPad app that has been opened on this Mac.",
+            Self::MissingIpa=>"Choose the matching downloaded IPA before preparing authorization.",
+            Self::Mismatch=>"The installed app and sample IPA must have the same bundle identifier, executable and version.",
+            Self::UnsupportedIpa=>"The sample IPA does not have a supported, unambiguous encrypted image and license inventory.",
+        })
+    }
+}
+impl std::error::Error for SampleProblem {}
+
+/// Check public app/version metadata before requesting any system authorization.
+pub fn preflight_current_sample(app: &Path, ipa: &Path) -> Result<()> {
+    let app = installed_app(app).context(SampleProblem::InstalledApp)?;
+    let (bundle, executable, info) = app_info(&app).context(SampleProblem::InstalledApp)?;
+    let (installed_sinf, selector) = installed_sinf(&app).context(SampleProblem::InstalledApp)?;
+    let mut license = OpenOptions::new();
+    license.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        license.custom_flags(libc::O_NOFOLLOW);
+    }
+    let license = license
+        .open(&installed_sinf)
+        .context(SampleProblem::InstalledApp)?;
+    let metadata = license.metadata().context(SampleProblem::InstalledApp)?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err(SampleProblem::InstalledApp.into());
+    }
+    let mut installed_sinf = zeroize::Zeroizing::new(Vec::new());
+    crate::application::operation::copy(&mut license.take(1024 * 1024 + 1), &mut *installed_sinf)?;
+    if installed_sinf.len() > 1024 * 1024
+        || !crate::fairplay::inspect_sinf(&installed_sinf)?.current_layout
+    {
+        return Err(SampleProblem::InstalledApp.into());
+    }
+    let installed: Value = plist::from_bytes(&info).context(SampleProblem::InstalledApp)?;
+    let installed = installed
+        .as_dictionary()
+        .context(SampleProblem::InstalledApp)?;
+    let field = |fields: &plist::Dictionary, name: &str| {
+        fields
+            .get(name)
+            .and_then(Value::as_string)
+            .map(str::to_owned)
+    };
+    let short = field(installed, "CFBundleShortVersionString")
+        .filter(|v| !v.is_empty())
+        .context(SampleProblem::InstalledApp)?;
+    let build = field(installed, "CFBundleVersion")
+        .filter(|v| !v.is_empty())
+        .context(SampleProblem::InstalledApp)?;
+    let source = File::open(ipa).context(SampleProblem::MissingIpa)?;
+    let mut archive = ZipArchive::new(source).context(SampleProblem::UnsupportedIpa)?;
+    let mut raw = File::open(ipa).context(SampleProblem::MissingIpa)?;
+    let mut matches = 0;
+    for index in 0..archive.len() {
+        crate::application::operation::check()?;
+        let mut entry = archive
+            .by_index(index)
+            .context(SampleProblem::UnsupportedIpa)?;
+        let name = duplicate_zip::read_raw_central_name(&mut raw, entry.central_header_start())?;
+        let name = std::str::from_utf8(&name).context(SampleProblem::UnsupportedIpa)?;
+        let Some(root) = name
+            .strip_prefix("Payload/")
+            .and_then(|n| n.strip_suffix("/Info.plist"))
+        else {
+            continue;
+        };
+        if root.contains('/') || !root.ends_with(".app") {
+            continue;
+        }
+        if entry.size() > 4 * 1024 * 1024 {
+            return Err(SampleProblem::UnsupportedIpa.into());
+        }
+        let mut bytes = Vec::new();
+        crate::application::operation::copy(
+            &mut (&mut entry).take(4 * 1024 * 1024 + 1),
+            &mut bytes,
+        )?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(SampleProblem::UnsupportedIpa.into());
+        }
+        let info: Value = plist::from_bytes(&bytes).context(SampleProblem::UnsupportedIpa)?;
+        let fields = info
+            .as_dictionary()
+            .context(SampleProblem::UnsupportedIpa)?;
+        if field(fields, "CFBundleIdentifier").as_deref() == Some(&bundle)
+            && field(fields, "CFBundleExecutable").as_deref() == Some(&executable)
+            && field(fields, "CFBundleShortVersionString").as_deref() == Some(&short)
+            && field(fields, "CFBundleVersion").as_deref() == Some(&build)
+        {
+            matches += 1;
+        }
+    }
+    if matches != 1 {
+        return Err(SampleProblem::Mismatch.into());
+    }
+    let required =
+        crate::fairplay_ipa::required_ipa_sinfs(ipa).context(SampleProblem::UnsupportedIpa)?;
+    if !required
+        .iter()
+        .any(|sinf| sinf.selector == selector && sinf.current_layout)
+    {
+        return Err(SampleProblem::Mismatch.into());
+    }
+    Ok(())
+}
+
+/// Current recovery needs only SIDB snapshots. It never collects ADI or native
+/// recovery images, nor sends advanced source overrides to the privileged helper.
+pub fn collect_current_enrollment(
+    options: &EnrollmentCollectOptions,
+) -> Result<EnrollmentCaptureManifest> {
+    let ipa = options.ipa.as_deref().context(SampleProblem::MissingIpa)?;
+    preflight_current_sample(&options.app, ipa)?;
+    let snapshot = if options.system_state.is_some() || options.shared_state.is_some() {
+        let mut files = Vec::new();
+        for (source, role) in [
+            (
+                options.system_state.as_deref(),
+                ipatool_authorization::Source::System,
+            ),
+            (
+                options.shared_state.as_deref(),
+                ipatool_authorization::Source::Shared,
+            ),
+        ] {
+            let Some(source) = source else {
+                continue;
+            };
+            let source = source.join("SC Info.sidb");
+            if !source.try_exists()? {
+                continue;
+            }
+            let bytes = crate::fairplay_recovery_output::read_private_bytes(
+                &source,
+                ipatool_authorization::MAX_STATE_BYTES,
+            )?;
+            files.push(ipatool_authorization::StateFile {
+                source: role,
+                bytes,
+            });
+        }
+        ipatool_authorization::Snapshot::checked(files)?
+    } else {
+        match ipatool_authorization::read_local_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(ipatool_authorization::Problem::PermissionDenied) => {
+                let operation = crate::application::operation::current();
+                ipatool_authorization::request_snapshot(move || {
+                    operation
+                        .as_ref()
+                        .is_some_and(|operation| operation.is_cancelled())
+                })
+                .map_err(|error| {
+                    if error == ipatool_authorization::Problem::Cancelled {
+                        anyhow::Error::from(crate::application::operation::Cancelled)
+                    } else {
+                        anyhow::Error::from(error)
+                    }
+                })?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    collect_impl(options, Some(&snapshot))
+}
+
 fn private_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
@@ -323,6 +501,13 @@ fn capture_ipa(
 }
 
 pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<EnrollmentCaptureManifest> {
+    collect_impl(options, None)
+}
+
+fn collect_impl(
+    options: &EnrollmentCollectOptions,
+    current: Option<&ipatool_authorization::Snapshot>,
+) -> Result<EnrollmentCaptureManifest> {
     if options.app.as_os_str().is_empty() || options.output.as_os_str().is_empty() {
         bail!("capture requires app and output paths");
     }
@@ -354,8 +539,12 @@ pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<Enrollme
         .fairplayd
         .as_deref()
         .unwrap_or_else(|| Path::new(FAIRPLAYD_PATH));
-    let fairplayd_bytes = fs::read(fairplayd_path).context("read fairplayd Mach-O")?;
-    let fairplayd_slice = arm64e_slice(&fairplayd_bytes)?;
+    let fairplayd_bytes = if current.is_none() {
+        Some(fs::read(fairplayd_path).context("read fairplayd Mach-O")?)
+    } else {
+        None
+    };
+    let fairplayd_slice = fairplayd_bytes.as_deref().map(arm64e_slice).transpose()?;
     let mac = hardware_mac(
         options.iomac_file.as_deref(),
         if options.interface.is_empty() {
@@ -371,12 +560,17 @@ pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<Enrollme
         .tempdir_in(parent)?;
     let root = staging.path();
     let mut files = Vec::new();
-    let fairplayd = write_private(
-        root,
-        Path::new("fairplayd/fairplayd.arm64e"),
-        fairplayd_slice,
-    )?;
-    files.push(fairplayd.clone());
+    let fairplayd = if let Some(fairplayd_slice) = fairplayd_slice {
+        let value = write_private(
+            root,
+            Path::new("fairplayd/fairplayd.arm64e"),
+            fairplayd_slice,
+        )?;
+        files.push(value.clone());
+        value
+    } else {
+        CaptureFile::default()
+    };
     let support =
         lookup_fairplay_build(&fairplayd.sha256).unwrap_or_else(|| FairPlayBuildSupport {
             build: build_version.clone(),
@@ -403,32 +597,43 @@ pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<Enrollme
     let licenses = copy_tree(root, &app.join("SC_Info"), Path::new("app/SC_Info"))?;
     files.extend(licenses);
     let mut state_count = 0;
-    for (source, relative) in [
-        (
-            options
-                .system_state
-                .as_deref()
-                .unwrap_or_else(|| Path::new(SYSTEM_STATE_PATH)),
-            "state/fpsd-sc-info",
-        ),
-        (
-            options
-                .shared_state
-                .as_deref()
-                .unwrap_or_else(|| Path::new(SHARED_STATE_PATH)),
-            "state/shared-sc-info",
-        ),
-        (
-            options
-                .adi_state
-                .as_deref()
-                .unwrap_or_else(|| Path::new(ADI_STATE_PATH)),
-            "state/adi",
-        ),
-    ] {
-        let captured = copy_tree(root, source, Path::new(relative))?;
-        state_count += captured.len();
-        files.extend(captured);
+    if let Some(snapshot) = current {
+        for file in &snapshot.files {
+            files.push(write_private(
+                root,
+                Path::new(file.source.capture_path()),
+                &file.bytes,
+            )?);
+            state_count += 1;
+        }
+    } else {
+        for (source, relative) in [
+            (
+                options
+                    .system_state
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(SYSTEM_STATE_PATH)),
+                "state/fpsd-sc-info",
+            ),
+            (
+                options
+                    .shared_state
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(SHARED_STATE_PATH)),
+                "state/shared-sc-info",
+            ),
+            (
+                options
+                    .adi_state
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(ADI_STATE_PATH)),
+                "state/adi",
+            ),
+        ] {
+            let captured = copy_tree(root, source, Path::new(relative))?;
+            state_count += captured.len();
+            files.extend(captured);
+        }
     }
     if state_count == 0 {
         bail!("capture found no native FairPlay state files");
@@ -445,7 +650,7 @@ pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<Enrollme
     if ipa.is_none() {
         warnings.push("capture has no IPA; recovery requires a matching personalized IPA".into());
     }
-    if support.status == "unsupported" {
+    if current.is_none() && support.status == "unsupported" {
         warnings.push("fairplayd hash is not supported".into());
     }
     let manifest = EnrollmentCaptureManifest {
@@ -506,6 +711,97 @@ mod tests {
 
     fn sinf() -> Vec<u8> {
         sinf_with_selector(SinfSelector { user: 7, key: 9 })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_collection_preflights_identity_and_reads_only_the_explicit_sidb_snapshot() {
+        use crate::fairplay_ipa::tests::{model_and_sinf, supf};
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("A.app");
+        fs::create_dir_all(app.join("SC_Info")).unwrap();
+        let (_, sinf) = model_and_sinf([0x31; 16]);
+        let (image, record, _) = crate::fairplay_decrypt::tests::encrypted_fixture([0x31; 16]);
+        let info = |version: &str| {
+            let mut fields = plist::Dictionary::new();
+            for (key, value) in [
+                ("CFBundleIdentifier", "invalid.example.sample"),
+                ("CFBundleExecutable", "A"),
+                ("CFBundleShortVersionString", version),
+                ("CFBundleVersion", "1"),
+            ] {
+                fields.insert(key.into(), Value::String(value.into()));
+            }
+            let mut data = Vec::new();
+            plist::to_writer_xml(&mut data, &fields).unwrap();
+            data
+        };
+        fs::write(app.join("Info.plist"), info("1.0")).unwrap();
+        fs::write(app.join("A"), &image).unwrap();
+        fs::write(app.join("SC_Info/A.sinf"), &sinf).unwrap();
+        fs::write(app.join("SC_Info/A.supf"), supf(record)).unwrap();
+        let ipa = root.path().join("sample.ipa");
+        let make = |version: &str| {
+            let mut zip = ZipWriter::new(File::create(&ipa).unwrap());
+            for (name, data) in [
+                ("Payload/A.app/Info.plist", info(version)),
+                ("Payload/A.app/A", image.clone()),
+                ("Payload/A.app/SC_Info/A.sinf", sinf.clone()),
+                ("Payload/A.app/SC_Info/A.supf", supf(record)),
+            ] {
+                zip.start_file(name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(&data).unwrap();
+            }
+            zip.finish().unwrap();
+        };
+        make("1.0");
+        let state = root.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let state_file = state.join("SC Info.sidb");
+        fs::write(&state_file, [0u8, 7, 0, 11]).unwrap();
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(state.join("must-not-copy"), b"unrelated state").unwrap();
+        let mac = root.path().join("iomac");
+        fs::write(&mac, [1u8, 2, 3, 4, 5, 6]).unwrap();
+        let options = EnrollmentCollectOptions {
+            app,
+            ipa: Some(ipa.clone()),
+            output: root.path().join("capture"),
+            fairplayd: Some(root.path().join("must-not-read-image")),
+            adi_state: Some(root.path().join("must-not-read-adi")),
+            system_state: Some(state),
+            iomac_file: Some(mac),
+            product_version: Some("fixture".into()),
+            build_version: Some("fixture".into()),
+            ..Default::default()
+        };
+        let captured = collect_current_enrollment(&options).unwrap();
+        assert!(captured.fairplayd.path.is_empty());
+        assert!(
+            captured
+                .files
+                .iter()
+                .any(|file| file.path == "state/fpsd-sc-info/SC Info.sidb")
+        );
+        assert!(
+            !captured
+                .files
+                .iter()
+                .any(|file| file.path.contains("must-not")
+                    || file.path.starts_with("fairplayd/")
+                    || file.path.starts_with("state/adi/"))
+        );
+        load_enrollment_capture(&options.output, true).unwrap();
+        let before = fs::read(&ipa).unwrap();
+        preflight_current_sample(&options.app, &ipa).unwrap();
+        assert_eq!(fs::read(&ipa).unwrap(), before);
+        make("1.1");
+        let error = preflight_current_sample(&options.app, &ipa).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SampleProblem>(),
+            Some(SampleProblem::Mismatch)
+        ));
     }
 
     #[test]

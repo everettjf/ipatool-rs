@@ -90,6 +90,16 @@ legacy signature binding, upstream-compatible repeated empty directory markers,
 and the real multi-image/plaintext gates. F1/F4/F5
 still require the scoped macOS authorization path and real setup/reuse evidence.
 
+The scoped authorization boundary is now implemented as a separate native Rust
+helper with fixed SIDB inputs, code-bound XPC, console-user checks and bounded
+private snapshots. Current setup preflights the installed app/IPA before any
+snapshot and omits native recovery images, ADI and unrelated state. The GUI has
+explicit register/status/settings/removal actions; opening or restoring it does
+not register access. Ad hoc builds disable the protected path. Synthetic tests
+pass, but Developer ID signing/notarization, actual approval/denial/removal and
+real recovery are still acceptance gates. See
+[the boundary design](FAIRPLAY_AUTHORIZATION.md); F1 remains unchecked.
+
 ## Current macOS Apple Silicon gates
 
 - [ ] Complete an interactive default macOS Keychain approval flow for `auth login` and `auth revoke` in a local user session. `auth info` succeeded after the user approved its Keychain dialog on October 27; the encrypted `--file-keychain` path also worked.

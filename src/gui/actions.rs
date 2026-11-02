@@ -98,6 +98,9 @@ impl DesktopWindow {
             self.fair.advanced = false;
         }
         self.fair.mode = mode;
+        if mode == FairMode::Setup {
+            self.refresh_authorization(cx);
+        }
         self.fair_scroll.set_offset(Default::default());
         cx.notify();
     }
@@ -1099,6 +1102,10 @@ impl DesktopWindow {
         {
             let mut request = task.request.clone();
             let title = task.title.clone();
+            let local_access = task
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.kind == FailureKind::LocalAuthorizationRequired);
             if let JobRequest::Download(download) = &mut request
                 && acquire
             {
@@ -1110,6 +1117,10 @@ impl DesktopWindow {
             }
             if let JobRequest::FairPlay(request) = request {
                 self.review_fairplay(request, window, cx);
+                if local_access {
+                    self.fair.setup_step = 0;
+                    self.refresh_authorization(cx);
+                }
             }
         }
     }

@@ -1118,3 +1118,51 @@ while reducing the outer enum. Windows GNU all-targets cross-Clippy passes;
 native Windows MSVC confirmation belongs to the next CI run. A regression reads
 the prior saved setup shape and verifies restart interrupts it without replaying
 private work. No lint suppression or journal schema change was used.
+
+The exact `6ab5b11` revision subsequently passed all five platform jobs in
+[CI run 41409487116](https://github.com/everettjf/ipatool-rs/actions/runs/41409487116),
+including native Windows MSVC GUI build/fixtures. This confirms the boxing fix;
+it predates the scoped authorization implementation below.
+
+## Scoped macOS authorization implementation
+
+The separate `ipatool-authorization` Rust workspace package adds supported
+SMAppService registration/status/removal and code-bound XPC without adding Store,
+network, guest, model or IPA code to the privileged helper. Its only operation
+returns bounded snapshots of two fixed SIDB files to the current console user.
+It accepts no paths or output locations. Root collection rejects symlinked path
+components, hard-linked/non-regular/world-writable final files, untrusted owners,
+changed metadata and unsupported headers. Both peers require the fixed opposing
+identifier, Developer ID chain and compiled signing team; accepted peers receive
+the same per-message requirement. Buffers are zeroizing and client requests have
+cooperative cancellation and a timeout. Recovery and private model publication
+remain in the ordinary user process.
+
+Current first-time preparation preflights the matching installed app and IPA
+before requesting a snapshot. It collects only required SIDB state and ordinary
+sample files, omitting ADI, unrelated private state and native recovery images.
+Explicit advanced overrides remain unprivileged. Manual advanced/CLI collection
+retains its existing legacy behavior. The GUI checks status on opening without
+registration, offers explicit approval/settings/removal actions and does not
+start preparation after approval. Ad hoc bundles disable protected access. A
+native signed-window check exposed an initial NotFound state with no registration
+entry; that state now also offers the explicit registration action.
+
+Local controls pass 490 library, 45 CLI, 46 desktop and seven helper tests (588
+active; 70 opt-in library tests ignored). The new controls include installed-app
+version mismatch, omission of ADI/images/unrelated files, protocol bounds and
+nonce matching, fixed-file metadata checks, OS parsing of both signing policies,
+rejection of the test process by those policies, and GUI approval/removal/denial
+without implicit collection. Formatting, strict default/GUI/GUI-test Clippy and
+Windows GNU all-targets workspace cross-Clippy pass. The rebuilt ARM64 CLI and
+Developer ID signed GUI/helper verify; the helper links system frameworks only.
+Both debug and release artifacts satisfy the exact production peer requirements;
+each rejects the opposing peer's identifier in native code-signature checks.
+
+The signed isolated GUI opened natively and displayed local-access status.
+Unprivileged local checks confirm the system SIDB requires permission and the
+shared SIDB is absent. No helper was registered and no new access was granted.
+No real SIDB, model or plaintext was collected. Signature/Gatekeeper checks are
+not notarization, administrator approval or recovery evidence. Final signed live
+registration, code-bound exchange, denial/cancellation/removal and real model/
+independent reuse remain open. See [the boundary design](FAIRPLAY_AUTHORIZATION.md).

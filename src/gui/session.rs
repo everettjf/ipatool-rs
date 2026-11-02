@@ -34,6 +34,18 @@ pub struct AccountView {
 /// Front-end services are replaceable in controller tests. The native
 /// implementation remains the same shared application layer used by the CLI.
 pub trait DesktopSession: Send + Sync {
+    fn authorization_status(&self) -> ipatool_authorization::Status {
+        ipatool_authorization::Status::Unsupported
+    }
+    fn register_authorization(&self) -> Result<ipatool_authorization::Status> {
+        anyhow::bail!(ipatool_authorization::Problem::Unsupported)
+    }
+    fn remove_authorization(&self) -> Result<ipatool_authorization::Status> {
+        anyhow::bail!(ipatool_authorization::Problem::Unsupported)
+    }
+    fn open_authorization_settings(&self) -> Result<()> {
+        anyhow::bail!(ipatool_authorization::Problem::Unsupported)
+    }
     fn saved_model_count(&self) -> Result<usize> {
         Ok(0)
     }
@@ -262,6 +274,18 @@ impl Session {
 }
 
 impl DesktopSession for Session {
+    fn authorization_status(&self) -> ipatool_authorization::Status {
+        ipatool_authorization::status()
+    }
+    fn register_authorization(&self) -> Result<ipatool_authorization::Status> {
+        Ok(ipatool_authorization::register()?)
+    }
+    fn remove_authorization(&self) -> Result<ipatool_authorization::Status> {
+        Ok(ipatool_authorization::unregister()?)
+    }
+    fn open_authorization_settings(&self) -> Result<()> {
+        Ok(ipatool_authorization::open_settings()?)
+    }
     fn saved_model_count(&self) -> Result<usize> {
         ipatool_rs::application::fairplay_setup::SavedModels::new(&self.directory).count()
     }

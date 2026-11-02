@@ -2,7 +2,60 @@ use super::*;
 use ipatool_rs::application::fairplay_setup::{SetupOptions, SetupRequest};
 
 impl DesktopWindow {
+    pub(super) fn refresh_authorization(&mut self, cx: &mut Context<Self>) {
+        if self.fair.authorization_busy {
+            return;
+        }
+        self.fair.authorization_busy = true;
+        let session = self.session.clone();
+        let work = cx.background_spawn(async move { session.authorization_status() });
+        cx.spawn(async move |view, cx| {
+            let status = work.await;
+            let _ = view.update(cx, |this, cx| {
+                this.fair.authorization = Some(status);
+                this.fair.authorization_busy = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Registration/removal are explicit user actions. Merely opening a page,
+    /// restoring a task or checking status never requests new system access.
+    pub(super) fn change_authorization(&mut self, remove: bool, cx: &mut Context<Self>) {
+        if self.fair.authorization_busy || self.account_busy() {
+            return;
+        }
+        self.fair.authorization_busy = true;
+        let session = self.session.clone();
+        let work = cx.background_spawn(async move {
+            if remove {
+                session.remove_authorization()
+            } else {
+                session.register_authorization()
+            }
+        });
+        cx.spawn(async move|view,cx|{
+            let result=work.await;
+            let _=view.update(cx,|this,cx|{
+                this.fair.authorization_busy=false;
+                match result {
+                    Ok(status)=>{this.fair.authorization=Some(status);this.show_notice(if status==ipatool_authorization::Status::RequiresApproval {"macOS needs administrator approval. Open System Settings, allow IPATOOL-RS, then refresh access status."}else if remove {"Local authorization access was removed. Saved models remain private and can still be used."}else{"Local access status updated. Nothing was collected or started automatically."},cx);},
+                    Err(error)=>this.show_notice(Failure::from_error(&error).message,cx),
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    pub(super) fn open_authorization_settings(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = self.session.open_authorization_settings() {
+            self.show_notice(Failure::from_error(&error).message, cx);
+        }
+    }
+
     pub(super) fn refresh_saved_models(&mut self, cx: &mut Context<Self>) {
+        self.refresh_authorization(cx);
         self.fair.model_status_generation = self.fair.model_status_generation.wrapping_add(1);
         let generation = self.fair.model_status_generation;
         self.fair.checking_models = true;

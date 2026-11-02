@@ -31,6 +31,9 @@ struct FixtureSession {
     jobs: Mutex<Vec<JobRequest>>,
     expire_next_job: AtomicBool,
     managed_models_ready: AtomicBool,
+    authorization: Mutex<ipatool_authorization::Status>,
+    authorization_calls: Mutex<Vec<&'static str>>,
+    authorization_denied: AtomicBool,
 }
 
 impl FixtureSession {
@@ -45,6 +48,9 @@ impl FixtureSession {
             jobs: Mutex::new(Vec::new()),
             expire_next_job: AtomicBool::new(false),
             managed_models_ready: AtomicBool::new(false),
+            authorization: Mutex::new(ipatool_authorization::Status::Unsupported),
+            authorization_calls: Mutex::new(Vec::new()),
+            authorization_denied: AtomicBool::new(false),
         }
     }
     fn account() -> AccountView {
@@ -72,6 +78,26 @@ impl FixtureSession {
 }
 
 impl DesktopSession for FixtureSession {
+    fn authorization_status(&self) -> ipatool_authorization::Status {
+        *self.authorization.lock().unwrap()
+    }
+    fn register_authorization(&self) -> Result<ipatool_authorization::Status> {
+        self.authorization_calls.lock().unwrap().push("register");
+        if self.authorization_denied.load(Ordering::SeqCst) {
+            anyhow::bail!(ipatool_authorization::Problem::PermissionDenied);
+        }
+        *self.authorization.lock().unwrap() = ipatool_authorization::Status::RequiresApproval;
+        Ok(ipatool_authorization::Status::RequiresApproval)
+    }
+    fn remove_authorization(&self) -> Result<ipatool_authorization::Status> {
+        self.authorization_calls.lock().unwrap().push("remove");
+        *self.authorization.lock().unwrap() = ipatool_authorization::Status::NotRegistered;
+        Ok(ipatool_authorization::Status::NotRegistered)
+    }
+    fn open_authorization_settings(&self) -> Result<()> {
+        self.authorization_calls.lock().unwrap().push("settings");
+        Ok(())
+    }
     fn saved_model_count(&self) -> Result<usize> {
         Ok(usize::from(
             self.managed_models_ready.load(Ordering::SeqCst),
@@ -552,6 +578,76 @@ fn first_time_model_wizard_reviews_before_starting_and_keeps_narrow_actions_visi
     assert!(
         matches!(&jobs[..], [JobRequest::FairPlay(super::FairPlayRequest::Setup(request))] if request.app == app && request.ipa == ipa && request.options.existing_model.is_none() && request.options.timeout_seconds == 600)
     );
+}
+
+#[gpui::test]
+fn local_authorization_needs_an_explicit_action_and_never_starts_private_preparation(
+    cx: &mut TestAppContext,
+) {
+    use ipatool_authorization::Status;
+    let (_directory, view, session, mut visual) = setup(cx);
+    // A complete signed bundle can initially report NotFound. It must still
+    // allow explicit registration without registering on status checks.
+    *session.authorization.lock().unwrap() = Status::NotFound;
+    visual.update(|window, cx| {
+        view.update(cx, |this, cx| this.open_setup(None, window, cx));
+    });
+    visual.run_until_parked();
+    assert!(session.authorization_calls.lock().unwrap().is_empty());
+    assert!(session.jobs.lock().unwrap().is_empty());
+    visual.update(|_, cx| {
+        view.update(cx, |this, cx| {
+            assert_eq!(this.fair.authorization, Some(Status::NotFound));
+            this.change_authorization(false, cx);
+            this.change_authorization(false, cx); // In-flight clicks do not duplicate registration.
+        });
+    });
+    visual.run_until_parked();
+    assert_eq!(*session.authorization_calls.lock().unwrap(), ["register"]);
+    visual.update(|_, cx| {
+        view.update(cx, |this, cx| {
+            assert_eq!(this.fair.authorization, Some(Status::RequiresApproval));
+            assert_eq!(this.fair.setup_step, 0);
+            this.open_authorization_settings(cx);
+        });
+    });
+    *session.authorization.lock().unwrap() = Status::Enabled;
+    visual.update(|_, cx| {
+        view.update(cx, |this, cx| this.refresh_authorization(cx));
+    });
+    visual.run_until_parked();
+    assert!(session.jobs.lock().unwrap().is_empty());
+    session.managed_models_ready.store(true, Ordering::SeqCst);
+    visual.update(|_, cx| {
+        view.update(cx, |this, cx| {
+            assert_eq!(this.fair.authorization, Some(Status::Enabled));
+            this.change_authorization(true, cx);
+        });
+    });
+    visual.run_until_parked();
+    assert!(session.managed_models_ready.load(Ordering::SeqCst));
+    session.authorization_denied.store(true, Ordering::SeqCst);
+    visual.update(|_, cx| {
+        view.update(cx, |this, cx| this.change_authorization(false, cx));
+    });
+    visual.run_until_parked();
+    visual.update(|_, cx| {
+        view.update(cx, |this, _| {
+            assert_eq!(this.fair.authorization, Some(Status::NotRegistered));
+            assert!(!this.fair.authorization_busy);
+            assert!(
+                this.notice
+                    .as_ref()
+                    .unwrap()
+                    .contains("macOS did not allow")
+            );
+        });
+    });
+    assert_eq!(
+        *session.authorization_calls.lock().unwrap(),
+        ["register", "settings", "remove", "register"]
+    );
+    assert!(session.jobs.lock().unwrap().is_empty());
 }
 
 #[gpui::test]

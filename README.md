@@ -118,6 +118,15 @@ sample, and saves the model privately only after processing and applicable page
 hash checks pass. Advanced options also allow importing an existing model with
 a matching sample.
 
+On macOS 13 or later, first-time preparation can use a separate, narrowly scoped
+authorization helper. The GUI stays unprivileged. Protected access requires a
+Developer ID signed, notarized bundle and explicit administrator approval in
+System Settings; opening the page never registers the helper. Local ad hoc builds
+disable this access. The helper reads only two fixed App Store authorization
+databases, not arbitrary paths, passwords or IPA files. Signed live registration
+and recovery acceptance are still pending; see the
+[authorization design](docs/FAIRPLAY_AUTHORIZATION.md).
+
 After preparation, new IPA downloads automatically queue a separate decryption
 task and match saved models using the IPA's authorization. You can turn this off
 or use **Decrypt IPA...** for an existing download. No model selection is needed

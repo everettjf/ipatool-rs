@@ -6,6 +6,11 @@ license = "MIT"
 description = "Rust port of ipatool-fairplay"
 default-run = "ipatool"
 
+[workspace]
+members = ["crates/authorization-helper"]
+default-members = [".", "crates/authorization-helper"]
+resolver = "3"
+
 [features]
 default = []
 gui = ["dep:gpui", "dep:gpui-component"]
@@ -21,6 +26,7 @@ path = "src/gui/main.rs"
 required-features = ["gui"]
 
 [dependencies]
+ipatool-authorization = { path = "crates/authorization-helper" }
 gpui = { version = "=0.2.2", optional = true }
 gpui-component = { version = "=0.5.1", optional = true }
 getrandom = "0.4"

@@ -3755,6 +3755,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipatool-authorization"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "libc",
+ "objc2",
+ "objc2-foundation",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "ipatool-rs"
 version = "0.2.1"
 dependencies = [
@@ -3779,6 +3791,7 @@ dependencies = [
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "hpke",
+ "ipatool-authorization",
  "libc",
  "libloading",
  "lzfse_rust",

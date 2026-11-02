@@ -27,7 +27,12 @@ that an IPA and model belong together.
    the deterministic selected route and the matching sample; account age is not
    a blanket prerequisite or a guarantee of success. Unsupported or ambiguous
    state fails without trying another record. Readable private authorization data
-   is required. The GUI does not currently grant permissions or elevate itself.
+   is required. The local-access card checks the helper status without requesting
+   access. A Developer ID signed, notarized bundle on macOS 13 or later offers
+   **Allow local access**; approve IPATOOL-RS in System Settings and refresh the
+   status. This is a separate read-only helper; the GUI stays unprivileged. Ad hoc
+   builds explain that a signed bundle is required. Registration, denied approval
+   and real recovery still require signed live acceptance.
 2. **Choose sample files:** select the installed `.app` and matching IPA. The app
    creates a private disposable working directory automatically. Under Advanced
    options, an existing selector-bound model can instead be imported with a
@@ -36,6 +41,12 @@ that an IPA and model belong together.
    Current** is the default. Select **Legacy system profile** explicitly to expose
    source/compatibility images, startup profiles, IOKit data and native tracing
    timeout options. A Current failure never triggers Legacy recovery.
+   Fresh Current setup checks installed-app bundle identity, executable and both
+   version fields against the IPA before requesting a private snapshot. It copies
+   only the required fixed SIDB inputs, with existing permissions when possible
+   and an already approved helper after a permission failure. It does not copy
+   ADI data or require a native recovery image. Manual advanced collection retains
+   the legacy collector; it does not automatically register a helper.
 3. **Review and prepare:** review the selected filenames and explicitly start.
    Fresh setup collects, recovers with the selected engine, validates the
    sample's processing report, and saves the model. Import runs the same sample
@@ -55,6 +66,8 @@ and publishes the model last. This closes a synthetic implementation gate, not
 the real desktop authorization/recovery gate. Per-image license association is
 connected and passes synthetic controls; complete IPA keyfile-variant/signature-
 binding handling and real multi-image processing remain under validation.
+The [authorization design](FAIRPLAY_AUTHORIZATION.md) describes the privileged
+boundary, packaging requirements, removal and remaining acceptance checks.
 
 The sample gate requires processed encrypted images/pages, zero final cryptids,
 exact mutation scope, matching encrypted-source CodeDirectory audits, and all

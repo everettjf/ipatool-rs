@@ -68,7 +68,97 @@ impl DesktopWindow {
                         .child(muted("3. Download the same app/version's encrypted IPA with the same account. An IPA by itself is not enough for initial setup.", cx))
                         .child(muted("Preparation checks this Mac's authorization format and validates the model with your sample IPA. Unsupported or ambiguous authorization data stops preparation; creating a new account does not guarantee success.", cx))
                         .child(muted("Already have a model? Continue and import it under Advanced options with a sample IPA. No local collection is needed for an import.", cx))
-                        .child(muted("This Mac's authorization format must be supported. Reading local FairPlay data requires existing permission; this app cannot elevate itself.", cx)));
+                        .child(muted("This Mac's authorization format must be supported. Local access uses a separate signed helper; this interface stays unprivileged. No Apple password is sent to the helper.", cx)));
+                    use ipatool_authorization::Status;
+                    let access = match self.fair.authorization {
+                        None => "Checking local access status...",
+                        Some(Status::Enabled) => {
+                            "Local access is approved. Preparation reads only the fixed App Store authorization databases when needed."
+                        }
+                        Some(Status::NotRegistered) => {
+                            "Local access is not enabled. If macOS protects these files, allow access here, then approve IPATOOL-RS in System Settings."
+                        }
+                        Some(Status::RequiresApproval) => {
+                            "macOS is waiting for administrator approval. Allow IPATOOL-RS in Login Items & Extensions, then refresh this status."
+                        }
+                        Some(Status::SigningRequired) => {
+                            "This build cannot request protected access. Use the Developer ID signed build, use already-readable files, or import an existing model."
+                        }
+                        Some(Status::Unsupported) => {
+                            "Automatic protected access requires macOS 13 or later. You can import an existing matching model instead."
+                        }
+                        Some(Status::NotFound) => {
+                            "macOS could not locate an active helper for this app. Keep the complete signed app in Applications, then register local access or refresh its status."
+                        }
+                    };
+                    let enabled = !self.fair.authorization_busy && !self.account_busy();
+                    form = form.child(
+                        v_flex()
+                            .gap_2()
+                            .child(div().child("Local authorization access"))
+                            .child(muted(access, cx))
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .when(
+                                        matches!(
+                                            self.fair.authorization,
+                                            Some(Status::NotRegistered | Status::NotFound)
+                                        ),
+                                        |row| {
+                                            row.child(
+                                                Button::new("allow-local-access")
+                                                    .small()
+                                                    .label("Allow local access...")
+                                                    .disabled(!enabled)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.change_authorization(false, cx)
+                                                    })),
+                                            )
+                                        },
+                                    )
+                                    .when(
+                                        self.fair.authorization == Some(Status::RequiresApproval),
+                                        |row| {
+                                            row.child(
+                                                Button::new("authorization-settings")
+                                                    .small()
+                                                    .label("Open System Settings")
+                                                    .disabled(!enabled)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.open_authorization_settings(cx)
+                                                    })),
+                                            )
+                                        },
+                                    )
+                                    .child(
+                                        Button::new("refresh-local-access")
+                                            .small()
+                                            .label("Refresh access status")
+                                            .disabled(!enabled)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.refresh_authorization(cx)
+                                            })),
+                                    )
+                                    .when(
+                                        matches!(
+                                            self.fair.authorization,
+                                            Some(Status::Enabled | Status::RequiresApproval)
+                                        ),
+                                        |row| {
+                                            row.child(
+                                                Button::new("remove-local-access")
+                                                    .small()
+                                                    .label("Remove access")
+                                                    .disabled(!enabled)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.change_authorization(true, cx)
+                                                    })),
+                                            )
+                                        },
+                                    ),
+                            ),
+                    );
                 }
                 1 => {
                     form = form
@@ -167,6 +257,7 @@ impl DesktopWindow {
                                     | "Compatibility fairplayd image (if requested)"
                                     | "Startup profile (optional)"
                                     | "IOKit selector data (optional)"
+                                    | "ADI directory (optional)"
                             )
                         {
                             continue;

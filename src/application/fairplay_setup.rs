@@ -510,7 +510,13 @@ impl SavedModels {
             let verified = check_report(&report).context(ModelProblem::Validation)?;
             (copied, verified)
         } else {
-            fairplay::collect(&EnrollmentCollectOptions {
+            let collect = if o.engine == RecoveryEngine::Current {
+                crate::fairplay_collect::collect_current_enrollment
+            } else {
+                fairplay::collect
+            };
+            operation::stage(Stage::Collecting)?;
+            collect(&EnrollmentCollectOptions {
                 app: request.app,
                 ipa: Some(request.ipa.clone()),
                 output: work.path().join("capture"),

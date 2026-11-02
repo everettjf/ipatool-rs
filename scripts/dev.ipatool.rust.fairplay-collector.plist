@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>dev.ipatool.rust.fairplay-collector</string>
+    <key>BundleProgram</key><string>Contents/Library/LaunchServices/ipatool-fairplay-helper</string>
+    <key>UserName</key><string>root</string>
+    <key>MachServices</key><dict><key>dev.ipatool.rust.fairplay-collector</key><true/></dict>
+    <key>AssociatedBundleIdentifiers</key><array><string>dev.ipatool.rust</string></array>
+    <key>ProcessType</key><string>Background</string>
+    <key>EnableTransactions</key><true/>
+    <key>EnablePressuredExit</key><true/>
+</dict></plist>

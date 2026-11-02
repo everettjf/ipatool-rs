@@ -16,6 +16,7 @@ pub enum FailureKind {
     OutputExists,
     Unavailable,
     ModelRequired,
+    LocalAuthorizationRequired,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,6 +38,56 @@ impl Failure {
                 title: "Cancelled".into(),
                 message: "The operation stopped at a safe boundary.".into(),
                 action: "Retry".into(),
+            };
+        }
+        if let Some(problem) = error.downcast_ref::<ipatool_authorization::Problem>() {
+            use ipatool_authorization::Problem;
+            let (kind, title, action) = match problem {
+                Problem::ApprovalRequired | Problem::PermissionDenied => (
+                    LocalAuthorizationRequired,
+                    "Allow local authorization access",
+                    "Review local access",
+                ),
+                Problem::SigningRequired => (
+                    Unavailable,
+                    "A signed application is required",
+                    "Use signed build or import a model",
+                ),
+                Problem::MissingState => (
+                    Unavailable,
+                    "App Store authorization is missing",
+                    "Review preparation",
+                ),
+                Problem::NotConsoleUser => (
+                    PermissionDenied,
+                    "Use the current Mac login session",
+                    "Review preparation",
+                ),
+                Problem::InvalidState | Problem::StateChanged => (
+                    Unavailable,
+                    "App Store authorization needs attention",
+                    "Review preparation",
+                ),
+                Problem::Cancelled => (Cancelled, "Cancelled", "Retry"),
+                _ => (
+                    Unavailable,
+                    "Local authorization access is unavailable",
+                    "Review local access",
+                ),
+            };
+            return Self {
+                kind,
+                title: title.into(),
+                message: problem.to_string(),
+                action: action.into(),
+            };
+        }
+        if let Some(problem) = error.downcast_ref::<crate::fairplay_collect::SampleProblem>() {
+            return Self {
+                kind: Unavailable,
+                title: "Review the installed app and sample IPA".into(),
+                message: problem.to_string(),
+                action: "Review sample files".into(),
             };
         }
         if let Some(problem) = error.downcast_ref::<super::fairplay_setup::ModelProblem>() {
@@ -212,6 +263,20 @@ impl Failure {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn authorization_and_sample_failures_survive_collection_context_without_private_details() {
+        let error = anyhow::Error::new(ipatool_authorization::Problem::ApprovalRequired)
+            .context("private fake token and capture path")
+            .context(crate::application::fairplay_setup::ModelProblem::Collection);
+        let failure = super::Failure::from_error(&error);
+        assert_eq!(failure.kind, super::FailureKind::LocalAuthorizationRequired);
+        assert!(!failure.message.contains("fake token"));
+        let error = anyhow::Error::new(crate::fairplay_collect::SampleProblem::Mismatch)
+            .context(crate::application::fairplay_setup::ModelProblem::Collection);
+        let failure = super::Failure::from_error(&error);
+        assert!(failure.message.contains("same bundle identifier"));
+        assert_eq!(failure.action, "Review sample files");
+    }
     use super::*;
     #[test]
     fn managed_model_failures_keep_private_context_out_of_history() {

@@ -133,6 +133,8 @@ struct DownloadForm {
 struct FairForm {
     mode: FairMode,
     engine: ipatool_rs::fairplay_recover_capture::RecoveryEngine,
+    authorization: Option<ipatool_authorization::Status>,
+    authorization_busy: bool,
     app: Entity<InputState>,
     input: Entity<InputState>,
     model: Entity<InputState>,
@@ -444,6 +446,8 @@ impl DesktopWindow {
             build_version: field(window, cx, "Build version", "", false),
             advanced: false,
             engine: Default::default(),
+            authorization: None,
+            authorization_busy: false,
             tools: false,
             setup_step: 0,
             saved_models: None,
