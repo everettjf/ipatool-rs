@@ -1166,3 +1166,11 @@ No real SIDB, model or plaintext was collected. Signature/Gatekeeper checks are
 not notarization, administrator approval or recovery evidence. Final signed live
 registration, code-bound exchange, denial/cancellation/removal and real model/
 independent reuse remain open. See [the boundary design](FAIRPLAY_AUTHORIZATION.md).
+
+The first authorization CI run exposed a workspace integration error in the
+separate Linux xattr compatibility step: Cargo treated the vendored package as
+an undeclared workspace member. All three vendored packages are now explicitly
+excluded; the root and authorization helper remain the intended members. The
+exact standalone xattr command runs successfully on macOS outside the filesystem
+sandbox (four integration tests and one documentation test). Native Linux CI
+still supplies the platform-specific confirmation; the failed run is not a pass.
