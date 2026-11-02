@@ -22,7 +22,6 @@ use crate::{
     fairplay_macho::{MachOSlice, is_macho, parse_macho_slices, parse_macho_slices_probe},
     fairplay_page::{PageKeyDeriver, app_mask_from_logical_key},
     fairplay_supf::{PAGE_BYTES, Supf},
-    slash_path::clean_slash_path,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -37,6 +36,9 @@ pub struct IpaDecryptResult {
 struct ImageReport {
     member: String,
     supf_member: String,
+    key_table_variant: u8,
+    key_table_envelope_verified: bool,
+    key_table_signature_binding: &'static str,
     sinf_member: String,
     logical_key_sha256: String,
     architecture: String,
@@ -156,12 +158,41 @@ struct Inventory {
 }
 
 pub fn required_ipa_sinfs(input: &Path) -> Result<Vec<crate::fairplay::SinfDiagnostic>> {
+    required_ipa_sinfs_for(input, None)
+}
+
+pub(crate) fn required_ipa_sinf_for_image(
+    input: &Path,
+    image: &str,
+) -> Result<crate::fairplay::SinfDiagnostic> {
+    required_ipa_sinfs_for(input, Some(image))?
+        .pop()
+        .context("image has no active license")
+}
+
+fn required_ipa_sinfs_for(
+    input: &Path,
+    image: Option<&str>,
+) -> Result<Vec<crate::fairplay::SinfDiagnostic>> {
     let mut raw = File::open(input)?;
     let mut archive = ZipArchive::new(File::open(input)?)?;
     validate_unique_zip_members(&mut raw, &archive)?;
-    let inventory = preflight_encrypted_images(&mut archive, &mut raw)?;
-    inventory
-        .sinfs
+    let inventory = preflight_encrypted_images(
+        &mut archive,
+        &mut raw,
+        &crate::fairplay_scinfo::Trust::pinned(),
+    )?;
+    let sinfs = if let Some(image) = image {
+        BTreeSet::from([inventory
+            .images
+            .get(image)
+            .context("main executable is not an inventoried encrypted image")?
+            .sinf_member
+            .clone()])
+    } else {
+        inventory.sinfs
+    };
+    sinfs
         .iter()
         .map(|name| {
             let bytes = Zeroizing::new(read_entry(&mut archive, &mut raw, name)?);
@@ -177,7 +208,11 @@ pub fn require_model_diagnostic(input: &Path) -> Result<String> {
     let mut directory_source = File::open(input).context("open IPA ZIP directory handle")?;
     let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
     validate_unique_zip_members(&mut directory_source, &archive)?;
-    let inventory = preflight_encrypted_images(&mut archive, &mut directory_source)?;
+    let inventory = preflight_encrypted_images(
+        &mut archive,
+        &mut directory_source,
+        &crate::fairplay_scinfo::Trust::pinned(),
+    )?;
     let mut diagnostics = Vec::new();
     for name in &inventory.sinfs {
         let sinf = Zeroizing::new(read_entry(&mut archive, &mut directory_source, name)?);
@@ -187,10 +222,10 @@ pub fn require_model_diagnostic(input: &Path) -> Result<String> {
 }
 
 // zip's public file list is keyed by name and silently replaces duplicate
-// central-directory entries. Inspect the raw directory before trusting it.
+// central-directory entries. Only repeated empty directory markers are harmless.
 fn validate_unique_zip_members(source: &mut File, archive: &ZipArchive<File>) -> Result<()> {
     source.seek(SeekFrom::Start(archive.central_directory_start()))?;
-    let mut names = HashSet::with_capacity(archive.len());
+    let mut names = BTreeMap::new();
     let mut count = 0usize;
     loop {
         let mut signature = [0u8; 4];
@@ -205,19 +240,54 @@ fn validate_unique_zip_members(source: &mut File, archive: &ZipArchive<File>) ->
         let comment_len = u16::from_le_bytes(header[28..30].try_into().unwrap()) as usize;
         let mut name = vec![0; name_len];
         source.read_exact(&mut name)?;
-        if !names.insert(name.clone()) {
+        let mut extra = vec![0; extra_len];
+        source.read_exact(&mut extra)?;
+        let empty = empty_directory_marker(&name, &header, &extra)?;
+        if let Some(previous_empty) = names.insert(name.clone(), empty)
+            && !(empty && previous_empty)
+        {
             bail!("duplicate IPA member {:?}", String::from_utf8_lossy(&name));
         }
-        source.seek(SeekFrom::Current((extra_len + comment_len) as i64))?;
+        source.seek(SeekFrom::Current(comment_len as i64))?;
         count += 1;
-        if count > archive.len() {
-            bail!("IPA ZIP central directory contains duplicate or hidden members");
+        if count > 250_000 {
+            bail!("IPA ZIP central directory exceeds its member limit");
         }
     }
-    if count != archive.len() {
+    if names.len() != archive.len() {
         bail!("IPA ZIP central directory member count is inconsistent");
     }
     Ok(())
+}
+
+fn empty_directory_marker(name: &[u8], header: &[u8; 42], extra: &[u8]) -> Result<bool> {
+    if !name.ends_with(b"/") {
+        return Ok(false);
+    }
+    let size = u32::from_le_bytes(header[20..24].try_into().unwrap());
+    if size != u32::MAX {
+        return Ok(size == 0);
+    }
+    let mut remaining = extra;
+    let mut size64 = None;
+    while !remaining.is_empty() {
+        if remaining.len() < 4 {
+            bail!("truncated directory ZIP extra field");
+        }
+        let id = u16::from_le_bytes(remaining[..2].try_into().unwrap());
+        let length = u16::from_le_bytes(remaining[2..4].try_into().unwrap()) as usize;
+        let payload = remaining
+            .get(4..4 + length)
+            .context("invalid directory ZIP extra extent")?;
+        if id == 1 {
+            if size64.is_some() || payload.len() < 8 {
+                bail!("ambiguous directory ZIP64 size");
+            }
+            size64 = Some(u64::from_le_bytes(payload[..8].try_into().unwrap()));
+        }
+        remaining = &remaining[4 + length..];
+    }
+    Ok(size64.context("missing directory ZIP64 size")? == 0)
 }
 
 fn read_macho_probe(member: &mut ZipFile<'_, File>) -> Result<Vec<u8>> {
@@ -257,6 +327,7 @@ fn read_macho_probe(member: &mut ZipFile<'_, File>) -> Result<Vec<u8>> {
 fn preflight_encrypted_images(
     archive: &mut ZipArchive<File>,
     source: &mut File,
+    trust: &crate::fairplay_scinfo::Trust,
 ) -> Result<Inventory> {
     if archive.len() > 250_000 {
         bail!("IPA exceeds the supported member count");
@@ -299,10 +370,19 @@ fn preflight_encrypted_images(
         if encrypted.is_empty() {
             continue;
         }
-        let supf_name = supf_for(&name, &names)
-            .with_context(|| format!("encrypted Mach-O {name} has no adjacent SUPF"))?;
-        let supf = Supf::parse(&read_entry(archive, source, supf_name)?)
-            .with_context(|| format!("parse {supf_name}"))?;
+        let (supf_name, supf) = crate::fairplay_key_tables::select(
+            &name,
+            &names,
+            &slices,
+            |path| read_entry(archive, source, path),
+            trust,
+        )
+        .with_context(|| format!("key table for {name}"))?;
+        if supf.universal_signature_sha1.is_some() {
+            // Universal probes retain every slice. Check the whole-file SUPP
+            // binding before resolving models or creating output staging.
+            supf.validate_signature_bindings(&probe, &slices)?;
+        }
         for architecture in &supf.architectures {
             table_bytes = table_bytes
                 .checked_add(architecture.records.len() * 32)
@@ -329,7 +409,7 @@ fn preflight_encrypted_images(
             name,
             ImageBinding {
                 sinf_member,
-                supf_member: supf_name.to_owned(),
+                supf_member: supf_name,
                 table: supf,
                 encrypted_slices,
             },
@@ -439,20 +519,6 @@ fn write_reencoded(
     Ok(())
 }
 
-fn supf_for<'a>(member: &str, names: &'a HashSet<String>) -> Option<&'a str> {
-    let (directory, base) = match member.rsplit_once('/') {
-        Some((directory, base)) => (clean_slash_path(&member[..directory.len() + 1]), base),
-        None => (".".to_owned(), member),
-    };
-    for suffix in [".v5.supf", ".supf"] {
-        let candidate = format!("{directory}/SC_Info/{base}{suffix}");
-        if let Some(name) = names.get(&candidate) {
-            return Some(name.as_str());
-        }
-    }
-    None
-}
-
 fn macho_architecture(cpu_type: u32, cpu_subtype: u32) -> String {
     match cpu_type {
         0x0c => match cpu_subtype & 0xff {
@@ -527,6 +593,19 @@ fn image_report(
     Ok(ImageReport {
         member: context.member.to_owned(),
         supf_member: context.supf_member.to_owned(),
+        key_table_variant: context.supf.variant,
+        key_table_envelope_verified: matches!(context.supf.variant, 1 | 4),
+        key_table_signature_binding: if context.supf.universal_signature_sha1.is_some() {
+            "universal-code-signatures-sha1"
+        } else if context.supf.architectures.iter().any(|arch| {
+            arch.cpu_type == layout.cpu_type
+                && arch.cpu_subtype == layout.cpu_subtype
+                && arch.signature_sha1.is_some()
+        }) {
+            "slice-code-signature-sha1"
+        } else {
+            "not-present"
+        },
         sinf_member: context.sinf_member.to_owned(),
         logical_key_sha256: context.logical_key_sha256.to_owned(),
         architecture: macho_architecture(layout.cpu_type, layout.cpu_subtype),
@@ -719,13 +798,31 @@ pub fn decrypt_ipa_with_options(
     report: Option<&Path>,
     force: bool,
 ) -> Result<IpaDecryptResult> {
+    decrypt_ipa_trusted(
+        input,
+        output,
+        model_path,
+        report,
+        force,
+        &crate::fairplay_scinfo::Trust::pinned(),
+    )
+}
+
+fn decrypt_ipa_trusted(
+    input: &Path,
+    output: &Path,
+    model_path: &Path,
+    report: Option<&Path>,
+    force: bool,
+    trust: &crate::fairplay_scinfo::Trust,
+) -> Result<IpaDecryptResult> {
     crate::application::operation::stage(crate::application::operation::Stage::Decrypting)?;
     validate_destinations(input, output, model_path, report, force)?;
     let source = File::open(input).with_context(|| format!("open IPA {}", input.display()))?;
     let mut raw_source = File::open(input).context("open IPA ZIP directory handle")?;
     let mut archive = ZipArchive::new(source).context("open IPA ZIP archive")?;
     validate_unique_zip_members(&mut raw_source, &archive)?;
-    let inventory = preflight_encrypted_images(&mut archive, &mut raw_source)?;
+    let inventory = preflight_encrypted_images(&mut archive, &mut raw_source, trust)?;
     let input_sha256 = sha256_file(input)?;
     let (licenses, license_reports) = resolve_licenses(
         &inventory,
@@ -1188,6 +1285,97 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn signed_supp_uses_file_origin_pages_and_preserves_outputs_after_authentication_failure() {
+        let sample = crate::fairplay_key_tables::tests::signed_supp_sample();
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("synthetic.ipa");
+        let output = directory.path().join("decrypted.ipa");
+        let report = directory.path().join("report.json");
+        let model_path = directory.path().join("model.bin");
+        let (model, sinf) = model_and_sinf([0x31; 16]);
+        fs::write(&model_path, model).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let make_ipa = |table: &[u8]| {
+            let mut writer = ZipWriter::new(File::create(&input).unwrap());
+            for (name, bytes) in [
+                ("Payload/A.app/A", sample.source.as_slice()),
+                ("Payload/A.app/SC_Info/A.sinf", sinf.as_slice()),
+                ("Payload/A.app/SC_Info/A.v4.supp", table),
+            ] {
+                writer
+                    .start_file(name, SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        };
+        make_ipa(&sample.table);
+        let original = fs::read(&input).unwrap();
+        // There is no production trust override for this invented authority.
+        assert!(
+            decrypt_ipa_with_options(&input, &output, &model_path, Some(&report), false).is_err()
+        );
+        assert!(!output.exists());
+        assert!(!report.exists());
+        let result = decrypt_ipa_trusted(
+            &input,
+            &output,
+            &model_path,
+            Some(&report),
+            false,
+            &sample.trust,
+        )
+        .unwrap();
+        assert_eq!((result.encrypted_images, result.decrypted_pages), (1, 2));
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(value["plaintext_verified"], true);
+        assert_eq!(value["signature_verified"], false);
+        assert_eq!(value["images"][0]["key_table_variant"], 4);
+        assert_eq!(value["images"][0]["key_table_envelope_verified"], true);
+        assert_eq!(
+            value["images"][0]["key_table_signature_binding"],
+            "not-present"
+        );
+        assert_eq!(
+            value["images"][0]["supf_member"],
+            "Payload/A.app/SC_Info/A.v4.supp"
+        );
+        let mut zip = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        let mut actual = Vec::new();
+        zip.by_name("Payload/A.app/A")
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(&actual[PAGE_BYTES..3 * PAGE_BYTES], sample.plaintext);
+        assert_eq!(&actual[48..52], &[0; 4]);
+        assert_eq!(fs::read(&input).unwrap(), original);
+        let previous_output = fs::read(&output).unwrap();
+        let previous_report = fs::read(&report).unwrap();
+        let mut tampered = sample.table.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        make_ipa(&tampered);
+        let changed_input = fs::read(&input).unwrap();
+        assert!(
+            decrypt_ipa_trusted(
+                &input,
+                &output,
+                &model_path,
+                Some(&report),
+                true,
+                &sample.trust
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&output).unwrap(), previous_output);
+        assert_eq!(fs::read(&report).unwrap(), previous_report);
+        assert_eq!(fs::read(&input).unwrap(), changed_input);
+    }
+
+    #[test]
     fn publishes_plaintext_coverage_and_rejects_wrong_last_page_without_replacing_outputs() {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("synthetic.ipa");
@@ -1209,7 +1397,7 @@ pub(crate) mod tests {
             for (name, bytes) in [
                 ("Payload/A.app/A", image.clone()),
                 ("Payload/A.app/SC_Info/A.sinf", sinf.clone()),
-                ("Payload/A.app/SC_Info/A.supf", supf_records(records)),
+                ("Payload/A.app/SC_Info/A.v5.supf", supf_records(records)),
             ] {
                 writer
                     .start_file(name, SimpleFileOptions::default())
@@ -1270,32 +1458,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn matches_go_slash_path_rules_for_adjacent_supf() {
-        let names: HashSet<_> = [
-            "./SC_Info/A.supf",
-            "Payload/A.app/SC_Info/A.supf",
-            "Payload/A.app/SC_Info/A.v5.supf",
-            "//SC_Info/A.supf",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
-        for member in [
-            "Payload/A.app/A",
-            "./Payload/A.app/A",
-            "Payload//A.app/A",
-            "Payload/Temp/../A.app/A",
-        ] {
-            assert_eq!(
-                supf_for(member, &names),
-                Some("Payload/A.app/SC_Info/A.v5.supf")
-            );
-        }
-        assert_eq!(supf_for("A", &names), Some("./SC_Info/A.supf"));
-        assert_eq!(supf_for("/A", &names), Some("//SC_Info/A.supf"));
-    }
-
-    #[test]
     fn decrypts_ipa_with_private_model_and_preserves_other_members() {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("source.ipa");
@@ -1316,7 +1478,7 @@ pub(crate) mod tests {
         let options = SimpleFileOptions::default();
         for (name, data) in [
             ("Payload/A.app/SC_Info/A.sinf", sinf.as_slice()),
-            ("Payload/A.app/SC_Info/A.supf", supf_bytes.as_slice()),
+            ("Payload/A.app/SC_Info/A.v5.supf", supf_bytes.as_slice()),
             ("Payload/A.app/A", encrypted.as_slice()),
             ("Payload/A.app/Info.plist", b"unchanged".as_slice()),
             ("Payload/A.app/Resources/ignored.SINF", b"other".as_slice()),
@@ -1429,7 +1591,11 @@ pub(crate) mod tests {
         let mut arch = Vec::new();
         arch.extend_from_slice(&0x0100_000cu32.to_be_bytes());
         arch.extend_from_slice(&2u32.to_be_bytes());
-        arch.extend_from_slice(&[0; 20]);
+        let signature = &crate::fairplay_macho::parse_macho_slices(&encrypted).unwrap()[0].layout;
+        arch.extend_from_slice(&sha1::Sha1::digest(
+            &encrypted
+                [signature.signature_offset..signature.signature_offset + signature.signature_size],
+        ));
         arch.extend_from_slice(&1u32.to_be_bytes());
         arch.extend_from_slice(&record);
         let mut supf3 = vec![3, 0, 0, 0];
@@ -1442,7 +1608,7 @@ pub(crate) mod tests {
         for (name, bytes) in [
             ("Payload/A.app/SC_Info/A.sinf", sinf.as_slice()),
             ("Payload/A.app/SC_Info/B.sinf", sinf.as_slice()),
-            ("Payload/A.app/SC_Info/A.supf", supf5.as_slice()),
+            ("Payload/A.app/SC_Info/A.v5.supf", supf5.as_slice()),
             ("Payload/A.app/SC_Info/B.supf", supf3.as_slice()),
             ("Payload/A.app/A", encrypted.as_slice()),
             ("Payload/A.app/B", encrypted.as_slice()),
@@ -1471,6 +1637,15 @@ pub(crate) mod tests {
         assert_eq!(
             report_data["images"][1]["supf_member"],
             "Payload/A.app/SC_Info/B.supf"
+        );
+        assert_eq!(report_data["images"][1]["key_table_variant"], 3);
+        assert_eq!(
+            report_data["images"][1]["key_table_envelope_verified"],
+            false
+        );
+        assert_eq!(
+            report_data["images"][1]["key_table_signature_binding"],
+            "slice-code-signature-sha1"
         );
         let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
         for name in ["Payload/A.app/A", "Payload/A.app/B"] {
@@ -1521,7 +1696,7 @@ pub(crate) mod tests {
             let (image, records, plain) =
                 crate::fairplay_decrypt::tests::pre_encryption_fixture(logical);
             let sinf_member = crate::fairplay_licenses::adjacent_sinf(member).unwrap();
-            let supf_member = sinf_member.strip_suffix(".sinf").unwrap().to_owned() + ".supf";
+            let supf_member = sinf_member.strip_suffix(".sinf").unwrap().to_owned() + ".v5.supf";
             entries.extend([
                 (member.to_owned(), image),
                 (sinf_member, sinf),
@@ -1623,7 +1798,10 @@ pub(crate) mod tests {
                 ("Payload/A.app/SC_Info/A.sinf", sinf.clone()),
                 ("Payload/A.app/SC_Info/Manifest.plist", plist.clone()),
                 ("Payload/A.app/PlugIns/B.appex/B", image.clone()),
-                ("Payload/A.app/PlugIns/B.appex/SC_Info/B.supf", supf(record)),
+                (
+                    "Payload/A.app/PlugIns/B.appex/SC_Info/B.v5.supf",
+                    supf(record),
+                ),
             ] {
                 writer
                     .start_file(name, SimpleFileOptions::default())
@@ -1703,7 +1881,7 @@ pub(crate) mod tests {
         let mut writer = ZipWriter::new(File::create(&input).unwrap());
         for (name, bytes) in [
             ("Payload/A.app/SC_Info/A.sinf", sinf.as_slice()),
-            ("Payload/A.app/SC_Info/A.supf", supf.as_slice()),
+            ("Payload/A.app/SC_Info/A.v5.supf", supf.as_slice()),
             ("Payload/A.app/A", fat.as_slice()),
         ] {
             writer
@@ -1794,7 +1972,10 @@ pub(crate) mod tests {
             .unwrap();
         writer.write_all(&sinf).unwrap();
         writer
-            .start_file("Payload/A.app/SC_Info/A.supf", SimpleFileOptions::default())
+            .start_file(
+                "Payload/A.app/SC_Info/A.v5.supf",
+                SimpleFileOptions::default(),
+            )
             .unwrap();
         writer.write_all(&supf_bytes).unwrap();
         writer
@@ -1827,7 +2008,10 @@ pub(crate) mod tests {
             .unwrap();
         writer.write_all(&sinf).unwrap();
         writer
-            .start_file("Payload/A.app/SC_Info/A.supf", SimpleFileOptions::default())
+            .start_file(
+                "Payload/A.app/SC_Info/A.v5.supf",
+                SimpleFileOptions::default(),
+            )
             .unwrap();
         writer.write_all(&supf_bytes).unwrap();
         writer
@@ -1868,7 +2052,7 @@ pub(crate) mod tests {
                 sinf.as_slice(),
             ),
             (
-                "Payload/A.app/SC_Info/A.supf",
+                "Payload/A.app/SC_Info/A.v5.supf",
                 "Payload/B.app/SC_Info/B.supf",
                 0x94c1_e7e8u32,
                 supf_bytes.as_slice(),
@@ -1908,7 +2092,7 @@ pub(crate) mod tests {
             );
         }
         assert!(names.contains(&b"Payload/A.app/SC_Info/A.sinf".to_vec()));
-        assert!(names.contains(&b"Payload/A.app/SC_Info/A.supf".to_vec()));
+        assert!(names.contains(&b"Payload/A.app/SC_Info/A.v5.supf".to_vec()));
     }
 
     #[test]
@@ -1928,6 +2112,120 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("no supported encrypted Mach-O images")
         );
+    }
+
+    #[test]
+    fn repeated_empty_directory_markers_do_not_hide_duplicate_files_or_nonempty_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("source.ipa");
+        let output = directory.path().join("decrypted.ipa");
+        let model_path = directory.path().join("model.bin");
+        let (model, sinf) = model_and_sinf([0x31; 16]);
+        let (image, records, plaintext) =
+            crate::fairplay_decrypt::tests::pre_encryption_fixture([0x31; 16]);
+        fs::write(&model_path, model).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut writer = ZipWriter::new(File::create(&input).unwrap());
+        for name in ["Payload/A.app/", "Payload/B.app/"] {
+            writer
+                .add_directory(name, SimpleFileOptions::default())
+                .unwrap();
+        }
+        for (name, bytes) in [
+            ("Payload/A.app/A", image),
+            ("Payload/A.app/SC_Info/A.sinf", sinf),
+            ("Payload/A.app/SC_Info/A.v5.supf", supf_records(&records)),
+        ] {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        writer.finish().unwrap();
+        let mut original = fs::read(&input).unwrap();
+        let old = b"Payload/B.app/";
+        let new = b"Payload/A.app/";
+        let mut replaced = 0;
+        for offset in 0..=original.len() - old.len() {
+            if &original[offset..offset + old.len()] == old {
+                original[offset..offset + old.len()].copy_from_slice(new);
+                replaced += 1;
+            }
+        }
+        assert_eq!(replaced, 2);
+        fs::write(&input, &original).unwrap();
+        assert!(
+            require_model_diagnostic(&input)
+                .unwrap()
+                .contains("requires a private enrollment model")
+        );
+        let result = decrypt_ipa(&input, &output, &model_path).unwrap();
+        assert!(result.plaintext_verified);
+        let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        assert_eq!(
+            archive
+                .file_names()
+                .map(Result::unwrap)
+                .filter(|name| *name == "Payload/A.app/")
+                .count(),
+            1
+        );
+        let mut actual = Vec::new();
+        archive
+            .by_name("Payload/A.app/A")
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(&actual[PAGE_BYTES..3 * PAGE_BYTES], plaintext);
+        assert_eq!(fs::read(&input).unwrap(), original);
+        // Both occurrences must be empty, even if zip's name index retains the
+        // other occurrence. Reject the raw ambiguity before model resolution.
+        let markers: Vec<_> = (0..original.len() - 46)
+            .filter(|&offset| {
+                original[offset..offset + 4] == *b"PK\x01\x02"
+                    && u16::from_le_bytes(original[offset + 28..offset + 30].try_into().unwrap())
+                        as usize
+                        == new.len()
+                    && original.get(offset + 46..offset + 46 + new.len()) == Some(new.as_slice())
+            })
+            .collect();
+        assert_eq!(markers.len(), 2);
+        let preserved = fs::read(&output).unwrap();
+        for marker in markers {
+            let mut changed = original.clone();
+            changed[marker + 24..marker + 28].copy_from_slice(&1u32.to_le_bytes());
+            fs::write(&input, &changed).unwrap();
+            assert!(
+                require_model_diagnostic(&input)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("duplicate IPA member")
+            );
+            assert!(decrypt_ipa_with_options(&input, &output, &model_path, None, true).is_err());
+            assert_eq!(fs::read(&output).unwrap(), preserved);
+            assert_eq!(fs::read(&input).unwrap(), changed);
+        }
+    }
+
+    #[test]
+    fn directory_zip64_empty_size_is_explicit_and_unambiguous() {
+        let mut header = [0; 42];
+        header[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut extra = vec![1, 0, 8, 0];
+        extra.extend(0u64.to_le_bytes());
+        assert!(empty_directory_marker(b"Payload/A.app/", &header, &extra).unwrap());
+        let mut nonempty = extra.clone();
+        nonempty[4] = 1;
+        assert!(!empty_directory_marker(b"Payload/A.app/", &header, &nonempty).unwrap());
+        assert!(empty_directory_marker(b"Payload/A.app/", &header, &[]).is_err());
+        assert!(empty_directory_marker(b"Payload/A.app/", &header, &extra[..7]).is_err());
+        let duplicate = [extra.as_slice(), extra.as_slice()].concat();
+        assert!(empty_directory_marker(b"Payload/A.app/", &header, &duplicate).is_err());
+        assert!(!empty_directory_marker(b"Payload/A.app/A", &header, &extra).unwrap());
     }
 
     #[test]
@@ -1982,10 +2280,8 @@ pub(crate) mod tests {
         writer.write_all(&encrypted).unwrap();
         writer.finish().unwrap();
         assert!(
-            require_model_diagnostic(&input)
-                .unwrap_err()
-                .to_string()
-                .contains("no adjacent SUPF")
+            format!("{:#}", require_model_diagnostic(&input).unwrap_err())
+                .contains("no adjacent SUPF or SUPP")
         );
     }
 

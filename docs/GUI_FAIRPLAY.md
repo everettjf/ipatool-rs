@@ -47,6 +47,11 @@ that an IPA and model belong together.
    and an already approved helper after a permission failure. It does not copy
    ADI data or require a native recovery image. Manual advanced collection retains
    the legacy collector; it does not automatically register a helper.
+   Matching names and versions do not prove matching Store authorization. The
+   main executable's active license must match the installed app; an unrelated
+   extension cannot stand in for it. A different authorization gets its own
+   message before collection. If the App Store account changed, install a test
+   app with the account used for the sample, or choose another matching pair.
 3. **Review and prepare:** review the selected filenames and explicitly start.
    Fresh setup collects, recovers with the selected engine, validates the
    sample's processing report, and saves the model. Import runs the same sample
@@ -63,9 +68,12 @@ It does not execute a native Apple recovery image. The algorithm identity in a
 typed model is distinct from a legacy model's source-image hash. The capture
 adapter works in private staging, verifies a snapshot of the matching sample IPA,
 and publishes the model last. This closes a synthetic implementation gate, not
-the real desktop authorization/recovery gate. Per-image license association is
-connected and passes synthetic controls; complete IPA keyfile-variant/signature-
-binding handling and real multi-image processing remain under validation.
+the real desktop authorization/recovery gate. Per-image license association,
+SUPF 3/5 and signed SUPP 1/4 selection are connected. Both versions of a class
+must agree on page records; a malformed selected class never falls back to the
+other class. Legacy signature hashes bind complete slice-relative signatures or,
+for a universal SUPP, signatures concatenated in fat-header order. Real
+multi-image processing remains under validation.
 The [authorization design](FAIRPLAY_AUTHORIZATION.md) describes the privileged
 boundary, packaging requirements, removal and remaining acceptance checks.
 
@@ -78,6 +86,15 @@ is no longer a decryption gate. Every encrypted image needs pre-encryption hash
 coverage for the aggregate `plaintext_verified` result to be true; older images
 without a table remain explicitly unverified. Embedded hash consistency does
 **not** establish Apple CMS signature trust. Unsupported samples still fail.
+Per-image reports identify the selected key-table variant, signed-envelope check
+and legacy signature-binding kind separately from plaintext coverage. The legacy
+`supf_member` field also holds a selected SUPP member. SUPF envelopes are not
+authenticated by standalone IPA decryption, matching the pinned upstream;
+capture preparation authenticates its keyfiles separately. Signed SUPP envelopes
+always require the pinned authority. Repeated empty ZIP directory markers are
+collapsed to one marker; ordinary duplicate files and nonempty duplicate
+directories are rejected. Directory-marker metadata follows the ZIP reader's
+retained entry rather than promising byte-identical upstream ZIP metadata.
 Original inputs are preserved. Temporary captures and sample plaintext are
 removed after normal completion, failure, or cooperative cancellation. A hard
 process crash may leave hidden private staging directories; they are ignored,

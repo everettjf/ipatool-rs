@@ -83,11 +83,25 @@ impl Failure {
             };
         }
         if let Some(problem) = error.downcast_ref::<crate::fairplay_collect::SampleProblem>() {
+            let enrollment = matches!(
+                problem,
+                crate::fairplay_collect::SampleProblem::EnrollmentMismatch
+            );
             return Self {
                 kind: Unavailable,
-                title: "Review the installed app and sample IPA".into(),
+                title: if enrollment {
+                    "App Store authorization does not match"
+                } else {
+                    "Review the installed app and sample IPA"
+                }
+                .into(),
                 message: problem.to_string(),
-                action: "Review sample files".into(),
+                action: if enrollment {
+                    "Choose matching files"
+                } else {
+                    "Review sample files"
+                }
+                .into(),
             };
         }
         if let Some(problem) = error.downcast_ref::<super::fairplay_setup::ModelProblem>() {
@@ -276,6 +290,18 @@ mod tests {
         let failure = super::Failure::from_error(&error);
         assert!(failure.message.contains("same bundle identifier"));
         assert_eq!(failure.action, "Review sample files");
+        let error = anyhow::Error::new(crate::fairplay_collect::SampleProblem::EnrollmentMismatch)
+            .context("private fake selector and capture path")
+            .context(crate::application::fairplay_setup::ModelProblem::Collection);
+        let failure = super::Failure::from_error(&error);
+        assert_eq!(failure.title, "App Store authorization does not match");
+        assert_eq!(failure.action, "Choose matching files");
+        assert!(
+            failure
+                .message
+                .contains("different App Store authorization")
+        );
+        assert!(!failure.message.contains("fake selector"));
     }
     use super::*;
     #[test]

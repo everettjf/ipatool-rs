@@ -51,6 +51,7 @@ pub enum SampleProblem {
     InstalledApp,
     MissingIpa,
     Mismatch,
+    EnrollmentMismatch,
     UnsupportedIpa,
 }
 impl std::fmt::Display for SampleProblem {
@@ -59,6 +60,7 @@ impl std::fmt::Display for SampleProblem {
             Self::InstalledApp=>"Choose an installed iPhone or iPad app that has been opened on this Mac.",
             Self::MissingIpa=>"Choose the matching downloaded IPA before preparing authorization.",
             Self::Mismatch=>"The installed app and sample IPA must have the same bundle identifier, executable and version.",
+            Self::EnrollmentMismatch=>"The installed app and IPA have different App Store authorization. Choose files installed and downloaded using the same Apple account. If the App Store account changed, reinstall a test app with that account; matching app names and versions alone are not enough.",
             Self::UnsupportedIpa=>"The sample IPA does not have a supported, unambiguous encrypted image and license inventory.",
         })
     }
@@ -67,6 +69,15 @@ impl std::error::Error for SampleProblem {}
 
 /// Check public app/version metadata before requesting any system authorization.
 pub fn preflight_current_sample(app: &Path, ipa: &Path) -> Result<()> {
+    current_sample(app, ipa).map(drop)
+}
+
+struct CurrentSample {
+    executable_member: String,
+    sinf_member: String,
+}
+
+fn current_sample(app: &Path, ipa: &Path) -> Result<CurrentSample> {
     let app = installed_app(app).context(SampleProblem::InstalledApp)?;
     let (bundle, executable, info) = app_info(&app).context(SampleProblem::InstalledApp)?;
     let (installed_sinf, selector) = installed_sinf(&app).context(SampleProblem::InstalledApp)?;
@@ -111,6 +122,7 @@ pub fn preflight_current_sample(app: &Path, ipa: &Path) -> Result<()> {
     let mut archive = ZipArchive::new(source).context(SampleProblem::UnsupportedIpa)?;
     let mut raw = File::open(ipa).context(SampleProblem::MissingIpa)?;
     let mut matches = 0;
+    let mut main_member = None;
     for index in 0..archive.len() {
         crate::application::operation::check()?;
         let mut entry = archive
@@ -148,20 +160,25 @@ pub fn preflight_current_sample(app: &Path, ipa: &Path) -> Result<()> {
             && field(fields, "CFBundleVersion").as_deref() == Some(&build)
         {
             matches += 1;
+            main_member = Some(format!("Payload/{root}/{executable}"));
         }
     }
     if matches != 1 {
         return Err(SampleProblem::Mismatch.into());
     }
-    let required =
-        crate::fairplay_ipa::required_ipa_sinfs(ipa).context(SampleProblem::UnsupportedIpa)?;
-    if !required
-        .iter()
-        .any(|sinf| sinf.selector == selector && sinf.current_layout)
-    {
-        return Err(SampleProblem::Mismatch.into());
+    let main_member = main_member.context(SampleProblem::Mismatch)?;
+    let required = crate::fairplay_ipa::required_ipa_sinf_for_image(ipa, &main_member)
+        .context(SampleProblem::UnsupportedIpa)?;
+    if !required.current_layout {
+        return Err(SampleProblem::UnsupportedIpa.into());
     }
-    Ok(())
+    if required.selector != selector {
+        return Err(SampleProblem::EnrollmentMismatch.into());
+    }
+    Ok(CurrentSample {
+        executable_member: main_member,
+        sinf_member: required.path.context(SampleProblem::UnsupportedIpa)?,
+    })
 }
 
 /// Current recovery needs only SIDB snapshots. It never collects ADI or native
@@ -170,7 +187,7 @@ pub fn collect_current_enrollment(
     options: &EnrollmentCollectOptions,
 ) -> Result<EnrollmentCaptureManifest> {
     let ipa = options.ipa.as_deref().context(SampleProblem::MissingIpa)?;
-    preflight_current_sample(&options.app, ipa)?;
+    let sample = current_sample(&options.app, ipa)?;
     let snapshot = if options.system_state.is_some() || options.shared_state.is_some() {
         let mut files = Vec::new();
         for (source, role) in [
@@ -221,7 +238,7 @@ pub fn collect_current_enrollment(
             Err(error) => return Err(error.into()),
         }
     };
-    collect_impl(options, Some(&snapshot))
+    collect_impl(options, Some(&snapshot), Some(&sample))
 }
 
 fn private_directory(path: &Path) -> Result<()> {
@@ -448,9 +465,48 @@ fn capture_ipa(
     source: &Path,
     selector: SinfSelector,
     executable: &str,
+    selection: Option<&CurrentSample>,
 ) -> Result<(CaptureFile, String, CaptureFile)> {
     let mut archive = ZipArchive::new(File::open(source)?)?;
     let mut raw_source = File::open(source)?;
+    if let Some(sample) = selection {
+        // Current preflight resolved the main image's actual adjacent/manifest
+        // license. Do not substitute an extension or scan unrelated licenses.
+        let mut target = None;
+        for index in 0..archive.len() {
+            crate::application::operation::check()?;
+            let mut member = archive.by_index(index)?;
+            let name = duplicate_zip::read_raw_central_name(
+                &mut raw_source,
+                member.central_header_start(),
+            )?;
+            if String::from_utf8_lossy(&name) != sample.sinf_member {
+                continue;
+            }
+            if member.size() > 1024 * 1024 {
+                bail!("selected sample license exceeds its size limit");
+            }
+            let mut bytes = zeroize::Zeroizing::new(Vec::new());
+            crate::application::operation::copy(
+                &mut (&mut member).take(1024 * 1024 + 1),
+                &mut *bytes,
+            )?;
+            if bytes.len() > 1024 * 1024 || parse_sinf_selector(&bytes)? != selector {
+                bail!("selected sample authorization changed after preflight");
+            }
+            target = Some(bytes);
+            break;
+        }
+        let target = target.context("selected sample license is missing")?;
+        let ipa_root = sample
+            .executable_member
+            .rsplit_once('/')
+            .context("selected executable has no bundle root")?
+            .0;
+        let copied = copy_private(root, Path::new("ipa/App.ipa"), source)?;
+        let target_file = write_private(root, Path::new("ipa/App.sinf"), &target)?;
+        return Ok((copied, ipa_root.to_owned(), target_file));
+    }
     let mut sinfs = Vec::new();
     if archive.has_duplicate_names() {
         sinfs = duplicate_zip::read_matching_entries(source, |name| {
@@ -501,12 +557,13 @@ fn capture_ipa(
 }
 
 pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<EnrollmentCaptureManifest> {
-    collect_impl(options, None)
+    collect_impl(options, None, None)
 }
 
 fn collect_impl(
     options: &EnrollmentCollectOptions,
     current: Option<&ipatool_authorization::Snapshot>,
+    selection: Option<&CurrentSample>,
 ) -> Result<EnrollmentCaptureManifest> {
     if options.app.as_os_str().is_empty() || options.output.as_os_str().is_empty() {
         bail!("capture requires app and output paths");
@@ -639,7 +696,8 @@ fn collect_impl(
         bail!("capture found no native FairPlay state files");
     }
     let (ipa, ipa_root, target_sinf_path) = if let Some(source) = options.ipa.as_deref() {
-        let (copied, root_name, target) = capture_ipa(root, source, selector, &executable)?;
+        let (copied, root_name, target) =
+            capture_ipa(root, source, selector, &executable, selection)?;
         files.push(copied.clone());
         files.push(target.clone());
         (Some(copied), root_name, target.path)
@@ -740,22 +798,36 @@ mod tests {
         fs::write(app.join("Info.plist"), info("1.0")).unwrap();
         fs::write(app.join("A"), &image).unwrap();
         fs::write(app.join("SC_Info/A.sinf"), &sinf).unwrap();
-        fs::write(app.join("SC_Info/A.supf"), supf(record)).unwrap();
+        fs::write(app.join("SC_Info/A.v5.supf"), supf(record)).unwrap();
         let ipa = root.path().join("sample.ipa");
-        let make = |version: &str| {
+        let make = |version: &str, main_sinf: &[u8], extension_sinf: Option<&[u8]>| {
             let mut zip = ZipWriter::new(File::create(&ipa).unwrap());
-            for (name, data) in [
+            let mut entries = vec![
                 ("Payload/A.app/Info.plist", info(version)),
                 ("Payload/A.app/A", image.clone()),
-                ("Payload/A.app/SC_Info/A.sinf", sinf.clone()),
-                ("Payload/A.app/SC_Info/A.supf", supf(record)),
-            ] {
+                ("Payload/A.app/SC_Info/A.sinf", main_sinf.to_vec()),
+                ("Payload/A.app/SC_Info/A.v5.supf", supf(record)),
+            ];
+            if let Some(sinf) = extension_sinf {
+                entries.extend([
+                    ("Payload/A.app/PlugIns/B.appex/B", image.clone()),
+                    (
+                        "Payload/A.app/PlugIns/B.appex/SC_Info/B.sinf",
+                        sinf.to_vec(),
+                    ),
+                    (
+                        "Payload/A.app/PlugIns/B.appex/SC_Info/B.v5.supf",
+                        supf(record),
+                    ),
+                ]);
+            }
+            for (name, data) in entries {
                 zip.start_file(name, SimpleFileOptions::default()).unwrap();
                 zip.write_all(&data).unwrap();
             }
             zip.finish().unwrap();
         };
-        make("1.0");
+        make("1.0", &sinf, None);
         let state = root.path().join("state");
         fs::create_dir(&state).unwrap();
         let state_file = state.join("SC Info.sidb");
@@ -796,12 +868,62 @@ mod tests {
         let before = fs::read(&ipa).unwrap();
         preflight_current_sample(&options.app, &ipa).unwrap();
         assert_eq!(fs::read(&ipa).unwrap(), before);
-        make("1.1");
+        make("1.1", &sinf, None);
         let error = preflight_current_sample(&options.app, &ipa).unwrap_err();
         assert!(matches!(
             error.downcast_ref::<SampleProblem>(),
             Some(SampleProblem::Mismatch)
         ));
+        let mut other_sinf = sinf.clone();
+        other_sinf[36..40].copy_from_slice(&10u32.to_be_bytes());
+        // A matching extension cannot stand in for the main application's
+        // different authorization, even with identical app/version metadata.
+        make("1.0", &other_sinf, Some(&sinf));
+        let error = preflight_current_sample(&options.app, &ipa).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SampleProblem>(),
+            Some(SampleProblem::EnrollmentMismatch)
+        ));
+        make("1.0", &sinf, Some(&other_sinf));
+        preflight_current_sample(&options.app, &ipa).unwrap();
+
+        // Current collection must carry the resolved manifest source through
+        // capture, rather than requiring a missing adjacent replica afterward.
+        let mut manifest_fields = plist::Dictionary::new();
+        manifest_fields.insert(
+            "SinfPaths".into(),
+            Value::Array(vec![Value::String("SC_Info/Source.sinf".into())]),
+        );
+        manifest_fields.insert(
+            "SinfReplicationPaths".into(),
+            Value::Array(vec![Value::String("SC_Info/A.sinf".into())]),
+        );
+        let mut manifest_bytes = Vec::new();
+        plist::to_writer_xml(&mut manifest_bytes, &manifest_fields).unwrap();
+        let mut zip = ZipWriter::new(File::create(&ipa).unwrap());
+        for (name, data) in [
+            ("Payload/A.app/Info.plist", info("1.0")),
+            ("Payload/A.app/A", image),
+            ("Payload/A.app/SC_Info/Source.sinf", sinf.clone()),
+            ("Payload/A.app/SC_Info/A.v5.supf", supf(record)),
+            ("Payload/A.app/SC_Info/Manifest.plist", manifest_bytes),
+            (
+                "Payload/A.app/SC_Info/Unused.sinf",
+                b"not an active license".to_vec(),
+            ),
+        ] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(&data).unwrap();
+        }
+        zip.finish().unwrap();
+        preflight_current_sample(&options.app, &ipa).unwrap();
+        let before = fs::read(&ipa).unwrap();
+        let mut options = options;
+        options.output = root.path().join("replica-capture");
+        let captured = collect_current_enrollment(&options).unwrap();
+        assert_eq!(captured.app.ipa_member_root, "Payload/A.app");
+        assert_eq!(fs::read(options.output.join("ipa/App.sinf")).unwrap(), sinf);
+        assert_eq!(fs::read(&ipa).unwrap(), before);
     }
 
     #[test]
@@ -827,7 +949,7 @@ mod tests {
         crate::duplicate_zip::write_duplicate_sinf_fixture(&ipa, &first, &second);
         let output = directory.path().join("capture");
         let (_, root, _) =
-            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A").unwrap();
+            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A", None).unwrap();
         assert_eq!(root, "Payload/A.app");
         assert_eq!(fs::read(output.join("ipa/App.sinf")).unwrap(), first);
     }
@@ -846,7 +968,7 @@ mod tests {
 
         let output = directory.path().join("capture");
         let (_, root, _) =
-            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A").unwrap();
+            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A", None).unwrap();
         assert_eq!(root, "Payload/\u{fffd}.app");
         assert_eq!(fs::read(output.join("ipa/App.sinf")).unwrap(), first);
     }
@@ -860,7 +982,7 @@ mod tests {
 
         let output = directory.path().join("capture");
         let (_, root, _) =
-            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A").unwrap();
+            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A", None).unwrap();
         assert_eq!(root, "Payload/A.app");
         assert_eq!(fs::read(output.join("ipa/App.sinf")).unwrap(), first);
     }

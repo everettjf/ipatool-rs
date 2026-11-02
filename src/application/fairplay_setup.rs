@@ -718,7 +718,7 @@ mod tests {
         let mut writer = zip::ZipWriter::new(fs::File::create(&ipa).unwrap());
         for (member, bytes) in [
             ("Payload/A.app/SC_Info/A.sinf", sinf),
-            ("Payload/A.app/SC_Info/A.supf", supf(record)),
+            ("Payload/A.app/SC_Info/A.v5.supf", supf(record)),
             ("Payload/A.app/A", encrypted),
         ] {
             writer

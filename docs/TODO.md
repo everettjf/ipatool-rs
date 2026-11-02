@@ -48,57 +48,29 @@ are separate gates; none is established by recognizing a host image hash.
 - [ ] F4: Complete terminal-free first setup, private model publication, relaunch reuse and independent automatic decryption of another matching IPA; make unavailable validation and failures actionable.
 - [ ] F5: Pass full regressions and signed builds, then authorized real setup plus a different matching IPA, complete plaintext-coverage control, mismatch, denial, collision, cancellation and restart. Update PR #7 on the same branch without merging.
 
-The first implementation increment adds pre-encryption hash audits, schema-2
-reports/receipts, explicit unavailable coverage, and the per-page absolute-offset
-key derivation used by the pinned upstream. Synthetic final-page rejection and
-output preservation pass. The native tag constructor matches 32 synthetic Go
-controls, but canonical recovery is not connected yet. F1/F2/F4/F5 and the
-remaining format/association work in F3 stay open; no private live gate is closed.
+Implemented in the shared service:
 
-The next increment implements the current-format Rust recovery kernel: bounded
-native codec/source derivation, container authentication, deterministic state
-slot selection, direct AES state/payload decoding, hardware tag lookup, strict
-selected-tree/version checks, account-class workspace derivation and selector-
-bound FPSENR2 construction. Two complete synthetic model controls match the
-pinned Go implementation byte-for-byte by hash; metadata fallback is rejected.
-F2 remains open for canonical capture normalization, signed-keyfile validation
-and the shared CLI/GUI adapter. Production setup still calls the old recovery
-path until those prerequisites are connected; private live validation remains open.
+- Versioned pre-encryption page-hash audits, explicit unavailable coverage and
+  wrong-final-page rejection; legacy receipts retain their original assurance.
+- Pinned current SIDB recovery, deterministic selected-route authentication,
+  signed capture normalization and matching-sample processing before publication.
+- Per-image SINF/manifest association, checked registry snapshots and independent
+  model selection for encrypted extensions/frameworks.
+- SUPF 3/5 and signed SUPP 1/4 class selection, consistent paired tables,
+  file-origin universal page mapping and available legacy signature bindings.
+  Repeated empty directory markers are supported; duplicate payload files fail.
+- Typed installed-app/IPA preflight and a separate fixed-input macOS helper;
+  explicit registration/status/settings/removal never run from page opening or
+  history restoration. Ad hoc builds disable protected access.
 
-The current increment connects bounded private capture normalization, pinned
-signed-keyfile verification and sample processing to the shared service. CLI
-`recover` and GUI setup now default to Current; legacy native tracing requires
-`--engine legacy` or the explicit advanced GUI choice. Synthetic controls cover
-complete recovery, sample plaintext hashes, refusal of unrelated records,
-descriptor/signature tampering, cancellation cleanup and managed-store reopen
-with a different synthetic IPA. F2's implementation is connected, but its real
-authorized-capture exit evidence remains open. Per-image IPA license association
-and strict IPA keyfile handling in F3, the scoped macOS authorization path in F1,
-and the real setup/reuse checks in F4/F5 remain required. The normalizer does not
-grant access to system state; another manual retry cannot resolve that permission.
-
-Per-image SINF association and model resolution are now connected as the next
-F3 increment. Encrypted apps/extensions/frameworks require their own adjacent or
-manifest-declared license; replicas are resolved by explicit identity or exact
-source bytes, never by trying unrelated keys. A different synthetic extension
-selector selects its own saved model after reopening the store. Additive v2
-report fields identify active licenses and image bindings, checked before saving
-a managed model. Twenty-nine manifest controls agree with pinned Go, and
-synthetic missing-model/conflicting-replica cases preserve inputs and outputs.
-F3 remains open for full SUPF/SUPP class selection, paired-variant consistency,
-legacy signature binding, upstream-compatible repeated empty directory markers,
-and the real multi-image/plaintext gates. F1/F4/F5
-still require the scoped macOS authorization path and real setup/reuse evidence.
-
-The scoped authorization boundary is now implemented as a separate native Rust
-helper with fixed SIDB inputs, code-bound XPC, console-user checks and bounded
-private snapshots. Current setup preflights the installed app/IPA before any
-snapshot and omits native recovery images, ADI and unrelated state. The GUI has
-explicit register/status/settings/removal actions; opening or restoring it does
-not register access. Ad hoc builds disable the protected path. Synthetic tests
-pass, but Developer ID signing/notarization, actual approval/denial/removal and
-real recovery are still acceptance gates. See
-[the boundary design](FAIRPLAY_AUTHORIZATION.md); F1 remains unchecked.
+Current synthetic evidence includes 39 pinned Go key-table controls, complete
+signed-SUPP IPA processing with plaintext hashes, private model reopen/reuse,
+wrong-key/final-page rejection and preservation of existing artifacts. These do
+not satisfy real acceptance. F1/F2/F3/F4/F5 remain open for the signed helper's
+notarization and actual lifecycle, an authorized private snapshot/model, real
+complete plaintext coverage, and a different matching IPA after restart. The
+existing controlled account/material authorization remains valid; no fresh
+account or material request is needed. See [the boundary design](FAIRPLAY_AUTHORIZATION.md).
 
 ## Current macOS Apple Silicon gates
 

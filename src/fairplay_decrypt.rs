@@ -35,6 +35,7 @@ pub fn decrypt_macho(
     logical_key: [u8; 16],
 ) -> Result<(Vec<u8>, Vec<DecryptedSlice>)> {
     let slices = parse_macho_slices(source)?;
+    supf.validate_signature_bindings(source, &slices)?;
     let encrypted: Vec<_> = slices
         .into_iter()
         .filter(|slice| slice.layout.crypt_id != 0)
@@ -195,8 +196,24 @@ pub(crate) mod tests {
         logical: [u8; 16],
         shift: u8,
     ) -> (Vec<u8>, Vec<[u8; 32]>, Vec<u8>) {
+        pre_encryption_fixture_with_records_and_shift(logical, shift, None)
+    }
+
+    pub(crate) fn pre_encryption_fixture_with_records(
+        logical: [u8; 16],
+        records: Vec<[u8; 32]>,
+    ) -> (Vec<u8>, Vec<[u8; 32]>, Vec<u8>) {
+        pre_encryption_fixture_with_records_and_shift(logical, 12, Some(records))
+    }
+
+    fn pre_encryption_fixture_with_records_and_shift(
+        logical: [u8; 16],
+        shift: u8,
+        records: Option<Vec<[u8; 32]>>,
+    ) -> (Vec<u8>, Vec<[u8; 32]>, Vec<u8>) {
         let (original, record, _) = encrypted_fixture(logical);
-        let records = vec![record, [0x47; 32]];
+        let records = records.unwrap_or_else(|| vec![record, [0x47; 32]]);
+        assert_eq!(records.len(), 2);
         let mut source = vec![0; PAGE_BYTES * 4];
         source[..PAGE_BYTES].copy_from_slice(&original[..PAGE_BYTES]);
         source[44..48].copy_from_slice(&(2 * PAGE_BYTES as u32).to_le_bytes());
@@ -271,10 +288,12 @@ pub(crate) mod tests {
         let (source, records, plaintext) = pre_encryption_fixture(logical);
         let mut supf = Supf {
             variant: 5,
+            universal_signature_sha1: None,
             architectures: vec![SupfArchitecture {
                 cpu_type: 0x0100_000c,
                 cpu_subtype: 2,
                 records,
+                signature_sha1: None,
             }],
         };
         let (output, reports) = decrypt_macho(&source, &supf, logical).unwrap();
@@ -295,10 +314,12 @@ pub(crate) mod tests {
                 pre_encryption_fixture_with_page_shift(logical, shift);
             let supf = Supf {
                 variant: 5,
+                universal_signature_sha1: None,
                 architectures: vec![SupfArchitecture {
                     cpu_type: 0x0100_000c,
                     cpu_subtype: 2,
                     records,
+                    signature_sha1: None,
                 }],
             };
             let (output, reports) = decrypt_macho(&source, &supf, logical).unwrap();
@@ -314,10 +335,12 @@ pub(crate) mod tests {
         let (source, record, plaintext) = encrypted_fixture(logical);
         let supf = Supf {
             variant: 5,
+            universal_signature_sha1: None,
             architectures: vec![SupfArchitecture {
                 cpu_type: 0x0100_000c,
                 cpu_subtype: 2,
                 records: vec![record],
+                signature_sha1: None,
             }],
         };
         let (output, reports) = decrypt_macho(&source, &supf, logical).unwrap();

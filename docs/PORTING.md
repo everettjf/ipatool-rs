@@ -1174,3 +1174,70 @@ excluded; the root and authorization helper remain the intended members. The
 exact standalone xattr command runs successfully on macOS outside the filesystem
 sandbox (four integration tests and one documentation test). Native Linux CI
 still supplies the platform-specific confirmation; the failed run is not a pass.
+
+The exact workspace-fix revision `ce30394` then passed all five native jobs in
+[CI run 41418650115](https://github.com/everettjf/ipatool-rs/actions/runs/41418650115),
+including the independent Linux xattr step and both Windows jobs.
+
+## SUPF/SUPP selection and legacy signature binding
+
+IPA inventory now follows the pinned current UnfairPlay class rules: the f-class
+has priority, `.supf` contains variant 3 and `.v5.supf` variant 5, while the p-class
+uses signed variants 1/4 in `.supp`/`.v4.supp`. Both present versions must have
+identical architecture/page records. A malformed selected class never retries
+another version or class. An empty legacy f placeholder requires a valid v5
+companion. Capture normalization permits that placeholder only with a signed,
+correctly named v5 companion and verifies suffix/variant consistency.
+
+SUPP envelopes require the pinned FairPlay authority at runtime. File-origin
+records are mapped to thin or universal encrypted ranges using absolute file
+pages. Legacy hashes bind each complete LC_CODE_SIGNATURE payload; a universal
+SUPP hashes concatenated signatures in fat-header order, including unencrypted
+slices. Bindings are checked before mutation, with the universal binding also
+checked before model resolution/staging. Standalone SUPF envelope trust remains
+unverified as in the pinned upstream. New per-image v2 report fields identify
+the table variant, signed-envelope verification and signature-binding kind;
+`supf_member` retains its name for compatibility when it refers to a SUPP.
+These checks are separate from plaintext hash coverage and Apple CMS trust.
+
+Thirty-nine public Go controls reproduce selected members, variants, exact
+record hashes, thin/universal mapping and signature-binding verdicts. They cover
+conflicting pairs, wrong suffixes, empty placeholders, class precedence,
+unauthenticated SUPP, incorrect page coverage and changed signatures. The
+test-only exporter is `scripts/reference-current-vectors/key_table_vectors_test.go`:
+copy it into the pinned reference's `internal/fairplay`, set an absolute empty
+`IPATOOL_PUBLIC_VECTOR_DIR`, and run
+`go test ./internal/fairplay -run '^TestRustKeyTablePublicVectors$' -count=1`.
+It generates signing keys only in memory and exports public data; regenerated
+PKI bytes differ. Production exposes no synthetic-authority override.
+
+A complete synthetic SUPP-backed IPA processes two encrypted pages with full
+pre-encryption coverage. Its signed file-origin header record is excluded from
+decryption. Tampered signatures preserve the original input and existing output/
+report; the production authority rejects the synthetic signer. Existing v3
+image controls now carry and check their real synthetic signature binding.
+Repeated empty directory markers collapse to one marker; duplicate payload files
+and nonempty duplicate directories still fail raw inventory. ZIP64 directory
+sizes require explicit unambiguous metadata. Directory-marker metadata follows
+the ZIP reader's retained entry, a documented Rust normalization rather than
+byte-identical upstream metadata selection.
+
+The native signed isolated GUI read the already authorized sample metadata and
+licenses. App identity, executable and both version fields matched, but its Store
+authorization differed from the installed app. This exposed a misleading version
+error. Preflight now reports enrollment mismatch separately and checks the main
+executable's active license, preventing an extension's matching selector from
+masking the main application's mismatch. The regression covers both directions
+and redacted task errors. Current collection carries the resolved main license
+through capture, including a manifest-declared source with a missing adjacent
+replica, and reads only that selected SINF rather than unrelated resources.
+Legacy explicit collection retains its original selection behavior. No protected SIDB, model or plaintext was read or saved
+in that walkthrough, and no helper was registered. This is a negative sample
+check, not successful real model recovery.
+
+Final local validation passes 494 library, 45 CLI, 46 desktop and seven helper
+tests (592 active; 70 opt-in library tests ignored), formatting, strict default/
+GUI/GUI-test all-targets Clippy and Windows GNU all-targets workspace cross-Clippy.
+The ARM64 CLI and Developer ID signed debug/release GUI/helper are rebuilt.
+Real signed lifecycle, matching-sample recovery and independent reuse remain
+required; public fixtures do not close those gates.

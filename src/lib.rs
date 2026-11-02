@@ -31,6 +31,7 @@ pub mod fairplay_enrollment_v3;
 pub mod fairplay_frame;
 pub mod fairplay_ipa;
 pub mod fairplay_key;
+mod fairplay_key_tables;
 pub mod fairplay_licenses;
 pub mod fairplay_macho;
 pub mod fairplay_oracle_domains;

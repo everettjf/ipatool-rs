@@ -352,9 +352,10 @@ checks available CodeDirectory pre-encryption hashes. Rust now defaults to the
 ported current-format semantic kernel through a shared capture adapter, with
 signed-keyfile verification and matching-sample processing before publication.
 Explicit legacy recovery remains available. Pre-encryption hash audits replace
-instruction plausibility as the plaintext check. Real authorization/recovery,
-complete SUPF/SUPP variant/signature-binding parity and real independent automatic
-reuse remain open. Per-image SINF association and registry resolution are now
+instruction plausibility as the plaintext check. SUPF/SUPP class/variant
+selection, signed SUPP handling and legacy signature bindings are now connected
+with public differential controls. Real authorization/recovery and independent
+automatic reuse remain open. Per-image SINF association and registry resolution are now
 connected and covered by synthetic reference/integration controls; this does
 not close the real multi-image gate.
 

@@ -2,7 +2,7 @@
 //! The selected SIDB is never replaced by a different candidate on failure.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{Read, Write},
     path::{Component, Path},
@@ -214,6 +214,8 @@ fn input(root: &Path, trust: &Trust) -> Result<Input> {
     }
     let mut snapshots = BTreeMap::new();
     let mut signed_keyfiles = 0;
+    let mut signed_v5 = BTreeSet::new();
+    let mut legacy_placeholders = BTreeSet::new();
     let mut sidb: Option<Zeroizing<Vec<u8>>> = None;
     let mut total = 0u64;
     for (path, file) in &files {
@@ -253,7 +255,27 @@ fn input(root: &Path, trust: &Trust) -> Result<Input> {
             verify_reader(handle, file, std::io::sink())?;
         }
         if keyfile {
-            trust.keyfile(&data, path.ends_with(".supp"))?;
+            if data.is_empty() && path.ends_with(".supf") && !path.ends_with(".v5.supf") {
+                legacy_placeholders
+                    .insert(format!("{}.v5.supf", path.strip_suffix(".supf").unwrap()));
+                continue;
+            }
+            let variant = trust.keyfile(&data, path.ends_with(".supp"))?;
+            let expected = if path.ends_with(".v5.supf") {
+                5
+            } else if path.ends_with(".v4.supp") {
+                4
+            } else if path.ends_with(".supf") {
+                3
+            } else {
+                1
+            };
+            if variant != expected {
+                bail!("capture keyfile suffix disagrees with its variant");
+            }
+            if variant == 5 {
+                signed_v5.insert(path.to_string());
+            }
             let name = path.rsplit('/').next().unwrap();
             if [".supf", ".v5.supf", ".supp", ".v4.supp"]
                 .iter()
@@ -276,6 +298,9 @@ fn input(root: &Path, trust: &Trust) -> Result<Input> {
         } else if role {
             snapshots.insert(*path, data);
         }
+    }
+    if !legacy_placeholders.is_subset(&signed_v5) {
+        bail!("empty captured legacy SUPF requires a signed v5 companion");
     }
     if signed_keyfiles == 0 {
         bail!("recovery requires a signed SUPF or SUPP keyfile for the installed executable");
@@ -513,7 +538,7 @@ mod tests {
         for (name, bytes) in [
             ("Payload/A.app/A", &image),
             ("Payload/A.app/SC_Info/A.sinf", &c.sinf),
-            ("Payload/A.app/SC_Info/A.supf", signed),
+            ("Payload/A.app/SC_Info/A.v5.supf", signed),
         ] {
             zip.start_file(name, SimpleFileOptions::default()).unwrap();
             zip.write_all(bytes).unwrap();
@@ -549,6 +574,39 @@ mod tests {
         };
         manifest(&capture, &m);
         (capture, m, vectors.trust(), c.model_sha256)
+    }
+
+    #[test]
+    fn empty_legacy_keyfile_needs_a_signed_correctly_named_v5_companion() {
+        let temp = tempfile::tempdir().unwrap();
+        let (capture, mut m, trust, _) = fixture(temp.path());
+        let legacy = "app/SC_Info/A.supf";
+        m.files.push(put(&capture, legacy, &[]));
+        manifest(&capture, &m);
+        let prepared = temp.path().join("prepared");
+        let result = recover_with_trust(&capture, &prepared, &trust).unwrap();
+        assert_eq!(result.decrypted_pages, 2);
+        assert_eq!(result.current_evidence.unwrap().signed_keyfiles, 1);
+        let signed = fs::read(capture.join("app/SC_Info/A.v5.supf")).unwrap();
+        m.files.retain(|file| file.path != "app/SC_Info/A.v5.supf");
+        manifest(&capture, &m);
+        assert!(
+            input(&capture, &trust)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("requires a signed v5")
+        );
+        *m.files.iter_mut().find(|file| file.path == legacy).unwrap() =
+            put(&capture, legacy, &signed);
+        manifest(&capture, &m);
+        assert!(
+            input(&capture, &trust)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("suffix disagrees")
+        );
     }
 
     #[test]
