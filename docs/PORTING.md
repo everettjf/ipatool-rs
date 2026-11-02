@@ -1266,5 +1266,8 @@ removal still require an explicit operator-confirmed access grant. A matching
 enrollment sample is also required: accepting a signature or granting access
 cannot repair the observed sample mismatch. Real model generation and independent
 decryption/reuse remain open. The exact `02cb19f` platform CI run is
-[41424032318](https://github.com/everettjf/ipatool-rs/actions/runs/41424032318);
-its result must be recorded independently of notarization.
+[41424032318](https://github.com/everettjf/ipatool-rs/actions/runs/41424032318)
+passed all five native jobs: Linux and Windows CLI, Linux and Windows GPUI,
+and the macOS GPUI preview. This includes native Windows MSVC desktop fixtures,
+strict warnings checks and executable builds. These account-free CI checks are
+separate from notarization and do not close the real model or decryption gates.
