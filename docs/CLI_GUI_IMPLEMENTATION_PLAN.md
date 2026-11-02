@@ -353,7 +353,10 @@ ported current-format semantic kernel through a shared capture adapter, with
 signed-keyfile verification and matching-sample processing before publication.
 Explicit legacy recovery remains available. Pre-encryption hash audits replace
 instruction plausibility as the plaintext check. Real authorization/recovery,
-complete IPA license association and independent automatic reuse remain open.
+complete SUPF/SUPP variant/signature-binding parity and real independent automatic
+reuse remain open. Per-image SINF association and registry resolution are now
+connected and covered by synthetic reference/integration controls; this does
+not close the real multi-image gate.
 
 ### F1: Make collection possible and failures actionable
 

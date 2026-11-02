@@ -9,8 +9,9 @@ use super::{
     tasks::{Artifact, ArtifactKind, JobOutcome},
 };
 use crate::{
-    fairplay::{SinfSelector, inspect_enrollment_model, inspect_ipa_sinfs},
+    fairplay::{SinfSelector, inspect_enrollment_model},
     fairplay_collect::EnrollmentCollectOptions,
+    fairplay_ipa::required_ipa_sinfs,
     fairplay_recover_capture::{RecoverCaptureOptions, RecoveryEngine},
     fairplay_recovery_output::read_private_bytes,
 };
@@ -215,7 +216,38 @@ fn check_report(path: &Path) -> Result<bool> {
     }
     let mut verified = true;
     let mut pages = 0u64;
+    let mut licenses = BTreeMap::new();
+    if let Some(values) = report.get("licenses") {
+        let values = values.as_array().context("invalid license report")?;
+        if values.is_empty() {
+            bail!("missing inventoried licenses");
+        }
+        for license in values {
+            let member = license["member"]
+                .as_str()
+                .context("missing license member")?;
+            let hash = license["logical_key_sha256"]
+                .as_str()
+                .context("missing logical-key digest")?;
+            if hash.len() != 64
+                || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || licenses.insert(member, hash).is_some()
+            {
+                bail!("invalid or duplicate inventoried license");
+            }
+        }
+    }
+    let mut used_licenses = std::collections::BTreeSet::new();
     for image in images {
+        if !licenses.is_empty() {
+            let member = image["sinf_member"]
+                .as_str()
+                .context("missing image license binding")?;
+            if licenses.get(member).copied() != image["logical_key_sha256"].as_str() {
+                bail!("image license binding does not match the inventory");
+            }
+            used_licenses.insert(member);
+        }
         if image["cryptid_before"].as_u64().unwrap_or(0) == 0
             || image["cryptid_after"] != 0
             || image["pages"].as_u64().unwrap_or(0) == 0
@@ -240,6 +272,7 @@ fn check_report(path: &Path) -> Result<bool> {
     }
     if report["plaintext_verified"].as_bool() != Some(verified)
         || report["decrypted_page_count"].as_u64() != Some(pages)
+        || used_licenses.len() != licenses.len()
     {
         bail!("inconsistent aggregate validation");
     }
@@ -344,7 +377,7 @@ impl SavedModels {
         if models.is_empty() {
             return Err(ModelProblem::Missing.into());
         }
-        let sinfs = inspect_ipa_sinfs(ipa).context(ModelProblem::Validation)?;
+        let sinfs = required_ipa_sinfs(ipa).context(ModelProblem::Validation)?;
         let selectors: BTreeMap<_, _> = sinfs
             .into_iter()
             .map(|s| (s.selector_id, s.selector))
@@ -381,7 +414,7 @@ impl SavedModels {
         let selector = info
             .selector
             .context("automatic matching requires a selector-bound model")?;
-        let sinfs = inspect_ipa_sinfs(ipa)?;
+        let sinfs = required_ipa_sinfs(ipa)?;
         if sinfs.is_empty()
             || sinfs
                 .iter()
@@ -447,7 +480,7 @@ impl SavedModels {
             operation::stage(Stage::ValidatingModel)?;
             let candidates =
                 crate::fairplay::inspect_model_registry(model).context(ModelProblem::Validation)?;
-            let sinfs = inspect_ipa_sinfs(&request.ipa).context(ModelProblem::Validation)?;
+            let sinfs = required_ipa_sinfs(&request.ipa).context(ModelProblem::Validation)?;
             let matches: Vec<_> = candidates
                 .iter()
                 .filter(|candidate| {
@@ -598,6 +631,62 @@ mod tests {
 
     fn fixture(directory: &Path, name: &str, logical: [u8; 16]) -> (PathBuf, PathBuf) {
         fixture_with_selector(directory, name, logical, 9)
+    }
+
+    #[test]
+    fn reopened_store_matches_each_active_extension_license_and_checks_report_bindings() {
+        let directory = tempfile::tempdir().unwrap();
+        let (first, first_model) = fixture_with_selector(directory.path(), "first", [0x31; 16], 9);
+        let (second, second_model) =
+            fixture_with_selector(directory.path(), "second", [0x61; 16], 10);
+        {
+            let store = SavedModels::new(directory.path());
+            store.setup(import(&first, &first_model)).unwrap();
+            store.setup(import(&second, &second_model)).unwrap();
+        }
+        let combined = directory.path().join("combined.ipa");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&combined).unwrap());
+        for (input, extension) in [(&first, false), (&second, true)] {
+            let mut archive = zip::ZipArchive::new(fs::File::open(input).unwrap()).unwrap();
+            for index in 0..archive.len() {
+                let mut member = archive.by_index(index).unwrap();
+                let mut name = member.name().unwrap().into_owned();
+                if extension {
+                    name = name
+                        .replace(
+                            "Payload/A.app/SC_Info/A",
+                            "Payload/A.app/PlugIns/B.appex/SC_Info/B",
+                        )
+                        .replace("Payload/A.app/A", "Payload/A.app/PlugIns/B.appex/B");
+                }
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                std::io::copy(&mut member, &mut writer).unwrap();
+            }
+        }
+        writer
+            .start_file(
+                "Payload/A.app/SC_Info/Unused.sinf",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        writer.write_all(b"unrelated invalid data").unwrap();
+        writer.finish().unwrap();
+        let before = fs::read(&combined).unwrap();
+        let store = SavedModels::new(directory.path());
+        assert_eq!(store.count().unwrap(), 2);
+        store.decrypt_saved(&combined, None, None).unwrap();
+        let report = combined.with_extension("decrypted.json");
+        assert!(!check_report(&report).unwrap()); // This fixture has no pre-encryption hashes.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(value["licenses"].as_array().unwrap().len(), 2);
+        value["images"][0]["logical_key_sha256"] = "0".repeat(64).into();
+        fs::write(&report, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(check_report(&report).is_err());
+        assert_eq!(fs::read(&combined).unwrap(), before);
+        assert_eq!(store.count().unwrap(), 2);
     }
 
     fn fixture_with_selector(

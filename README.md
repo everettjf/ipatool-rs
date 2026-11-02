@@ -124,6 +124,9 @@ or use **Decrypt IPA...** for an existing download. No model selection is needed
 for each app. Missing or mismatched models preserve the original download and
 offer preparation; existing output files are never replaced. PKGs are unaffected.
 Models are enrollment-specific; the same Apple ID does not guarantee a match.
+Encrypted executables, extensions and frameworks resolve their own adjacent or
+manifest-declared authorization. Missing or ambiguous relationships stop processing;
+unused SINF resources do not select a model for an unrelated image.
 Managed model storage currently requires macOS/Linux private-file permissions;
 Windows support and real private-processing validation remain open. These checks
 require complete pre-encryption page-hash coverage to report verified plaintext.
@@ -156,7 +159,7 @@ The CLI, MCP server, and optional GPUI desktop share Rust application modules. P
 
 Selected Store and SAP signing paths load pinned Apple framework images and execute ARM64 guest code through Unicorn. Rust supplies the image loaders, execution control, and host-call models. The program does not launch a separate Go, Python, or Swift executable; it still depends on the corresponding Apple guest code and the Unicorn runtime for these paths.
 
-FairPlay setup defaults to native current-format SIDB recovery ported from pinned UnfairPlay. It verifies captured signed keyfiles, authenticates one selected enrollment route, and processes a matching sample IPA before saving a model. `fairplay-enroll recover --engine legacy` retains exact-build `fairplayd`/startup-profile research explicitly; there is no automatic legacy retry. Private enrollment and decryption still need end-to-end validation, including macOS authorization and per-image license associations.
+FairPlay setup defaults to native current-format SIDB recovery ported from pinned UnfairPlay. It verifies captured signed keyfiles, authenticates one selected enrollment route, and processes a matching sample IPA before saving a model. `fairplay-enroll recover --engine legacy` retains exact-build `fairplayd`/startup-profile research explicitly; there is no automatic legacy retry. Private enrollment and decryption still need end-to-end validation, including macOS authorization and real multi-image processing. Complete keyfile variant and signature-binding parity remains in progress.
 
 The editable diagram is available as [SVG](docs/images/architecture.svg). Implementation and parity evidence are recorded in [PORTING.md](docs/PORTING.md).
 

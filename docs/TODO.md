@@ -77,6 +77,19 @@ and strict IPA keyfile handling in F3, the scoped macOS authorization path in F1
 and the real setup/reuse checks in F4/F5 remain required. The normalizer does not
 grant access to system state; another manual retry cannot resolve that permission.
 
+Per-image SINF association and model resolution are now connected as the next
+F3 increment. Encrypted apps/extensions/frameworks require their own adjacent or
+manifest-declared license; replicas are resolved by explicit identity or exact
+source bytes, never by trying unrelated keys. A different synthetic extension
+selector selects its own saved model after reopening the store. Additive v2
+report fields identify active licenses and image bindings, checked before saving
+a managed model. Twenty-nine manifest controls agree with pinned Go, and
+synthetic missing-model/conflicting-replica cases preserve inputs and outputs.
+F3 remains open for full SUPF/SUPP class selection, paired-variant consistency,
+legacy signature binding, upstream-compatible repeated empty directory markers,
+and the real multi-image/plaintext gates. F1/F4/F5
+still require the scoped macOS authorization path and real setup/reuse evidence.
+
 ## Current macOS Apple Silicon gates
 
 - [ ] Complete an interactive default macOS Keychain approval flow for `auth login` and `auth revoke` in a local user session. `auth info` succeeded after the user approved its Keychain dialog on October 27; the encrypted `--file-keychain` path also worked.

@@ -52,8 +52,9 @@ It does not execute a native Apple recovery image. The algorithm identity in a
 typed model is distinct from a legacy model's source-image hash. The capture
 adapter works in private staging, verifies a snapshot of the matching sample IPA,
 and publishes the model last. This closes a synthetic implementation gate, not
-the real desktop authorization/recovery gate. Complete per-image license
-association and strict IPA keyfile-format handling remain under validation.
+the real desktop authorization/recovery gate. Per-image license association is
+connected and passes synthetic controls; complete IPA keyfile-variant/signature-
+binding handling and real multi-image processing remain under validation.
 
 The sample gate requires processed encrypted images/pages, zero final cryptids,
 exact mutation scope, matching encrypted-source CodeDirectory audits, and all
@@ -86,9 +87,15 @@ an explicit final review and start. Completed IPA downloads also offer **Decrypt
 IPA...**, which opens automatic matching with stale model/output/report fields
 cleared; it does not start another task. Missing files produce a notice.
 
-Matching uses the IPA's SINF authorization selectors, not the account display
-name or application title. Every selector must have exactly one validated saved
-candidate. Default outputs are separate `.decrypted.ipa` and `.decrypted.json`
+Matching uses the authorization selectors required by inventoried encrypted
+images, not the account display name or application title. Each image uses its
+adjacent SINF or an explicit `SC_Info/Manifest.plist` mapping. A missing replica
+can use a declared source only when that source is unambiguous; an existing
+conflicting replica is rejected. There is no archive-wide first-license fallback.
+Unreferenced SINF resources are preserved without selecting models for them.
+Every required selector must have exactly one validated saved candidate, and
+all required licenses are resolved against one private model-registry snapshot
+before output staging. Default outputs are separate `.decrypted.ipa` and `.decrypted.json`
 files beside the original. Existing files cause a stop, never replacement.
 Custom paths stay under Advanced options. Results and reports appear in Downloads.
 
@@ -102,7 +109,11 @@ or conflicting models. Schema-2 receipts distinguish pre-encryption hash coverag
 from unavailable plaintext validation. Schema-1 receipts retain their original
 structural-check policy and are never upgraded by inventory or reuse. Reports
 use `ipatool-fairplay-decryption-v2`, with per-image validation status and
-pre-encryption audits; instruction-audit fields were removed. Receipts are not
+pre-encryption audits; instruction-audit fields were removed. Reports additionally
+list each active license, its selected model and logical-key digest, and bind
+each image to that license. A multi-license report does not copy one license's
+oracle evidence into the aggregate; it retains per-license evidence instead.
+The managed sample gate checks these bindings as well as page audits. Receipts are not
 cryptographic attestations of Apple signature trust. Model bytes, captures,
 sample plaintext, and raw private errors are excluded from preferences/history;
 reviewable request paths remain there.

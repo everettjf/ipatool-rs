@@ -1055,3 +1055,66 @@ hoc signature is not distribution notarization or helper approval evidence.
 The preceding kernel revision `7c3d049` passed all five native jobs in
 [CI run 41395832853](https://github.com/everettjf/ipatool-rs/actions/runs/41395832853).
 That result predates this adapter and does not substitute for its pending CI.
+
+## Per-image IPA license relationships
+
+The shared decryption service no longer requires exactly one SINF in an IPA.
+Before staging output it inventories encrypted images, resolves each adjacent
+license or explicit `SC_Info/Manifest.plist` association, and authenticates every
+required SINF against a checked private model-registry snapshot. XML and binary
+manifests are supported. Declared sources are sorted deterministically. A target
+that is itself a declared source retains its identity; an existing replica must
+match a declared source byte-for-byte. A missing replica is safe only when all
+declared sources are byte-identical. Duplicate sources/targets, overlapping
+manifest mappings, missing sources and conflicting/ambiguous replicas fail.
+No unrelated SINF is retried after failure, and unreferenced resources do not
+choose models. Managed setup/import/reuse now use only the active image license
+inventory rather than requiring every SINF resource's selector.
+
+Additive fields in the v2 processing report list active licenses and their
+per-license model/oracle evidence. Each image identifies `sinf_member` and its
+logical-key digest. A single-license report preserves the original aggregate
+oracle shape; a multi-license report retains only common request evidence there,
+with complete per-license evidence in `licenses`. Managed sample validation
+rejects missing, duplicate, mismatched or unused reported bindings. Plaintext
+coverage, CMS limitations and receipt assurance policies are unchanged.
+
+The implementation bounds license/manifest reads, declaration counts, retained
+source bytes and total key-table storage, and loads each private model once per
+operation. Checked model bytes cannot mix generations if a registry file changes
+midway. As an intentional Rust safety constraint, encrypted member paths must be
+canonical: traversal, slash aliases, absolute names, backslashes and NULs are
+rejected rather than normalizing them onto another image's license. The lexical
+SUPF path helper's existing Go-compatible behavior remains independently tested.
+
+Twenty-nine public XML/binary manifest controls reproduce the pinned Go verdicts
+and exact mappings, including multiple distinct sources, missing replicas,
+nested manifests, duplicate declarations, noncanonical roots, uppercase source
+suffixes and typed/malformed plists. A checked-in Go test exporter regenerates
+these invented inputs; no private material is involved. Synthetic complete IPA
+tests decrypt a main executable and an extension with different selectors, keys
+and model files, checking all four plaintext hash pages and per-image evidence.
+Other controls cover a declared missing replica, a conflicting existing replica,
+unused invalid SINF resources, missing model preservation of existing outputs,
+one-registry-snapshot behavior, and reopened managed matching of both licenses.
+The original IPA remains unchanged, and altered report bindings are rejected.
+
+Full SUPF/SUPP class selection, paired-variant consistency, legacy code-signature
+binding and real multi-image coverage remain open F3 work. This increment does
+not grant macOS authorization or close the real model/reuse gates.
+
+Local verification passes 488 library, 45 CLI and 45 desktop tests (578 active;
+70 opt-in library tests ignored), the expanded 29-case Go corpus, formatting,
+strict default/GUI/GUI-test all-targets Clippy, and ad hoc signed Apple Silicon
+CLI/debug/release desktop builds. The new bundles were not launched against
+private user state. No real account, downloaded user package or private model
+was read. These results establish the synthetic licensing increment only.
+
+The preceding adapter revision `cabfb15` passed macOS and both Linux jobs but
+failed the two Windows jobs on strict `large_enum_variant` Clippy: adding the
+engine field made inline setup requests enlarge `JobRequest` to 440 bytes there.
+Setup request storage is now boxed, preserving its Serde/journal representation
+while reducing the outer enum. Windows GNU all-targets cross-Clippy passes;
+native Windows MSVC confirmation belongs to the next CI run. A regression reads
+the prior saved setup shape and verifies restart interrupts it without replaying
+private work. No lint suppression or journal schema change was used.
