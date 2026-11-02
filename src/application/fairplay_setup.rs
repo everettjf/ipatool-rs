@@ -11,7 +11,7 @@ use super::{
 use crate::{
     fairplay::{SinfSelector, inspect_enrollment_model, inspect_ipa_sinfs},
     fairplay_collect::EnrollmentCollectOptions,
-    fairplay_recover_capture::RecoverCaptureOptions,
+    fairplay_recover_capture::{RecoverCaptureOptions, RecoveryEngine},
     fairplay_recovery_output::read_private_bytes,
 };
 use anyhow::{Context, Result, bail};
@@ -36,6 +36,7 @@ pub struct SetupRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SetupOptions {
+    pub engine: RecoveryEngine,
     pub existing_model: Option<PathBuf>,
     pub fairplayd: Option<PathBuf>,
     pub compat_fairplayd: Option<PathBuf>,
@@ -54,6 +55,7 @@ pub struct SetupOptions {
 impl Default for SetupOptions {
     fn default() -> Self {
         Self {
+            engine: RecoveryEngine::Current,
             existing_model: None,
             fairplayd: None,
             compat_fairplayd: None,
@@ -433,6 +435,14 @@ impl SavedModels {
         let work = private_work(&self.root, ".setup-")?;
         let before = digest(&request.ipa)?;
         let o = &request.options;
+        if o.existing_model.is_none()
+            && o.engine == RecoveryEngine::Current
+            && (o.compat_fairplayd.is_some()
+                || o.startup_profile.is_some()
+                || o.iokit15_output.is_some())
+        {
+            return Err(anyhow::anyhow!("profile and native-image overrides require explicit Legacy recovery; clear them before selecting Current").context(ModelProblem::Recovery));
+        }
         let (model, plaintext_verified) = if let Some(model) = &o.existing_model {
             operation::stage(Stage::ValidatingModel)?;
             let candidates =
@@ -483,6 +493,7 @@ impl SavedModels {
             .context(ModelProblem::Collection)?;
             let output = work.path().join("recovery");
             let recovered = fairplay::recover(RecoverCaptureOptions {
+                engine: o.engine,
                 capture: &work.path().join("capture"),
                 output: &output,
                 compat_fairplayd: o.compat_fairplayd.as_deref(),

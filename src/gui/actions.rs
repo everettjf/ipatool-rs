@@ -1193,6 +1193,7 @@ impl DesktopWindow {
                 self.set_fair_mode(FairMode::Setup, window, cx);
                 self.fair.setup_step = 1;
                 let o = request.options;
+                self.fair.engine = o.engine;
                 fields.extend([
                     (self.fair.app.clone(), path(Some(request.app))),
                     (self.fair.input.clone(), path(Some(request.ipa))),
@@ -1293,6 +1294,7 @@ impl DesktopWindow {
                 ]);
             }
             FairPlayRequest::Recover {
+                engine,
                 capture,
                 output,
                 compat_fairplayd,
@@ -1301,6 +1303,7 @@ impl DesktopWindow {
                 timeout_seconds,
             } => {
                 self.set_fair_mode(FairMode::Recover, window, cx);
+                self.fair.engine = engine;
                 fields.extend([
                     (self.fair.capture.clone(), path(Some(capture))),
                     (self.fair.directory_output.clone(), path(Some(output))),
@@ -1455,6 +1458,7 @@ impl DesktopWindow {
                     return;
                 }
                 FairPlayRequest::Recover {
+                    engine: self.fair.engine,
                     capture,
                     output,
                     compat_fairplayd: optional(&self.fair.fairplayd),

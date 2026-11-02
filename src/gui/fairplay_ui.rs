@@ -46,10 +46,10 @@ pub(super) fn guide(mode: FairMode) -> Guide {
             tab: "3. Create model",
             title: "Create a decryption model from collected files",
             introduction: "A model contains the FairPlay parameters needed by the final step. It is not an AI model.",
-            prepare: "Prepare: the complete materials folder from step 2 and a new output folder. Run step 1 first if you do not know whether its system build is supported. Add any requested matching files under Advanced options.",
-            result: "Result: a decryption model. After success, choose Use for decryption on the result, then select the matching IPA in step 4.",
+            prepare: "Prepare: the complete materials folder from step 2, including a matching sample IPA, and a new output folder. Current recovery checks the captured authorization format. Legacy system-profile recovery is an explicit Advanced option.",
+            result: "Result: a model and a processed sample IPA with a validation report. After success, choose Use for decryption to process another matching IPA in step 4.",
             action: "Create model",
-            action_hint: "Processes collected files; this does not decrypt the IPA.",
+            action_hint: "Creates a model only after processing the matching sample IPA.",
         },
         FairMode::Decrypt => Guide {
             tab: "4. Decrypt IPA",
@@ -92,9 +92,17 @@ pub(super) fn check_description(name: &str, passed: bool) -> &'static str {
             "No matching model was found. Choose the model for this IPA and the same system build."
         }
         ("capture_integrity", true) => "Collected files passed their integrity checks.",
-        ("supported_fairplayd", true) => "The detected system build supports model creation.",
+        ("current_capture_inputs", true) => {
+            "Collected authorization files passed format, integrity and keyfile signature checks. Model creation still needs validation."
+        }
+        ("current_capture_inputs", false) => {
+            "Collected authorization files need attention before Current recovery. Open the details for the failed prerequisite."
+        }
+        ("supported_fairplayd", true) => {
+            "A legacy system recovery profile is recognized. This does not prove that model creation will succeed."
+        }
         ("supported_fairplayd", false) => {
-            "This system build is not supported for model creation. A different version label will not fix this."
+            "No legacy system recovery profile is recognized. Current recovery is checked separately from authorization files."
         }
         ("native_state_accessible", true) => "Local FairPlay data is accessible for collection.",
         ("native_state_accessible", false) => {

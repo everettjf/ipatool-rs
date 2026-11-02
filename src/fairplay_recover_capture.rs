@@ -60,7 +60,18 @@ pub struct RecoverFromSinfCopyOptions<'a> {
     pub skip_differential: bool,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, Serialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryEngine {
+    #[default]
+    Current,
+    Legacy,
+}
+
 pub struct RecoverCaptureOptions<'a> {
+    pub engine: RecoveryEngine,
     pub capture: &'a Path,
     pub compat_fairplayd: Option<&'a Path>,
     pub native_26b_research: bool,
@@ -91,6 +102,8 @@ pub struct CaptureRecoveryResult {
     pub all_cryptids_zero: bool,
     pub all_code_directory_slots_match: bool,
     pub differential_cases: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_evidence: Option<crate::fairplay_current_capture::CurrentEvidence>,
 }
 
 fn private_directory(path: &Path) -> Result<()> {
@@ -270,9 +283,28 @@ fn checkpoint_stage(
     Ok(())
 }
 
-/// Start from a checked capture and a matching public startup overlay.
-/// The first stage is traced in Rust before continuing the build-specific recovery.
+/// Current recovery is the default. Legacy recovery must be selected explicitly;
+/// a current authentication failure never retries a different engine or record.
 pub fn recover_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureRecoveryResult> {
+    if options.engine == RecoveryEngine::Legacy {
+        return recover_legacy_capture(options);
+    }
+    if options.timeout.is_zero() || options.timeout > Duration::from_secs(3600) {
+        bail!("recovery phase timeout must be between 1 and 3600 seconds");
+    }
+    if options.compat_fairplayd.is_some()
+        || options.native_26b_research
+        || options.startup_profile.is_some()
+        || options.iokit15_output.is_some()
+        || options.skip_differential
+    {
+        bail!("profile and native-image recovery options require the explicit legacy engine");
+    }
+    crate::fairplay_current_capture::recover(options.capture, options.output)
+}
+
+/// Build-specific native tracing retained for explicit legacy research.
+pub fn recover_legacy_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureRecoveryResult> {
     if options.timeout.is_zero() || options.timeout > Duration::from_secs(3600) {
         bail!("recovery phase timeout must be between 1 and 3600 seconds");
     }
@@ -584,6 +616,7 @@ fn recover_from_account_with_binary(
         all_cryptids_zero: true,
         all_code_directory_slots_match: true,
         differential_cases,
+        current_evidence: None,
     };
     write_private_binary(
         &options.output.join("recovery-report.json"),
@@ -859,6 +892,7 @@ pub fn recover_from_sinf_copy(
         all_cryptids_zero: true,
         all_code_directory_slots_match: true,
         differential_cases,
+        current_evidence: None,
     };
     write_private_binary(
         &options.output.join("recovery-report.json"),
@@ -972,6 +1006,7 @@ mod tests {
         .unwrap();
         let output = root.path().join("recovery");
         let error = recover_capture(RecoverCaptureOptions {
+            engine: RecoveryEngine::Legacy,
             capture: &capture,
             compat_fairplayd: None,
             native_26b_research: false,
@@ -1011,6 +1046,7 @@ mod tests {
         }
         let output = root.path().join("recovery");
         let missing = recover_capture(RecoverCaptureOptions {
+            engine: RecoveryEngine::Legacy,
             capture: &capture,
             compat_fairplayd: None,
             native_26b_research: false,
@@ -1024,6 +1060,7 @@ mod tests {
         assert!(format!("{missing:#}").contains("requires --compat-fairplayd"));
         assert!(!output.exists());
         let error = recover_capture(RecoverCaptureOptions {
+            engine: RecoveryEngine::Legacy,
             capture: &capture,
             compat_fairplayd: Some(&wrong_binary),
             native_26b_research: false,

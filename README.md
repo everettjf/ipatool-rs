@@ -156,7 +156,7 @@ The CLI, MCP server, and optional GPUI desktop share Rust application modules. P
 
 Selected Store and SAP signing paths load pinned Apple framework images and execute ARM64 guest code through Unicorn. Rust supplies the image loaders, execution control, and host-call models. The program does not launch a separate Go, Python, or Swift executable; it still depends on the corresponding Apple guest code and the Unicorn runtime for these paths.
 
-FairPlay processing uses exact-build `fairplayd` images, startup profiles, and matched private inputs. The bundled startup profiles do not establish support for arbitrary system builds. Private enrollment and decryption still need end-to-end validation.
+FairPlay setup defaults to native current-format SIDB recovery ported from pinned UnfairPlay. It verifies captured signed keyfiles, authenticates one selected enrollment route, and processes a matching sample IPA before saving a model. `fairplay-enroll recover --engine legacy` retains exact-build `fairplayd`/startup-profile research explicitly; there is no automatic legacy retry. Private enrollment and decryption still need end-to-end validation, including macOS authorization and per-image license associations.
 
 The editable diagram is available as [SVG](docs/images/architecture.svg). Implementation and parity evidence are recorded in [PORTING.md](docs/PORTING.md).
 

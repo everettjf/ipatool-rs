@@ -5,8 +5,9 @@ use super::{
     tasks::{Artifact, ArtifactKind, JobOutcome},
 };
 use crate::{
-    fairplay::write_doctor_report, fairplay_collect::EnrollmentCollectOptions,
-    fairplay_recover_capture::RecoverCaptureOptions,
+    fairplay::write_doctor_report,
+    fairplay_collect::EnrollmentCollectOptions,
+    fairplay_recover_capture::{RecoverCaptureOptions, RecoveryEngine},
 };
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,8 @@ pub enum FairPlayRequest {
         build_version: Option<String>,
     },
     Recover {
+        #[serde(default)]
+        engine: RecoveryEngine,
         capture: PathBuf,
         output: PathBuf,
         compat_fairplayd: Option<PathBuf>,
@@ -186,6 +189,7 @@ pub fn execute(request: FairPlayRequest) -> Result<JobOutcome> {
             })
         }
         FairPlayRequest::Recover {
+            engine,
             capture,
             output,
             compat_fairplayd,
@@ -198,6 +202,7 @@ pub fn execute(request: FairPlayRequest) -> Result<JobOutcome> {
             }
             operation::stage(Stage::Recovering)?;
             let result = recover(RecoverCaptureOptions {
+                engine,
                 capture: &capture,
                 output: &output,
                 compat_fairplayd: compat_fairplayd.as_deref(),
@@ -207,7 +212,28 @@ pub fn execute(request: FairPlayRequest) -> Result<JobOutcome> {
                 native_26b_research: false,
                 skip_differential: false,
             })?;
-            Ok(JobOutcome { summary: "Recovery completed with differential checks enabled. Inspect the output before further use.".into(), artifacts: vec![Artifact { kind: ArtifactKind::Model, path: result.enrollment_model }, Artifact { kind: ArtifactKind::DecryptedIpa, path: result.decrypted_ipa }, Artifact { kind: ArtifactKind::Report, path: output.join("recovery-report.json") }], details: None })
+            Ok(JobOutcome {
+                summary: if result.current_evidence.is_some() {
+                    "Current recovery completed and processed the matching sample IPA. Review the report for plaintext hash coverage.".into()
+                } else {
+                    "Legacy recovery completed with differential checks enabled. Review the output before further use.".into()
+                },
+                artifacts: vec![
+                    Artifact {
+                        kind: ArtifactKind::Model,
+                        path: result.enrollment_model,
+                    },
+                    Artifact {
+                        kind: ArtifactKind::DecryptedIpa,
+                        path: result.decrypted_ipa,
+                    },
+                    Artifact {
+                        kind: ArtifactKind::Report,
+                        path: output.join("recovery-report.json"),
+                    },
+                ],
+                details: None,
+            })
         }
     }
 }

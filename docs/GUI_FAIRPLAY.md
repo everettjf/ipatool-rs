@@ -2,7 +2,7 @@
 
 The desktop exposes primary workflows through the shared Rust application
 layer. It does not invoke the CLI or parse terminal output. This is experimental
-exact-build research software; prerequisite checks do not authenticate plaintext.
+research software; prerequisite checks do not authenticate plaintext.
 For practical use, prefer the original ipatool and UnfairPlay projects.
 
 ## Primary journeys
@@ -23,23 +23,37 @@ that an IPA and model belong together.
 1. **Prepare this Mac:** sign in to the Mac App Store with the account that owns
    the IPA, install an offered iPhone/iPad app, and open it once. Download the same
    app/version's personalized IPA. Signing in only inside IPATOOL-RS does not
-   prepare the Mac's authorization. Current recovery assumes a fresh account
-   enrolled through this Mac's App Store; older/migrated profiles are unsupported,
-   and a fresh account alone does not guarantee success. The system build and
-   readable private authorization data must also be supported. The GUI does not
-   grant permissions or elevate itself.
+   prepare the Mac's authorization. Current recovery checks authorization formats,
+   the deterministic selected route and the matching sample; account age is not
+   a blanket prerequisite or a guarantee of success. Unsupported or ambiguous
+   state fails without trying another record. Readable private authorization data
+   is required. The GUI does not currently grant permissions or elevate itself.
 2. **Choose sample files:** select the installed `.app` and matching IPA. The app
    creates a private disposable working directory automatically. Under Advanced
    options, an existing selector-bound model can instead be imported with a
    matching IPA; import skips collection and does not require an installed app.
-   System-image/profile/state overrides, interface, build/version and the
-   1–3600-second phase timeout remain advanced.
+   State overrides, interface and build/version remain advanced. **Recovery:
+   Current** is the default. Select **Legacy system profile** explicitly to expose
+   source/compatibility images, startup profiles, IOKit data and native tracing
+   timeout options. A Current failure never triggers Legacy recovery.
 3. **Review and prepare:** review the selected filenames and explicitly start.
-   Fresh setup collects, recovers with differential checks enabled, validates the
+   Fresh setup collects, recovers with the selected engine, validates the
    sample's processing report, and saves the model. Import runs the same sample
    processing/page-hash gate before saving. Merely changing steps never starts
    private work. A model without a binding selector is not eligible for managed
    reuse; the manual expert workflow remains available.
+
+Current recovery normalizes bounded private capture snapshots, rejects duplicate
+descriptors and symlinked paths, verifies file hashes and signed SUPF/SUPP
+envelopes against the pinned FairPlay authority, and requires one unambiguous
+current SIDB database (identical captured copies are allowed). The native current
+kernel authenticates its selected license before building a selector-bound model.
+It does not execute a native Apple recovery image. The algorithm identity in a
+typed model is distinct from a legacy model's source-image hash. The capture
+adapter works in private staging, verifies a snapshot of the matching sample IPA,
+and publishes the model last. This closes a synthetic implementation gate, not
+the real desktop authorization/recovery gate. Complete per-image license
+association and strict IPA keyfile-format handling remain under validation.
 
 The sample gate requires processed encrypted images/pages, zero final cryptids,
 exact mutation scope, matching encrypted-source CodeDirectory audits, and all

@@ -22,6 +22,14 @@ pub struct RecoveredEnrollment {
     pub route: tree::RouteEvidence,
 }
 
+/// Algorithm identity stored in typed models; this is not an OS image hash.
+pub fn algorithm_sha256() -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(b"unfairplay/typed-current-enrollment/v1")
+    )
+}
+
 /// Recover from exactly one authenticated SIDB and one installed SINF. This
 /// validates the selected license. The capture adapter must verify signed
 /// keyfiles and process the matching IPA before publishing a managed model.

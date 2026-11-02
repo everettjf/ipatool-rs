@@ -111,6 +111,7 @@ pub(super) fn request_description(request: &JobRequest) -> String {
             build_version.as_deref().unwrap_or("Current host")
         ),
         JobRequest::FairPlay(FairPlayRequest::Recover {
+            engine,
             capture,
             output,
             compat_fairplayd,
@@ -118,7 +119,7 @@ pub(super) fn request_description(request: &JobRequest) -> String {
             iokit15_output,
             timeout_seconds,
         }) => format!(
-            "Recover enrollment\nCapture: {}\nOutput: {}\nCompatibility fairplayd: {}\nStartup profile: {}\nIOKit selector output: {}\nPhase timeout: {} seconds",
+            "Recover enrollment ({engine:?})\nCapture: {}\nOutput: {}\nCompatibility fairplayd: {}\nStartup profile: {}\nIOKit selector output: {}\nPhase timeout: {} seconds",
             path(capture),
             path(output),
             optional(compat_fairplayd),
@@ -1424,24 +1425,33 @@ impl DesktopWindow {
                 &self.fair.report, false, true, cx,
             ));
         }
+        if self.fair.advanced && mode == FairMode::Recover {
+            form = form.child(self.recovery_engine_control(cx));
+        }
         if self.fair.advanced && matches!(mode, FairMode::Collect | FairMode::Recover) {
             form = form.child(muted(if mode == FairMode::Collect {
                 "Normally use this Mac's detected settings. Only override paths or system versions when you have matching materials; changing a version label does not make an unsupported build compatible. Collection needs permission to read this Mac's FairPlay data. The app cannot grant that permission."
             } else {
                 "Some system builds need additional matching files. If the compatibility check requests them, select those files here; do not substitute files from a different build. Leave other fields at their defaults."
             }, cx));
-            form = form.child(self.path_control(
-                if mode == FairMode::Collect {
-                    "Matching fairplayd image (optional)"
-                } else {
-                    "26A428 compatibility fairplayd (optional)"
-                },
-                &self.fair.fairplayd,
-                false,
-                false,
-                cx,
-            ));
-            if mode == FairMode::Recover {
+            if mode == FairMode::Collect
+                || self.fair.engine == ipatool_rs::fairplay_recover_capture::RecoveryEngine::Legacy
+            {
+                form = form.child(self.path_control(
+                    if mode == FairMode::Collect {
+                        "Matching fairplayd image (optional)"
+                    } else {
+                        "26A428 compatibility fairplayd (optional)"
+                    },
+                    &self.fair.fairplayd,
+                    false,
+                    false,
+                    cx,
+                ));
+            }
+            if mode == FairMode::Recover
+                && self.fair.engine == ipatool_rs::fairplay_recover_capture::RecoveryEngine::Legacy
+            {
                 form = form
                     .child(self.path_control(
                         "Checked startup profile (optional)",
@@ -1463,7 +1473,7 @@ impl DesktopWindow {
                             .child(label("Per-phase timeout in seconds (1–3600)", cx))
                             .child(Input::new(&self.fair.timeout)),
                     );
-            } else {
+            } else if mode == FairMode::Collect {
                 form = form
                     .child(self.path_control(
                         "System SC Info (optional)",

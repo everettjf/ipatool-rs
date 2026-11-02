@@ -10,7 +10,7 @@ use math::*;
 const MAX_MODULUS: usize = 18;
 const MAX_PAYLOAD: usize = 1 << 20;
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Layout {
     pub codec_bytes: usize,
     pub payload_offset: usize,

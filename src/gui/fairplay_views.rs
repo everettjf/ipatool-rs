@@ -2,6 +2,25 @@ use super::views::{label, muted};
 use super::*;
 
 impl DesktopWindow {
+    pub(super) fn recovery_engine_control(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use ipatool_rs::fairplay_recover_capture::RecoveryEngine;
+        h_flex().child(
+            Button::new("recovery-engine")
+                .small()
+                .label(match self.fair.engine {
+                    RecoveryEngine::Current => "Recovery: Current",
+                    RecoveryEngine::Legacy => "Recovery: Legacy system profile",
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.fair.engine = match this.fair.engine {
+                        RecoveryEngine::Current => RecoveryEngine::Legacy,
+                        RecoveryEngine::Legacy => RecoveryEngine::Current,
+                    };
+                    cx.notify();
+                })),
+        )
+    }
+
     pub(super) fn fairplay_guided_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let setup = self.fair.mode == FairMode::Setup;
         let step = self.fair.setup_step;
@@ -47,9 +66,9 @@ impl DesktopWindow {
                         .child(muted("1. Sign in to the Mac App Store with the Apple account that owns your IPA. Signing in only inside IPATOOL-RS does not prepare this Mac's authorization.", cx))
                         .child(muted("2. Install an iPhone or iPad app through the Mac App Store and open it once. Choose an app offered for this Mac.", cx))
                         .child(muted("3. Download the same app/version's encrypted IPA with the same account. An IPA by itself is not enough for initial setup.", cx))
-                        .child(muted("Current recovery support assumes a fresh Apple account enrolled through this Mac's App Store. Older or migrated account profiles are not supported; a fresh account alone does not guarantee success.", cx))
+                        .child(muted("Preparation checks this Mac's authorization format and validates the model with your sample IPA. Unsupported or ambiguous authorization data stops preparation; creating a new account does not guarantee success.", cx))
                         .child(muted("Already have a model? Continue and import it under Advanced options with a sample IPA. No local collection is needed for an import.", cx))
-                        .child(muted("The Mac's system build and authorization must be supported. Reading local FairPlay data requires existing permission; this app cannot elevate itself.", cx)));
+                        .child(muted("This Mac's authorization format must be supported. Reading local FairPlay data requires existing permission; this app cannot elevate itself.", cx)));
                 }
                 1 => {
                     form = form
@@ -103,7 +122,8 @@ impl DesktopWindow {
             );
             if self.fair.advanced {
                 if setup {
-                    form = form.child(muted("Normally leave these empty. Importing an existing model replaces collection and recovery with a sample IPA validation. Other fields override this Mac's detected settings and must match the source build.", cx));
+                    form = form.child(self.recovery_engine_control(cx))
+                        .child(muted("Normally use Current recovery and leave these fields empty. Importing a model validates it with your sample IPA. Compatibility images, startup profiles and IOKit data are only used by explicit Legacy recovery; they are never tried after a Current failure.", cx));
                     for (title, input, directory) in [
                         (
                             "Existing model to validate and save (optional)",
@@ -139,6 +159,18 @@ impl DesktopWindow {
                             false,
                         ),
                     ] {
+                        if self.fair.engine
+                            == ipatool_rs::fairplay_recover_capture::RecoveryEngine::Current
+                            && matches!(
+                                title,
+                                "Source fairplayd image (optional)"
+                                    | "Compatibility fairplayd image (if requested)"
+                                    | "Startup profile (optional)"
+                                    | "IOKit selector data (optional)"
+                            )
+                        {
+                            continue;
+                        }
                         form = form.child(self.path_control(title, input, directory, false, cx));
                     }
                     form = form
@@ -147,9 +179,14 @@ impl DesktopWindow {
                         .child(label("Source macOS version override (optional)", cx))
                         .child(Input::new(&self.fair.product_version))
                         .child(label("Source system build override (optional)", cx))
-                        .child(Input::new(&self.fair.build_version))
-                        .child(label("Per-phase timeout, seconds (1–3600)", cx))
-                        .child(Input::new(&self.fair.timeout));
+                        .child(Input::new(&self.fair.build_version));
+                    if self.fair.engine
+                        == ipatool_rs::fairplay_recover_capture::RecoveryEngine::Legacy
+                    {
+                        form = form
+                            .child(label("Legacy phase timeout, seconds (1–3600)", cx))
+                            .child(Input::new(&self.fair.timeout));
+                    }
                 } else {
                     form = form.child(self.guided_path("New output IPA (optional)", "Blank creates a separate .decrypted.ipa beside the input. Existing files are preserved.", &self.fair.output, false, true, cx))
                         .child(self.guided_path("New report file (optional)", "Blank creates a .decrypted.json report beside the input. Reports may contain private paths and identifiers.", &self.fair.report, false, true, cx));

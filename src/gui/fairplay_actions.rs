@@ -177,6 +177,7 @@ impl DesktopWindow {
             app: PathBuf::from(value(&self.fair.app)),
             ipa: PathBuf::from(value(&self.fair.input)),
             options: SetupOptions {
+                engine: self.fair.engine,
                 existing_model: path(&self.fair.model),
                 fairplayd: path(&self.fair.fairplayd),
                 compat_fairplayd: path(&self.fair.compat),

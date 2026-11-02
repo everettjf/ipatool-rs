@@ -348,9 +348,12 @@ The newer upstream comparison is pinned to
 It supplements, rather than silently replaces, the sibling Go port baseline.
 Its production recovery parses the current SIDB format and authenticates the
 selected enrollment route without executing a native image. Its decryption
-checks available CodeDirectory pre-encryption hashes. Rust currently uses
-exact-build checkpoint recovery and encrypted-source page audits plus structural
-plausibility checks. These are material differences, not missing GUI labels.
+checks available CodeDirectory pre-encryption hashes. Rust now defaults to the
+ported current-format semantic kernel through a shared capture adapter, with
+signed-keyfile verification and matching-sample processing before publication.
+Explicit legacy recovery remains available. Pre-encryption hash audits replace
+instruction plausibility as the plaintext check. Real authorization/recovery,
+complete IPA license association and independent automatic reuse remain open.
 
 ### F1: Make collection possible and failures actionable
 

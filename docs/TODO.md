@@ -65,6 +65,18 @@ F2 remains open for canonical capture normalization, signed-keyfile validation
 and the shared CLI/GUI adapter. Production setup still calls the old recovery
 path until those prerequisites are connected; private live validation remains open.
 
+The current increment connects bounded private capture normalization, pinned
+signed-keyfile verification and sample processing to the shared service. CLI
+`recover` and GUI setup now default to Current; legacy native tracing requires
+`--engine legacy` or the explicit advanced GUI choice. Synthetic controls cover
+complete recovery, sample plaintext hashes, refusal of unrelated records,
+descriptor/signature tampering, cancellation cleanup and managed-store reopen
+with a different synthetic IPA. F2's implementation is connected, but its real
+authorized-capture exit evidence remains open. Per-image IPA license association
+and strict IPA keyfile handling in F3, the scoped macOS authorization path in F1,
+and the real setup/reuse checks in F4/F5 remain required. The normalizer does not
+grant access to system state; another manual retry cannot resolve that permission.
+
 ## Current macOS Apple Silicon gates
 
 - [ ] Complete an interactive default macOS Keychain approval flow for `auth login` and `auth revoke` in a local user session. `auth info` succeeded after the user approved its Keychain dialog on October 27; the encrypted `--file-keychain` path also worked.

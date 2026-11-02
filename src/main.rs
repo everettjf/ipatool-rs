@@ -32,7 +32,7 @@ use ipatool_rs::fairplay_oracle_model::OracleModel;
 use ipatool_rs::fairplay_portable;
 use ipatool_rs::fairplay_raw_source::run_kernel;
 use ipatool_rs::fairplay_recover_capture::{
-    RecoverCaptureOptions, RecoverFromAccountOptions, RecoverFromSinfCopyOptions,
+    RecoverCaptureOptions, RecoverFromAccountOptions, RecoverFromSinfCopyOptions, RecoveryEngine,
     recover_from_account, recover_from_sinf_copy,
 };
 use ipatool_rs::fairplay_recovery;
@@ -290,9 +290,11 @@ enum FairplayEnrollCommand {
         #[arg(long)]
         skip_differential: bool,
     },
-    /// Recover and decrypt a checked capture with its bundled startup profile.
+    /// Recover and validate a checked capture with the current semantic engine.
     #[command(name = "recover", visible_alias = "recover-capture")]
     RecoverCapture {
+        #[arg(long, value_enum, default_value_t = RecoveryEngine::Current)]
+        engine: RecoveryEngine,
         #[arg(long)]
         capture: PathBuf,
         #[arg(
@@ -1117,6 +1119,7 @@ fn run() -> Result<()> {
                 }
             }
             FairplayEnrollCommand::RecoverCapture {
+                engine,
                 capture,
                 compat_fairplayd,
                 native_26b_research,
@@ -1127,6 +1130,7 @@ fn run() -> Result<()> {
                 skip_differential,
             } => {
                 let result = recover_capture(RecoverCaptureOptions {
+                    engine,
                     capture: &capture,
                     compat_fairplayd: compat_fairplayd.as_deref(),
                     native_26b_research,
@@ -3081,7 +3085,7 @@ mod tests {
     }
 
     #[test]
-    fn fairplay_recover_uses_bundled_profile_by_default() {
+    fn fairplay_recover_uses_current_engine_by_default() {
         let cli = Cli::try_parse_from([
             "ipatool",
             "fairplay-enroll",
@@ -3096,6 +3100,7 @@ mod tests {
             cli.command,
             Command::FairplayEnroll {
                 command: FairplayEnrollCommand::RecoverCapture {
+                    engine: RecoveryEngine::Current,
                     startup_profile: None,
                     timeout_seconds: 600,
                     ..

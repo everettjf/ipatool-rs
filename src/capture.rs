@@ -171,7 +171,8 @@ fn private_permissions(info: &fs::Metadata) -> bool {
 }
 
 pub fn model_matches_capture_build(model_hash: &str, capture: &EnrollmentCaptureManifest) -> bool {
-    model_hash == capture.fairplayd.sha256
+    model_hash == crate::fairplay_current::algorithm_sha256()
+        || model_hash == capture.fairplayd.sha256
         || (!capture.fairplay.compatibility_sha256.is_empty()
             && model_hash == capture.fairplay.compatibility_sha256)
 }
