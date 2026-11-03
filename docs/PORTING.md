@@ -23,6 +23,20 @@ the earlier private-flow status below for that tested host/enrollment only. See
 [the detailed acceptance record](#real-fairplay-acceptance-2026-11-03); portable
 private-data and broader account gates remain open.
 
+## Version 0.3.0 distribution preparation (2026-11-03)
+
+PR #7 is being prepared for the authorized main-branch merge and release.
+The release adds a separately installed Apple Silicon GPUI desktop ZIP and
+Homebrew cask to the existing three-target CLI distribution. The production
+bundle contains no test-state environment override; GUI and scoped helper share
+Developer ID signing, and packaging requires a stapled accepted notarization
+ticket. The release workflow verifies both macOS archives before publishing.
+README and the static website now describe desktop installation, account-region
+selection, one-time preparation, automatic reuse and remaining experimental gates.
+The preceding real FairPlay acceptance remains the private-flow evidence; a
+version change and public distribution do not close broader platform/account gates.
+Final publication and installation evidence is recorded after the release passes.
+
 ## Release snapshot (2026-10-27)
 
 - Version 0.2.1 ships macOS ARM64, Linux x86_64, and Windows x86_64 archives only. Version 0.2.0 shipped two additional ARM64 portable archives, which are historical artifacts outside the current release scope. Native x86_64 Linux and Windows CI passed tests, Clippy, release builds, version checks, public catalog search, packaging, and checksums. Account-backed flows on these systems remain unvalidated.

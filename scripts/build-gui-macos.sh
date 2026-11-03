@@ -57,6 +57,9 @@ cp LICENSE NOTICE "$BUNDLE/Contents/Resources/"
 cp licenses/LICENSE-DARKPHOENIX.txt "$BUNDLE/Contents/Resources/"
 cp assets/desktop/ipatool.icns "$BUNDLE/Contents/Resources/ipatool.icns"
 printf 'ipatool-rs desktop %s (%s)\n' "$VERSION" "$PROFILE" > "$BUNDLE/Contents/Resources/ipatool-build.txt"
+if SOURCE_COMMIT=$(git rev-parse HEAD 2>/dev/null); then
+  printf 'source %s\n' "$SOURCE_COMMIT" >> "$BUNDLE/Contents/Resources/ipatool-build.txt"
+fi
 cat > "$BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

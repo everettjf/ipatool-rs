@@ -70,7 +70,7 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: Verify signed macOS archive
+    name: Verify signed macOS CLI and desktop
     runs-on: macos-15
     steps:
       - name: Download draft release assets
@@ -81,6 +81,7 @@ jobs:
         run: |
           mkdir -p dist
           gh release download "$RELEASE_TAG" --dir dist --pattern "ipatool-rs-*-macos-arm64.tar.gz*"
+          gh release download "$RELEASE_TAG" --dir dist --pattern "ipatool-rs-*-gui-macos-arm64.zip*"
       - name: Verify checksum, signature, and public search
         env:
           RELEASE_TAG: ${{ inputs.tag }}
@@ -95,6 +96,34 @@ jobs:
           codesign --verify --strict extracted/ipatool-rs
           extracted/ipatool-rs --version
           extracted/ipatool-rs --non-interactive --format json search ScriptWidget --platform macos --country US --limit 1
+      - name: Verify desktop checksum, version, signatures, and notarization
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version=${RELEASE_TAG#v}
+          cd dist
+          archive="ipatool-rs-$version-gui-macos-arm64.zip"
+          shasum -a 256 -c "$archive.sha256"
+          ditto -x -k "$archive" desktop
+          bundle=desktop/IPATOOL-RS.app
+          info="$bundle/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$info")" = "$version"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info")" = dev.ipatool.rust
+          if /usr/libexec/PlistBuddy -c 'Print :LSEnvironment' "$info" >/dev/null 2>&1; then
+            echo 'A public desktop bundle must not contain environment overrides.' >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict "$bundle"
+          for item in "$bundle" "$bundle/Contents/Library/LaunchServices/ipatool-fairplay-helper"; do
+            details=$(codesign -d --verbose=4 "$item" 2>&1)
+            printf '%s\n' "$details" | grep -q '^Authority=Developer ID Application:'
+            printf '%s\n' "$details" | grep -q '^TeamIdentifier=YPV49M8592$'
+          done
+          test "$(lipo -archs "$bundle/Contents/MacOS/ipatool-gui")" = arm64
+          test "$(lipo -archs "$bundle/Contents/Library/LaunchServices/ipatool-fairplay-helper")" = arm64
+          xcrun stapler validate "$bundle"
+          spctl --assess --type execute --verbose=2 "$bundle"
 
   publish:
     name: Publish draft release

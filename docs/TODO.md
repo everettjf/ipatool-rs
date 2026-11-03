@@ -1,6 +1,6 @@
 # Remaining work
 
-Status as of 2026-11-03. The 0.2.1 delivery targets are macOS on Apple Silicon, Linux x86_64, and Windows x86_64. Linux ARM64 and Windows ARM64 are no longer release targets. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
+Status as of 2026-11-03. The 0.3.0 delivery targets are macOS on Apple Silicon, Linux x86_64, and Windows x86_64. Linux ARM64 and Windows ARM64 are no longer release targets. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
 
 Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and release packaging jobs. Both Linux architectures previously passed account-free version and public-search smoke checks in Debian 13 QEMU guests; ARM64 is now deferred. The native CI results and release artifact checks are recorded in [PORTING.md](PORTING.md); account-backed workflows remain open.
 
@@ -26,7 +26,7 @@ checkboxes and local/CI evidence do not close the separate live-validation gates
 - [x] Default public browsing to the loaded account's region, preserve explicit overrides during same-account refresh, and display a persistent cross-region download warning with a return-to-account-region action.
 - [x] Validate native Linux x86_64 and Windows MSVC x86_64 GUI builds, deterministic controllers and strict all-targets Clippy in CI. Windows GNU GUI cross-build and strict all-targets Clippy also pass on macOS. The successful CI run is linked in [PORTING.md](PORTING.md).
 - [ ] Validate Linux x86_64 and Windows x86_64 GUI desktop interaction and account workflows. Headless controller tests and CLI CI do not establish these gates.
-- [ ] Complete distribution signing/notarization and release packaging before distributing the GUI. The local Developer ID preview is notarized and passed real controlled-account/FairPlay tests; public GUI release packaging remains open and current published releases are CLI-only.
+- [ ] Publish and verify the v0.3.0 Developer ID signed/notarized Apple Silicon desktop ZIP and Homebrew cask alongside the three CLI archives. Release packaging and CI verification are implemented; publication evidence is recorded after the release gates pass.
 - [ ] Finish fixture and live validation of the implemented account, download, and FairPlay desktop workflows, including 2FA, credential-store access, task recovery, safe cancellation, and output selection. Keep manual account/private-data checks last.
 - [x] Complete the controlled macOS Apple Silicon FairPlay processing and interruption walkthroughs (2026-11-03): real setup, verified sample, automatic independent reuse after restart, cancellation cleanup, access removal and output preservation. See the acceptance record below.
 
@@ -47,7 +47,7 @@ the tested macOS Apple Silicon host and current-format enrollment.
 - [x] F2: Port the pinned current UnfairPlay canonical/semantic recovery path into shared Rust, including deterministic route selection and selected-license authentication; retain the old exact-build path explicitly.
 - [x] F3: Add complete available pre-encryption CodeDirectory hash validation, missing-coverage reporting, versioned receipts/reports and corrupt-final-page rejection. Audit per-image license/page-table associations and unsupported formats.
 - [x] F4: Complete terminal-free first setup, private model publication, relaunch reuse and independent automatic decryption of another matching IPA; make unavailable validation and failures actionable.
-- [x] F5: Pass full regressions and signed builds, then authorized real setup plus a different matching IPA, complete plaintext-coverage control, mismatch, denial, collision, cancellation and restart. Update PR #7 on the same branch without merging.
+- [x] F5: Pass full regressions and signed builds, then authorized real setup plus a different matching IPA, complete plaintext-coverage control, mismatch, denial, collision, cancellation and restart. The implementation and acceptance were reviewed in PR #7; release publication is a separate step.
 
 Implemented in the shared service:
 
@@ -76,11 +76,11 @@ output preservation were exercised natively. See
 [the acceptance record](PORTING.md#real-fairplay-acceptance-2026-11-03) and
 [the authorization boundary](FAIRPLAY_AUTHORIZATION.md).
 
-Remaining release work is GUI distribution/packaging, accessibility, the account
-challenge/session gates below, and native Linux/Windows account interaction.
-Windows managed-model storage still requires equivalent ACL enforcement. This
-work does not merge PR #7, publish a GUI release or establish arbitrary-enrollment
-or cross-platform private-data parity.
+Remaining work includes the v0.3.0 distribution gate above, accessibility, account
+challenge/session gates and native Linux/Windows account interaction. Windows
+managed-model storage still requires equivalent ACL enforcement. Controlled
+acceptance does not establish arbitrary-enrollment or cross-platform private-data
+parity.
 
 ## Current macOS Apple Silicon gates
 

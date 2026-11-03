@@ -1,5 +1,16 @@
 # Native desktop captures
 
+## Desktop release capture (2026-11-03)
+
+[Public iOS catalog](release-desktop.png) is an unretouched native capture of the
+current UI, signed out, with public ScriptWidget search results in the US region.
+It shows the iOS launch default, region dropdown, details, dark sidebar and
+account entry used by the v0.3.0 desktop release. It contains no private account
+identity, package paths, captures or model data. It is browsing evidence only;
+the separate real FairPlay acceptance is recorded in [PORTING.md](../PORTING.md).
+
+## Historical captures
+
 These are actual, unretouched captures of the locally built GPUI application on
 macOS Apple Silicon on 2026-10-28. The top-level images below use native services
 for public browsing and empty-form validation. The separate

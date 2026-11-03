@@ -1,6 +1,6 @@
 # ipatool-rs
 
-App Store search, account management, IPA / PKG downloads, and FairPlay tooling in Rust.
+A native dark desktop and CLI for App Store search, account access, IPA / PKG downloads, and guided FairPlay workflows in Rust.
 
 [![Release](https://img.shields.io/badge/releases-download-178c82?style=flat-square)](https://github.com/everettjf/ipatool-rs/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-487bc4?style=flat-square)](LICENSE)
@@ -10,14 +10,14 @@ Built on the work of [ipatool](https://github.com/majd/ipatool), [UnfairPlay](ht
 
 > **Experimental Rust rewrite.** This project was created to use otherwise-unused Codex quota and explore whether Codex could carry a substantial port through implementation, testing, and release. For practical use, prefer the original projects. Full parity remains under validation; see [known limitations](#known-limitations).
 
-[Install](#install) · [Quick start](#quick-start) · [Commands](#commands) · [Desktop preview](#desktop-preview-gpui) · [Architecture](#architecture) · [MCP](#mcp) · [Development](#development) · [Documentation](#documentation)
+[Install](#install) · [Quick start](#quick-start) · [Commands](#commands) · [Desktop app](#desktop-app-gpui) · [Architecture](#architecture) · [MCP](#mcp) · [Development](#development) · [Documentation](#documentation)
 
 ## Features
 
 | Area | Capabilities |
 | --- | --- |
 | Public catalog | Search applications, look up details, and find the latest external version ID without signing in. |
-| Desktop preview | Optional GPUI desktop for public browsing, account interaction, Library, download tasks, and primary FairPlay workflows. Controlled Apple Silicon download, FairPlay setup and automatic reuse passed; other live gates remain. |
+| Desktop app | Native dark GPUI desktop for public browsing, account interaction, Library, download tasks, and primary FairPlay workflows. Controlled Apple Silicon download, FairPlay setup and automatic reuse passed; other live gates remain. |
 | Account and Store | Sign in, inspect or revoke saved credentials, obtain free-app licenses, and query purchases and version metadata. |
 | Packages | Download entitled IPA or Mac PKG packages, with package metadata and SINF handling. |
 | MCP | Expose six App Store tools to compatible clients over standard input and output. |
@@ -29,7 +29,7 @@ The following release targets are available:
 
 | Operating system | Architecture | Distribution | Current scope |
 | --- | --- | --- | --- |
-| macOS | Apple Silicon / arm64 | Homebrew or `.tar.gz` | Developer ID signed and notarized; selected real-account and package flows checked. |
+| macOS | Apple Silicon / arm64 | Homebrew formula (CLI), cask (GUI), `.tar.gz` / `.zip` | Developer ID signed and notarized CLI and desktop; controlled account, download and FairPlay setup/reuse checked. |
 | Linux | x86_64 | `.tar.gz` | Experimental; native CI and public catalog checks pass. Real account and package flows remain unverified. |
 | Windows | x86_64 | `.zip` | Experimental; native CI and public catalog checks pass. Real account and package flows remain unverified. |
 
@@ -37,7 +37,24 @@ macOS x86_64, Linux ARM64, Windows ARM64, and iOS runtime releases are deferred.
 
 ## Install
 
-### Homebrew on Apple Silicon macOS
+### Desktop on Apple Silicon macOS
+
+```sh
+brew tap everettjf/tap
+brew install --cask everettjf/tap/ipatool-rs-gui
+```
+
+Open **IPATOOL-RS** from Applications. Requires macOS 12 or later; protected
+FairPlay preparation requires macOS 13 or later and explicit administrator
+approval. Browse first, sign in when downloading, then follow **FairPlay →
+First-time preparation** once for a matching installed app and sample IPA. Later
+matching IPA downloads automatically reuse the saved model. Models and original
+downloads stay local. Remove collection access in the app before uninstalling it.
+
+For upgrades, use `brew upgrade --cask everettjf/tap/ipatool-rs-gui`. The CLI and
+desktop are installed separately; you can use either or both.
+
+### CLI on Apple Silicon macOS
 
 ```sh
 brew tap everettjf/tap
@@ -53,11 +70,12 @@ Download the matching archive and its companion `.sha256` file from [GitHub Rele
 
 | Platform | Archive |
 | --- | --- |
-| macOS arm64 | [Latest release](https://github.com/everettjf/ipatool-rs/releases/latest) — choose `*-macos-arm64.tar.gz` |
+| macOS arm64 desktop | [Latest release](https://github.com/everettjf/ipatool-rs/releases/latest) — choose `*-gui-macos-arm64.zip`, then move `IPATOOL-RS.app` to Applications |
+| macOS arm64 CLI | [Latest release](https://github.com/everettjf/ipatool-rs/releases/latest) — choose `*-macos-arm64.tar.gz` |
 | Linux x86_64 | [Latest release](https://github.com/everettjf/ipatool-rs/releases/latest) — choose `*-linux-x86_64.tar.gz` |
 | Windows x86_64 | [Latest release](https://github.com/everettjf/ipatool-rs/releases/latest) — choose `*-windows-x86_64.zip` |
 
-Verify the checksum, extract the archive, and put the directory containing `ipatool-rs` on your `PATH`. On Windows, the executable is `ipatool-rs.exe`. The installed command is **`ipatool-rs`** and can coexist with the original `ipatool`.
+For CLI archives, verify the checksum, extract the archive, and put the directory containing `ipatool-rs` on your `PATH`. On Windows, the executable is `ipatool-rs.exe`. The installed command is **`ipatool-rs`** and can coexist with the original `ipatool`.
 
 <details>
 <summary>Checksum verification</summary>
@@ -172,9 +190,13 @@ FairPlay setup defaults to native current-format SIDB recovery ported from pinne
 
 The editable diagram is available as [SVG](docs/images/architecture.svg). Implementation and parity evidence are recorded in [PORTING.md](docs/PORTING.md).
 
-## Desktop preview (GPUI)
+## Desktop app (GPUI)
 
-Build and run the optional native desktop from source:
+![Native dark desktop: public iOS search, region selection and application details.](docs/screenshots/release-desktop.png)
+
+Actual public-catalog capture; no account credentials or private packages are shown.
+
+Install the signed and notarized Apple Silicon app with the [Homebrew cask](#desktop-on-apple-silicon-macos), or build the optional desktop from source:
 
 ```sh
 cargo run --locked --features gui --bin ipatool-gui
@@ -196,8 +218,10 @@ automatically and clear the previous selection while loading. Select a result to
 inspect metadata or copy identifiers, JSON, and CLI commands. Queries run in the
 background and report loading, empty, and error states.
 
-The GUI is a source-only experiment, initially validated on Apple Silicon macOS.
-It is not included in release archives or Homebrew. The Windows GNU x86_64 GUI
+Version 0.3.0 adds a signed, notarized Apple Silicon desktop ZIP and Homebrew
+cask alongside the existing CLI distributions. This is an experimental release,
+with real controlled macOS account, download and FairPlay setup/reuse acceptance.
+The Windows GNU x86_64 GUI
 cross-build links successfully on macOS. Native CI also passes GUI builds,
 controller fixtures and Clippy on Linux x86_64 and Windows MSVC x86_64.
 Interactive Linux/Windows desktop and account checks remain open; CLI release
@@ -206,7 +230,7 @@ GPUI requires a graphical desktop and graphics support; macOS builds need Xcode
 with the Metal compiler tools. See the pinned [GPUI crate](https://docs.rs/crate/gpui/0.2.2)
 for platform dependencies.
 
-The in-progress desktop also exposes login/verification and file-store unlock,
+The desktop also exposes login/verification and file-store unlock,
 purchase history, version selection, background downloads, and FairPlay
 inspection/collection/recovery/model decryption through shared Rust application
 workflows. Browsing does not open credential storage. Account access starts only
@@ -227,8 +251,9 @@ explicit review and retry. See [current evidence and remaining gates](docs/PORTI
 For a locally signed Apple Silicon application bundle, use
 `scripts/build-gui-macos.sh` (or `--debug`). The generated `.app` is ad hoc signed,
 not notarized or published by default. An explicitly Developer ID signed preview
-has passed notarization and controlled macOS account/FairPlay acceptance; public
-GUI release packaging and the remaining live account/platform gates stay open.
+has passed notarization and controlled macOS account/FairPlay acceptance. Public
+desktop packages use Developer ID signing and stapled notarization tickets; the
+remaining account/platform gates stay open.
 Building without `--features gui` keeps the CLI-only build;
 plain `cargo run` still selects `ipatool`.
 
