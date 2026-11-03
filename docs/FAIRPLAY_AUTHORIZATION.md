@@ -38,8 +38,12 @@ It accepts a versioned snapshot operation and a 16-byte nonce, with no caller
 paths, commands, output locations, credentials or optional operations. Unknown
 fields or versions are rejected. Each input is limited to 2 MiB. Every path
 component is opened relative to a retained directory descriptor with no symlink
-following. Non-regular files, hard links, untrusted owners, world-writable final
-files, changed metadata and unsupported headers are rejected. Only the current
+following. Non-regular files, hard links, untrusted owners, changed metadata and
+unsupported headers are rejected. Native source databases may be writable by
+other users; they remain untrusted inputs and their permissions are never changed.
+The user process saves private snapshots, then recovery authenticates the selected
+state and license and validates the sample before publishing a model. A source's
+file mode does not establish enrollment authenticity. Only the current
 console user may request a snapshot; the console identity is checked again after
 reading. Concurrent reads are bounded. No root-owned capture or model is written.
 

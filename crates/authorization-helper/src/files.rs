@@ -100,9 +100,10 @@ fn read_fixed(
         if !directory && meta.nlink() != 1 {
             return Err(Problem::StateLinks);
         }
-        if !directory && meta.mode() & 0o002 != 0 {
-            return Err(Problem::StateWritable);
-        }
+        // A native SIDB may be writable by other users. Treat its bytes as
+        // untrusted input; source permissions do not authenticate enrollment.
+        // The caller writes a private snapshot and recovery authenticates the
+        // selected state/license before publishing a model. Never chmod here.
         parent = next;
     }
     let before = parent.metadata().map_err(io)?;
@@ -169,8 +170,15 @@ mod tests {
         );
         fs::set_permissions(&file, fs::Permissions::from_mode(0o666)).unwrap();
         assert_eq!(
-            read_fixed(root.path(), &["SC Info", "SC Info.sidb"], uid).err(),
-            Some(Problem::StateWritable)
+            read_fixed(root.path(), &["SC Info", "SC Info.sidb"], uid)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            [0, 7, 0, 11]
+        );
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o666
         );
         assert!(read_fixed(root.path(), &["SC Info"], uid).is_err());
         for name in ["../SC Info.sidb", "..", "/etc/passwd", ""] {
