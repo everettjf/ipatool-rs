@@ -91,12 +91,17 @@ fn read_fixed(
         // SAFETY: this call owns the fresh openat descriptor.
         let next = unsafe { File::from_raw_fd(raw) };
         let meta = next.metadata().map_err(io)?;
-        if (directory && !meta.is_dir())
-            || (!directory && !meta.is_file())
-            || (meta.uid() > 500 && meta.uid() != uid)
-            || (!directory && (meta.nlink() != 1 || meta.mode() & 0o002 != 0))
-        {
+        if (directory && !meta.is_dir()) || (!directory && !meta.is_file()) {
             return Err(Problem::UnsafeStateMetadata);
+        }
+        if meta.uid() > 500 && meta.uid() != uid {
+            return Err(Problem::StateOwner);
+        }
+        if !directory && meta.nlink() != 1 {
+            return Err(Problem::StateLinks);
+        }
+        if !directory && meta.mode() & 0o002 != 0 {
+            return Err(Problem::StateWritable);
         }
         parent = next;
     }
@@ -155,13 +160,17 @@ mod tests {
         fs::hard_link(&file, root.path().join("linked")).unwrap();
         assert_eq!(
             read_fixed(root.path(), &["SC Info", "SC Info.sidb"], uid).err(),
-            Some(Problem::UnsafeStateMetadata)
+            Some(Problem::StateLinks)
         );
         fs::remove_file(root.path().join("linked")).unwrap();
+        assert_eq!(
+            read_fixed(root.path(), &["SC Info", "SC Info.sidb"], uid + 1).err(),
+            Some(Problem::StateOwner)
+        );
         fs::set_permissions(&file, fs::Permissions::from_mode(0o666)).unwrap();
         assert_eq!(
             read_fixed(root.path(), &["SC Info", "SC Info.sidb"], uid).err(),
-            Some(Problem::UnsafeStateMetadata)
+            Some(Problem::StateWritable)
         );
         assert!(read_fixed(root.path(), &["SC Info"], uid).is_err());
         for name in ["../SC Info.sidb", "..", "/etc/passwd", ""] {

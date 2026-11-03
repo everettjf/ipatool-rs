@@ -30,6 +30,9 @@ pub enum Problem {
     UnsafeStateMetadata,
     StateTooLarge,
     UnsupportedStateFormat,
+    StateOwner,
+    StateLinks,
+    StateWritable,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -50,6 +53,9 @@ impl Problem {
             Self::UnsafeStateMetadata => 12,
             Self::StateTooLarge => 13,
             Self::UnsupportedStateFormat => 14,
+            Self::StateOwner => 15,
+            Self::StateLinks => 16,
+            Self::StateWritable => 17,
         }
     }
     pub(crate) fn from_code(code: u64) -> Self {
@@ -68,6 +74,9 @@ impl Problem {
             12 => Self::UnsafeStateMetadata,
             13 => Self::StateTooLarge,
             14 => Self::UnsupportedStateFormat,
+            15 => Self::StateOwner,
+            16 => Self::StateLinks,
+            17 => Self::StateWritable,
             _ => Self::InvalidRequest,
         }
     }
@@ -90,6 +99,9 @@ impl fmt::Display for Problem {
             Self::UnsafeStateMetadata => "The local authorization database has an unsupported file type, owner, link or write permission. Its permissions were not changed.",
             Self::StateTooLarge => "The local authorization database exceeds the supported collection size. No model was saved.",
             Self::UnsupportedStateFormat => "The local authorization database version is not supported by this collector. No model was saved.",
+            Self::StateOwner => "A local authorization database component belongs to another Mac user. Its ownership was not changed.",
+            Self::StateLinks => "The local authorization database has multiple hard links. No database bytes were collected.",
+            Self::StateWritable => "The local authorization database allows writes by all users. Its permissions were not changed.",
         })
     }
 }
@@ -242,6 +254,9 @@ mod tests {
             Problem::UnsafeStateMetadata,
             Problem::StateTooLarge,
             Problem::UnsupportedStateFormat,
+            Problem::StateOwner,
+            Problem::StateLinks,
+            Problem::StateWritable,
         ] {
             assert_eq!(Problem::from_code(problem.code()), problem);
             assert!(!problem.to_string().contains("/Users/"));

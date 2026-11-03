@@ -68,7 +68,10 @@ impl Failure {
                     "App Store authorization needs attention",
                     "Review preparation",
                 ),
-                Problem::UnsafeStateMetadata => (
+                Problem::UnsafeStateMetadata
+                | Problem::StateOwner
+                | Problem::StateLinks
+                | Problem::StateWritable => (
                     Unavailable,
                     "Authorization database file is not supported",
                     "Review preparation",
@@ -307,6 +310,18 @@ mod tests {
             (
                 Problem::UnsupportedStateFormat,
                 "Authorization database version is not supported",
+            ),
+            (
+                Problem::StateOwner,
+                "Authorization database file is not supported",
+            ),
+            (
+                Problem::StateLinks,
+                "Authorization database file is not supported",
+            ),
+            (
+                Problem::StateWritable,
+                "Authorization database file is not supported",
             ),
         ] {
             let error = anyhow::Error::new(problem)
