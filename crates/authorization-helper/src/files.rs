@@ -19,6 +19,8 @@ pub(crate) fn local() -> Result<Snapshot, Problem> {
 fn io(error: std::io::Error) -> Problem {
     if error.kind() == std::io::ErrorKind::PermissionDenied {
         Problem::PermissionDenied
+    } else if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+        Problem::UnsafeStateMetadata
     } else {
         Problem::InvalidState
     }
@@ -94,13 +96,13 @@ fn read_fixed(
             || (meta.uid() > 500 && meta.uid() != uid)
             || (!directory && (meta.nlink() != 1 || meta.mode() & 0o002 != 0))
         {
-            return Err(Problem::InvalidState);
+            return Err(Problem::UnsafeStateMetadata);
         }
         parent = next;
     }
     let before = parent.metadata().map_err(io)?;
     if before.len() > crate::MAX_STATE_BYTES as u64 {
-        return Err(Problem::InvalidState);
+        return Err(Problem::StateTooLarge);
     }
     let mut bytes = Zeroizing::new(Vec::new());
     (&mut parent)
@@ -118,7 +120,7 @@ fn read_fixed(
         return Err(Problem::StateChanged);
     }
     if bytes.len() > crate::MAX_STATE_BYTES {
-        return Err(Problem::InvalidState);
+        return Err(Problem::StateTooLarge);
     }
     Ok(Some(bytes))
 }
@@ -146,12 +148,21 @@ mod tests {
             [0, 7, 0, 11]
         );
         symlink("SC Info", root.path().join("alias")).unwrap();
-        assert!(read_fixed(root.path(), &["alias", "SC Info.sidb"], uid).is_err());
+        assert_eq!(
+            read_fixed(root.path(), &["alias", "SC Info.sidb"], uid).err(),
+            Some(Problem::UnsafeStateMetadata)
+        );
         fs::hard_link(&file, root.path().join("linked")).unwrap();
-        assert!(read_fixed(root.path(), &["SC Info", "SC Info.sidb"], uid).is_err());
+        assert_eq!(
+            read_fixed(root.path(), &["SC Info", "SC Info.sidb"], uid).err(),
+            Some(Problem::UnsafeStateMetadata)
+        );
         fs::remove_file(root.path().join("linked")).unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(read_fixed(root.path(), &["SC Info", "SC Info.sidb"], uid).is_err());
+        assert_eq!(
+            read_fixed(root.path(), &["SC Info", "SC Info.sidb"], uid).err(),
+            Some(Problem::UnsafeStateMetadata)
+        );
         assert!(read_fixed(root.path(), &["SC Info"], uid).is_err());
         for name in ["../SC Info.sidb", "..", "/etc/passwd", ""] {
             assert!(read_fixed(root.path(), &[name], uid).is_err());
@@ -160,6 +171,19 @@ mod tests {
             read_fixed(root.path(), &["missing"], uid)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn oversized_state_is_distinct_from_unsafe_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state");
+        let file = fs::File::create(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        file.set_len(crate::MAX_STATE_BYTES as u64 + 1).unwrap();
+        assert_eq!(
+            read_fixed(root.path(), &["state"], unsafe { libc::geteuid() }).err(),
+            Some(Problem::StateTooLarge)
         );
     }
 }

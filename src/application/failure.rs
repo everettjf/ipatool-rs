@@ -68,6 +68,21 @@ impl Failure {
                     "App Store authorization needs attention",
                     "Review preparation",
                 ),
+                Problem::UnsafeStateMetadata => (
+                    Unavailable,
+                    "Authorization database file is not supported",
+                    "Review preparation",
+                ),
+                Problem::StateTooLarge => (
+                    Unavailable,
+                    "Authorization database exceeds the supported size",
+                    "Review preparation",
+                ),
+                Problem::UnsupportedStateFormat => (
+                    Unavailable,
+                    "Authorization database version is not supported",
+                    "Review preparation",
+                ),
                 Problem::Cancelled => (Cancelled, "Cancelled", "Retry"),
                 _ => (
                     Unavailable,
@@ -277,6 +292,32 @@ impl Failure {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn collection_rejections_keep_their_specific_reason_without_private_context() {
+        use ipatool_authorization::Problem;
+        for (problem, title) in [
+            (
+                Problem::UnsafeStateMetadata,
+                "Authorization database file is not supported",
+            ),
+            (
+                Problem::StateTooLarge,
+                "Authorization database exceeds the supported size",
+            ),
+            (
+                Problem::UnsupportedStateFormat,
+                "Authorization database version is not supported",
+            ),
+        ] {
+            let error = anyhow::Error::new(problem)
+                .context("private fixture state bytes")
+                .context(crate::application::fairplay_setup::ModelProblem::Collection);
+            let failure = super::Failure::from_error(&error);
+            assert_eq!(failure.title, title);
+            assert!(!serde_json::to_string(&failure).unwrap().contains("fixture"));
+        }
+    }
+
     #[test]
     fn authorization_and_sample_failures_survive_collection_context_without_private_details() {
         let error = anyhow::Error::new(ipatool_authorization::Problem::ApprovalRequired)

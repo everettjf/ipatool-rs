@@ -27,6 +27,9 @@ pub enum Problem {
     InvalidState,
     StateChanged,
     Cancelled,
+    UnsafeStateMetadata,
+    StateTooLarge,
+    UnsupportedStateFormat,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -44,6 +47,9 @@ impl Problem {
             Self::InvalidState => 9,
             Self::StateChanged => 10,
             Self::Cancelled => 11,
+            Self::UnsafeStateMetadata => 12,
+            Self::StateTooLarge => 13,
+            Self::UnsupportedStateFormat => 14,
         }
     }
     pub(crate) fn from_code(code: u64) -> Self {
@@ -59,6 +65,9 @@ impl Problem {
             9 => Self::InvalidState,
             10 => Self::StateChanged,
             11 => Self::Cancelled,
+            12 => Self::UnsafeStateMetadata,
+            13 => Self::StateTooLarge,
+            14 => Self::UnsupportedStateFormat,
             _ => Self::InvalidRequest,
         }
     }
@@ -78,6 +87,9 @@ impl fmt::Display for Problem {
             Self::InvalidState => "This Mac's authorization database has an unsupported format or unsafe file metadata.",
             Self::StateChanged => "App Store authorization changed while being read. Finish any App Store activity before retrying.",
             Self::Cancelled => "Authorization collection was cancelled.",
+            Self::UnsafeStateMetadata => "The local authorization database has an unsupported file type, owner, link or write permission. Its permissions were not changed.",
+            Self::StateTooLarge => "The local authorization database exceeds the supported collection size. No model was saved.",
+            Self::UnsupportedStateFormat => "The local authorization database version is not supported by this collector. No model was saved.",
         })
     }
 }
@@ -122,11 +134,14 @@ impl Snapshot {
         }
         let mut seen = Vec::new();
         for file in &files {
-            if seen.contains(&file.source)
-                || file.bytes.len() > MAX_STATE_BYTES
-                || file.bytes.get(..4) != Some(&[0, 7, 0, 11])
-            {
+            if seen.contains(&file.source) {
                 return Err(Problem::InvalidState);
+            }
+            if file.bytes.len() > MAX_STATE_BYTES {
+                return Err(Problem::StateTooLarge);
+            }
+            if file.bytes.get(..4) != Some(&[0, 7, 0, 11]) {
+                return Err(Problem::UnsupportedStateFormat);
             }
             seen.push(file.source);
         }
@@ -199,7 +214,7 @@ mod tests {
                 bytes: Zeroizing::new(vec![0; MAX_STATE_BYTES + 1])
             }])
             .err(),
-            Some(Problem::InvalidState)
+            Some(Problem::StateTooLarge)
         );
         assert_eq!(
             Snapshot::checked(vec![StateFile {
@@ -207,7 +222,7 @@ mod tests {
                 bytes: Zeroizing::new(vec![0, 7, 0, 12])
             }])
             .err(),
-            Some(Problem::InvalidState)
+            Some(Problem::UnsupportedStateFormat)
         );
     }
     #[test]
@@ -224,6 +239,9 @@ mod tests {
             Problem::InvalidState,
             Problem::StateChanged,
             Problem::Cancelled,
+            Problem::UnsafeStateMetadata,
+            Problem::StateTooLarge,
+            Problem::UnsupportedStateFormat,
         ] {
             assert_eq!(Problem::from_code(problem.code()), problem);
             assert!(!problem.to_string().contains("/Users/"));
