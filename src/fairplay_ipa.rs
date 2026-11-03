@@ -491,11 +491,16 @@ fn full_options(
         .last_modified_time(member.last_modified().unwrap_or_default());
     let local = without_zip64(local)?;
     let central = without_zip64(central)?;
-    let central_only = central
-        .strip_prefix(local.as_slice())
-        .context("IPA ZIP central extras do not contain the local extras as a prefix")?;
-    add_extra_fields(&mut options, &local, false)?;
-    add_extra_fields(&mut options, central_only, true)?;
+    if let Some(central_only) = central.strip_prefix(local.as_slice()) {
+        add_extra_fields(&mut options, &local, false)?;
+        add_extra_fields(&mut options, central_only, true)?;
+    } else {
+        // ZIP local and central metadata are independent. Info-ZIP Unix
+        // fields commonly omit UID/GID in the central directory. The writer
+        // cannot express arbitrary independent extras; use the central
+        // FileHeader metadata for both, matching Go's archive/zip writer.
+        add_extra_fields(&mut options, &central, false)?;
+    }
     Ok(options)
 }
 
@@ -1455,6 +1460,95 @@ pub(crate) mod tests {
         let member = archive.by_name(name).unwrap();
         let local = local_extra(&mut File::open(path).unwrap(), &member).unwrap();
         (local, member.extra_data().unwrap_or_default().to_vec())
+    }
+
+    #[test]
+    fn decrypts_valid_nonprefix_and_local_only_zip_extras() {
+        for central_payload in [8usize, 0] {
+            let directory = tempfile::tempdir().unwrap();
+            let input = directory.path().join("source.ipa");
+            let output = directory.path().join("decrypted.ipa");
+            let model_path = directory.path().join("model.bin");
+            let logical = [0x31; 16];
+            let (model, sinf) = model_and_sinf(logical);
+            fs::write(&model_path, model).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let (encrypted, record, plaintext) = encrypted_fixture(logical);
+            let mut options = FullFileOptions::default();
+            options.add_extra_field(0x5855, [0; 12], false).unwrap();
+            let mut writer = ZipWriter::new(File::create(&input).unwrap());
+            writer
+                .add_directory("Payload/A.app/", options.clone())
+                .unwrap();
+            for (name, data) in [
+                ("Payload/A.app/SC_Info/A.sinf", sinf),
+                ("Payload/A.app/SC_Info/A.v5.supf", supf(record)),
+                ("Payload/A.app/A", encrypted),
+                ("Payload/A.app/Info.plist", b"unchanged".to_vec()),
+                ("Payload/A.app/tiny", b"x".to_vec()),
+            ] {
+                writer.start_file(name, options.clone()).unwrap();
+                writer.write_all(&data).unwrap();
+            }
+            writer.finish().unwrap();
+            let mut archive = ZipArchive::new(File::open(&input).unwrap()).unwrap();
+            let mut positions = Vec::new();
+            for i in 0..archive.len() {
+                let member = archive.by_index(i).unwrap();
+                positions.push((
+                    member.central_header_start() as usize,
+                    member.name_raw().len(),
+                ));
+            }
+            drop(archive);
+            // Info-ZIP Unix fields legitimately omit UID/GID in the central
+            // directory. Other entries can omit local-only metadata entirely.
+            let mut bytes = fs::read(&input).unwrap();
+            let removed = if central_payload == 0 { 16 } else { 4 };
+            for &(start, name_len) in positions.iter().rev() {
+                let extra = start + 46 + name_len;
+                let size = if central_payload == 0 { 0u16 } else { 12 };
+                bytes[start + 30..start + 32].copy_from_slice(&size.to_le_bytes());
+                if central_payload != 0 {
+                    bytes[extra + 2..extra + 4].copy_from_slice(&8u16.to_le_bytes());
+                }
+                bytes.drain(extra + 16 - removed..extra + 16);
+            }
+            let end = bytes.len() - 22;
+            let size = u32::from_le_bytes(bytes[end + 12..end + 16].try_into().unwrap());
+            bytes[end + 12..end + 16]
+                .copy_from_slice(&(size - (removed * positions.len()) as u32).to_le_bytes());
+            fs::write(&input, &bytes).unwrap();
+            let original = extras(&input, "Payload/A.app/A");
+            assert!(!original.1.starts_with(&original.0));
+            let result =
+                decrypt_ipa_with_options(&input, &output, &model_path, None, false).unwrap();
+            assert_eq!(result.decrypted_pages, 1);
+            assert_eq!(fs::read(&input).unwrap(), bytes);
+            assert_eq!(
+                extras(&output, "Payload/A.app/A"),
+                (original.1.clone(), original.1)
+            );
+            let mut archive = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+            let mut decrypted = Vec::new();
+            archive
+                .by_name("Payload/A.app/A")
+                .unwrap()
+                .read_to_end(&mut decrypted)
+                .unwrap();
+            assert_eq!(&decrypted[PAGE_BYTES..PAGE_BYTES * 2], &plaintext);
+            let mut resource = Vec::new();
+            archive
+                .by_name("Payload/A.app/Info.plist")
+                .unwrap()
+                .read_to_end(&mut resource)
+                .unwrap();
+            assert_eq!(resource, b"unchanged");
+        }
     }
 
     #[test]
