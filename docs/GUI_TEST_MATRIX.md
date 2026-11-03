@@ -39,18 +39,27 @@ account/private-data gates. All work remains on `codex/gpui-catalog` / PR #7.
 
 ## FairPlay and delivery
 
+The 2026-11-03 controlled Apple Silicon acceptance supersedes earlier synthetic-only
+status for the primary FairPlay journey. The notarized GUI completed real setup,
+then a different fresh download automatically reused the saved model after
+restart and collection-access removal. The two IPAs covered 37 encrypted images /
+179,040 pages with full available plaintext hashes and 16,546 member-content
+comparisons against pinned UnfairPlay. Native mismatch, missing access,
+cancellation/cleanup and output collision/preservation checks also passed. See
+[the detailed acceptance record](PORTING.md#real-fairplay-acceptance-2026-11-03).
+
 | Requirement | Current evidence | Remaining work |
 | --- | --- | --- |
-| Inspect, collect, recover, model decryption | Shared application adapters; native forms and task results. | Mode-specific App/IPA/capture/file-output/directory-output regression passed. Native synthetic selector mismatch and matched prerequisites, report collision, explicit retry and decryption-input handoff passed. Real private processing remains open. |
-| Private report and output preservation | Doctor reports stage privately and publish without replacement. Final full suites include output/report rollback/collision fixtures. Native synthetic report collision preserved the file; edited-path retry succeeded and reports had mode 0600. | Private processing outputs still require matched live inputs. |
-| Pickers/drop inputs and artifact handoff | Native path pickers, typed drop targets, completed IPA to inspection. | Native model file and directory selection passed. Checked IPA/model handoff to decryption review passed without starting work. Private capture processing remains open. |
+| Inspect, collect, recover, model decryption | Shared application adapters; native forms and task results. | Mode-specific App/IPA/capture/file-output/directory-output regression passed. Native synthetic selector mismatch and matched prerequisites, report collision, explicit retry and decryption-input handoff passed. The controlled macOS primary setup/decryption/reuse journey passed; broader enrollment/platform support remains open. |
+| Private report and output preservation | Doctor reports stage privately and publish without replacement. Final full suites include output/report rollback/collision fixtures. Native synthetic report collision preserved the file; edited-path retry succeeded and reports had mode 0600. | Both real outputs passed plaintext hashes and matched reference member contents; the live collision preserved existing artifacts. |
+| Pickers/drop inputs and artifact handoff | Native path pickers, typed drop targets, completed IPA to inspection. | Native model file and directory selection passed. Checked IPA/model handoff to decryption review passed without starting work. The signed primary GUI completed a real protected snapshot and model publication. |
 | Expert command disposition | [GUI_FAIRPLAY.md](GUI_FAIRPLAY.md) inventories supported journeys, all retained expert CLI commands, combined download flags, and startup-profile exclusions. | Reconcile with final PR scope. |
-| Native macOS bundle | Debug and release bundles built; Info.plist linted; strict ad hoc signatures passed; actual launch succeeded; application icon decoded natively. | Final debug/release rebuilds and strict signatures passed. Public release launch and native controls passed. Guest execution under the bundle identity still needs the controlled-account gate. |
+| Native macOS bundle | Debug and release bundles built; Info.plist linted; strict ad hoc signatures passed; actual launch succeeded; application icon decoded natively. | Final debug/release rebuilds and strict signatures passed. Public release launch and native controls passed. The notarized bundle identity completed saved-account loading and a fresh entitled IPA download; live 2FA/session gates remain separate. |
 | Release CLI | Apple Silicon release script built a signed executable returning 0.2.1. | Current source rebuilt; signed executable returns 0.2.1. |
 | Portable desktop builds | Native Linux x86_64 and Windows MSVC x86_64 CI passed shared fixtures, deterministic GUI controllers, strict Clippy and GUI linking. macOS CI also passed its app-bundle build/signature checks. Windows GNU GUI cross-build and strict all-targets Clippy passed locally. See the exact run in PORTING. | Native Linux/Windows desktop and account interaction remain open. GUI CI builds are debug executables; GUI distribution/release packaging is separate. |
-| Complete local regression | Current default suite: 459 library + 45 CLI passed, 70 ignored. GUI-test adds 45 passing desktop tests, including iOS startup over old macOS preferences, one-time setup and automatic follow-up. Strict default, production-GUI and GUI-test all-targets Clippy passed; debug/release signed bundles and ARM64 CLI rebuilt. The prior source `ca1f433` passed [all five native CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/40824972940); reusable-setup CI is tracked separately in PR #7. | Real desktop/account/private processing and distribution remain distinct gates. Repeat affected checks if source changes. |
+| Complete local regression | Current default suite: 497 library + 45 CLI + 8 helper passed, 70 library tests ignored. GUI-test adds 46 passing desktop tests, including iOS startup over old macOS preferences, one-time setup and automatic follow-up. Strict default, production-GUI and GUI-test all-targets Clippy passed; the Developer ID release bundle and ARM64 CLI were rebuilt. The prior source `ca1f433` passed [all five native CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/40824972940); reusable-setup CI is tracked separately in PR #7. | Real desktop/account/private processing and distribution remain distinct gates. Repeat affected checks if source changes. |
 | Reviewable PR, no main merge | Reviewed changes and current native screenshot pushed to `codex/gpui-catalog` / PR #7 after local verification. Shared workflows and desktop changes are recorded separately. | Keep remaining gates explicit; never merge main in this task. |
-| Final controlled-account/private gates | User manual testing reached a signed-in account and reported catalog-preflight misses. Public-only diagnosis reproduced the relevant region difference; no authenticated package transfer or private FairPlay success has been reported. | Continue only the remaining authorized manual checks after autonomous verification. User-reported sign-in does not close live 2FA, entitlement, package, or private processing gates. |
+| Final controlled-account/private gates | The controlled native GUI loaded its saved account, downloaded entitled IPAs, prepared a real model, and automatically decrypted a different fresh IPA after relaunch and helper removal. | Continue only the remaining authorized manual checks after autonomous verification. User-reported sign-in does not close live 2FA, entitlement, package, or private processing gates. |
 
 ## Final controlled-account checks
 
@@ -143,11 +152,11 @@ fixed footer, successful synthetic download and separate missing-model task.
 The native harness disables private setup; positive cryptographic reuse is tested
 in the synthetic service suite. New-head portable CI is tracked in PR #7.
 
-Remaining manual gates: prepare/import with authorized matching real materials,
-then download another matching IPA and verify independent automatic decryption,
-content/report, collision behavior, cancellation and relaunch. Windows managed
-private storage awaits ACL support. No actual account/private FairPlay gate is
-closed by the synthetic suite or screenshots.
+The authorized real preparation and independent download/reuse gates passed on
+2026-11-03; see the acceptance record above. Explicit import retains synthetic
+coverage. Windows managed private storage awaits ACL support; Linux/Windows live
+interaction and broader account/enrollment gates remain open. Synthetic suites
+and screenshots alone do not establish those gates.
 
 ## iOS startup default
 

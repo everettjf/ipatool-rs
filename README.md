@@ -17,11 +17,11 @@ Built on the work of [ipatool](https://github.com/majd/ipatool), [UnfairPlay](ht
 | Area | Capabilities |
 | --- | --- |
 | Public catalog | Search applications, look up details, and find the latest external version ID without signing in. |
-| Desktop preview | Optional GPUI desktop for public browsing, account interaction, Library, download tasks, and primary FairPlay workflows. Desktop account/private-data validation is in progress. |
+| Desktop preview | Optional GPUI desktop for public browsing, account interaction, Library, download tasks, and primary FairPlay workflows. Controlled Apple Silicon download, FairPlay setup and automatic reuse passed; other live gates remain. |
 | Account and Store | Sign in, inspect or revoke saved credentials, obtain free-app licenses, and query purchases and version metadata. |
 | Packages | Download entitled IPA or Mac PKG packages, with package metadata and SINF handling. |
 | MCP | Expose six App Store tools to compatible clients over standard input and output. |
-| FairPlay | Diagnostics, collection, recovery, and model-based decryption command paths. Private-data flows remain unverified end to end. |
+| FairPlay | Diagnostics, collection, recovery, and model-based decryption command paths. Controlled macOS setup and two real multi-image IPAs matched pinned UnfairPlay; broader private-data parity remains open. |
 
 ## Platforms
 
@@ -123,8 +123,8 @@ authorization helper. The GUI stays unprivileged. Protected access requires a
 Developer ID signed, notarized bundle and explicit administrator approval in
 System Settings; opening the page never registers the helper. Local ad hoc builds
 disable this access. The helper reads only two fixed App Store authorization
-databases, not arbitrary paths, passwords or IPA files. Signed live registration
-and recovery acceptance are still pending; see the
+databases, not arbitrary paths, passwords or IPA files. Signed live registration,
+collection and real recovery passed on the controlled Apple Silicon host; see the
 [authorization design](docs/FAIRPLAY_AUTHORIZATION.md).
 
 After preparation, new IPA downloads automatically queue a separate decryption
@@ -137,7 +137,7 @@ Encrypted executables, extensions and frameworks resolve their own adjacent or
 manifest-declared authorization. Missing or ambiguous relationships stop processing;
 unused SINF resources do not select a model for an unrelated image.
 Managed model storage currently requires macOS/Linux private-file permissions;
-Windows support and real private-processing validation remain open. These checks
+Windows support and portable private-processing validation remain open. These checks
 require complete pre-encryption page-hash coverage to report verified plaintext.
 Older executables without these tables remain explicitly unverified; a present
 malformed or mismatching table rejects output. Embedded hashes do not establish
@@ -168,7 +168,7 @@ The CLI, MCP server, and optional GPUI desktop share Rust application modules. P
 
 Selected Store and SAP signing paths load pinned Apple framework images and execute ARM64 guest code through Unicorn. Rust supplies the image loaders, execution control, and host-call models. The program does not launch a separate Go, Python, or Swift executable; it still depends on the corresponding Apple guest code and the Unicorn runtime for these paths.
 
-FairPlay setup defaults to native current-format SIDB recovery ported from pinned UnfairPlay. It verifies captured signed keyfiles, authenticates one selected enrollment route, and processes a matching sample IPA before saving a model. `fairplay-enroll recover --engine legacy` retains exact-build `fairplayd`/startup-profile research explicitly; there is no automatic legacy retry. SUPF variants 3/5 and signed SUPP variants 1/4 use deterministic class selection, consistent paired tables and available legacy code-signature bindings; conflicting tables never trigger a fallback. Private enrollment and decryption still need end-to-end validation, including macOS authorization and real multi-image processing.
+FairPlay setup defaults to native current-format SIDB recovery ported from pinned UnfairPlay. It verifies captured signed keyfiles, authenticates one selected enrollment route, and processes a matching sample IPA before saving a model. `fairplay-enroll recover --engine legacy` retains exact-build `fairplayd`/startup-profile research explicitly; there is no automatic legacy retry. SUPF variants 3/5 and signed SUPP variants 1/4 use deterministic class selection, consistent paired tables and available legacy code-signature bindings; conflicting tables never trigger a fallback. Controlled macOS authorization, model recovery and real multi-image decryption passed, including automatic reuse after restart; broader enrollment and portable private-data parity remain open. See [real acceptance evidence](docs/PORTING.md#real-fairplay-acceptance-2026-11-03).
 
 The editable diagram is available as [SVG](docs/images/architecture.svg). Implementation and parity evidence are recorded in [PORTING.md](docs/PORTING.md).
 
@@ -226,8 +226,10 @@ explicit review and retry. See [current evidence and remaining gates](docs/PORTI
 
 For a locally signed Apple Silicon application bundle, use
 `scripts/build-gui-macos.sh` (or `--debug`). The generated `.app` is ad hoc signed,
-not notarized or published. Live desktop account and private FairPlay checks
-remain open. Building without `--features gui` keeps the CLI-only build;
+not notarized or published by default. An explicitly Developer ID signed preview
+has passed notarization and controlled macOS account/FairPlay acceptance; public
+GUI release packaging and the remaining live account/platform gates stay open.
+Building without `--features gui` keeps the CLI-only build;
 plain `cargo run` still selects `ipatool`.
 
 [Native screenshots](docs/screenshots/README.md) include public browsing and
@@ -289,7 +291,7 @@ MCP uses standard input for its protocol, so it cannot prompt for the file-store
 
 - Linux and Windows real-account login, credential-store migration, and package workflows have not been validated end to end.
 - macOS still needs a real 2FA challenge, successful expired-token recovery, and complete interactive default-Keychain login and revoke checks. Some authenticated MCP paths also remain unverified.
-- Private FairPlay enrollment and real IPA decryption require matched inputs and a supported build; they remain unverified end to end.
+- Current-format FairPlay setup and two real IPAs passed on the controlled Apple Silicon host. Matching authorization is required; arbitrary enrollment formats, portable private flows and legacy private-data parity remain unverified.
 - Automatic generation of a new FairPlay startup profile during collection is not implemented in the release.
 
 See [TODO.md](docs/TODO.md) for actionable remaining work and [PORTING.md](docs/PORTING.md) for the evidence behind each status. The release version does not imply full parity with the reference projects.

@@ -77,7 +77,7 @@ If access is removed, saved models can still be used without collecting again.
 The helper requires macOS 13; the main GUI's older supported launch target does
 not imply protected collection support. Windows/Linux do not register it.
 
-## Evidence and remaining gates
+## Initial evidence before live acceptance
 
 Protocol controls cover fixed operations, nonce binding, unknown fields, bounds,
 fixed signing-policy construction and OS policy parsing/rejection of the test
@@ -89,7 +89,7 @@ status, settings handoff, removal without model deletion and rejected requests.
 The helper's native dependencies contain system frameworks only; no guest engine
 or separate Swift runtime is linked.
 
-Still required before F1/F2/F4/F5 acceptance: a notarized bundle's actual
+Before the live acceptance below, the remaining F1/F2/F4/F5 checks included a notarized bundle's actual
 registration and code-bound exchange, denial/cancellation/removal, an authorized
 private snapshot, successful real model preparation, complete available plaintext
 hash validation, and independent saved-model reuse after restart. None of these
@@ -109,3 +109,28 @@ the distinct enrollment-match preflight before any protected read. Actual
 exchange, denial/cancellation/removal and real recovery/reuse remain
 unproven; notarization does not close them. Details are in
 [PORTING.md](PORTING.md#notarized-fairplay-preview-acceptance).
+
+## Real macOS acceptance (2026-11-03)
+
+After the operator aligned the installed app and downloaded sample, the approved
+notarized preview completed the code-bound protected snapshot exchange and
+current-format recovery. The real source database uses writable native metadata;
+treating its bytes as untrusted input, rather than requiring private output
+permissions on that system-owned source, matches the pinned reference. Its owner,
+regular-file, no-follow, hard-link, size and stability checks remain enforced.
+The app never changes system source permissions. All capture directory components
+are now created as 0700; copied files remain 0600. This fixed a collector/recovery
+permission mismatch exposed by the real run.
+
+The GUI saved the sample-verified model privately, then removed collection access
+and stopped the helper. After relaunch, a different fresh account download
+matched that saved model and decrypted without re-enabling collection. Missing
+access, mismatched input, operation cancellation and output collisions preserved
+original packages and saved models. The operation-cancellation test is not a
+claim that the operator cancelled an OS administrator authentication sheet.
+
+Both real IPAs passed complete available plaintext hashes and matched pinned
+UnfairPlay member contents. Synthetic file/protocol controls remain the evidence
+for malicious peer/owner/symlink/oversize rejection; live acceptance does not
+replace those controls or imply arbitrary enrollment support. See
+[the detailed record](PORTING.md#real-fairplay-acceptance-2026-11-03).

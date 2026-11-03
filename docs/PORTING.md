@@ -13,7 +13,17 @@ It writes `target/release/ipatool-macos-arm64` and applies an ad-hoc signature.
 The original `scripts/build-macos.sh` command still builds a universal executable
 if x86_64 support is resumed. A local signature is not Apple notarization.
 
-## Current snapshot (2026-10-27)
+## Latest FairPlay acceptance (2026-11-03)
+
+The controlled macOS Apple Silicon GUI completed protected collection, real model
+preparation and automatic decryption of a different fresh IPA after restart and
+removal of collection access. Both real multi-image outputs matched pinned
+UnfairPlay and passed complete available plaintext page hashes. This supersedes
+the earlier private-flow status below for that tested host/enrollment only. See
+[the detailed acceptance record](#real-fairplay-acceptance-2026-11-03); portable
+private-data and broader account gates remain open.
+
+## Release snapshot (2026-10-27)
 
 - Version 0.2.1 ships macOS ARM64, Linux x86_64, and Windows x86_64 archives only. Version 0.2.0 shipped two additional ARM64 portable archives, which are historical artifacts outside the current release scope. Native x86_64 Linux and Windows CI passed tests, Clippy, release builds, version checks, public catalog search, packaging, and checksums. Account-backed flows on these systems remain unvalidated.
 - Earlier source cross-built for Linux ARM64/x86_64 and Windows ARM64/x86_64. A repeatable MinGW-w64 Windows x86_64 script was added. Both Linux binaries ran in isolated Debian 13 QEMU guests, reporting their expected CPU architecture, `ipatool 0.1.0`, and successful public Apple/iPhone/US search with no account or private state. Windows binaries were inspected as PE images but were not executed on Windows at that time. Both platforms have since shipped experimental binaries. The v0.2.0 macOS archive includes the two checked startup profiles as optional external files under `assets/fairplay-startup/`; the executable already embeds and selects them during recovery. The earlier `v0.1.0` archive did not contain these external files.
@@ -1290,3 +1300,61 @@ passed all five native jobs: Linux and Windows CLI, Linux and Windows GPUI,
 and the macOS GPUI preview. This includes native Windows MSVC desktop fixtures,
 strict warnings checks and executable builds. These account-free CI checks are
 separate from notarization and do not close the real model or decryption gates.
+
+## Real FairPlay acceptance (2026-11-03)
+
+The operator aligned the Mac App Store installation with the controlled account's
+sample IPA. Read-only preflight then confirmed matching app identity, executable,
+version/build and main-license authorization. Earlier mismatch observations above
+are historical; matching metadata alone was never substituted for authorization.
+Testing stayed in an isolated local state directory and no private identifiers,
+selectors, package hashes, model bytes or captures were published.
+
+Three real-run compatibility defects were corrected without bypassing validation:
+
+- Native SIDB sources can have writable permissions. The fixed-input helper now
+  treats source bytes as untrusted while retaining code/console-user binding,
+  trusted ownership, regular-file/no-follow/hard-link checks, 2 MiB bounds and
+  before/after stability. It never changes system source permissions. Its private
+  output requirements still apply to copied captures.
+- Recursive capture creation previously secured only the leaf directory, leaving
+  intermediate directories incompatible with the recovery reader. Every new
+  component now starts at 0700, with files at 0600. The regression failed before
+  the fix and passed afterward.
+- Real IPAs contain independent local/central ZIP extras, including Info-ZIP Unix
+  fields with 12-byte local and 8-byte central payloads, plus local-only fields.
+  The writer no longer requires a prefix relationship. Representable pairs are
+  preserved; otherwise it uses validated central metadata for both headers,
+  matching Go's archive/zip rewrite behavior. Regression covers encrypted images,
+  directories, ordinary resources and tiny files; original inputs are preserved.
+
+Fixed phase/check diagnostics retain no raw error chain in GUI history. The real
+first model candidate matched UnfairPlay
+`b3a7a432da2047a0d4f1ed5a3152c538a5497183` byte for byte. The reference executable
+was used only for offline comparison of the same bounded capture; Rust's GUI and
+CLI require no Go, Python or Swift executable for production recovery/decryption.
+
+| Real check | Result |
+| --- | --- |
+| Native first-time GUI preparation | Approved code-bound snapshot, current recovery, sample processing and private model publication completed. The receipt records verified sample plaintext; model and directory modes are 0600/0700. Temporary capture and sample plaintext were removed. |
+| Setup sample | 19 encrypted images / 53,692 pages; complete available pre-encryption hash coverage for every image. All 11,239 output members, in order, matched UnfairPlay byte for byte. |
+| Restart and independent reuse | Removed collection access and verified the helper stopped, relaunched, loaded the saved controlled account, and downloaded a different IPA. Automatic model matching/decryption completed without selecting a model or re-enabling collection. |
+| Independent IPA | 18 encrypted images / 125,348 pages; complete available plaintext coverage. All 5,307 output members, in order, matched the pinned reference. |
+| Independent hash controls | A separate local hash audit checked 107,384 and 250,696 CodeDirectory slots across all 37 images, matching the Rust coverage results. Mutating the final plaintext page was detected for each IPA. |
+| Tampered input | Final ciphertext-page mutation failed source page hashes without publishing output/report. Repairing those source hashes still failed the signed SUPF binding. This is distinct from the separate final-plaintext hash audit. |
+| Native rejection/preservation | Missing/removed access reported the authorization requirement; mismatched installed app/IPA was rejected before a protected read; cancellation during sample decryption cleaned temporary state without publishing a model. Reusing an existing decrypted output reported a collision and preserved all three original download/output/report digests. Original setup IPAs were unchanged. |
+| Regression and build | 497 library, 45 CLI, 8 helper and 46 GUI tests passed (596 active total; 70 opt-in library tests ignored). Default and GUI-test all-target suites, formatting, strict default/GUI/GUI-test Clippy and ARM64 release CLI build passed. |
+
+The core fixes were exercised in the notarized `1e4dc94` preview. Final source
+`d6f836f` also corrects the review text to describe actual plaintext coverage;
+its Developer ID GUI/helper build passed notarization, stapling, strict deep
+signature and Gatekeeper checks. No GUI release was published or PR merged.
+The application retains its private saved model and original user artifacts;
+comparison-only captures, duplicate models and derived corruption controls are
+cleaned after the comparison.
+
+This closes the controlled macOS current-format model/decryption/reuse acceptance,
+not arbitrary enrollment or operating-system support. Apple CMS signature trust,
+legacy private 26B118 parity, portable live account/private flows, Windows private
+ACL support, accessibility, account 2FA/session gates and public GUI distribution
+remain separate items in TODO.md.

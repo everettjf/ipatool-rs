@@ -150,7 +150,8 @@ reviewable request paths remain there.
 
 Managed storage/reuse is disabled on Windows until equivalent private ACL support
 is implemented. Unix storage is not evidence that collection/recovery works on
-arbitrary Linux hosts or macOS builds. No private platform parity gate is closed.
+arbitrary Linux hosts or macOS builds. Controlled Apple Silicon acceptance is
+recorded below; portable private-data parity remains open.
 
 ### Expert tools
 
@@ -184,7 +185,12 @@ data or arbitrary-build parity.
 | Force, native 26B118 research, skipped differential checks | CLI-only expert policy; the primary GUI retains conservative build/output checks. |
 | Startup-candidate exporter in draft PR #6 | Separate unimplemented project gate, not a dependency of this delivery. |
 
-Authorized live account and private recovery/decryption checks remain open.
-Synthetic fixtures and UI captures do not close them. See
+Authorized macOS Apple Silicon setup, real multi-image decryption and automatic
+reuse after restart passed on 2026-11-03. The collection helper was removed before
+the independent download/reuse check. Both outputs matched pinned UnfairPlay and
+passed complete available plaintext page hashes. See the
+[real acceptance record](PORTING.md#real-fairplay-acceptance-2026-11-03). Broader
+account challenges and Linux/Windows private workflows remain open; synthetic
+fixtures and screenshots do not establish those gates. See
 [GUI_TEST_MATRIX.md](GUI_TEST_MATRIX.md), [PORTING.md](PORTING.md), and
 [TODO.md](TODO.md).

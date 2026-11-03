@@ -337,6 +337,12 @@ Public release publication and Rust package publication are separate actions.
 
 ## FairPlay completion workstream (2026-11-01)
 
+**Acceptance update (2026-11-03):** the controlled macOS first-time setup and
+independent automatic reuse after restart passed. See the
+[real acceptance record](PORTING.md#real-fairplay-acceptance-2026-11-03). The
+initial observations below describe the starting point, before the scoped helper
+and current recovery were validated. Portable private-data gates remain open.
+
 This is an implementation plan, not a record of completed recovery. The native
 desktop walkthrough reached collection with a matching installed-app/IPA
 selection. Its compatibility check could read the IPA and identify a bundled
