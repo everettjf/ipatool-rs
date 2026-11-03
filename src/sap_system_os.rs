@@ -125,6 +125,7 @@ impl<'a> SystemOsCache<'a> {
     pub fn read_vm_region(&mut self, mut address: u64, output: &mut [u8]) -> Result<()> {
         let mut written = 0usize;
         while written < output.len() {
+            crate::application::operation::check()?;
             let suffix = self.member_suffix_for_address(address)?.to_string();
             let member = self.cached_member(&suffix)?;
             let mapping = member

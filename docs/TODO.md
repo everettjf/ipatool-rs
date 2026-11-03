@@ -1,6 +1,6 @@
 # Remaining work
 
-Status as of 2026-10-27. The 0.2.1 delivery targets are macOS on Apple Silicon, Linux x86_64, and Windows x86_64. Linux ARM64 and Windows ARM64 are no longer release targets. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
+Status as of 2026-11-03. The 0.3.0 delivery targets are macOS on Apple Silicon, Linux x86_64, and Windows x86_64. Linux ARM64 and Windows ARM64 are no longer release targets. Detailed implementation history and test evidence are in [PORTING.md](PORTING.md).
 
 Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and release packaging jobs. Both Linux architectures previously passed account-free version and public-search smoke checks in Debian 13 QEMU guests; ARM64 is now deferred. The native CI results and release artifact checks are recorded in [PORTING.md](PORTING.md); account-backed workflows remain open.
 
@@ -14,13 +14,81 @@ Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and r
 - The published `v0.2.1` release has only macOS ARM64, Linux x86_64, and Windows x86_64 archives with companion SHA-256 files. Main and release CI passed native tests and packaging for both portable targets; the macOS archive was signed and notarized with zero issues. All three public archive checksums passed after download. The Homebrew tap passed strict audit, installation, `brew test`, signature verification, and public search. Linux and Windows authenticated workflows remain untested.
 - The macOS ARM64 release build and signature check, 421 active library tests, 45 CLI tests, and Clippy. Three affected pinned Store guest tests also passed explicitly. The 69 ignored library tests are opt-in checks, not a count of known failures.
 
+## GPUI desktop preview
+
+The shared CLI/GUI workflow architecture, implementation milestones,
+and acceptance criteria are in [CLI_GUI_IMPLEMENTATION_PLAN.md](CLI_GUI_IMPLEMENTATION_PLAN.md).
+Rust package publication and a workspace split are deferred. Implementation
+checkboxes and local/CI evidence do not close the separate live-validation gates.
+
+- [ ] Validate screen-reader accessibility and keyboard navigation. The pinned GPUI build's macOS accessibility tree currently exposes the window chrome but not the custom catalog controls.
+- [x] Clarify iOS/platform selection and browsing versus account regions: refresh catalog results after filter changes, offer a searchable region dropdown and editable download target, and identify account-region catalog misses before package transfer. Real authenticated downloads remain a separate gate.
+- [x] Default public browsing to the loaded account's region, preserve explicit overrides during same-account refresh, and display a persistent cross-region download warning with a return-to-account-region action.
+- [x] Validate native Linux x86_64 and Windows MSVC x86_64 GUI builds, deterministic controllers and strict all-targets Clippy in CI. Windows GNU GUI cross-build and strict all-targets Clippy also pass on macOS. The successful CI run is linked in [PORTING.md](PORTING.md).
+- [ ] Validate Linux x86_64 and Windows x86_64 GUI desktop interaction and account workflows. Headless controller tests and CLI CI do not establish these gates.
+- [ ] Publish and verify the v0.3.0 Developer ID signed/notarized Apple Silicon desktop ZIP and Homebrew cask alongside the three CLI archives. Release packaging and CI verification are implemented; publication evidence is recorded after the release gates pass.
+- [ ] Finish fixture and live validation of the implemented account, download, and FairPlay desktop workflows, including 2FA, credential-store access, task recovery, safe cancellation, and output selection. Keep manual account/private-data checks last.
+- [x] Complete the controlled macOS Apple Silicon FairPlay processing and interruption walkthroughs (2026-11-03): real setup, verified sample, automatic independent reuse after restart, cancellation cleanup, access removal and output preservation. See the acceptance record below.
+
+- [x] Add a reviewed one-time FairPlay preparation guide, advanced validated-model import, private selector-bound model reuse, and independent automatic decryption after new IPA downloads. Advanced parameters/tools are collapsed and actions remain visible at 900×650. Synthetic crypto/controller tests and native captures pass; real macOS acceptance is recorded below.
+- [x] Validate real one-time setup followed by a different matching IPA download, automatic decryption after relaunch, content checks, cancellation and collision protection on macOS Apple Silicon. Explicit model import has synthetic coverage; same Apple ID alone does not prove matching enrollment.
+- [ ] Implement equivalent private Windows ACL enforcement before enabling managed FairPlay model storage/reuse there.
+
+### FairPlay completion sequence (2026-11-01)
+
+The detailed dependencies and exit evidence are in the
+[FairPlay completion workstream](CLI_GUI_IMPLEMENTATION_PLAN.md#fairplay-completion-workstream-2026-11-01).
+The 2026-11-03 authorized native walkthrough passed protected collection, real
+model recovery, sample verification and automatic reuse for a different fresh IPA
+after relaunch and removal of collection access. This acceptance is specific to
+the tested macOS Apple Silicon host and current-format enrollment.
+
+- [x] F1: Add typed setup preflight and a signed, scoped macOS authorization/collection path; verify denial, cancellation, ownership and private cleanup.
+- [x] F2: Port the pinned current UnfairPlay canonical/semantic recovery path into shared Rust, including deterministic route selection and selected-license authentication; retain the old exact-build path explicitly.
+- [x] F3: Add complete available pre-encryption CodeDirectory hash validation, missing-coverage reporting, versioned receipts/reports and corrupt-final-page rejection. Audit per-image license/page-table associations and unsupported formats.
+- [x] F4: Complete terminal-free first setup, private model publication, relaunch reuse and independent automatic decryption of another matching IPA; make unavailable validation and failures actionable.
+- [x] F5: Pass full regressions and signed builds, then authorized real setup plus a different matching IPA, complete plaintext-coverage control, mismatch, denial, collision, cancellation and restart. The implementation and acceptance were reviewed in PR #7; release publication is a separate step.
+
+Implemented in the shared service:
+
+- Versioned pre-encryption page-hash audits, explicit unavailable coverage and
+  wrong-final-page rejection; legacy receipts retain their original assurance.
+- Pinned current SIDB recovery, deterministic selected-route authentication,
+  signed capture normalization and matching-sample processing before publication.
+- Per-image SINF/manifest association, checked registry snapshots and independent
+  model selection for encrypted extensions/frameworks.
+- SUPF 3/5 and signed SUPP 1/4 class selection, consistent paired tables,
+  file-origin universal page mapping and available legacy signature bindings.
+  Repeated empty directory markers are supported; duplicate payload files fail.
+- Typed installed-app/IPA preflight and a separate fixed-input macOS helper;
+  explicit registration/status/settings/removal never run from page opening or
+  history restoration. Ad hoc builds disable protected access.
+
+The controlled setup sample passed 19 encrypted images / 53,692 pages. A different
+fresh GUI download automatically reused the saved model for 18 images / 125,348
+pages after restart, with the collection helper removed. Both reported complete
+available plaintext-hash coverage. Every output member matched pinned UnfairPlay
+byte for byte (11,239 and 5,307 members); model bytes also matched. Independent
+page-hash audits covered every encrypted image and detected final-page plaintext
+mutation. Real ciphertext and signature-binding mutations were rejected without
+publishing output. Missing access, mismatched samples, cancellation, cleanup and
+output preservation were exercised natively. See
+[the acceptance record](PORTING.md#real-fairplay-acceptance-2026-11-03) and
+[the authorization boundary](FAIRPLAY_AUTHORIZATION.md).
+
+Remaining work includes the v0.3.0 distribution gate above, accessibility, account
+challenge/session gates and native Linux/Windows account interaction. Windows
+managed-model storage still requires equivalent ACL enforcement. Controlled
+acceptance does not establish arbitrary-enrollment or cross-platform private-data
+parity.
+
 ## Current macOS Apple Silicon gates
 
 - [ ] Complete an interactive default macOS Keychain approval flow for `auth login` and `auth revoke` in a local user session. `auth info` succeeded after the user approved its Keychain dialog on October 27; the encrypted `--file-keychain` path also worked.
 - [ ] Complete an actual 2FA challenge during account login. The controlled-account logins did not trigger one.
 - [ ] Resolve the live Store token rejection and verify successful expired-token recovery in purchase and download flows. An earlier October 27 MCP download triggered refresh but still returned `password token is expired` afterward; the later signed preview.2 CLI download succeeded with a valid saved account, which does not establish expired-token recovery. Fixture retry tests pass.
 - [ ] Verify successful authenticated MCP `list_app_versions`, `get_version_metadata`, and `download_app` outputs with a controlled account. `list_purchases` and `purchase_app` passed. In a later isolated run, version requests returned Apple's generic metadata error for multiple apps, and downloads for TouchLink and PhonePad failed after session refresh.
-- [ ] Validate private FairPlay enrollment and real IPA decryption with matched device, app, SINF, and private enrollment data on a supported macOS host. The current unprivileged process cannot read the required private FairPlay state.
+- [x] Validate current-format FairPlay setup and independent IPA decryption on the controlled macOS Apple Silicon host through the scoped helper. Broader enrollment formats, Linux/Windows private flows and explicit legacy private-data parity remain separate gates.
 - [ ] Implement the opt-in FairPlay startup candidate export described in [STARTUP_PROFILE_EXPORT.md](STARTUP_PROFILE_EXPORT.md), tracked in [issue #2](https://github.com/everettjf/ipatool-rs/issues/2) and [draft PR #6](https://github.com/everettjf/ipatool-rs/pull/6). `collect` currently has only application and private state files, which cannot reconstruct a new startup overlay. Validate a new profile before placing it in `assets/fairplay-startup`; then validate the new build's request entry and recovery model. Copying the two embedded profiles into a release archive does not satisfy this gate.
 - [ ] If matched 26B118 private data becomes available, compare its oracle/model results with the Go reference. Public synthetic vectors already matched; they do not establish private-data parity.
 - [ ] Determine whether the remaining live Store workflows reach the Swift preawaited continuation flag rejected by the current Go and Rust guests; implement and verify immediate suspension only if one does.

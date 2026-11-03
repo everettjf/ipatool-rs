@@ -46,8 +46,212 @@ pub struct EnrollmentCollectOptions {
     pub build_version: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum SampleProblem {
+    InstalledApp,
+    MissingIpa,
+    Mismatch,
+    EnrollmentMismatch,
+    UnsupportedIpa,
+}
+impl std::fmt::Display for SampleProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InstalledApp=>"Choose an installed iPhone or iPad app that has been opened on this Mac.",
+            Self::MissingIpa=>"Choose the matching downloaded IPA before preparing authorization.",
+            Self::Mismatch=>"The installed app and sample IPA must have the same bundle identifier, executable and version.",
+            Self::EnrollmentMismatch=>"The installed app and IPA have different App Store authorization. Choose files installed and downloaded using the same Apple account. If the App Store account changed, reinstall a test app with that account; matching app names and versions alone are not enough.",
+            Self::UnsupportedIpa=>"The sample IPA does not have a supported, unambiguous encrypted image and license inventory.",
+        })
+    }
+}
+impl std::error::Error for SampleProblem {}
+
+/// Check public app/version metadata before requesting any system authorization.
+pub fn preflight_current_sample(app: &Path, ipa: &Path) -> Result<()> {
+    current_sample(app, ipa).map(drop)
+}
+
+struct CurrentSample {
+    executable_member: String,
+    sinf_member: String,
+}
+
+fn current_sample(app: &Path, ipa: &Path) -> Result<CurrentSample> {
+    let app = installed_app(app).context(SampleProblem::InstalledApp)?;
+    let (bundle, executable, info) = app_info(&app).context(SampleProblem::InstalledApp)?;
+    let (installed_sinf, selector) = installed_sinf(&app).context(SampleProblem::InstalledApp)?;
+    let mut license = OpenOptions::new();
+    license.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        license.custom_flags(libc::O_NOFOLLOW);
+    }
+    let license = license
+        .open(&installed_sinf)
+        .context(SampleProblem::InstalledApp)?;
+    let metadata = license.metadata().context(SampleProblem::InstalledApp)?;
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return Err(SampleProblem::InstalledApp.into());
+    }
+    let mut installed_sinf = zeroize::Zeroizing::new(Vec::new());
+    crate::application::operation::copy(&mut license.take(1024 * 1024 + 1), &mut *installed_sinf)?;
+    if installed_sinf.len() > 1024 * 1024
+        || !crate::fairplay::inspect_sinf(&installed_sinf)?.current_layout
+    {
+        return Err(SampleProblem::InstalledApp.into());
+    }
+    let installed: Value = plist::from_bytes(&info).context(SampleProblem::InstalledApp)?;
+    let installed = installed
+        .as_dictionary()
+        .context(SampleProblem::InstalledApp)?;
+    let field = |fields: &plist::Dictionary, name: &str| {
+        fields
+            .get(name)
+            .and_then(Value::as_string)
+            .map(str::to_owned)
+    };
+    let short = field(installed, "CFBundleShortVersionString")
+        .filter(|v| !v.is_empty())
+        .context(SampleProblem::InstalledApp)?;
+    let build = field(installed, "CFBundleVersion")
+        .filter(|v| !v.is_empty())
+        .context(SampleProblem::InstalledApp)?;
+    let source = File::open(ipa).context(SampleProblem::MissingIpa)?;
+    let mut archive = ZipArchive::new(source).context(SampleProblem::UnsupportedIpa)?;
+    let mut raw = File::open(ipa).context(SampleProblem::MissingIpa)?;
+    let mut matches = 0;
+    let mut main_member = None;
+    for index in 0..archive.len() {
+        crate::application::operation::check()?;
+        let mut entry = archive
+            .by_index(index)
+            .context(SampleProblem::UnsupportedIpa)?;
+        let name = duplicate_zip::read_raw_central_name(&mut raw, entry.central_header_start())?;
+        let name = std::str::from_utf8(&name).context(SampleProblem::UnsupportedIpa)?;
+        let Some(root) = name
+            .strip_prefix("Payload/")
+            .and_then(|n| n.strip_suffix("/Info.plist"))
+        else {
+            continue;
+        };
+        if root.contains('/') || !root.ends_with(".app") {
+            continue;
+        }
+        if entry.size() > 4 * 1024 * 1024 {
+            return Err(SampleProblem::UnsupportedIpa.into());
+        }
+        let mut bytes = Vec::new();
+        crate::application::operation::copy(
+            &mut (&mut entry).take(4 * 1024 * 1024 + 1),
+            &mut bytes,
+        )?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(SampleProblem::UnsupportedIpa.into());
+        }
+        let info: Value = plist::from_bytes(&bytes).context(SampleProblem::UnsupportedIpa)?;
+        let fields = info
+            .as_dictionary()
+            .context(SampleProblem::UnsupportedIpa)?;
+        if field(fields, "CFBundleIdentifier").as_deref() == Some(&bundle)
+            && field(fields, "CFBundleExecutable").as_deref() == Some(&executable)
+            && field(fields, "CFBundleShortVersionString").as_deref() == Some(&short)
+            && field(fields, "CFBundleVersion").as_deref() == Some(&build)
+        {
+            matches += 1;
+            main_member = Some(format!("Payload/{root}/{executable}"));
+        }
+    }
+    if matches != 1 {
+        return Err(SampleProblem::Mismatch.into());
+    }
+    let main_member = main_member.context(SampleProblem::Mismatch)?;
+    let required = crate::fairplay_ipa::required_ipa_sinf_for_image(ipa, &main_member)
+        .context(SampleProblem::UnsupportedIpa)?;
+    if !required.current_layout {
+        return Err(SampleProblem::UnsupportedIpa.into());
+    }
+    if required.selector != selector {
+        return Err(SampleProblem::EnrollmentMismatch.into());
+    }
+    Ok(CurrentSample {
+        executable_member: main_member,
+        sinf_member: required.path.context(SampleProblem::UnsupportedIpa)?,
+    })
+}
+
+/// Current recovery needs only SIDB snapshots. It never collects ADI or native
+/// recovery images, nor sends advanced source overrides to the privileged helper.
+pub fn collect_current_enrollment(
+    options: &EnrollmentCollectOptions,
+) -> Result<EnrollmentCaptureManifest> {
+    let ipa = options.ipa.as_deref().context(SampleProblem::MissingIpa)?;
+    let sample = current_sample(&options.app, ipa)?;
+    let snapshot = if options.system_state.is_some() || options.shared_state.is_some() {
+        let mut files = Vec::new();
+        for (source, role) in [
+            (
+                options.system_state.as_deref(),
+                ipatool_authorization::Source::System,
+            ),
+            (
+                options.shared_state.as_deref(),
+                ipatool_authorization::Source::Shared,
+            ),
+        ] {
+            let Some(source) = source else {
+                continue;
+            };
+            let source = source.join("SC Info.sidb");
+            if !source.try_exists()? {
+                continue;
+            }
+            let bytes = crate::fairplay_recovery_output::read_private_bytes(
+                &source,
+                ipatool_authorization::MAX_STATE_BYTES,
+            )?;
+            files.push(ipatool_authorization::StateFile {
+                source: role,
+                bytes,
+            });
+        }
+        ipatool_authorization::Snapshot::checked(files)?
+    } else {
+        match ipatool_authorization::read_local_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(ipatool_authorization::Problem::PermissionDenied) => {
+                let operation = crate::application::operation::current();
+                ipatool_authorization::request_snapshot(move || {
+                    operation
+                        .as_ref()
+                        .is_some_and(|operation| operation.is_cancelled())
+                })
+                .map_err(|error| {
+                    if error == ipatool_authorization::Problem::Cancelled {
+                        anyhow::Error::from(crate::application::operation::Cancelled)
+                    } else {
+                        anyhow::Error::from(error)
+                    }
+                })?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    collect_impl(options, Some(&snapshot), Some(&sample))
+}
+
 fn private_directory(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // Every newly created component is checked by current recovery, not
+        // only the final parent. Never rely on the process umask for captures.
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -100,6 +304,7 @@ fn copy_private(root: &Path, relative: &Path, source: &Path) -> Result<CaptureFi
     let mut size = 0u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
+        crate::application::operation::check()?;
         let count = input.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -137,6 +342,7 @@ fn copy_tree(root: &Path, source: &Path, relative: &Path) -> Result<Vec<CaptureF
     entries.sort_by_key(|entry| entry.file_name());
     let mut files = Vec::new();
     for entry in entries {
+        crate::application::operation::check()?;
         let kind = entry.file_type()?;
         if kind.is_symlink() {
             bail!(
@@ -268,9 +474,48 @@ fn capture_ipa(
     source: &Path,
     selector: SinfSelector,
     executable: &str,
+    selection: Option<&CurrentSample>,
 ) -> Result<(CaptureFile, String, CaptureFile)> {
     let mut archive = ZipArchive::new(File::open(source)?)?;
     let mut raw_source = File::open(source)?;
+    if let Some(sample) = selection {
+        // Current preflight resolved the main image's actual adjacent/manifest
+        // license. Do not substitute an extension or scan unrelated licenses.
+        let mut target = None;
+        for index in 0..archive.len() {
+            crate::application::operation::check()?;
+            let mut member = archive.by_index(index)?;
+            let name = duplicate_zip::read_raw_central_name(
+                &mut raw_source,
+                member.central_header_start(),
+            )?;
+            if String::from_utf8_lossy(&name) != sample.sinf_member {
+                continue;
+            }
+            if member.size() > 1024 * 1024 {
+                bail!("selected sample license exceeds its size limit");
+            }
+            let mut bytes = zeroize::Zeroizing::new(Vec::new());
+            crate::application::operation::copy(
+                &mut (&mut member).take(1024 * 1024 + 1),
+                &mut *bytes,
+            )?;
+            if bytes.len() > 1024 * 1024 || parse_sinf_selector(&bytes)? != selector {
+                bail!("selected sample authorization changed after preflight");
+            }
+            target = Some(bytes);
+            break;
+        }
+        let target = target.context("selected sample license is missing")?;
+        let ipa_root = sample
+            .executable_member
+            .rsplit_once('/')
+            .context("selected executable has no bundle root")?
+            .0;
+        let copied = copy_private(root, Path::new("ipa/App.ipa"), source)?;
+        let target_file = write_private(root, Path::new("ipa/App.sinf"), &target)?;
+        return Ok((copied, ipa_root.to_owned(), target_file));
+    }
     let mut sinfs = Vec::new();
     if archive.has_duplicate_names() {
         sinfs = duplicate_zip::read_matching_entries(source, |name| {
@@ -294,6 +539,7 @@ fn capture_ipa(
     }
     let mut roots = Vec::new();
     for (name, bytes) in &sinfs {
+        crate::application::operation::check()?;
         if parse_sinf_selector(bytes).ok() == Some(selector) {
             roots.push(name.split("/SC_Info/").next().unwrap().to_owned());
         }
@@ -320,6 +566,14 @@ fn capture_ipa(
 }
 
 pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<EnrollmentCaptureManifest> {
+    collect_impl(options, None, None)
+}
+
+fn collect_impl(
+    options: &EnrollmentCollectOptions,
+    current: Option<&ipatool_authorization::Snapshot>,
+    selection: Option<&CurrentSample>,
+) -> Result<EnrollmentCaptureManifest> {
     if options.app.as_os_str().is_empty() || options.output.as_os_str().is_empty() {
         bail!("capture requires app and output paths");
     }
@@ -351,8 +605,12 @@ pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<Enrollme
         .fairplayd
         .as_deref()
         .unwrap_or_else(|| Path::new(FAIRPLAYD_PATH));
-    let fairplayd_bytes = fs::read(fairplayd_path).context("read fairplayd Mach-O")?;
-    let fairplayd_slice = arm64e_slice(&fairplayd_bytes)?;
+    let fairplayd_bytes = if current.is_none() {
+        Some(fs::read(fairplayd_path).context("read fairplayd Mach-O")?)
+    } else {
+        None
+    };
+    let fairplayd_slice = fairplayd_bytes.as_deref().map(arm64e_slice).transpose()?;
     let mac = hardware_mac(
         options.iomac_file.as_deref(),
         if options.interface.is_empty() {
@@ -368,12 +626,17 @@ pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<Enrollme
         .tempdir_in(parent)?;
     let root = staging.path();
     let mut files = Vec::new();
-    let fairplayd = write_private(
-        root,
-        Path::new("fairplayd/fairplayd.arm64e"),
-        fairplayd_slice,
-    )?;
-    files.push(fairplayd.clone());
+    let fairplayd = if let Some(fairplayd_slice) = fairplayd_slice {
+        let value = write_private(
+            root,
+            Path::new("fairplayd/fairplayd.arm64e"),
+            fairplayd_slice,
+        )?;
+        files.push(value.clone());
+        value
+    } else {
+        CaptureFile::default()
+    };
     let support =
         lookup_fairplay_build(&fairplayd.sha256).unwrap_or_else(|| FairPlayBuildSupport {
             build: build_version.clone(),
@@ -400,38 +663,50 @@ pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<Enrollme
     let licenses = copy_tree(root, &app.join("SC_Info"), Path::new("app/SC_Info"))?;
     files.extend(licenses);
     let mut state_count = 0;
-    for (source, relative) in [
-        (
-            options
-                .system_state
-                .as_deref()
-                .unwrap_or_else(|| Path::new(SYSTEM_STATE_PATH)),
-            "state/fpsd-sc-info",
-        ),
-        (
-            options
-                .shared_state
-                .as_deref()
-                .unwrap_or_else(|| Path::new(SHARED_STATE_PATH)),
-            "state/shared-sc-info",
-        ),
-        (
-            options
-                .adi_state
-                .as_deref()
-                .unwrap_or_else(|| Path::new(ADI_STATE_PATH)),
-            "state/adi",
-        ),
-    ] {
-        let captured = copy_tree(root, source, Path::new(relative))?;
-        state_count += captured.len();
-        files.extend(captured);
+    if let Some(snapshot) = current {
+        for file in &snapshot.files {
+            files.push(write_private(
+                root,
+                Path::new(file.source.capture_path()),
+                &file.bytes,
+            )?);
+            state_count += 1;
+        }
+    } else {
+        for (source, relative) in [
+            (
+                options
+                    .system_state
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(SYSTEM_STATE_PATH)),
+                "state/fpsd-sc-info",
+            ),
+            (
+                options
+                    .shared_state
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(SHARED_STATE_PATH)),
+                "state/shared-sc-info",
+            ),
+            (
+                options
+                    .adi_state
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(ADI_STATE_PATH)),
+                "state/adi",
+            ),
+        ] {
+            let captured = copy_tree(root, source, Path::new(relative))?;
+            state_count += captured.len();
+            files.extend(captured);
+        }
     }
     if state_count == 0 {
         bail!("capture found no native FairPlay state files");
     }
     let (ipa, ipa_root, target_sinf_path) = if let Some(source) = options.ipa.as_deref() {
-        let (copied, root_name, target) = capture_ipa(root, source, selector, &executable)?;
+        let (copied, root_name, target) =
+            capture_ipa(root, source, selector, &executable, selection)?;
         files.push(copied.clone());
         files.push(target.clone());
         (Some(copied), root_name, target.path)
@@ -442,7 +717,7 @@ pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<Enrollme
     if ipa.is_none() {
         warnings.push("capture has no IPA; recovery requires a matching personalized IPA".into());
     }
-    if support.status == "unsupported" {
+    if current.is_none() && support.status == "unsupported" {
         warnings.push("fairplayd hash is not supported".into());
     }
     let manifest = EnrollmentCaptureManifest {
@@ -472,8 +747,10 @@ pub fn collect_enrollment(options: &EnrollmentCollectOptions) -> Result<Enrollme
     output.write_all(b"\n")?;
     output.sync_all()?;
     drop(output);
-    fs::rename(root, &options.output)
-        .with_context(|| format!("publish capture {}", options.output.display()))?;
+    crate::application::operation::publish(|| {
+        fs::rename(root, &options.output)
+            .with_context(|| format!("publish capture {}", options.output.display()))
+    })?;
     Ok(manifest)
 }
 
@@ -503,6 +780,175 @@ mod tests {
         sinf_with_selector(SinfSelector { user: 7, key: 9 })
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn current_collection_preflights_identity_and_reads_only_the_explicit_sidb_snapshot() {
+        use crate::fairplay_ipa::tests::{model_and_sinf, supf};
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("A.app");
+        fs::create_dir_all(app.join("SC_Info")).unwrap();
+        let (_, sinf) = model_and_sinf([0x31; 16]);
+        let (image, record, _) = crate::fairplay_decrypt::tests::encrypted_fixture([0x31; 16]);
+        let info = |version: &str| {
+            let mut fields = plist::Dictionary::new();
+            for (key, value) in [
+                ("CFBundleIdentifier", "invalid.example.sample"),
+                ("CFBundleExecutable", "A"),
+                ("CFBundleShortVersionString", version),
+                ("CFBundleVersion", "1"),
+            ] {
+                fields.insert(key.into(), Value::String(value.into()));
+            }
+            let mut data = Vec::new();
+            plist::to_writer_xml(&mut data, &fields).unwrap();
+            data
+        };
+        fs::write(app.join("Info.plist"), info("1.0")).unwrap();
+        fs::write(app.join("A"), &image).unwrap();
+        fs::write(app.join("SC_Info/A.sinf"), &sinf).unwrap();
+        fs::write(app.join("SC_Info/A.v5.supf"), supf(record)).unwrap();
+        let ipa = root.path().join("sample.ipa");
+        let make = |version: &str, main_sinf: &[u8], extension_sinf: Option<&[u8]>| {
+            let mut zip = ZipWriter::new(File::create(&ipa).unwrap());
+            let mut entries = vec![
+                ("Payload/A.app/Info.plist", info(version)),
+                ("Payload/A.app/A", image.clone()),
+                ("Payload/A.app/SC_Info/A.sinf", main_sinf.to_vec()),
+                ("Payload/A.app/SC_Info/A.v5.supf", supf(record)),
+            ];
+            if let Some(sinf) = extension_sinf {
+                entries.extend([
+                    ("Payload/A.app/PlugIns/B.appex/B", image.clone()),
+                    (
+                        "Payload/A.app/PlugIns/B.appex/SC_Info/B.sinf",
+                        sinf.to_vec(),
+                    ),
+                    (
+                        "Payload/A.app/PlugIns/B.appex/SC_Info/B.v5.supf",
+                        supf(record),
+                    ),
+                ]);
+            }
+            for (name, data) in entries {
+                zip.start_file(name, SimpleFileOptions::default()).unwrap();
+                zip.write_all(&data).unwrap();
+            }
+            zip.finish().unwrap();
+        };
+        make("1.0", &sinf, None);
+        let state = root.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let state_file = state.join("SC Info.sidb");
+        fs::write(&state_file, [0u8, 7, 0, 11]).unwrap();
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(state.join("must-not-copy"), b"unrelated state").unwrap();
+        let mac = root.path().join("iomac");
+        fs::write(&mac, [1u8, 2, 3, 4, 5, 6]).unwrap();
+        let options = EnrollmentCollectOptions {
+            app,
+            ipa: Some(ipa.clone()),
+            output: root.path().join("capture"),
+            fairplayd: Some(root.path().join("must-not-read-image")),
+            adi_state: Some(root.path().join("must-not-read-adi")),
+            system_state: Some(state),
+            iomac_file: Some(mac),
+            product_version: Some("fixture".into()),
+            build_version: Some("fixture".into()),
+            ..Default::default()
+        };
+        let captured = collect_current_enrollment(&options).unwrap();
+        assert!(captured.fairplayd.path.is_empty());
+        assert!(
+            captured
+                .files
+                .iter()
+                .any(|file| file.path == "state/fpsd-sc-info/SC Info.sidb")
+        );
+        assert!(
+            !captured
+                .files
+                .iter()
+                .any(|file| file.path.contains("must-not")
+                    || file.path.starts_with("fairplayd/")
+                    || file.path.starts_with("state/adi/"))
+        );
+        fn assert_private_tree(path: &Path) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert_eq!(
+                metadata.permissions().mode() & 0o077,
+                0,
+                "capture entries must stay private"
+            );
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    assert_private_tree(&entry.unwrap().path());
+                }
+            }
+        }
+        assert_private_tree(&options.output);
+        load_enrollment_capture(&options.output, true).unwrap();
+        let before = fs::read(&ipa).unwrap();
+        preflight_current_sample(&options.app, &ipa).unwrap();
+        assert_eq!(fs::read(&ipa).unwrap(), before);
+        make("1.1", &sinf, None);
+        let error = preflight_current_sample(&options.app, &ipa).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SampleProblem>(),
+            Some(SampleProblem::Mismatch)
+        ));
+        let mut other_sinf = sinf.clone();
+        other_sinf[36..40].copy_from_slice(&10u32.to_be_bytes());
+        // A matching extension cannot stand in for the main application's
+        // different authorization, even with identical app/version metadata.
+        make("1.0", &other_sinf, Some(&sinf));
+        let error = preflight_current_sample(&options.app, &ipa).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<SampleProblem>(),
+            Some(SampleProblem::EnrollmentMismatch)
+        ));
+        make("1.0", &sinf, Some(&other_sinf));
+        preflight_current_sample(&options.app, &ipa).unwrap();
+
+        // Current collection must carry the resolved manifest source through
+        // capture, rather than requiring a missing adjacent replica afterward.
+        let mut manifest_fields = plist::Dictionary::new();
+        manifest_fields.insert(
+            "SinfPaths".into(),
+            Value::Array(vec![Value::String("SC_Info/Source.sinf".into())]),
+        );
+        manifest_fields.insert(
+            "SinfReplicationPaths".into(),
+            Value::Array(vec![Value::String("SC_Info/A.sinf".into())]),
+        );
+        let mut manifest_bytes = Vec::new();
+        plist::to_writer_xml(&mut manifest_bytes, &manifest_fields).unwrap();
+        let mut zip = ZipWriter::new(File::create(&ipa).unwrap());
+        for (name, data) in [
+            ("Payload/A.app/Info.plist", info("1.0")),
+            ("Payload/A.app/A", image),
+            ("Payload/A.app/SC_Info/Source.sinf", sinf.clone()),
+            ("Payload/A.app/SC_Info/A.v5.supf", supf(record)),
+            ("Payload/A.app/SC_Info/Manifest.plist", manifest_bytes),
+            (
+                "Payload/A.app/SC_Info/Unused.sinf",
+                b"not an active license".to_vec(),
+            ),
+        ] {
+            zip.start_file(name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(&data).unwrap();
+        }
+        zip.finish().unwrap();
+        preflight_current_sample(&options.app, &ipa).unwrap();
+        let before = fs::read(&ipa).unwrap();
+        let mut options = options;
+        options.output = root.path().join("replica-capture");
+        let captured = collect_current_enrollment(&options).unwrap();
+        assert_eq!(captured.app.ipa_member_root, "Payload/A.app");
+        assert_eq!(fs::read(options.output.join("ipa/App.sinf")).unwrap(), sinf);
+        assert_eq!(fs::read(&ipa).unwrap(), before);
+    }
+
     #[test]
     fn installed_sinf_uses_go_equal_fold_extension() {
         let directory = tempfile::tempdir().unwrap();
@@ -526,7 +972,7 @@ mod tests {
         crate::duplicate_zip::write_duplicate_sinf_fixture(&ipa, &first, &second);
         let output = directory.path().join("capture");
         let (_, root, _) =
-            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A").unwrap();
+            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A", None).unwrap();
         assert_eq!(root, "Payload/A.app");
         assert_eq!(fs::read(output.join("ipa/App.sinf")).unwrap(), first);
     }
@@ -545,7 +991,7 @@ mod tests {
 
         let output = directory.path().join("capture");
         let (_, root, _) =
-            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A").unwrap();
+            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A", None).unwrap();
         assert_eq!(root, "Payload/\u{fffd}.app");
         assert_eq!(fs::read(output.join("ipa/App.sinf")).unwrap(), first);
     }
@@ -559,7 +1005,7 @@ mod tests {
 
         let output = directory.path().join("capture");
         let (_, root, _) =
-            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A").unwrap();
+            capture_ipa(&output, &ipa, SinfSelector { user: 7, key: 9 }, "A", None).unwrap();
         assert_eq!(root, "Payload/A.app");
         assert_eq!(fs::read(output.join("ipa/App.sinf")).unwrap(), first);
     }

@@ -184,10 +184,18 @@ enum Endpoint {
 
 impl DownloadProductClient {
     pub fn open() -> Result<Self> {
+        Self::open_in(
+            &prepare_state_directory_from_environment()?,
+            Arc::from(open_system_keychain()?),
+        )
+    }
+
+    pub fn open_in(
+        state_directory: &Path,
+        credentials: Arc<dyn CredentialStore + Send + Sync>,
+    ) -> Result<Self> {
         let hardware_id = hardware_mac_address().context("read Store hardware identity")?;
-        let state_directory = prepare_state_directory_from_environment()?;
-        let transport = Arc::new(Transport::with_cookies(&state_directory)?);
-        let credentials = Arc::from(open_system_keychain()?);
+        let transport = Arc::new(Transport::with_cookies(state_directory)?);
         let sender_transport = Arc::clone(&transport);
         Ok(Self::with_sender(hardware_id, move |request| {
             sender_transport.send_store(request)
@@ -448,6 +456,7 @@ impl DownloadProductClient {
         )
         .context("patch downloaded IPA")?;
         fs::remove_file(&temporary).context("remove temporary IPA")?;
+        let _ = fs::remove_file(crate::download_file::resume_checkpoint_path(&temporary));
         Ok(destination)
     }
 
@@ -830,8 +839,8 @@ impl DownloadProductClient {
             "serialNumber": STANDARD.encode(serial),
             "externalVersionId": version,
         });
-        let mut body = Vec::new();
-        plist::to_writer_xml(&mut body, &parameters).context("encode ent/download plist")?;
+        let body = crate::transport::encode_store_plist(&parameters)
+            .context("encode ent/download plist")?;
         let mut url = Url::parse(ENT_DOWNLOAD_URL)?;
         url.query_pairs_mut().append_pair("guid", guid);
         let mut headers = HeaderMap::new();
@@ -1004,8 +1013,8 @@ impl DownloadProductClient {
                 _ => "appExtVrsId",
             }] = Value::String(version.to_owned());
         }
-        let mut body = Vec::new();
-        plist::to_writer_xml(&mut body, &parameters).context("encode download-product plist")?;
+        let body = crate::transport::encode_store_plist(&parameters)
+            .context("encode download-product plist")?;
         let mut headers = HeaderMap::new();
         headers.insert(
             CONTENT_TYPE,
@@ -1197,6 +1206,15 @@ fn package_destination(
     };
     if destination.file_name().is_none() {
         bail!("package output path has no file name");
+    }
+    if crate::application::operation::transfer_identity().is_some()
+        && fs::symlink_metadata(&destination).is_ok()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "package output already exists; choose a new output path",
+        )
+        .into());
     }
     Ok(destination)
 }

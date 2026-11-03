@@ -100,6 +100,7 @@ impl<'a> AeaReader<'a> {
             .min(usize::try_from(self.root.file_size - offset).unwrap_or(usize::MAX));
         let mut written = 0usize;
         while written < wanted {
+            crate::application::operation::check()?;
             let position = offset + written as u64;
             let segment_index = usize::try_from(position / u64::from(self.root.segment_size))?;
             let segment = self
@@ -140,7 +141,8 @@ impl<'a> AeaReader<'a> {
 
 impl Read for AeaReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = AeaReader::read_at(self, buffer, self.cursor).map_err(io::Error::other)?;
+        let count = AeaReader::read_at(self, buffer, self.cursor)
+            .map_err(crate::application::operation::into_io_error)?;
         self.cursor += count as u64;
         Ok(count)
     }
@@ -198,7 +200,7 @@ impl Read for SharedAeaReader<'_> {
             .inner
             .borrow_mut()
             .read_at(buffer, self.position)
-            .map_err(io::Error::other)?;
+            .map_err(crate::application::operation::into_io_error)?;
         self.position += count as u64;
         Ok(count)
     }
@@ -312,16 +314,11 @@ impl AeaHeader {
     /// Fetch the Apple-published restore-image key and unwrap this image's AEA key.
     pub fn resolve_symmetric_key(&self) -> Result<Zeroizing<Vec<u8>>> {
         let url = self.fcs_key_url()?;
+        if crate::application::operation::is_active() {
+            return self.unwrap_fcs_key(&fetch_fcs_cancellable(url)?);
+        }
         let client = reqwest::blocking::Client::builder()
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 10 {
-                    attempt.error("too many Apple FCS redirects")
-                } else if attempt.url().scheme() != "https" {
-                    attempt.error("Apple FCS redirect is not HTTPS")
-                } else {
-                    attempt.follow()
-                }
-            }))
+            .redirect(fcs_redirect_policy())
             .timeout(Duration::from_secs(30))
             .build()
             .context("create Apple FCS client")?;
@@ -391,6 +388,57 @@ impl AeaHeader {
             .map_err(|_| anyhow::anyhow!("unwrap AEA symmetric key"))?;
         Ok(Zeroizing::new(key))
     }
+}
+
+fn fcs_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            attempt.error("too many Apple FCS redirects")
+        } else if attempt.url().scheme() != "https" {
+            attempt.error("Apple FCS redirect is not HTTPS")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+fn fetch_fcs_cancellable(url: Url) -> Result<Zeroizing<Vec<u8>>> {
+    use crate::application::operation;
+    operation::check()?;
+    let client = reqwest::Client::builder()
+        .redirect(fcs_redirect_policy())
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .context("create Apple FCS client")?;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(async {
+            let mut response = operation::wait(client.get(url).send())
+                .await
+                .context("download Apple FCS key")?;
+            if response.status() != reqwest::StatusCode::OK {
+                bail!("Apple FCS key server returned HTTP {}", response.status());
+            }
+            if response
+                .content_length()
+                .is_some_and(|size| size > MAX_FCS_KEY_SIZE)
+            {
+                bail!("Apple FCS key response is too large");
+            }
+            let mut pem = Zeroizing::new(Vec::new());
+            while let Some(chunk) = operation::wait(response.chunk())
+                .await
+                .context("read Apple FCS key")?
+            {
+                if pem.len().saturating_add(chunk.len()) as u64 > MAX_FCS_KEY_SIZE {
+                    bail!("Apple FCS key response is too large");
+                }
+                pem.extend_from_slice(&chunk);
+            }
+            Ok(pem)
+        })
 }
 
 pub fn read_remote_header(remote: &RemoteFile, entry: ArchiveEntry) -> Result<AeaHeader> {
@@ -724,6 +772,75 @@ mod tests {
     use p256::pkcs8::{EncodePrivateKey, LineEnding};
     use reqwest::blocking::Client;
     use std::{io::Write, net::TcpListener, thread};
+
+    #[test]
+    fn cancellable_fcs_fetch_keeps_response_status_and_size_limits() {
+        use crate::application::operation::Operation;
+        for (reply, succeeds) in [
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nConnection: close\r\n\r\nfixture-public-key".as_slice(), true),
+            (b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(), false),
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 65537\r\nConnection: close\r\n\r\n".as_slice(), false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = Url::parse(&format!("http://{}/fixture-key", listener.local_addr().unwrap())).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new(); let mut byte = [0];
+                while stream.read_exact(&mut byte).is_ok() {
+                    request.push(byte[0]); if request.ends_with(b"\r\n\r\n") { break; }
+                }
+                stream.write_all(reply).unwrap();
+            });
+            let result = Operation::default().run(|| fetch_fcs_cancellable(url));
+            assert_eq!(result.is_ok(), succeeds);
+            if let Ok(bytes) = result { assert_eq!(bytes.as_slice(), b"fixture-public-key"); }
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn cancellable_fcs_fetch_stops_a_stalled_key_body() {
+        use crate::application::operation::{self, Operation};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/fixture-key",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while stream.read_exact(&mut byte).is_ok() {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npart",
+                )
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        let operation = Operation::default();
+        let cancellation = operation.clone();
+        let cancel = thread::spawn(move || {
+            ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            cancellation.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = operation.run(|| fetch_fcs_cancellable(url)).unwrap_err();
+        assert!(operation::is_cancellation(&error));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = release_tx.send(());
+        cancel.join().unwrap();
+        server.join().unwrap();
+    }
 
     #[test]
     fn parses_bounded_aea_metadata_and_fcs_url() {

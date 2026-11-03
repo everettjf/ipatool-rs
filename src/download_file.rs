@@ -17,6 +17,13 @@ use url::Url;
 
 use crate::transport::Transport;
 
+#[path = "download_file_resume.rs"]
+mod resume;
+
+pub(crate) fn resume_checkpoint_path(package: &Path) -> std::path::PathBuf {
+    resume::path(package)
+}
+
 static SHOW_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Enable terminal progress for CLI package downloads.
@@ -44,6 +51,11 @@ impl ProgressDisplay {
     }
 
     fn update(&mut self, current: u64, total: Option<u64>) {
+        crate::application::operation::progress(
+            crate::application::operation::Stage::Downloading,
+            current,
+            total,
+        );
         if !self.enabled {
             return;
         }
@@ -99,6 +111,9 @@ enum RangePlan {
 /// Download a package into `destination`, resuming an existing partial file.
 /// Invalid range responses leave the partial file unchanged.
 pub fn download_file(url: &str, destination: &Path) -> Result<u64> {
+    if crate::application::operation::is_active() {
+        return download_cancellable(&Transport::new()?, url, destination);
+    }
     let client = Client::builder()
         .no_gzip()
         .no_brotli()
@@ -120,6 +135,9 @@ pub fn download_file_with_transport(
     url: &str,
     destination: &Path,
 ) -> Result<u64> {
+    if crate::application::operation::is_active() {
+        return download_cancellable(transport, url, destination);
+    }
     let mut progress = ProgressDisplay::new();
     let result = download_file_with_progress(
         url,
@@ -166,6 +184,7 @@ fn download_file_with_progress(
     request: &mut impl FnMut(Url, u64) -> Result<Response>,
     progress: &mut impl FnMut(u64, Option<u64>),
 ) -> Result<u64> {
+    crate::application::operation::check()?;
     let url = Url::parse(url).context("invalid package URL")?;
     if !matches!(url.scheme(), "https" | "http") {
         bail!("package URL must use HTTP or HTTPS");
@@ -229,7 +248,9 @@ fn copy_with_progress(
     let mut buffer = [0u8; 64 * 1024];
     let mut written = 0u64;
     loop {
+        crate::application::operation::check()?;
         let bytes = reader.read(&mut buffer).context("read package download")?;
+        crate::application::operation::check()?;
         if bytes == 0 {
             break;
         }
@@ -242,9 +263,158 @@ fn copy_with_progress(
     Ok(written)
 }
 
+fn download_cancellable(transport: &Transport, url: &str, destination: &Path) -> Result<u64> {
+    use crate::application::operation;
+    use sha2::{Digest, Sha256};
+    operation::check()?;
+    let identity = operation::transfer_identity().map(|scope| resume::identity(&scope, url));
+    let url = Url::parse(url).context("invalid package URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("package URL must use HTTP or HTTPS");
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o644);
+        }
+        if identity.is_some()
+            && let Ok(metadata) = std::fs::symlink_metadata(destination)
+            && !metadata.is_file()
+        {
+            bail!("partial package must be a regular file");
+        }
+        let mut file = options.open(destination).context("open partial package")?;
+        let checkpoint = identity
+            .as_ref()
+            .map(|identity| resume::load(destination, identity))
+            .transpose()?
+            .flatten();
+        let actual_size = file.metadata()?.len();
+        let local_size = if identity.is_none() || checkpoint.is_some() {
+            actual_size
+        } else {
+            0
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        headers.insert(
+            RANGE,
+            HeaderValue::from_str(&format!("bytes={local_size}-"))?,
+        );
+        if let Some((checkpoint, _)) = &checkpoint {
+            headers.insert(
+                reqwest::header::IF_RANGE,
+                HeaderValue::from_str(&checkpoint.validator)?,
+            );
+        }
+        let mut response = transport.stream_get_async(url, headers, None).await?;
+        let validator = resume::validator(response.headers());
+        if let Some((checkpoint, _)) = &checkpoint
+            && response.status().as_u16() != 200
+            && validator.as_deref() != Some(&checkpoint.validator)
+        {
+            let _ = std::fs::remove_file(resume::path(destination));
+            bail!("package validator changed; restart the transfer");
+        }
+        let (offset, length, total) = match response_range_headers(
+            response.status().as_u16(),
+            response.headers(),
+            local_size,
+        )? {
+            RangePlan::Complete(size) => {
+                if identity.is_some() && checkpoint.is_none() {
+                    bail!("cannot accept completed transfer without a verified checkpoint");
+                }
+                if checkpoint.as_ref().is_some_and(|(checkpoint, _)| {
+                    checkpoint.total.is_some_and(|total| total != size)
+                }) {
+                    let _ = std::fs::remove_file(resume::path(destination));
+                    bail!("completed package length changed; restart the transfer");
+                }
+                return Ok(size);
+            }
+            RangePlan::Transfer {
+                offset,
+                length,
+                total,
+            } => (offset, length, total),
+        };
+        if response.status().as_u16() == 206
+            && checkpoint.as_ref().is_some_and(|(checkpoint, _)| {
+                checkpoint.total.is_some() && checkpoint.total != total
+            })
+        {
+            let _ = std::fs::remove_file(resume::path(destination));
+            bail!("package total length changed; restart the transfer");
+        }
+        operation::check()?;
+        let mut hash = if offset == 0 {
+            Sha256::new()
+        } else {
+            checkpoint.map(|(_, hash)| hash).unwrap_or_default()
+        };
+        if offset == 0 {
+            file.set_len(0)?;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut progress = ProgressDisplay::new();
+        let mut written = 0u64;
+        progress.update(offset, total);
+        let transfer: Result<()> = async {
+            while let Some(chunk) = operation::wait(response.chunk()).await? {
+                operation::check()?;
+                if length
+                    .is_some_and(|expected| written.saturating_add(chunk.len() as u64) > expected)
+                {
+                    bail!("package download exceeds the advertised range");
+                }
+                file.write_all(&chunk)?;
+                hash.update(&chunk);
+                written += chunk.len() as u64;
+                progress.update(offset + written, total);
+            }
+            Ok(())
+        }
+        .await;
+        let checkpoint_result = file.sync_all().map_err(anyhow::Error::from).and_then(|_| {
+            if let Some(identity) = &identity {
+                resume::save(
+                    destination,
+                    identity,
+                    validator.as_deref(),
+                    offset + written,
+                    total,
+                    &hash,
+                )
+            } else {
+                Ok(())
+            }
+        });
+        progress.finish();
+        transfer?;
+        checkpoint_result?;
+        if length.is_some_and(|expected| written != expected)
+            || total.is_some_and(|expected| offset.checked_add(written) != Some(expected))
+        {
+            bail!("package download is incomplete");
+        }
+        file.sync_all()?;
+        Ok(offset + written)
+    })
+}
+
 fn response_range(response: &Response, local_size: u64) -> Result<RangePlan> {
-    let content_length = response
-        .headers()
+    response_range_headers(response.status().as_u16(), response.headers(), local_size)
+}
+
+fn response_range_headers(status: u16, headers: &HeaderMap, local_size: u64) -> Result<RangePlan> {
+    let content_length = headers
         .get(CONTENT_LENGTH)
         .map(|value| -> Result<u64> {
             value
@@ -254,14 +424,14 @@ fn response_range(response: &Response, local_size: u64) -> Result<RangePlan> {
                 .context("invalid package Content-Length")
         })
         .transpose()?;
-    match response.status().as_u16() {
+    match status {
         200 => Ok(RangePlan::Transfer {
             offset: 0,
             length: content_length,
             total: content_length,
         }),
         206 => {
-            let header = header_text(response, CONTENT_RANGE)?;
+            let header = header_text(headers, CONTENT_RANGE)?;
             let span = content_range_value(header)?;
             let (bounds, total) = span
                 .split_once('/')
@@ -286,7 +456,7 @@ fn response_range(response: &Response, local_size: u64) -> Result<RangePlan> {
             })
         }
         416 => {
-            let header = header_text(response, CONTENT_RANGE)?;
+            let header = header_text(headers, CONTENT_RANGE)?;
             if content_range_value(header)? != format!("*/{local_size}") {
                 bail!("rejected package range does not match partial file");
             }
@@ -306,9 +476,8 @@ fn content_range_value(header: &str) -> Result<&str> {
     Ok(value)
 }
 
-fn header_text(response: &Response, key: reqwest::header::HeaderName) -> Result<&str> {
-    response
-        .headers()
+fn header_text(headers: &HeaderMap, key: reqwest::header::HeaderName) -> Result<&str> {
+    headers
         .get(key)
         .context("missing package response header")?
         .to_str()
@@ -318,6 +487,167 @@ fn header_text(response: &Response, key: reqwest::header::HeaderName) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_transfer_cancels_a_stalled_body_and_keeps_received_bytes() {
+        use crate::application::operation::{Cancelled, Operation};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/app.ipa", listener.local_addr().unwrap());
+        let (close_tx, close_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while stream.read_exact(&mut byte).is_ok() {
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nETag: \"fixture\"\r\n\r\npart",
+                )
+                .unwrap();
+            let _ = close_rx.recv_timeout(Duration::from_secs(5));
+        });
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let operation = Operation::new(move |progress| {
+            if progress.completed >= 4 {
+                let _ = progress_tx.send(());
+            }
+        });
+        let operation = operation.with_transfer_identity("fixture-account-and-app".into());
+        let cancellation = operation.clone();
+        let cancel = thread::spawn(move || {
+            progress_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            cancellation.cancel();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("app.partial");
+        let started = Instant::now();
+        let error = operation.run(|| download_file(&url, &package)).unwrap_err();
+        assert!(error.is::<Cancelled>());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(fs::read(&package).unwrap(), b"part");
+        assert!(
+            resume::load(&package, &resume::identity("fixture-account-and-app", &url))
+                .unwrap()
+                .is_some()
+        );
+        close_tx.send(()).unwrap();
+        cancel.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn scoped_transfer_resumes_only_verified_bytes_and_restarts_changed_account_or_bytes() {
+        use crate::application::operation::Operation;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/app.ipa", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let replies: [&[u8]; 4] = [
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"a\"\r\nConnection: close\r\n\r\nabcd",
+                b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-9/10\r\nContent-Length: 6\r\nETag: \"a\"\r\nConnection: close\r\n\r\nefghij",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"b\"\r\nConnection: close\r\n\r\n0123456789",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"c\"\r\nConnection: close\r\n\r\nABCDEFGHIJ",
+            ];
+            for (index, reply) in replies.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while stream.read_exact(&mut byte).is_ok() {
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.contains(if index == 1 {
+                    "range: bytes=4-\r\n"
+                } else {
+                    "range: bytes=0-\r\n"
+                }));
+                assert_eq!(request.contains("if-range: \"a\"\r\n"), index == 1);
+                stream.write_all(reply).unwrap();
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("app.partial");
+        let original = Operation::default().with_transfer_identity("account-app-version".into());
+        assert!(original.run(|| download_file(&url, &package)).is_err());
+        assert_eq!(fs::read(&package).unwrap(), b"abcd");
+        assert_eq!(original.run(|| download_file(&url, &package)).unwrap(), 10);
+        assert_eq!(fs::read(&package).unwrap(), b"abcdefghij");
+        fs::write(&package, b"tampered!!").unwrap();
+        original.run(|| download_file(&url, &package)).unwrap();
+        assert_eq!(fs::read(&package).unwrap(), b"0123456789");
+        Operation::default()
+            .with_transfer_identity("other-account-app-version".into())
+            .run(|| download_file(&url, &package))
+            .unwrap();
+        assert_eq!(fs::read(&package).unwrap(), b"ABCDEFGHIJ");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn scoped_transfer_rejects_changed_validator_or_total_before_writing_partial_bytes() {
+        use crate::application::operation::Operation;
+        use sha2::{Digest, Sha256};
+        let replies: [&[u8]; 3] = [
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-9/10\r\nContent-Length: 6\r\nETag: \"changed\"\r\nConnection: close\r\n\r\nWRONG!",
+            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 4-10/11\r\nContent-Length: 7\r\nETag: \"original\"\r\nConnection: close\r\n\r\nWRONG!!",
+            b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */4\r\nContent-Length: 0\r\nETag: \"original\"\r\nConnection: close\r\n\r\n",
+        ];
+        for reply in replies {
+            let (url, captured, server) = spawn_server(reply);
+            let directory = tempfile::tempdir().unwrap();
+            let package = directory.path().join("partial");
+            fs::write(&package, b"abcd").unwrap();
+            resume::save(
+                &package,
+                &resume::identity("fixture", &url),
+                Some("\"original\""),
+                4,
+                Some(10),
+                &Sha256::new_with_prefix(b"abcd"),
+            )
+            .unwrap();
+            assert!(
+                Operation::default()
+                    .with_transfer_identity("fixture".into())
+                    .run(|| download_file(&url, &package))
+                    .is_err()
+            );
+            assert_eq!(fs::read(&package).unwrap(), b"abcd");
+            assert!(!resume::path(&package).exists());
+            server.join().unwrap();
+            assert!(
+                captured
+                    .lock()
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("if-range: \"original\"")
+            );
+        }
+    }
+
+    #[test]
+    fn application_range_validation_preserves_partial_files_and_can_resume() {
+        use crate::application::operation::Operation;
+        for (reply, expected, succeeds) in [
+            (&b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 7-14/15\r\nContent-Length: 8\r\nConnection: close\r\n\r\ndownload"[..], &b"partialdownload"[..], true),
+            (&b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-7/15\r\nContent-Length: 8\r\nConnection: close\r\n\r\ndownload"[..], &b"partial"[..], false),
+            (&b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */7\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"[..], &b"partial"[..], true),
+        ] {
+            let (url, _, server) = spawn_server(reply);
+            let directory = tempfile::tempdir().unwrap(); let package = directory.path().join("partial");
+            fs::write(&package, b"partial").unwrap();
+            assert_eq!(Operation::default().run(|| download_file(&url, &package)).is_ok(), succeeds);
+            assert_eq!(fs::read(package).unwrap(), expected);
+            server.join().unwrap();
+        }
+    }
     use crate::transport::Request;
     use std::{
         fs,

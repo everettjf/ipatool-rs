@@ -49,9 +49,12 @@ pub struct NativeOwnedBackend {
 
 impl NativeOwnedBackend {
     pub fn open() -> Result<Self> {
+        Self::open_in(&prepare_state_directory_from_environment()?)
+    }
+
+    pub fn open_in(state_directory: &std::path::Path) -> Result<Self> {
         let hardware_id = hardware_mac_address().context("read Store hardware identity")?;
-        let state_directory = prepare_state_directory_from_environment()?;
-        let transport = Arc::new(Transport::with_cookies(&state_directory)?);
+        let transport = Arc::new(Transport::with_cookies(state_directory)?);
         Ok(Self::with_sender(hardware_id, move |request| {
             transport.send_store(request)
         }))

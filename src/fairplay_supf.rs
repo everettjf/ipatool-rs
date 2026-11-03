@@ -4,7 +4,8 @@ use aes::{
     Aes128,
     cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray},
 };
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use sha1::{Digest, Sha1};
 use zeroize::Zeroizing;
 
 use crate::fairplay_page::PageKeyDeriver;
@@ -16,12 +17,14 @@ pub struct SupfArchitecture {
     pub cpu_type: u32,
     pub cpu_subtype: u32,
     pub records: Vec<[u8; 32]>,
+    pub signature_sha1: Option<[u8; 20]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Supf {
     pub variant: u8,
     pub architectures: Vec<SupfArchitecture>,
+    pub universal_signature_sha1: Option<[u8; 20]>,
 }
 
 impl Supf {
@@ -83,6 +86,8 @@ impl Supf {
                 cpu_type,
                 cpu_subtype,
                 records,
+                signature_sha1: (variant == 3)
+                    .then(|| blob[start + 8..start + 28].try_into().unwrap()),
             });
             cursor = end;
         }
@@ -92,6 +97,7 @@ impl Supf {
         Ok(Self {
             variant,
             architectures,
+            universal_signature_sha1: None,
         })
     }
 
@@ -103,6 +109,64 @@ impl Supf {
             .ok_or_else(|| {
                 anyhow::anyhow!("SUPF has no matching architecture {cpu_type:#x}/{cpu_subtype:#x}")
             })
+    }
+
+    /// Check legacy bindings against complete LC_CODE_SIGNATURE payloads before
+    /// mutation. A universal SUPP binds every slice, in fat-header order.
+    /// These hashes do not establish Apple CMS signature trust.
+    pub fn validate_signature_bindings(
+        &self,
+        executable: &[u8],
+        slices: &[crate::fairplay_macho::MachOSlice],
+    ) -> Result<()> {
+        let signature = |slice: &crate::fairplay_macho::MachOSlice| -> Result<&[u8]> {
+            let start = slice
+                .offset
+                .checked_add(slice.layout.signature_offset)
+                .context("key-table signature offset overflow")?;
+            let end = start
+                .checked_add(slice.layout.signature_size)
+                .context("key-table signature extent overflow")?;
+            let slice_end = slice
+                .offset
+                .checked_add(slice.size)
+                .context("key-table slice extent overflow")?;
+            if slice.layout.signature_size == 0 || end > slice_end {
+                bail!("key-table signature binding has invalid slice extent");
+            }
+            executable
+                .get(start..end)
+                .context("key-table signature binding exceeds file")
+        };
+        if let Some(expected) = self.universal_signature_sha1 {
+            if slices.is_empty() {
+                bail!("SUPP universal signature binding has no slices");
+            }
+            let mut digest = Sha1::new();
+            for slice in slices {
+                crate::application::operation::check()?;
+                digest.update(signature(slice)?);
+            }
+            if digest.finalize().as_slice() != expected {
+                bail!("SUPP universal signature binding mismatch");
+            }
+        }
+        for slice in slices.iter().filter(|slice| slice.layout.crypt_id != 0) {
+            let arch = self
+                .architectures
+                .iter()
+                .find(|arch| {
+                    arch.cpu_type == slice.layout.cpu_type
+                        && arch.cpu_subtype == slice.layout.cpu_subtype
+                })
+                .context("key-table signature binding has no matching architecture")?;
+            if let Some(expected) = arch.signature_sha1
+                && Sha1::digest(signature(slice)?).as_slice() != expected
+            {
+                bail!("SUPF signature binding mismatch");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -129,14 +193,19 @@ pub fn decrypt_pages_in_place(
     let absolute_offset = slice_offset
         .checked_add(crypt_offset as u64)
         .ok_or_else(|| anyhow::anyhow!("FairPlay crypt offset overflow"))?;
-    for (page, record) in image[crypt_offset..end]
+    for (index, (page, record)) in image[crypt_offset..end]
         .as_chunks_mut::<PAGE_BYTES>()
         .0
         .iter_mut()
         .zip(records)
+        .enumerate()
     {
-        let key =
-            Zeroizing::new(deriver.page_key(record[..16].try_into().unwrap(), absolute_offset));
+        crate::application::operation::check()?;
+        let page_offset = (index as u64)
+            .checked_mul(PAGE_BYTES as u64)
+            .and_then(|offset| absolute_offset.checked_add(offset))
+            .ok_or_else(|| anyhow::anyhow!("FairPlay page offset overflow"))?;
+        let key = Zeroizing::new(deriver.page_key(record[..16].try_into().unwrap(), page_offset));
         let cipher = Aes128::new_from_slice(&key[..]).unwrap();
         let mut previous: [u8; 16] = record[16..32].try_into().unwrap();
         for chunk in page.as_chunks_mut::<16>().0 {

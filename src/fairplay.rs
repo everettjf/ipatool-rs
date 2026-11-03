@@ -156,7 +156,7 @@ pub fn inspect_sinf(bytes: &[u8]) -> Result<SinfDiagnostic> {
         selector_id: selector.identifier(),
         private_bytes,
         atoms: names,
-        current_layout: private_bytes == 440 || private_bytes == 448,
+        current_layout: (440..=616).contains(&private_bytes) && private_bytes.is_multiple_of(8),
         legacy_markers,
     })
 }
@@ -490,8 +490,17 @@ pub fn doctor_fairplay(
                 report
                     .checks
                     .insert("supported_fairplayd".into(), manifest.fairplay.recovery);
+                let current = crate::fairplay_current_capture::validate_inputs(path);
+                report
+                    .checks
+                    .insert("current_capture_inputs".into(), current.is_ok());
+                if let Err(error) = current {
+                    report
+                        .warnings
+                        .push(format!("current recovery prerequisites: {error:#}"));
+                }
                 if !manifest.fairplay.compatibility_sha256.is_empty() && model_path.is_none() {
-                    report.warnings.push(format!("this capture requires the checked compatibility evaluator; pass --compat-fairplayd with arm64e SHA-256 {} to fairplay-enroll recover", manifest.fairplay.compatibility_sha256));
+                    report.warnings.push(format!("only the explicit legacy engine requires the compatibility image with arm64e SHA-256 {}; current recovery uses the captured authorization format", manifest.fairplay.compatibility_sha256));
                 }
                 if resolved_ipa.is_none()
                     && let Some(ipa) = manifest.ipa.as_ref()
@@ -523,7 +532,7 @@ pub fn doctor_fairplay(
         }
     }
     if !report.sinf.is_empty() || capture_manifest.is_some() {
-        report.warnings.push("SINF geometry cannot prove account age; current support assumes a newly created, natively enrolled Apple Account".into());
+        report.warnings.push("Format and prerequisite checks do not authenticate the selected enrollment or validate a model; recovery and sample IPA validation are separate gates".into());
     }
     if let Some(path) = model_path {
         match inspect_model_path(path) {
@@ -582,17 +591,12 @@ pub fn doctor_fairplay(
                 .next_actions
                 .push("collect native enrollment with fairplay-enroll collect".into());
         }
-        Some(capture) if !capture.fairplay.recovery => report
-            .next_actions
-            .push("add and validate an exact evaluator for this fairplayd hash".into()),
-        Some(capture) if model_path.is_none() => {
-            if capture.fairplay.compatibility_sha256.is_empty() {
-                report
-                    .next_actions
-                    .push("recover fairplay-enrollment.bin with fairplay-enroll recover".into());
+        Some(_) if model_path.is_none() => {
+            report.next_actions.push(if report.checks.get("current_capture_inputs") == Some(&true) {
+                "recover and validate the sample with fairplay-enroll recover".into()
             } else {
-                report.next_actions.push("recover fairplay-enrollment.bin with fairplay-enroll recover --compat-fairplayd /private/path/fairplayd.arm64e".into());
-            }
+                "resolve the current capture prerequisite failures before recovery; legacy native profiles require --engine legacy".into()
+            });
         }
         Some(_) => {}
     }
@@ -607,7 +611,14 @@ pub fn doctor_fairplay(
             && report.checks.get("current_sinf_layout") == Some(&true)
             && (capture_manifest.is_none()
                 || report.checks.get("capture_integrity") == Some(&true)
-                    && report.checks.get("supported_fairplayd") == Some(&true)
+                    && (report.checks.get("current_capture_inputs") == Some(&true)
+                        || report.compatible_model.as_ref().is_some_and(|path| {
+                            report.models.iter().any(|model| {
+                                &model.path == path
+                                    && model.fairplayd_sha256
+                                        != crate::fairplay_current::algorithm_sha256()
+                            })
+                        }) && report.checks.get("supported_fairplayd") == Some(&true))
                     && report.checks.get("capture_selector_match") == Some(&true))
             && (model_path.is_none() || report.checks.get("selector_match") == Some(&true))
     } else if report.host.is_some() {
@@ -621,31 +632,29 @@ pub fn doctor_fairplay(
 }
 
 pub fn write_doctor_report(path: &Path, report: &FairPlayDoctorReport) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir_all(parent)?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
     }
-    let mut output = options
-        .open(path)
-        .with_context(|| format!("create private report: {}", path.display()))?;
+    #[cfg(not(unix))]
+    fs::create_dir_all(parent)?;
+    let mut output = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("stage private report: {}", path.display()))?;
     serde_json::to_writer_pretty(&mut output, report)?;
     output.write_all(b"\n")?;
-    output.flush()?;
+    output.as_file().sync_all()?;
+    output
+        .persist_noclobber(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish private report: {}", path.display()))?;
     Ok(())
 }
 

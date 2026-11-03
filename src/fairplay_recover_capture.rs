@@ -60,7 +60,18 @@ pub struct RecoverFromSinfCopyOptions<'a> {
     pub skip_differential: bool,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, Serialize, clap::ValueEnum,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryEngine {
+    #[default]
+    Current,
+    Legacy,
+}
+
 pub struct RecoverCaptureOptions<'a> {
+    pub engine: RecoveryEngine,
     pub capture: &'a Path,
     pub compat_fairplayd: Option<&'a Path>,
     pub native_26b_research: bool,
@@ -91,9 +102,12 @@ pub struct CaptureRecoveryResult {
     pub all_cryptids_zero: bool,
     pub all_code_directory_slots_match: bool,
     pub differential_cases: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_evidence: Option<crate::fairplay_current_capture::CurrentEvidence>,
 }
 
 fn private_directory(path: &Path) -> Result<()> {
+    crate::application::operation::check()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -110,6 +124,27 @@ fn private_directory(path: &Path) -> Result<()> {
             .with_context(|| format!("create private recovery directory {}", path.display()))?;
     }
     Ok(())
+}
+
+fn recovery_stage(label: &'static str) -> Result<()> {
+    use crate::application::operation::{self, Stage};
+    if operation::is_active() {
+        let stage = if label.contains("validate") {
+            Stage::ValidatingModel
+        } else if label.contains("build") || label.contains("recover-") {
+            Stage::BuildingModel
+        } else if label == "decrypt-and-verify" {
+            Stage::Decrypting
+        } else if label.contains("oracle") || label.contains("index-domains") {
+            Stage::RecoveringOracle
+        } else {
+            Stage::Recovering
+        };
+        operation::stage(stage)
+    } else {
+        eprintln!("fairplay_recovery_stage={label}");
+        Ok(())
+    }
 }
 
 fn read_checked_fairplayd(path: &Path, expected: &str) -> Result<Zeroizing<Vec<u8>>> {
@@ -248,9 +283,28 @@ fn checkpoint_stage(
     Ok(())
 }
 
-/// Start from a checked capture and a matching public startup overlay.
-/// The first stage is traced in Rust before continuing the build-specific recovery.
+/// Current recovery is the default. Legacy recovery must be selected explicitly;
+/// a current authentication failure never retries a different engine or record.
 pub fn recover_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureRecoveryResult> {
+    if options.engine == RecoveryEngine::Legacy {
+        return recover_legacy_capture(options);
+    }
+    if options.timeout.is_zero() || options.timeout > Duration::from_secs(3600) {
+        bail!("recovery phase timeout must be between 1 and 3600 seconds");
+    }
+    if options.compat_fairplayd.is_some()
+        || options.native_26b_research
+        || options.startup_profile.is_some()
+        || options.iokit15_output.is_some()
+        || options.skip_differential
+    {
+        bail!("profile and native-image recovery options require the explicit legacy engine");
+    }
+    crate::fairplay_current_capture::recover(options.capture, options.output)
+}
+
+/// Build-specific native tracing retained for explicit legacy research.
+pub fn recover_legacy_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureRecoveryResult> {
     if options.timeout.is_zero() || options.timeout > Duration::from_secs(3600) {
         bail!("recovery phase timeout must be between 1 and 3600 seconds");
     }
@@ -323,12 +377,12 @@ pub fn recover_capture(options: RecoverCaptureOptions<'_>) -> Result<CaptureReco
     };
     let seed_path = temporary.path().join("request-entry.checkpoint.pkl.gz");
     let first_path = temporary.path().join("first-stage.checkpoint.pkl.gz");
-    eprintln!("fairplay_recovery_stage=seed-request");
+    recovery_stage("seed-request")?;
     seed_request_checkpoint(&startup_profile, &fairplayd, &executable_path, &seed_path)?;
     let seed = FairplayCheckpoint::load_private(&seed_path)?;
     let mac_path = capture_file_path(options.capture, &manifest.hardware_iomac.path)?;
     let mac = parse_private_mac(&mac_path)?;
-    eprintln!("fairplay_recovery_stage=trace-first-checkpoint");
+    recovery_stage("trace-first-checkpoint")?;
     let mut runner = CheckpointRunner::new_preserving_text(&seed, &binary, preserved_text)?;
     runner.set_missing_files_are_enoent(true);
     runner.set_mac_address(mac);
@@ -416,7 +470,7 @@ fn recover_from_account_with_binary(
     let checkpoints = options.output.join("checkpoints");
     private_directory(&checkpoints)?;
 
-    eprintln!("fairplay_recovery_stage=derive-source");
+    recovery_stage("derive-source")?;
     let source_path = checkpoints.join("first-private-read.checkpoint.pkl.gz");
     let mut runner = CheckpointRunner::new(&account, &binary)?;
     runner.set_missing_files_are_enoent(true);
@@ -433,7 +487,7 @@ fn recover_from_account_with_binary(
     runner.write_checkpoint(&account, &fairplayd, &source_path)?;
     let source = FairplayCheckpoint::load_private(&source_path)?;
 
-    eprintln!("fairplay_recovery_stage=derive-transform");
+    recovery_stage("derive-transform")?;
     let transformed_path = checkpoints.join("first-transform-output.checkpoint.pkl.gz");
     checkpoint_stage(
         &source,
@@ -450,7 +504,7 @@ fn recover_from_account_with_binary(
     )?;
     let transformed = FairplayCheckpoint::load_private(&transformed_path)?;
 
-    eprintln!("fairplay_recovery_stage=derive-oracle");
+    recovery_stage("derive-oracle")?;
     let oracle_path = checkpoints.join("core-entry.checkpoint.pkl.gz");
     checkpoint_stage(
         &source,
@@ -467,7 +521,7 @@ fn recover_from_account_with_binary(
     )?;
     let oracle = FairplayCheckpoint::load_private(&oracle_path)?;
 
-    eprintln!("fairplay_recovery_stage=trace-oracle");
+    recovery_stage("trace-oracle")?;
     let trace_path = options.output.join("oracle-memory-trace.json");
     let mut runner = CheckpointRunner::new(&oracle, &binary)?;
     let trace = runner.run_until_hit_with_memory_trace(
@@ -494,7 +548,7 @@ fn recover_from_account_with_binary(
         }))?,
     )?;
 
-    eprintln!("fairplay_recovery_stage=export-oracle");
+    recovery_stage("export-oracle")?;
     let oracle_model_path = options.output.join("fairplay-oracle.model.gz");
     let exported = export_checked_model(&oracle, &binary, &trace_path, None)?;
     write_private_binary(&oracle_model_path, &exported.compressed)?;
@@ -502,17 +556,17 @@ fn recover_from_account_with_binary(
     let differential_cases = if options.skip_differential {
         None
     } else {
-        eprintln!("fairplay_recovery_stage=validate-oracle");
+        recovery_stage("validate-oracle")?;
         Some(validate_26a428_model(&oracle, &binary, &model, options.timeout, 16)?.cases)
     };
 
-    eprintln!("fairplay_recovery_stage=recover-aes");
+    recovery_stage("recover-aes")?;
     let recovered_path = options.output.join("recovered-whitebox-model.json");
     let mut target = WhiteboxTarget::new(&model)?;
     let recovered = fairplay_recovery::recover(&mut target)?;
     write_private_model(&recovered_path, &recovered)?;
 
-    eprintln!("fairplay_recovery_stage=build-enrollment");
+    recovery_stage("build-enrollment")?;
     let source_address = source.register_u64("x23")?;
     let source_block = source.read_block::<FIRST_TRANSFORM_BYTES>(source_address)?;
     let encoded = transformed.read_block::<FIRST_TRANSFORM_BYTES>(ORACLE_BLOCK)?;
@@ -529,7 +583,7 @@ fn recover_from_account_with_binary(
     let candidate = options.output.join("fairplay-enrollment.candidate.bin");
     write_private_binary(&candidate, &enrollment)?;
 
-    eprintln!("fairplay_recovery_stage=decrypt-and-verify");
+    recovery_stage("decrypt-and-verify")?;
     let decrypted_ipa = options.output.join("App.decrypted.ipa");
     let decryption_report = options.output.join("App.decrypted.json");
     let decrypted = decrypt_ipa_with_options(
@@ -562,6 +616,7 @@ fn recover_from_account_with_binary(
         all_cryptids_zero: true,
         all_code_directory_slots_match: true,
         differential_cases,
+        current_evidence: None,
     };
     write_private_binary(
         &options.output.join("recovery-report.json"),
@@ -615,7 +670,7 @@ pub fn recover_from_sinf_copy(
     let checkpoints = options.output.join("checkpoints");
     private_directory(&checkpoints)?;
 
-    eprintln!("fairplay_recovery_stage=derive-26b-normalizer");
+    recovery_stage("derive-26b-normalizer")?;
     let normalizer_entry_path = checkpoints.join("normalizer-entry.checkpoint.pkl.gz");
     let mut runner =
         CheckpointRunner::new_preserving_text(&entry, &binary, &PRESERVED_26B118_TEXT)?;
@@ -699,7 +754,7 @@ pub fn recover_from_sinf_copy(
     )?;
     let oracle = FairplayCheckpoint::load_private(&oracle_path)?;
 
-    eprintln!("fairplay_recovery_stage=trace-26b-oracle");
+    recovery_stage("trace-26b-oracle")?;
     let trace_path = options.output.join("oracle-memory-trace.json");
     let mut runner =
         CheckpointRunner::new_preserving_text(&oracle, &binary, &PRESERVED_26B118_TEXT)?;
@@ -726,7 +781,7 @@ pub fn recover_from_sinf_copy(
             "memory_write_events": trace.memory_write_events,
         }))?,
     )?;
-    eprintln!("fairplay_recovery_stage=learn-26b-index-domains");
+    recovery_stage("learn-26b-index-domains")?;
     let domains_path = options.output.join("index-domains.json");
     let domains = learn_26b118_domains(
         &oracle,
@@ -736,7 +791,7 @@ pub fn recover_from_sinf_copy(
     )?;
     write_private_binary(&domains_path, &domains.json)?;
 
-    eprintln!("fairplay_recovery_stage=export-26b-oracle");
+    recovery_stage("export-26b-oracle")?;
     let oracle_model_path = options.output.join("fairplay-oracle.model.gz");
     let exported = export_checked_model(&oracle, &binary, &trace_path, Some(&domains_path))?;
     write_private_binary(&oracle_model_path, &exported.compressed)?;
@@ -744,11 +799,11 @@ pub fn recover_from_sinf_copy(
     let differential_cases = if options.skip_differential {
         None
     } else {
-        eprintln!("fairplay_recovery_stage=validate-26b-oracle");
+        recovery_stage("validate-26b-oracle")?;
         Some(validate_26b118_model(&oracle, &binary, &model, options.timeout, 16)?.cases)
     };
 
-    eprintln!("fairplay_recovery_stage=recover-26b-aes");
+    recovery_stage("recover-26b-aes")?;
     let recovered_path = options.output.join("recovered-whitebox-model.json");
     let mut target = WhiteboxTarget::new(&model)?;
     let recovered = fairplay_recovery::recover(&mut target)?;
@@ -785,7 +840,7 @@ pub fn recover_from_sinf_copy(
     )?;
     let postcodec_exit = FairplayCheckpoint::load_private(&postcodec_exit_path)?;
 
-    eprintln!("fairplay_recovery_stage=build-26b-enrollment");
+    recovery_stage("build-26b-enrollment")?;
     let whitebox_entry = oracle.read_block::<FIRST_TRANSFORM_BYTES>(BUFFER)?;
     let postcodec_input = postcodec_entry.read_block::<FIRST_TRANSFORM_BYTES>(BUFFER)?;
     let postcodec_output = postcodec_exit.read_block::<FIRST_TRANSFORM_BYTES>(BUFFER)?;
@@ -804,7 +859,7 @@ pub fn recover_from_sinf_copy(
     let candidate = options.output.join("fairplay-enrollment.candidate.bin");
     write_private_binary(&candidate, &enrollment)?;
 
-    eprintln!("fairplay_recovery_stage=decrypt-and-verify");
+    recovery_stage("decrypt-and-verify")?;
     let decrypted_ipa = options.output.join("App.decrypted.ipa");
     let decryption_report = options.output.join("App.decrypted.json");
     let decrypted = decrypt_ipa_with_options(
@@ -837,6 +892,7 @@ pub fn recover_from_sinf_copy(
         all_cryptids_zero: true,
         all_code_directory_slots_match: true,
         differential_cases,
+        current_evidence: None,
     };
     write_private_binary(
         &options.output.join("recovery-report.json"),
@@ -950,6 +1006,7 @@ mod tests {
         .unwrap();
         let output = root.path().join("recovery");
         let error = recover_capture(RecoverCaptureOptions {
+            engine: RecoveryEngine::Legacy,
             capture: &capture,
             compat_fairplayd: None,
             native_26b_research: false,
@@ -989,6 +1046,7 @@ mod tests {
         }
         let output = root.path().join("recovery");
         let missing = recover_capture(RecoverCaptureOptions {
+            engine: RecoveryEngine::Legacy,
             capture: &capture,
             compat_fairplayd: None,
             native_26b_research: false,
@@ -1002,6 +1060,7 @@ mod tests {
         assert!(format!("{missing:#}").contains("requires --compat-fairplayd"));
         assert!(!output.exists());
         let error = recover_capture(RecoverCaptureOptions {
+            engine: RecoveryEngine::Legacy,
             capture: &capture,
             compat_fairplayd: Some(&wrong_binary),
             native_26b_research: false,

@@ -1,0 +1,136 @@
+# English region names from the public-domain IANA tzdata iso3166.tab (2025-07-01).
+# Codes follow the existing account-storefront mappings in src/storefront.rs.
+AL	Albania
+DZ	Algeria
+AO	Angola
+AI	Anguilla
+AG	Antigua & Barbuda
+AR	Argentina
+AM	Armenia
+AU	Australia
+AT	Austria
+AZ	Azerbaijan
+BS	Bahamas
+BH	Bahrain
+BD	Bangladesh
+BB	Barbados
+BY	Belarus
+BE	Belgium
+BZ	Belize
+BM	Bermuda
+BO	Bolivia
+BW	Botswana
+BR	Brazil
+GB	Britain (UK)
+BN	Brunei
+BG	Bulgaria
+CA	Canada
+KY	Cayman Islands
+CL	Chile
+CN	China
+CO	Colombia
+CR	Costa Rica
+HR	Croatia
+CY	Cyprus
+CZ	Czech Republic
+CI	Côte d’Ivoire
+DK	Denmark
+DM	Dominica
+DO	Dominican Republic
+EC	Ecuador
+EG	Egypt
+SV	El Salvador
+EE	Estonia
+FI	Finland
+FR	France
+GE	Georgia
+DE	Germany
+GH	Ghana
+GR	Greece
+GD	Grenada
+GT	Guatemala
+GY	Guyana
+HN	Honduras
+HK	Hong Kong
+HU	Hungary
+IS	Iceland
+IN	India
+ID	Indonesia
+IQ	Iraq
+IE	Ireland
+IL	Israel
+IT	Italy
+JM	Jamaica
+JP	Japan
+JO	Jordan
+KZ	Kazakhstan
+KE	Kenya
+KR	Korea (South)
+KW	Kuwait
+LV	Latvia
+LB	Lebanon
+LI	Liechtenstein
+LT	Lithuania
+LU	Luxembourg
+MO	Macau
+MG	Madagascar
+MY	Malaysia
+MV	Maldives
+ML	Mali
+MT	Malta
+MU	Mauritius
+MX	Mexico
+MD	Moldova
+MN	Mongolia
+MS	Montserrat
+NP	Nepal
+NL	Netherlands
+NZ	New Zealand
+NI	Nicaragua
+NE	Niger
+NG	Nigeria
+MK	North Macedonia
+NO	Norway
+OM	Oman
+PK	Pakistan
+PA	Panama
+PY	Paraguay
+PE	Peru
+PH	Philippines
+PL	Poland
+PT	Portugal
+QA	Qatar
+RO	Romania
+RU	Russia
+SA	Saudi Arabia
+SN	Senegal
+RS	Serbia
+SG	Singapore
+SK	Slovakia
+SI	Slovenia
+ZA	South Africa
+ES	Spain
+LK	Sri Lanka
+KN	St Kitts & Nevis
+LC	St Lucia
+VC	St Vincent
+SR	Suriname
+SE	Sweden
+CH	Switzerland
+TW	Taiwan
+TZ	Tanzania
+TH	Thailand
+TT	Trinidad & Tobago
+TN	Tunisia
+TR	Turkey
+TC	Turks & Caicos Is
+UG	Uganda
+UA	Ukraine
+AE	United Arab Emirates
+US	United States
+UY	Uruguay
+UZ	Uzbekistan
+VE	Venezuela
+VN	Vietnam
+VG	Virgin Islands (UK)
+YE	Yemen

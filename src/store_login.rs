@@ -1,6 +1,6 @@
 //! App Store login protocol over the pinned Store request backend.
 
-use std::{error::Error, fmt, sync::Arc, thread, time::Duration};
+use std::{error::Error, fmt, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -43,9 +43,12 @@ pub struct NativeAuthenticationBackend {
 
 impl NativeAuthenticationBackend {
     pub fn open() -> Result<Self> {
+        Self::open_in(&prepare_state_directory_from_environment()?)
+    }
+
+    pub fn open_in(state_directory: &std::path::Path) -> Result<Self> {
         let hardware_id = hardware_mac_address().context("read Store hardware identity")?;
-        let state_directory = prepare_state_directory_from_environment()?;
-        let transport = Arc::new(Transport::with_cookies(&state_directory)?);
+        let transport = Arc::new(Transport::with_cookies(state_directory)?);
         Ok(Self::with_sender(hardware_id, move |request| {
             transport.send_store(request)
         }))
@@ -131,8 +134,8 @@ impl AuthenticationBackend for NativeAuthenticationBackend {
         ] {
             fields.insert(key.into(), value);
         }
-        let mut body = Vec::new();
-        plist::to_writer_xml(&mut body, &parameters).context("encode authentication plist")?;
+        let body = crate::transport::encode_store_plist(&parameters)
+            .context("encode authentication plist")?;
         let signature = signer(&body).context("sign authentication request")?;
         if signature.is_empty() {
             bail!("authentication signer returned an empty signature");
@@ -237,7 +240,7 @@ pub fn login<B: AuthenticationBackend, S: CredentialStore>(
         input,
         &config,
         &mut |body| signer.sign(body),
-        thread::sleep,
+        crate::application::operation::sleep,
     );
     let close = signer.close().context("close SAP action signer");
     match (result, close) {
@@ -256,7 +259,14 @@ pub fn login_with_signer<B: AuthenticationBackend, S: CredentialStore>(
     let config = backend
         .sap_config()
         .context("load Store SAP configuration")?;
-    login_with_config(backend, accounts, input, &config, signer, thread::sleep)
+    login_with_config(
+        backend,
+        accounts,
+        input,
+        &config,
+        signer,
+        crate::application::operation::sleep,
+    )
 }
 
 fn login_with_config<B: AuthenticationBackend, S: CredentialStore>(
@@ -369,6 +379,7 @@ fn login_with_config<B: AuthenticationBackend, S: CredentialStore>(
             password: input.password.clone(),
             pod: response.header("pod").unwrap_or_default().into(),
         };
+        crate::application::operation::check()?;
         accounts.save(&account).context("save App Store account")?;
         return Ok(account);
     }
@@ -382,6 +393,7 @@ fn send_with_retries<B: AuthenticationBackend>(
 ) -> Result<Response> {
     let mut outcomes = Vec::new();
     for retry in 0..MAX_HTTP_ATTEMPTS {
+        crate::application::operation::check()?;
         let result = backend.send_authentication(
             StoreBackendRequest {
                 method: request.method,

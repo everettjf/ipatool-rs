@@ -1,21 +1,49 @@
 # Releasing for macOS, Linux, and Windows
 
-The 0.2.1 distribution targets are macOS ARM64, Linux x86_64, and Windows x86_64. Linux ARM64 and Windows ARM64 were published in v0.2.0 but are no longer release targets. Keep the CLI name `ipatool-rs` so it can coexist with the original `ipatool`. Do not publish account state, cookies, downloaded app packages, enrollment material, or credentials. Portable binaries are experimental until real account and package flows are checked on their target systems.
+The 0.3.0 distribution targets are macOS ARM64, Linux x86_64, and Windows x86_64. Linux ARM64 and Windows ARM64 were published in v0.2.0 but are no longer release targets. Keep the CLI name `ipatool-rs` so it can coexist with the original `ipatool`. Do not publish account state, cookies, downloaded app packages, enrollment material, or credentials. Portable binaries are experimental until real account and package flows are checked on their target systems. Version 0.3.0 also distributes a native Apple Silicon desktop ZIP, separately from the CLI archives and Homebrew formula.
 
 ## Prepare and validate
 
 1. Update the version in `Cargo.toml` and `Cargo.lock`, the release links in `README.md` and `web/index.html`, and the release limitations in `docs/TODO.md`.
-2. Run `cargo fmt --check`, `cargo test --all-targets --quiet`, and `cargo clippy --all-targets -- -D warnings` locally. Require the two native portable jobs in `.github/workflows/platform-ci.yml` to pass on the exact release commit. Clean CI runners omit 20 pinned Apple image tests that need a checked local cache; `scripts/test-portable.sh` names those skips explicitly.
+2. Run `cargo fmt --check`, `cargo test --all-targets --quiet`, and `cargo clippy --all-targets -- -D warnings` locally. Require all five platform jobs in `.github/workflows/platform-ci.yml` to pass on the exact release tree, including the macOS application bundle and portable GUI fixtures. Run the GUI-test all-target suite and strict GUI/GUI-test Clippy for desktop changes. Clean CI runners omit 20 pinned Apple image tests that need a checked local cache; `scripts/test-portable.sh` names those skips explicitly.
 3. Set `IPATOOL_CODESIGN_IDENTITY` to a local Developer ID Application identity and run `scripts/package-macos.sh`. The script rebuilds the ARM64 executable, signs it with the hardened runtime, `scripts/macos-release.entitlements`, and a secure timestamp, and creates a tarball, a SHA-256 file, and a ZIP for notarization under `dist/`. The two runtime entitlements allow the checksum-pinned Unicorn library from the user cache to load and execute its JIT code.
 4. Check the archive with `shasum -a 256 -c dist/ipatool-rs-VERSION-macos-arm64.tar.gz.sha256`. Confirm it contains `LICENSE`, `NOTICE`, `licenses/LICENSE-DARKPHOENIX.txt`, and both checked files under `assets/fairplay-startup/`. These account-independent profiles are optional external copies of profiles already embedded in the executable; this package change applies to releases after `v0.1.0`. Extract it into a temporary directory, run `codesign --verify --strict` on `ipatool-rs`, verify both runtime entitlements with `codesign -d --entitlements -`, and exercise `--version` and a public catalog search. With a controlled account, run `list-purchases --platform macos --max-results 1` from the signed archive to catch dynamic-library or JIT signing failures before publication.
 5. Submit the ZIP with `xcrun notarytool submit dist/ipatool-rs-VERSION-macos-arm64-notary.zip --keychain-profile PROFILE --wait`. Create the profile with `xcrun notarytool store-credentials PROFILE` and use its interactive credential prompts. Do not pass passwords in command arguments or commit them. Verify an accepted result and inspect the submission log for issues before publishing. The ZIP is only for notarization; attach the tarball and its checksum to the release. A standalone CLI executable cannot have the ticket stapled directly, so macOS retrieves its ticket online.
 
+## Signed desktop package
+
+1. Use the same clean source tree as the release CLI. Set the existing local
+   `IPATOOL_CODESIGN_IDENTITY` and public `IPATOOL_AUTHORIZATION_TEAM`, then run
+   `scripts/build-gui-macos.sh target/distribution/IPATOOL-RS.app`. The helper and
+   GUI must share the configured Developer ID team. The bundle records its source
+   commit, includes licenses and the fixed-input helper, and must not contain
+   `LSEnvironment`, test state, captures, account packages or models.
+2. Create an app-only notarization ZIP with
+   `ditto -c -k --keepParent target/distribution/IPATOOL-RS.app target/distribution/desktop-notary.zip`.
+   Submit it using the existing interactive Keychain notary profile. Require an
+   accepted result with no issues, then run
+   `xcrun stapler staple target/distribution/IPATOOL-RS.app`.
+3. Run `scripts/package-gui-macos.sh target/distribution/IPATOOL-RS.app dist`.
+   It verifies the version, architecture, absence of environment overrides,
+   Developer ID signatures for both executables, stapled ticket and Gatekeeper
+   before creating `ipatool-rs-VERSION-gui-macos-arm64.zip` and its checksum.
+4. Extract the ZIP into a clean directory and repeat signature, stapler and
+   Gatekeeper checks. Launch through the native desktop, exercise public browsing
+   and FairPlay navigation, and confirm it does not silently register collection
+   access. Keep controlled private-model acceptance separate from public captures.
+5. Publish the ZIP and checksum alongside the signed CLI. Add or update
+   `Casks/ipatool-rs-gui.rb` in `everettjf/homebrew-tap`, requiring Apple Silicon
+   and macOS 12 or later. Protected collection requires macOS 13 or later.
+   Install through the actual tap, repeat trust checks on the installed app,
+   and preserve user state. Advise removing collection access in the app before
+   uninstalling; do not add model deletion to cask uninstall or zap actions.
+
 ## Publish through CI
 
 1. Merge the reviewed source, then tag that exact `main` commit with `vVERSION` and push the tag.
-2. Create a draft GitHub release with release notes, the notarized macOS tarball, and its SHA-256 file. State the tested targets and remaining live-validation gaps. The macOS notarization ZIP stays local.
-3. Dispatch `.github/workflows/release.yml` with the tag. Native GitHub runners run tests, build Linux and Windows executables, exercise version and public-search smoke checks, and package two archives with SHA-256 files. A macOS runner verifies the staged signed archive. The final CI job uploads all portable assets and publishes the draft release. Check every job and every published checksum. Version `v0.1.0` was released before this CI workflow and contained only the macOS archive.
-4. Update `everettjf/homebrew-tap` with `Formula/ipatool-rs.rb` pointing at the exact macOS release asset and its SHA-256 digest. Test the formula locally and install it from the tap.
+2. Create a draft GitHub release with release notes, the notarized macOS CLI tarball and stapled desktop ZIP, each with its SHA-256 file. State the tested targets and remaining live-validation gaps. The macOS notarization ZIP stays local.
+3. Dispatch `.github/workflows/release.yml` with the tag. Native GitHub runners run tests, build Linux and Windows executables, exercise version and public-search smoke checks, and package two archives with SHA-256 files. A macOS runner verifies both staged signed archives, the desktop/helper signatures, architecture, version, lack of environment overrides, stapled ticket and Gatekeeper assessment. The final CI job uploads all portable assets and publishes the draft release. Check every job and every published checksum. Version `v0.1.0` was released before this CI workflow and contained only the macOS archive.
+4. Update `everettjf/homebrew-tap` with `Formula/ipatool-rs.rb` pointing at the exact macOS release asset and its SHA-256 digest. Also update `Casks/ipatool-rs-gui.rb` with the desktop ZIP checksum. Run style and strict audits, CLI installation/upgrade and `brew test`, cask installation and installed-app trust checks.
 5. Confirm the GitHub Pages install link and release links, and compare the Homebrew-installed binary version with the release tag.
 
 Developer ID signing and notarization are release steps. The ordinary `scripts/build-macos.sh --arm64` development build remains ad hoc signed.

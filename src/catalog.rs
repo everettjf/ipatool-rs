@@ -22,6 +22,9 @@ pub struct App {
     pub purchase_date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platforms: Option<Vec<Platform>>,
+    /// Optional public display artwork; excluded from the CLI/MCP JSON contract.
+    #[serde(skip)]
+    pub artwork_url: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -51,6 +54,12 @@ struct CatalogResponse {
 
 #[derive(Debug, Deserialize)]
 struct CatalogApp {
+    #[serde(
+        rename = "artworkUrl100",
+        default,
+        deserialize_with = "default_on_null"
+    )]
+    artwork_url: String,
     #[serde(rename = "trackId", default, deserialize_with = "default_on_null")]
     id: i64,
     #[serde(rename = "bundleId", default, deserialize_with = "default_on_null")]
@@ -119,6 +128,7 @@ impl From<CatalogApp> for App {
             price: raw.price,
             purchase_date: raw.purchase_date,
             platforms: Some(platforms),
+            artwork_url: raw.artwork_url,
         }
     }
 }
@@ -300,6 +310,19 @@ pub fn lookup_url(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_artwork_is_available_without_changing_cli_json_fields() {
+        let raw: CatalogApp = serde_json::from_value(serde_json::json!({
+            "trackId": 42, "trackName": "Fixture", "artworkUrl100": "https://is1-ssl.mzstatic.com/image.png"
+        })).unwrap();
+        let app = App::from(raw);
+        assert!(!app.artwork_url.is_empty());
+        let json = serde_json::to_value(app).unwrap();
+        assert!(json.get("artwork_url").is_none());
+        assert!(json.get("artworkUrl100").is_none());
+        assert_eq!(json["id"], 42);
+    }
 
     use std::{
         io::{BufRead, BufReader, Write},

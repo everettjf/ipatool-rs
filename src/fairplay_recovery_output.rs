@@ -66,8 +66,7 @@ pub fn read_private_frame(path: &Path) -> Result<Zeroizing<[u8; 16]>> {
 pub fn read_private_bytes(path: &Path, max_size: usize) -> Result<Zeroizing<Vec<u8>>> {
     let file = open_private_file(path, None, max_size as u64)?;
     let mut bytes = Zeroizing::new(Vec::new());
-    file.take(max_size as u64 + 1)
-        .read_to_end(&mut bytes)
+    crate::application::operation::copy(&mut file.take(max_size as u64 + 1), &mut *bytes)
         .context("read private recovery input")?;
     if bytes.len() > max_size {
         bail!("private recovery input grew beyond its size limit");
@@ -185,6 +184,7 @@ fn write_private_output(
     path: &Path,
     write: impl FnOnce(&mut fs::File) -> Result<()>,
 ) -> Result<()> {
+    crate::application::operation::check()?;
     let parent = path.parent().context("recovery path has no parent")?;
     let metadata = fs::symlink_metadata(parent)
         .with_context(|| format!("inspect recovery directory {}", parent.display()))?;
@@ -209,6 +209,7 @@ fn write_private_output(
     }
     write(temporary.as_file_mut())?;
     temporary.as_file_mut().sync_all()?;
+    crate::application::operation::check()?;
     fs::hard_link(temporary.path(), path)
         .with_context(|| format!("publish new recovered model {}", path.display()))?;
     Ok(())
@@ -222,7 +223,8 @@ pub fn write_private_model(path: &Path, recovery: &Recovery) -> Result<()> {
 /// Atomically publish a new private binary model without replacing a prior one.
 pub fn write_private_binary(path: &Path, bytes: &[u8]) -> Result<()> {
     write_private_output(path, |file| {
-        file.write_all(bytes)
+        crate::application::operation::copy(&mut &bytes[..], file)
+            .map(|_| ())
             .context("write private enrollment model")
     })
 }

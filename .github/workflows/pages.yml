@@ -6,6 +6,7 @@ on:
     paths:
       - web/**
       - docs/images/architecture.*
+      - docs/screenshots/release-*.png
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -33,6 +34,7 @@ jobs:
         run: |
           mkdir -p web/images
           cp docs/images/architecture.png docs/images/architecture.svg web/images/
+          cp docs/screenshots/release-*.png web/images/
       - name: Upload the static site
         uses: actions/upload-pages-artifact@v4
         with:

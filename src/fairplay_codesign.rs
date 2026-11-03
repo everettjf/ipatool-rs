@@ -1,4 +1,4 @@
-//! Audit embedded CodeDirectory hashes over encrypted Mach-O pages.
+//! Audit embedded CodeDirectory source and pre-encryption page hashes.
 
 use anyhow::{Result, bail};
 use serde::Serialize;
@@ -37,6 +37,23 @@ pub fn audit_code_directories(
     executable: &[u8],
     layout: &MachOLayout,
 ) -> Result<Vec<CodeDirectoryAudit>> {
+    audit_directories(executable, layout, false)
+}
+
+/// Check every available pre-encryption table over the encrypted ranges.
+/// An empty result means coverage is unavailable, never that plaintext passed.
+pub fn audit_pre_encryption_code_directories(
+    executable: &[u8],
+    layout: &MachOLayout,
+) -> Result<Vec<CodeDirectoryAudit>> {
+    audit_directories(executable, layout, true)
+}
+
+fn audit_directories(
+    executable: &[u8],
+    layout: &MachOLayout,
+    pre_encryption: bool,
+) -> Result<Vec<CodeDirectoryAudit>> {
     let signature_end = layout
         .signature_offset
         .checked_add(layout.signature_size)
@@ -54,10 +71,11 @@ pub fn audit_code_directories(
     }
     let total = be32(signature, 4);
     let count = be32(signature, 8);
-    if total > signature.len() || count > (total.saturating_sub(12)) / 8 {
+    if total < 12 || total > signature.len() || count > (total - 12) / 8 {
         bail!("invalid embedded signature geometry");
     }
     let mut reports = Vec::new();
+    let mut directories = 0;
     for index in 0..count {
         let offset = be32(signature, 16 + index * 8);
         if offset > total || total - offset < 8 {
@@ -71,6 +89,7 @@ pub fn audit_code_directories(
         if magic != CODE_DIRECTORY as usize {
             continue;
         }
+        directories += 1;
         let directory = &signature[offset..offset + length];
         if directory.len() < 44 {
             bail!("CodeDirectory is truncated");
@@ -82,6 +101,9 @@ pub fn audit_code_directories(
             if directory.len() < header_size || be32(directory, 44) != 0 {
                 bail!("truncated or unsupported scattered CodeDirectory");
             }
+        }
+        if version >= 0x20200 {
+            header_size = 52;
         }
         let mut code_limit = be32(directory, 32);
         if version >= 0x20300 {
@@ -97,7 +119,19 @@ pub fn audit_code_directories(
                         })?;
             }
         }
-        let hash_offset = be32(directory, 16);
+        if version >= 0x20400 {
+            header_size = 88;
+        }
+        if version >= 0x20500 {
+            header_size = 96;
+        }
+        if version >= 0x20600 {
+            header_size = 108;
+        }
+        if directory.len() < header_size {
+            bail!("extended CodeDirectory is truncated");
+        }
+        let mut hash_offset = be32(directory, 16);
         let code_slots = be32(directory, 28);
         let hash_size = directory[36] as usize;
         let hash_type = directory[37];
@@ -134,8 +168,27 @@ pub fn audit_code_directories(
         {
             bail!("CodeDirectory table is truncated");
         }
+        if pre_encryption {
+            if version < 0x20500 {
+                continue;
+            }
+            let pre_offset = be32(directory, 92);
+            if pre_offset == 0 {
+                continue;
+            }
+            if pre_offset < header_size
+                || code_slots
+                    .checked_mul(hash_size)
+                    .and_then(|size| pre_offset.checked_add(size))
+                    .is_none_or(|end| end > directory.len())
+            {
+                bail!("CodeDirectory pre-encryption table is invalid or truncated");
+            }
+            hash_offset = pre_offset;
+        }
         let mut matched_slots = 0;
         for slot in first_slot..last_slot {
+            crate::application::operation::check()?;
             let start = slot * page_size;
             let end = start.saturating_add(page_size).min(code_limit);
             let actual = hash_code_page(hash_type, &executable[start..end])?;
@@ -154,7 +207,7 @@ pub fn audit_code_directories(
             matched_slots,
         });
     }
-    if reports.is_empty() {
+    if directories == 0 {
         bail!("embedded signature contains no CodeDirectory");
     }
     Ok(reports)
@@ -245,5 +298,67 @@ mod tests {
         blob[layout.signature_offset + 20 + 32..layout.signature_offset + 20 + 36]
             .copy_from_slice(&4096u32.to_be_bytes());
         assert!(audit_code_directories(&blob, &layout).is_err());
+    }
+
+    fn pre_encryption_fixture(shift: u8, hash_type: u8) -> (Vec<u8>, MachOLayout) {
+        let (mut blob, mut layout) = fixture(shift, hash_type);
+        let old = &blob[layout.signature_offset + 20..];
+        let mut directory = vec![0; 96];
+        directory[..44].copy_from_slice(&old[..44]);
+        directory[8..12].copy_from_slice(&0x20500u32.to_be_bytes());
+        directory[16..20].copy_from_slice(&96u32.to_be_bytes());
+        let pre_offset = 96 + old.len() - 44;
+        directory[92..96].copy_from_slice(&(pre_offset as u32).to_be_bytes());
+        directory.extend_from_slice(&old[44..]);
+        directory.extend_from_slice(&old[44..]);
+        let length = directory.len() as u32;
+        directory[4..8].copy_from_slice(&length.to_be_bytes());
+        blob.truncate(layout.signature_offset + 20);
+        blob.extend_from_slice(&directory);
+        layout.signature_size = 20 + directory.len();
+        blob[layout.signature_offset + 4..layout.signature_offset + 8]
+            .copy_from_slice(&(layout.signature_size as u32).to_be_bytes());
+        (blob, layout)
+    }
+
+    #[test]
+    fn pre_encryption_audit_covers_last_page_and_all_hash_geometries() {
+        for shift in [0, 12, 13, 14] {
+            for hash_type in [1, 2, 3, 4] {
+                let (mut blob, layout) = pre_encryption_fixture(shift, hash_type);
+                let checks = audit_pre_encryption_code_directories(&blob, &layout).unwrap();
+                assert_eq!(checks.len(), 1);
+                assert_eq!(checks[0].matched_slots, checks[0].slot_count);
+                blob[layout.crypt_offset + layout.crypt_size - 1] ^= 1;
+                let checks = audit_pre_encryption_code_directories(&blob, &layout).unwrap();
+                assert_eq!(checks[0].matched_slots + 1, checks[0].slot_count);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_pre_table_is_unavailable_but_present_malformed_table_is_an_error() {
+        let (blob, layout) = fixture(12, 2);
+        assert!(
+            audit_pre_encryption_code_directories(&blob, &layout)
+                .unwrap()
+                .is_empty()
+        );
+        for offset in [0, 44, u32::MAX] {
+            let (mut blob, layout) = pre_encryption_fixture(12, 2);
+            let start = layout.signature_offset + 20 + 92;
+            blob[start..start + 4].copy_from_slice(&offset.to_be_bytes());
+            let result = audit_pre_encryption_code_directories(&blob, &layout);
+            if offset == 0 {
+                assert!(result.unwrap().is_empty());
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let (mut blob, layout) = pre_encryption_fixture(12, 2);
+        let start = layout.signature_offset + 20;
+        blob[start + 8..start + 12].copy_from_slice(&0x20600u32.to_be_bytes());
+        blob[start + 4..start + 8].copy_from_slice(&96u32.to_be_bytes());
+        assert!(audit_pre_encryption_code_directories(&blob, &layout).is_err());
     }
 }

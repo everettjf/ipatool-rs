@@ -3,7 +3,7 @@
 use std::{
     collections::HashSet,
     fs::File,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -162,7 +162,18 @@ fn copy_member(
     output.write_all(name)?;
     output.write_all(&local_extra)?;
     source.seek(SeekFrom::Start(data_start))?;
-    let copied = io::copy(&mut source.take(compressed), output)?;
+    let mut remaining = source.take(compressed);
+    let mut copied = 0;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        crate::application::operation::check()?;
+        let count = remaining.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        output.write_all(&buffer[..count])?;
+        copied += count as u64;
+    }
     ensure!(copied == compressed, "truncated IPA ZIP member");
     if uses_descriptor {
         output.write_all(&DESCRIPTOR.to_le_bytes())?;

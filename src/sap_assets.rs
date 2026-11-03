@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -85,6 +85,7 @@ impl SapFrameworkAssets {
         let mut volume = apfs::ApfsVolume::open(image).context("open macOS APFS volume")?;
         let mut files = Vec::with_capacity(FRAMEWORK_PATHS.len());
         for (path, spec) in FRAMEWORK_PATHS.into_iter().zip(&SPECS[1..]) {
+            crate::application::operation::check()?;
             let stat = volume
                 .stat(path)
                 .with_context(|| format!("inspect Apple SAP asset {}", spec.name))?;
@@ -115,6 +116,7 @@ impl SapFrameworkAssets {
 impl SapAssetBundle {
     /// Load a validated cache or download and atomically replace the pinned assets.
     pub fn load_or_download() -> Result<Self> {
+        crate::application::operation::check()?;
         if let Some(directory) = configured_cache_directory()? {
             return Self::load_from(&directory).context("validate IPATOOL_SAP_CACHE_DIR assets");
         }
@@ -145,6 +147,7 @@ impl SapAssetBundle {
 
     pub fn validate(&self) -> Result<()> {
         for (spec, bytes) in SPECS.iter().zip(self.files()) {
+            crate::application::operation::check()?;
             validate_file(*spec, bytes)?;
         }
         Ok(())
@@ -166,6 +169,7 @@ impl SapAssetBundle {
     pub fn load_from(directory: &Path) -> Result<Self> {
         let mut files = Vec::with_capacity(SPECS.len());
         for spec in SPECS {
+            crate::application::operation::check()?;
             let path = directory.join(spec.name);
             let bytes = read_cache_file(&path, spec.size)
                 .with_context(|| format!("read cached Apple SAP asset {}", spec.name))?;
@@ -191,12 +195,14 @@ impl SapAssetBundle {
             fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
         }
         for (spec, bytes) in SPECS.iter().zip(self.files()) {
+            crate::application::operation::check()?;
             let mut temporary = tempfile::NamedTempFile::new_in(directory)
                 .with_context(|| format!("create temporary cache file for {}", spec.name))?;
-            temporary.write_all(bytes)?;
+            crate::application::operation::copy(&mut &bytes[..], &mut temporary)?;
             temporary.flush()?;
             temporary.as_file().sync_all()?;
             let destination = directory.join(spec.name);
+            crate::application::operation::check()?;
             temporary
                 .persist(&destination)
                 .with_context(|| format!("install cached SAP asset {}", spec.name))?;
@@ -237,7 +243,10 @@ fn read_cache_file(path: &Path, expected_size: usize) -> Result<Vec<u8>> {
             metadata.len()
         );
     }
-    let bytes = fs::read(path).with_context(|| format!("read cached asset {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(expected_size);
+    let mut input = fs::File::open(path)?.take(expected_size as u64 + 1);
+    crate::application::operation::copy(&mut input, &mut bytes)
+        .with_context(|| format!("read cached asset {}", path.display()))?;
     if bytes.len() != expected_size {
         bail!("cached asset changed size while being read");
     }

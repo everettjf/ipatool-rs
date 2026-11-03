@@ -12,6 +12,63 @@ permissions:
   contents: read
 
 jobs:
+  gui-macos:
+    name: GPUI desktop preview (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust components
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - name: Check formatting
+        run: cargo +stable fmt --check
+      - name: Test shared workflows with desktop dependencies
+        run: scripts/test-portable.sh aarch64-apple-darwin gui
+      - name: Test deterministic desktop controllers
+        run: cargo +stable test --locked --features gui-test --bin ipatool-gui
+      - name: Check desktop warnings
+        run: cargo +stable clippy --locked --features gui-test --all-targets -- -D warnings
+      - name: Build desktop executable
+        run: cargo +stable build --locked --features gui --bin ipatool-gui
+      - name: Build and verify native application bundle
+        run: scripts/build-gui-macos.sh --debug
+
+  gui-portable:
+    name: GPUI build and fixtures (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: Windows x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust components
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - name: Install Linux desktop development dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libfontconfig1-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libvulkan-dev libssl-dev pkg-config
+      - name: Test shared workflows and desktop fixtures
+        run: scripts/test-portable.sh '${{ matrix.target }}' gui
+      - name: Test Linux xattr compatibility patch
+        if: runner.os == 'Linux'
+        run: cargo +stable test --manifest-path vendor/xattr/Cargo.toml --target-dir target --quiet
+      - name: Test deterministic desktop controllers
+        run: cargo +stable test --locked --features gui-test --target '${{ matrix.target }}' --bin ipatool-gui
+      - name: Check desktop warnings
+        run: cargo +stable clippy --locked --features gui-test --target '${{ matrix.target }}' --all-targets -- -D warnings
+      - name: Build desktop executable
+        run: cargo +stable build --locked --features gui --target '${{ matrix.target }}' --bin ipatool-gui
+
   native:
     name: ${{ matrix.name }}
     strategy:

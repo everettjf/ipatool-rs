@@ -10240,6 +10240,10 @@ fn export_object(
                     export_object(state, address, active, depth + 1)?,
                 );
             }
+            // Preserve the original sorted-map encoding even when another
+            // front end enables serde_json's insertion-ordered map feature.
+            // Guest dictionaries use HashMap, so their traversal is arbitrary.
+            result.sort_keys();
             Value::Object(result)
         }
     };

@@ -1,15 +1,35 @@
 [package]
 name = "ipatool-rs"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "Rust port of ipatool-fairplay"
+default-run = "ipatool"
+
+[workspace]
+members = ["crates/authorization-helper"]
+exclude = ["vendor/apfs", "vendor/apple-xar", "vendor/xattr"]
+default-members = [".", "crates/authorization-helper"]
+resolver = "3"
+
+[features]
+default = []
+gui = ["dep:gpui", "dep:gpui-component"]
+gui-test = ["gui", "gpui/test-support"]
 
 [[bin]]
 name = "ipatool"
 path = "src/main.rs"
 
+[[bin]]
+name = "ipatool-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
 [dependencies]
+ipatool-authorization = { path = "crates/authorization-helper" }
+gpui = { version = "=0.2.2", optional = true }
+gpui-component = { version = "=0.5.1", optional = true }
 getrandom = "0.4"
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
@@ -40,7 +60,9 @@ tempfile = "3.27"
 base64 = "0.22"
 hpke = { version = "0.14.1", default-features = false, features = ["nistp", "aes", "alloc", "getrandom"] }
 p256 = { version = "0.13", features = ["pkcs8", "pem"] }
-aes = "0.8"
+aes = { version = "0.8", features = ["zeroize"] }
+subtle = "2.6"
+x509-cert = { version = "=0.2.5", default-features = false, features = ["std"] }
 ring = "0.17"
 ctr = "0.9"
 hkdf = "0.12"
@@ -52,7 +74,7 @@ roxmltree = "0.21"
 yaxpeax-arm = { version = "0.5.0", default-features = false, features = ["std", "fmt"] }
 yaxpeax-arch = { version = "0.3.2", default-features = false, features = ["std"] }
 rmcp = { version = "3.7.0", default-features = false, features = ["server", "macros", "transport-io"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "time"] }
 schemars = "1"
 flate2 = "1"
 serde-pickle = "1.2.0"
@@ -80,3 +102,4 @@ tar = "0.4"
 [patch.crates-io]
 apfs = { path = "vendor/apfs" }
 apple-xar = { path = "vendor/apple-xar" }
+xattr = { path = "vendor/xattr" }
