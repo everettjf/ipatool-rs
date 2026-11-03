@@ -23,19 +23,60 @@ the earlier private-flow status below for that tested host/enrollment only. See
 [the detailed acceptance record](#real-fairplay-acceptance-2026-11-03); portable
 private-data and broader account gates remain open.
 
-## Version 0.3.0 distribution preparation (2026-11-03)
+## Version 0.3.0 desktop and Homebrew release (2026-11-03)
 
-PR #7 is being prepared for the authorized main-branch merge and release.
-The release adds a separately installed Apple Silicon GPUI desktop ZIP and
-Homebrew cask to the existing three-target CLI distribution. The production
-bundle contains no test-state environment override; GUI and scoped helper share
-Developer ID signing, and packaging requires a stapled accepted notarization
-ticket. The release workflow verifies both macOS archives before publishing.
-README and the static website now describe desktop installation, account-region
-selection, one-time preparation, automatic reuse and remaining experimental gates.
-The preceding real FairPlay acceptance remains the private-flow evidence; a
-version change and public distribution do not close broader platform/account gates.
-Final publication and installation evidence is recorded after the release passes.
+[PR #7](https://github.com/everettjf/ipatool-rs/pull/7) was merged into `main`.
+Tag `v0.3.0` names merge commit `9368505940e0eb995e01f57de669e35b9f2e3d9b`.
+All five [main platform CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/41711635219)
+passed on that exact source. Full local default and GUI-test suites again passed
+497 library, 45 CLI, 8 helper and 46 GUI tests (596 active; 70 opt-in library tests
+ignored), formatting, strict default/GUI/GUI-test Clippy and ARM64 release builds.
+Workflow actionlint and changed-script shellcheck also passed.
+
+The [native release workflow](https://github.com/everettjf/ipatool-rs/actions/runs/41715373642)
+verified both macOS packages, built/tested Linux and Windows x86_64 CLI archives,
+checked portable checksums and published the latest regular
+[v0.3.0 release](https://github.com/everettjf/ipatool-rs/releases/tag/v0.3.0).
+The first hosted macOS ticket lookup lost its network connection to Apple's
+CloudKit service; retrying the failed/dependent jobs passed every original check.
+No signature, ticket, architecture or publication requirement was bypassed.
+All four public archives and four companion checksum files were independently
+downloaded and verified. The two macOS archives matched the local verified
+uploads byte for byte; no notarization-input ZIP or private state was published.
+
+Apple notarization accepted CLI submission `43c39097-bfb6-4d43-abe0-1790bdf53f80`
+and desktop submission `31f4b74e-6bf6-4260-9661-1cc85a98650f` with zero issues.
+The production GUI and scoped helper share Developer ID signing; the app has a
+stapled ticket and passed strict deep signature checks and Gatekeeper after
+extraction and Homebrew installation. Its source stamp names the tagged merge
+commit, and its Info.plist contains no test-state environment override. The
+signed extracted CLI passed its version, public catalog and controlled saved-account
+Store request in temporary isolated state, which was cleaned afterward.
+
+The [Homebrew tap update](https://github.com/everettjf/homebrew-tap/commit/3685f7c7e9ff8027f8be82f468fc8a07cc4b4ee7)
+updates `Formula/ipatool-rs.rb` and adds `Casks/ipatool-rs-gui.rb` using the verified
+public archive hashes. Both definitions passed style and strict audits. The actual
+tap upgraded the CLI to 0.3.0 and passed `brew test`, signature, byte-identity and
+public catalog checks. The cask installed `/Applications/IPATOOL-RS.app`, whose
+executables matched the notarized payload and passed installed-app trust checks.
+The GUI launched, loaded the saved account, selected its account region without
+showing the account name, and retained one private model with automatic reuse on.
+
+Before the Homebrew installation, the signed production GUI's advanced import
+validated the controlled real sample against complete available plaintext page
+hashes and saved a private model in normal application state. Model bytes matched
+the retained original; the receipt required verified pre-encryption hashes,
+private permissions passed and temporary staging was removed. Homebrew installation
+and relaunch preserved both model copies. No local collection ran for this import,
+and the collection helper remained stopped. This adds real explicit-import
+acceptance to the earlier protected-setup and independent-reuse record below.
+
+README, the static website, the three-interface architecture diagram and the
+FairPlay migration guide reflect this distribution. Public screenshots contain
+only signed-out catalog browsing. Linux/Windows live account and package flows,
+Windows managed-model ACLs, accessibility, remaining account challenges and broader
+enrollment parity remain open. GUI binaries are distributed only for Apple
+Silicon macOS; the three CLI target architectures are unchanged.
 
 ## Release snapshot (2026-10-27)
 

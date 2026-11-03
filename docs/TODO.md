@@ -12,7 +12,7 @@ Linux x86_64 and Windows x86_64 have native CI test, build, catalog smoke, and r
 - The published `v0.1.0` Apple Silicon macOS archive is Developer ID signed and Apple notarization returned `Accepted` with zero issues. Its signed executable is byte-identical to the notarized ZIP payload and passed a public catalog search and controlled-account purchase-history request. The Homebrew tap fetched and installed the archive, passed style, strict audit, and `brew test`, retained a valid signature, and completed an account-backed purchase-history request. Preview.2 previously passed TouchLink version listing, version metadata, and IPA download. Preview.1's hardened runtime blocked the cached Unicorn library and its JIT; later versions include the two required runtime entitlements. The 0.1.0 release does not close the gates below.
 - The published `v0.2.0` release has macOS ARM64, Linux x86_64/ARM64, and Windows x86_64/ARM64 archives and companion SHA-256 files. The release workflow passed native tests, release builds, version and public catalog smoke checks, package checksums, and signed macOS archive verification. Main and PR platform CI also passed all four portable jobs. The macOS archive was notarized with zero issues. The updated Homebrew tap passed strict audit, installation, `brew test`, code-signature verification, and public search. These account-free portable checks do not establish account or FairPlay parity.
 - The published `v0.2.1` release has only macOS ARM64, Linux x86_64, and Windows x86_64 archives with companion SHA-256 files. Main and release CI passed native tests and packaging for both portable targets; the macOS archive was signed and notarized with zero issues. All three public archive checksums passed after download. The Homebrew tap passed strict audit, installation, `brew test`, signature verification, and public search. Linux and Windows authenticated workflows remain untested.
-- The macOS ARM64 release build and signature check, 421 active library tests, 45 CLI tests, and Clippy. Three affected pinned Store guest tests also passed explicitly. The 69 ignored library tests are opt-in checks, not a count of known failures.
+- v0.3.0 passed 596 active local tests (497 library, 45 CLI, 8 helper, 46 GUI), formatting, strict default/GUI/GUI-test Clippy and ARM64 release builds. The 70 ignored library tests are opt-in checks, not a count of known failures. Five main platform CI jobs and native release CI passed; the public CLI and desktop were installed through Homebrew and verified.
 
 ## GPUI desktop preview
 
@@ -26,12 +26,12 @@ checkboxes and local/CI evidence do not close the separate live-validation gates
 - [x] Default public browsing to the loaded account's region, preserve explicit overrides during same-account refresh, and display a persistent cross-region download warning with a return-to-account-region action.
 - [x] Validate native Linux x86_64 and Windows MSVC x86_64 GUI builds, deterministic controllers and strict all-targets Clippy in CI. Windows GNU GUI cross-build and strict all-targets Clippy also pass on macOS. The successful CI run is linked in [PORTING.md](PORTING.md).
 - [ ] Validate Linux x86_64 and Windows x86_64 GUI desktop interaction and account workflows. Headless controller tests and CLI CI do not establish these gates.
-- [ ] Publish and verify the v0.3.0 Developer ID signed/notarized Apple Silicon desktop ZIP and Homebrew cask alongside the three CLI archives. Release packaging and CI verification are implemented; publication evidence is recorded after the release gates pass.
+- [x] Publish and verify v0.3.0: Developer ID signed/notarized Apple Silicon desktop ZIP and Homebrew cask alongside the three CLI archives. All five main CI jobs, native release CI, four public archive checksums, strict formula/cask audits, actual CLI upgrade/test, GUI installation/trust checks and model preservation passed. See the [release record](PORTING.md#version-030-desktop-and-homebrew-release-2026-11-03).
 - [ ] Finish fixture and live validation of the implemented account, download, and FairPlay desktop workflows, including 2FA, credential-store access, task recovery, safe cancellation, and output selection. Keep manual account/private-data checks last.
 - [x] Complete the controlled macOS Apple Silicon FairPlay processing and interruption walkthroughs (2026-11-03): real setup, verified sample, automatic independent reuse after restart, cancellation cleanup, access removal and output preservation. See the acceptance record below.
 
 - [x] Add a reviewed one-time FairPlay preparation guide, advanced validated-model import, private selector-bound model reuse, and independent automatic decryption after new IPA downloads. Advanced parameters/tools are collapsed and actions remain visible at 900×650. Synthetic crypto/controller tests and native captures pass; real macOS acceptance is recorded below.
-- [x] Validate real one-time setup followed by a different matching IPA download, automatic decryption after relaunch, content checks, cancellation and collision protection on macOS Apple Silicon. Explicit model import has synthetic coverage; same Apple ID alone does not prove matching enrollment.
+- [x] Validate real one-time setup followed by a different matching IPA download, automatic decryption after relaunch, content checks, cancellation and collision protection on macOS Apple Silicon. Explicit model import also passed against the signed v0.3.0 production bundle, with complete available sample hash coverage, private storage and temporary cleanup; same Apple ID alone does not prove matching enrollment.
 - [ ] Implement equivalent private Windows ACL enforcement before enabling managed FairPlay model storage/reuse there.
 
 ### FairPlay completion sequence (2026-11-01)
@@ -76,8 +76,8 @@ output preservation were exercised natively. See
 [the acceptance record](PORTING.md#real-fairplay-acceptance-2026-11-03) and
 [the authorization boundary](FAIRPLAY_AUTHORIZATION.md).
 
-Remaining work includes the v0.3.0 distribution gate above, accessibility, account
-challenge/session gates and native Linux/Windows account interaction. Windows
+Remaining work includes accessibility, account challenge/session gates and native
+Linux/Windows account interaction. Windows
 managed-model storage still requires equivalent ACL enforcement. Controlled
 acceptance does not establish arbitrary-enrollment or cross-platform private-data
 parity.

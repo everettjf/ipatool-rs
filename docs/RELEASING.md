@@ -57,3 +57,18 @@ The requested `v0.1.0` archive passed the same checks. The notarization service 
 Version `v0.2.0` was published by the [release CI workflow](https://github.com/everettjf/ipatool-rs/actions/runs/40631088067) after all four native portable jobs, macOS archive verification, and four portable checksum checks succeeded. The signed macOS archive matched its notarization ZIP executable; submission `67827331-5eb0-42bb-9140-13a1c273a606` was accepted with no issues. The public release has five archives and five checksum files. The Homebrew tap upgraded and passed strict audit, `brew test`, signature verification, and public search. The platform-specific live account gaps remain in [TODO.md](TODO.md).
 
 Version `v0.2.1` was published by the [release CI workflow](https://github.com/everettjf/ipatool-rs/actions/runs/40638453544) with two native x86_64 portable jobs and the macOS archive check. The public release has exactly three archives and three SHA-256 files; all three downloaded checksums passed. Apple notarization accepted the final macOS ZIP submission `ece034ff-f6b2-4777-a086-986974aded18` with no issues. The Homebrew tap upgraded to v0.2.1 and passed strict audit, `brew test`, signature verification, and public search. The account-backed Linux and Windows workflows remain untested.
+
+
+Version `v0.3.0` adds the signed/notarized Apple Silicon desktop ZIP and Homebrew
+cask to the three CLI archives. All five [main CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/41711635219)
+passed on the tagged merge commit `9368505`. The [release workflow](https://github.com/everettjf/ipatool-rs/actions/runs/41715373642)
+passed and published four archives and four checksum files, independently checked
+after download. A first hosted ticket-service connection loss was resolved by
+retrying only failed/dependent jobs while retaining every trust check. CLI
+notarization `43c39097-bfb6-4d43-abe0-1790bdf53f80` and desktop notarization
+`31f4b74e-6bf6-4260-9661-1cc85a98650f` were accepted with zero issues. The actual
+Homebrew formula upgrade and cask installation passed strict audits, CLI tests,
+byte identity, signatures, desktop stapler/Gatekeeper checks and native launch.
+A controlled real model import was preserved across installation/relaunch without
+re-enabling collection. The detailed [release record](PORTING.md#version-030-desktop-and-homebrew-release-2026-11-03)
+keeps the account, accessibility and portable private-data limitations explicit.

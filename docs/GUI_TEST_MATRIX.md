@@ -1,5 +1,18 @@
 # Shared application and desktop validation matrix
 
+
+## Published desktop acceptance (2026-11-03)
+
+The signed/notarized v0.3.0 Apple Silicon desktop passed public-archive extraction,
+actual Homebrew cask installation, executable byte identity, deep signatures,
+stapled-ticket validation, Gatekeeper and native launch. Saved account loading
+and account-region selection passed without displaying the account name. A real
+advanced model import passed complete available sample page hashes, private
+permissions and cleanup; the model remained ready after installation/relaunch.
+The helper stayed stopped. The exact release source passed all five main CI jobs
+and native release CI. See the [release record](PORTING.md#version-030-desktop-and-homebrew-release-2026-11-03).
+The earlier sections retain their historical fixture and acceptance scope.
+
 Status: final local and CI validation, 2026-10-28. Keep this matrix aligned
 with [the implementation plan](CLI_GUI_IMPLEMENTATION_PLAN.md). A test proves
 only the behavior it exercises; fixture and public-catalog evidence do not close
@@ -55,7 +68,7 @@ cancellation/cleanup and output collision/preservation checks also passed. See
 | Pickers/drop inputs and artifact handoff | Native path pickers, typed drop targets, completed IPA to inspection. | Native model file and directory selection passed. Checked IPA/model handoff to decryption review passed without starting work. The signed primary GUI completed a real protected snapshot and model publication. |
 | Expert command disposition | [GUI_FAIRPLAY.md](GUI_FAIRPLAY.md) inventories supported journeys, all retained expert CLI commands, combined download flags, and startup-profile exclusions. | Reconcile with final PR scope. |
 | Native macOS bundle | Debug and release bundles built; Info.plist linted; strict ad hoc signatures passed; actual launch succeeded; application icon decoded natively. | Final debug/release rebuilds and strict signatures passed. Public release launch and native controls passed. The notarized bundle identity completed saved-account loading and a fresh entitled IPA download; live 2FA/session gates remain separate. |
-| Release CLI | Apple Silicon release script built a signed executable returning 0.2.1. | Current source rebuilt; signed executable returns 0.2.1. |
+| Release CLI | v0.3.0 signed/notarized archive passed version, signature, public catalog and controlled Store checks; the Homebrew upgrade passed `brew test` and byte identity. | Published CLI returns 0.3.0; broader account gates remain open. |
 | Portable desktop builds | Native Linux x86_64 and Windows MSVC x86_64 CI passed shared fixtures, deterministic GUI controllers, strict Clippy and GUI linking. macOS CI also passed its app-bundle build/signature checks. Windows GNU GUI cross-build and strict all-targets Clippy passed locally. See the exact run in PORTING. | Native Linux/Windows desktop and account interaction remain open. GUI CI builds are debug executables; GUI distribution/release packaging is separate. |
 | Complete local regression | Current default suite: 497 library + 45 CLI + 8 helper passed, 70 library tests ignored. GUI-test adds 46 passing desktop tests, including iOS startup over old macOS preferences, one-time setup and automatic follow-up. Strict default, production-GUI and GUI-test all-targets Clippy passed; the Developer ID release bundle and ARM64 CLI were rebuilt. The prior source `ca1f433` passed [all five native CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/40824972940); reusable-setup CI is tracked separately in PR #7. | Real desktop/account/private processing and distribution remain distinct gates. Repeat affected checks if source changes. |
 | Reviewable PR, no main merge | Reviewed changes and current native screenshot pushed to `codex/gpui-catalog` / PR #7 after local verification. Shared workflows and desktop changes are recorded separately. | Keep remaining gates explicit; never merge main in this task. |
@@ -153,8 +166,11 @@ The native harness disables private setup; positive cryptographic reuse is teste
 in the synthetic service suite. New-head portable CI is tracked in PR #7.
 
 The authorized real preparation and independent download/reuse gates passed on
-2026-11-03; see the acceptance record above. Explicit import retains synthetic
-coverage. Windows managed private storage awaits ACL support; Linux/Windows live
+2026-11-03; see the acceptance record above. Explicit import also passed in the
+signed v0.3.0 production bundle: the real sample passed complete available page
+hashes, the private model matched its source bytes, and temporary staging was
+removed without enabling collection access. Windows managed private storage
+awaits ACL support; Linux/Windows live
 interaction and broader account/enrollment gates remain open. Synthetic suites
 and screenshots alone do not establish those gates.
 

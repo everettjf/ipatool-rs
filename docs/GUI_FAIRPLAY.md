@@ -194,3 +194,21 @@ account challenges and Linux/Windows private workflows remain open; synthetic
 fixtures and screenshots do not establish those gates. See
 [GUI_TEST_MATRIX.md](GUI_TEST_MATRIX.md), [PORTING.md](PORTING.md), and
 [TODO.md](TODO.md).
+
+
+## Moving an existing model to the desktop release
+
+The Homebrew desktop uses normal private application state; local preview bundles
+may have selected a different `IPATOOL_STATE_DIR`. Keep the original private state
+until migration is verified. In **First-time preparation**, continue to sample
+selection, choose the matching IPA, and expand **Advanced options** to select the
+existing model. An installed app and collection permission are not required for
+this import. Review the import summary, then choose **Prepare and save model**.
+The app validates the sample before saving a private copy and retains the source
+model and original IPA. Future matching downloads can use the saved copy.
+
+This import path passed with the signed v0.3.0 production bundle and the controlled
+real sample on 2026-11-03. Complete available plaintext page hashes passed for
+every image; private permissions, original-model equality and temporary cleanup
+were checked. The collection helper remained disabled. The managed model is user
+state and is never part of the downloadable app or Homebrew package.

@@ -88,6 +88,12 @@ macOS:
 shasum -a 256 -c ipatool-rs-*-macos-arm64.tar.gz.sha256
 ```
 
+For the macOS desktop ZIP:
+
+```sh
+shasum -a 256 -c ipatool-rs-*-gui-macos-arm64.zip.sha256
+```
+
 Linux:
 
 ```sh
@@ -180,7 +186,7 @@ Use `ipatool-rs --help` or a command's `--help` for its available options.
 
 ## Architecture
 
-![ipatool-rs architecture: CLI and MCP share Rust workflows backed by platform services, Apple endpoints, and build-specific guest execution.](docs/images/architecture.png)
+![ipatool-rs architecture: desktop, CLI and MCP share Rust workflows backed by platform services, Apple endpoints and selected guest execution.](docs/images/architecture.png)
 
 The CLI, MCP server, and optional GPUI desktop share Rust application modules. Public catalog queries use the catalog client directly and do not need a saved account or Apple guest execution.
 

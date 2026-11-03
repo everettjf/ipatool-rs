@@ -1,14 +1,16 @@
 # CLI and GPUI implementation plan
 
-Status: implementation and local validation in progress, 2026-10-28.
+Status: controlled macOS acceptance completed and v0.3.0 published, 2026-11-03.
+The milestone history below records the original 2026-10-28 development plan.
 Checkboxes record implemented and locally verified work; each milestone's exit
 evidence remains a separate acceptance gate. Current validation is recorded in
 `docs/PORTING.md` and `docs/GUI_TEST_MATRIX.md`; fixture evidence does not establish
 live account, private FairPlay, or portable desktop completion.
 
-Continue on `codex/gpui-catalog` and PR #7. The immediate objective is a shared
-Rust application layer supporting a compatible CLI and a usable GPUI desktop
-application. Publishing a Rust package is deferred.
+PR #7 was merged into `main`. The shared Rust application layer now supports the
+CLI and published Apple Silicon GPUI desktop. The [release record](PORTING.md#version-030-desktop-and-homebrew-release-2026-11-03)
+links the exact source, CI, notarization and Homebrew acceptance. Publishing a Rust
+package remains deferred.
 
 The project remains an experimental Rust rewrite created to use otherwise-unused
 Codex quota and test a substantial port. Recommend the original ipatool and
