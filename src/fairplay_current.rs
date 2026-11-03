@@ -7,6 +7,8 @@ pub mod state;
 pub mod tags;
 pub mod tree;
 
+use crate::fairplay_recovery_diagnostics::{Phase, RecoveryProblem};
+
 use aes::{
     Aes128,
     cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray},
@@ -40,8 +42,10 @@ pub fn recover(container: &[u8], hardware: &[u8], sinf: &[u8]) -> Result<Recover
     }
     crate::application::operation::check()?;
     let selector = crate::fairplay::parse_sinf_selector(sinf)?;
-    let decoded = state::decode(container, hardware)?;
-    let mut selected = tree::select(&decoded.body, hardware, selector)?;
+    let decoded = state::decode(container, hardware)
+        .map_err(|error| RecoveryProblem::annotate(error, Phase::Database))?;
+    let mut selected = tree::select(&decoded.body, hardware, selector)
+        .map_err(|error| RecoveryProblem::annotate(error, Phase::Selection))?;
     let key = class::account_key(hardware, selector.user, selector.key)?;
     let cipher = Aes128::new_from_slice(&*key).expect("validated account-class key");
     cipher.decrypt_block(GenericArray::from_mut_slice(&mut *selected.ciphertext));
@@ -61,7 +65,8 @@ pub fn recover(container: &[u8], hardware: &[u8], sinf: &[u8]) -> Result<Recover
     let _logical = Zeroizing::new(
         crate::fairplay_key::CurrentSinfModel::parse(&model)?
             .logical_key(sinf)
-            .context("selected SIDB value did not authenticate the SINF")?,
+            .context("selected SIDB value did not authenticate the SINF")
+            .map_err(|error| RecoveryProblem::annotate(error, Phase::License))?,
     );
     Ok(RecoveredEnrollment {
         model,

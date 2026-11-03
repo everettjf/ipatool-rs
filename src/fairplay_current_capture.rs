@@ -18,6 +18,7 @@ use crate::{
     capture::{CaptureFile, ENROLLMENT_CAPTURE_SCHEMA, EnrollmentCaptureManifest},
     fairplay_current::{outer::Layout, tree::RouteEvidence},
     fairplay_recover_capture::CaptureRecoveryResult,
+    fairplay_recovery_diagnostics::{Phase, RecoveryProblem},
     fairplay_recovery_output::{write_private_binary, write_private_json},
     fairplay_scinfo::Trust,
 };
@@ -349,7 +350,8 @@ fn recover_with_trust(
     if fs::symlink_metadata(output).is_ok() {
         bail!("recovery output already exists");
     }
-    let input = input(capture, trust)?;
+    let input =
+        input(capture, trust).map_err(|error| RecoveryProblem::annotate(error, Phase::Inputs))?;
     let recovered = crate::fairplay_current::recover(&input.sidb, &input.hardware, &input.sinf)?;
     let parent = output.parent().context("recovery output needs a parent")?;
     let staging = tempfile::Builder::new()
@@ -378,7 +380,8 @@ fn recover_with_trust(
         &candidate,
         Some(&work.join("App.decrypted.json")),
         false,
-    )?;
+    )
+    .map_err(|error| RecoveryProblem::annotate(error, Phase::Sample))?;
     let report_path = work.join("App.decrypted.json");
     let mut report: serde_json::Value =
         serde_json::from_slice(&bounded(File::open(&report_path)?, MAX_MANIFEST)?)?;

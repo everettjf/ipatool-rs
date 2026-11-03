@@ -122,6 +122,16 @@ impl Failure {
                 .into(),
             };
         }
+        if let Some(problem) =
+            error.downcast_ref::<crate::fairplay_recovery_diagnostics::RecoveryProblem>()
+        {
+            return Self {
+                kind: Unavailable,
+                title: problem.to_string(),
+                message: problem.message(),
+                action: "Review preparation".into(),
+            };
+        }
         if let Some(problem) = error.downcast_ref::<super::fairplay_setup::ModelProblem>() {
             use super::fairplay_setup::ModelProblem;
             let (kind, message, action) = match problem {
@@ -360,6 +370,25 @@ mod tests {
         assert!(!failure.message.contains("fake selector"));
     }
     use super::*;
+    #[test]
+    fn recovery_diagnostics_preserve_the_check_without_private_context() {
+        use crate::fairplay_recovery_diagnostics::{Phase, RecoveryProblem};
+        for (root, classified) in [
+            ("current SIDB container authentication failed", true),
+            ("private fake token and /private/path", false),
+        ] {
+            let error = RecoveryProblem::annotate(
+                anyhow::anyhow!(root).context("private fake selector"),
+                Phase::Database,
+            )
+            .context(crate::application::fairplay_setup::ModelProblem::Recovery);
+            let failure = Failure::from_error(&error);
+            let serialized = serde_json::to_string(&failure).unwrap();
+            assert!(failure.message.contains("authenticated"));
+            assert_eq!(!failure.message.contains("unclassified"), classified);
+            assert!(!serialized.contains("fake") && !serialized.contains("/private/path"));
+        }
+    }
     #[test]
     fn managed_model_failures_keep_private_context_out_of_history() {
         use crate::application::fairplay_setup::ModelProblem;

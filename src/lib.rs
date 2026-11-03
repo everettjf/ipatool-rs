@@ -42,6 +42,7 @@ pub mod fairplay_portable;
 pub mod fairplay_raw_source;
 pub mod fairplay_recover_capture;
 pub mod fairplay_recovery;
+mod fairplay_recovery_diagnostics;
 pub mod fairplay_recovery_linear;
 pub mod fairplay_recovery_math;
 pub mod fairplay_recovery_output;
