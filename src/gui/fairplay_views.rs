@@ -178,7 +178,7 @@ impl DesktopWindow {
                         .child(muted(if self.fair.model.read(cx).value().is_empty() { format!("Installed app: {}", name(&self.fair.app)) } else { format!("Existing model: {}", name(&self.fair.model)) }, cx))
                         .child(muted(format!("Sample IPA: {}", name(&self.fair.input)), cx))
                         .child(muted(if self.fair.model.read(cx).value().is_empty() { "Collect local authorization → create model → process and check sample IPA → save reusable model." } else { "Validate the imported model with the sample IPA → save reusable model. No local collection will run." }, cx))
-                        .child(muted("Original files are preserved. Only a model that passes sample processing and structural checks is saved. These checks do not authenticate plaintext or Apple's signature.", cx)));
+                        .child(muted("Your original files are preserved. The sample is checked against all available plaintext page hashes before the model is saved privately. Missing verification is reported. These checks do not verify Apple's signature.", cx)));
                 }
             }
         } else {
