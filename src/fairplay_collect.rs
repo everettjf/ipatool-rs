@@ -242,7 +242,16 @@ pub fn collect_current_enrollment(
 }
 
 fn private_directory(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        // Every newly created component is checked by current recovery, not
+        // only the final parent. Never rely on the process umask for captures.
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -864,6 +873,20 @@ mod tests {
                     || file.path.starts_with("fairplayd/")
                     || file.path.starts_with("state/adi/"))
         );
+        fn assert_private_tree(path: &Path) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert_eq!(
+                metadata.permissions().mode() & 0o077,
+                0,
+                "capture entries must stay private"
+            );
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    assert_private_tree(&entry.unwrap().path());
+                }
+            }
+        }
+        assert_private_tree(&options.output);
         load_enrollment_capture(&options.output, true).unwrap();
         let before = fs::read(&ipa).unwrap();
         preflight_current_sample(&options.app, &ipa).unwrap();
