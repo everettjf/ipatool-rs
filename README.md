@@ -373,7 +373,7 @@ Cargo's internal binary name is `ipatool` (`ipatool.exe` on Windows). Release pa
 | [RELEASING.md](docs/RELEASING.md) | Packaging, signing, notarization, CI releases, and Homebrew updates. |
 | [STARTUP_PROFILE_EXPORT.md](docs/STARTUP_PROFILE_EXPORT.md) | Design for the unfinished startup-profile export feature. |
 
-[Project website](https://xnu.app/ipatool-rs/) · [Releases](https://github.com/everettjf/ipatool-rs/releases) · [Issues](https://github.com/everettjf/ipatool-rs/issues)
+[Project website](https://atomsprout.com/ipatool-rs/) · [Releases](https://github.com/everettjf/ipatool-rs/releases) · [Issues](https://github.com/everettjf/ipatool-rs/issues)
 
 ## License and attribution
 

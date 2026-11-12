@@ -35,6 +35,8 @@ jobs:
           mkdir -p web/images
           cp docs/images/architecture.png docs/images/architecture.svg web/images/
           cp docs/screenshots/release-*.png web/images/
+      - name: Redirect legacy website to AtomSprout
+        run: python3 scripts/redirect-legacy-site.py web ipatool-rs
       - name: Upload the static site
         uses: actions/upload-pages-artifact@v4
         with:
