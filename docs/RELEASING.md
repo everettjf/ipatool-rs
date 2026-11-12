@@ -72,3 +72,21 @@ byte identity, signatures, desktop stapler/Gatekeeper checks and native launch.
 A controlled real model import was preserved across installation/relaunch without
 re-enabling collection. The detailed [release record](PORTING.md#version-030-desktop-and-homebrew-release-2026-11-03)
 keeps the account, accessibility and portable private-data limitations explicit.
+
+
+Version `v0.3.1` updates AtomSprout public support and copyright references. All
+five [platform CI jobs](https://github.com/everettjf/ipatool-rs/actions/runs/43322323592)
+passed on the tagged commit `95f46b49afac0232156ea4905bda09c357447a7e`.
+The [release workflow](https://github.com/everettjf/ipatool-rs/actions/runs/43326314748)
+passed, including independent verification of the signed Mac archives and native
+Linux/Windows tests, public search and packaging. All four published archive
+checksums and all eight GitHub asset digests were independently checked after
+download. Final CLI notarization `da0f5b6c-84d3-4990-b74d-eb87d71c13d8` and desktop
+notarization `c842775e-a7af-47e2-b591-4e3481118e08` were accepted with no issues.
+The extracted final desktop passed strict signatures, stapler and Gatekeeper;
+the extracted CLI passed signature/entitlement checks, version and public search.
+Local validation also passed 103 signed synthetic runtime fixture tests and the
+three matrix regression tests. No controlled live account or private model was
+used for this maintenance release; the outstanding acceptance gaps in
+[TODO.md](TODO.md) still apply. Homebrew formula/cask checksums point to these
+exact published Mac assets.
