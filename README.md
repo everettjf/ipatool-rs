@@ -224,6 +224,8 @@ automatically and clear the previous selection while loading. Select a result to
 inspect metadata or copy identifiers, JSON, and CLI commands. Queries run in the
 background and report loading, empty, and error states.
 
+Version 0.3.1 refreshes public support links, the contact email and project copyright to AtomSprout. Platform and live-validation limitations below remain applicable.
+
 Version 0.3.0 adds a signed, notarized Apple Silicon desktop ZIP and Homebrew
 cask alongside the existing CLI distributions. This is an experimental release,
 with real controlled macOS account, download and FairPlay setup/reuse acceptance.
