@@ -284,9 +284,9 @@ impl Mat8 {
 
     pub fn transpose(self) -> Self {
         let mut result = [0; 8];
-        for row in 0..8 {
+        for (row, source) in self.0.into_iter().enumerate() {
             for (column, target) in result.iter_mut().enumerate() {
-                if self.0[row] >> column & 1 != 0 {
+                if source >> column & 1 != 0 {
                     *target |= 1 << row;
                 }
             }
@@ -386,8 +386,8 @@ pub fn intertwiner_basis(left: Mat8, right: Mat8) -> Vec<u64> {
     for row in 0..8 {
         for column in 0..8 {
             let mut coefficient = 0;
-            for k in 0..8 {
-                if left.0[k] >> column & 1 != 0 {
+            for (k, left_row) in left.0.into_iter().enumerate() {
+                if left_row >> column & 1 != 0 {
                     coefficient ^= 1u64 << (row * 8 + k);
                 }
                 if right.0[row] >> k & 1 != 0 {
